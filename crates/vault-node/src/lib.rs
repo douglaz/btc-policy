@@ -1,7 +1,7 @@
 //! vault-node: one federation key, one policy engine, `POST /sign`.
 //!
 //! First-light scope (see docs/DESIGN.md "Milestones"): PIN verification,
-//! the two policy-core checks, user partial-signature presence, and node
+//! the two policy-core checks, user partial-signature verification, and node
 //! signing at first submission (`hold_secs = 0`). The Hold, duress actions,
 //! lockdown, watchtower duty, and `GET /events` are v0 work.
 
@@ -159,22 +159,20 @@ pub fn handle_sign(node: &Node, request: &SignRequest) -> Result<SignResponse, B
     // ADR-0008); first light runs no further checks on it.
     decode_psbt(&request.escape_psbt, "escape_psbt")?;
 
-    // 3. The first-light policy checks (destination allowlist, fee cap).
-    if let Err(v) = policy_core::evaluate(&psbt, &node.check_params) {
-        return Ok(refusal(map_policy_code(v.code), v.check, v.detail));
+    // 3. The user's partial signature must cryptographically verify on every
+    //    input against the node's own recomputed sighash — presence of a
+    //    partial_sig is never enough (DESIGN.md, "Sighash enforcement"). This
+    //    subsumes the "no output mutation after authorization" check: any
+    //    mutation after signing changes the sighash and invalidates the very
+    //    signature the node verifies. Runs before policy-core and signing:
+    //    only if every input passes does the node proceed.
+    if let Err(response) = verify_user_signatures(node, &psbt) {
+        return Ok(response);
     }
 
-    // 4. The user's partial signature must be present for the user key on
-    //    every input. Presence only at first light; cryptographic
-    //    verification against the node's own recomputed sighash is v0 work.
-    for (index, input) in psbt.inputs.iter().enumerate() {
-        if !input.partial_sigs.contains_key(&node.user_pubkey) {
-            return Ok(refusal(
-                RefusalCode::UserSigInvalid,
-                "user_signature",
-                format!("input {index} carries no partial signature for the user key"),
-            ));
-        }
+    // 4. The first-light policy checks (destination allowlist, fee cap).
+    if let Err(v) = policy_core::evaluate(&psbt, &node.check_params) {
+        return Ok(refusal(map_policy_code(v.code), v.check, v.detail));
     }
 
     // 5. hold_secs = 0: sign at first submission (ADR-0004's instant path).
@@ -202,6 +200,83 @@ fn map_policy_code(code: policy_core::ViolationCode) -> RefusalCode {
         policy_core::ViolationCode::FeeExceedsCap => RefusalCode::FeeExceedsCap,
         policy_core::ViolationCode::PsbtInconsistent => RefusalCode::PsbtInconsistent,
     }
+}
+
+/// Cryptographically verify the user's partial signature on every input
+/// before the node contributes its own (DESIGN.md, Policy model →
+/// "Sighash enforcement"). For each input the node recomputes the P2WSH
+/// sighash from its own full `and_v(v:pk(USER),multi(...))` witness script,
+/// the `witness_utxo` amount, and sighash type ALL, then:
+///
+/// - requires a `partial_sig` under the configured user key
+///   (absent → `USER_SIG_INVALID`);
+/// - requires that signature to commit to SIGHASH_ALL — P2WSH has no
+///   SIGHASH_DEFAULT (anything else → `BAD_SIGHASH`);
+/// - ECDSA-verifies it against the recomputed sighash and the user pubkey
+///   (invalid → `USER_SIG_INVALID`).
+///
+/// A stale, garbage, or wrong-key signature — and any output mutated after
+/// the user signed — all fail here. `Err` carries the wire refusal to return.
+fn verify_user_signatures(node: &Node, psbt: &Psbt) -> Result<(), SignResponse> {
+    let secp = Secp256k1::verification_only();
+    let mut cache = SighashCache::new(&psbt.unsigned_tx);
+    for (index, input) in psbt.inputs.iter().enumerate() {
+        // Amount comes from witness_utxo; without it no sighash exists to
+        // verify against — a decodable-but-inconsistent PSBT.
+        let utxo = input.witness_utxo.as_ref().ok_or_else(|| {
+            refusal(
+                RefusalCode::PsbtInconsistent,
+                "user_signature",
+                format!("input {index} has no witness_utxo; sighash cannot be computed"),
+            )
+        })?;
+        let sighash = cache
+            .p2wsh_signature_hash(
+                index,
+                &node.witness_script,
+                utxo.value,
+                EcdsaSighashType::All,
+            )
+            .map_err(|e| {
+                refusal(
+                    RefusalCode::PsbtInconsistent,
+                    "user_signature",
+                    format!("cannot compute sighash for input {index}: {e}"),
+                )
+            })?;
+        let Some(sig) = input.partial_sigs.get(&node.user_pubkey) else {
+            return Err(refusal(
+                RefusalCode::UserSigInvalid,
+                "user_signature",
+                format!("input {index} carries no partial signature for the user key"),
+            ));
+        };
+        if sig.sighash_type != EcdsaSighashType::All {
+            return Err(refusal(
+                RefusalCode::BadSighash,
+                "user_signature",
+                format!(
+                    "input {index} user signature commits to {:?}, not SIGHASH_ALL",
+                    sig.sighash_type
+                ),
+            ));
+        }
+        secp.verify_ecdsa(
+            &Message::from_digest(sighash.to_byte_array()),
+            &sig.signature,
+            &node.user_pubkey.inner,
+        )
+        .map_err(|_| {
+            refusal(
+                RefusalCode::UserSigInvalid,
+                "user_signature",
+                format!(
+                    "input {index} user signature does not verify against the recomputed sighash"
+                ),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Add this node's partial signature to every input, signing the node's own

@@ -60,17 +60,19 @@ fn fixture() -> Fixture {
     }
 }
 
-/// One-input PSBT spending the vault to `outputs`, with witness data filled.
-fn vault_psbt(fixture: &Fixture, outputs: Vec<(ScriptBuf, u64)>) -> Psbt {
+/// A `count`-input PSBT spending the vault to `outputs`, witness data filled.
+fn vault_psbt_n(fixture: &Fixture, count: u32, outputs: Vec<(ScriptBuf, u64)>) -> Psbt {
     let tx = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
+        input: (0..count)
+            .map(|vout| TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), vout),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            })
+            .collect(),
         output: outputs
             .into_iter()
             .map(|(script_pubkey, sats)| TxOut {
@@ -80,43 +82,69 @@ fn vault_psbt(fixture: &Fixture, outputs: Vec<(ScriptBuf, u64)>) -> Psbt {
             .collect(),
     };
     let mut psbt = Psbt::from_unsigned_tx(tx).expect("unsigned tx");
-    psbt.inputs[0].witness_utxo = Some(TxOut {
-        script_pubkey: fixture.descriptor.script_pubkey(),
-        value: Amount::from_sat(100_000_000),
-    });
-    psbt.inputs[0].witness_script = Some(
-        fixture
-            .descriptor
-            .explicit_script()
-            .expect("wsh witness script"),
-    );
+    let witness_script = fixture
+        .descriptor
+        .explicit_script()
+        .expect("wsh witness script");
+    for input in psbt.inputs.iter_mut() {
+        input.witness_utxo = Some(TxOut {
+            script_pubkey: fixture.descriptor.script_pubkey(),
+            value: Amount::from_sat(100_000_000),
+        });
+        input.witness_script = Some(witness_script.clone());
+    }
     psbt
 }
 
-fn user_sign(fixture: &Fixture, psbt: &mut Psbt) {
+/// One-input PSBT spending the vault to `outputs` (the common case).
+fn vault_psbt(fixture: &Fixture, outputs: Vec<(ScriptBuf, u64)>) -> Psbt {
+    vault_psbt_n(fixture, 1, outputs)
+}
+
+/// Insert a partial signature under the configured user pubkey (index 1) on
+/// input `index`, signing the P2WSH sighash of type `sighash_type` with `key`.
+/// The sighash is computed for that same type, so an honest SIGHASH_ALL
+/// signature verifies while a SIGHASH_NONE one is a genuine but wrong-type
+/// signature. The signature is always *filed* under the user key — that is
+/// where the node looks for it — so varying `key` (not the storage slot) is
+/// what lets the garbage-key test sign with a non-user key.
+fn sign_input(
+    fixture: &Fixture,
+    psbt: &mut Psbt,
+    index: usize,
+    key: &SecretKey,
+    sighash_type: EcdsaSighashType,
+) {
     let secp = Secp256k1::new();
     let witness_script = fixture
         .descriptor
         .explicit_script()
         .expect("wsh witness script");
-    let unsigned_tx = psbt.unsigned_tx.clone();
-    let mut cache = SighashCache::new(&unsigned_tx);
-    let value = psbt.inputs[0]
+    let value = psbt.inputs[index]
         .witness_utxo
         .as_ref()
         .expect("witness_utxo")
         .value;
+    let unsigned_tx = psbt.unsigned_tx.clone();
+    let mut cache = SighashCache::new(&unsigned_tx);
     let sighash = cache
-        .p2wsh_signature_hash(0, &witness_script, value, EcdsaSighashType::All)
+        .p2wsh_signature_hash(index, &witness_script, value, sighash_type)
         .expect("sighash");
-    let signature = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &seckey(1));
-    psbt.inputs[0].partial_sigs.insert(
+    let signature = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), key);
+    psbt.inputs[index].partial_sigs.insert(
         pubkey(&secp, 1),
         bitcoin::ecdsa::Signature {
             signature,
-            sighash_type: EcdsaSighashType::All,
+            sighash_type,
         },
     );
+}
+
+/// Honestly sign every input with the user key (index 1), SIGHASH_ALL.
+fn user_sign(fixture: &Fixture, psbt: &mut Psbt) {
+    for index in 0..psbt.inputs.len() {
+        sign_input(fixture, psbt, index, &seckey(1), EcdsaSighashType::All);
+    }
 }
 
 fn request(psbt: &Psbt, pin: &str) -> SignRequest {
@@ -169,6 +197,79 @@ fn missing_user_signature_is_refused() {
         handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN)).expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
+}
+
+#[test]
+fn output_mutation_after_user_signing_is_refused() {
+    let fixture = fixture();
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    // The user committed to 99_990_000 sat; mutating the output afterwards
+    // changes the sighash and must invalidate the very signature the node
+    // verifies (mutation is subsumed by sighash enforcement).
+    psbt.unsigned_tx.output[0].value = Amount::from_sat(99_980_000);
+    let response =
+        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN)).expect("decodable request");
+    let refusal = expect_refusal(response);
+    assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
+}
+
+#[test]
+fn wrong_sighash_type_is_refused_with_bad_sighash() {
+    let fixture = fixture();
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    // A genuine user signature, but committing to SIGHASH_NONE, not ALL.
+    sign_input(&fixture, &mut psbt, 0, &seckey(1), EcdsaSighashType::None);
+    let response =
+        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN)).expect("decodable request");
+    let refusal = expect_refusal(response);
+    assert_eq!(refusal.code, RefusalCode::BadSighash);
+}
+
+#[test]
+fn missing_user_signature_on_one_of_several_inputs_is_refused() {
+    let fixture = fixture();
+    let mut psbt = vault_psbt_n(&fixture, 2, vec![(fixture.hot_spk.clone(), 199_990_000)]);
+    // Sign only the first input; the second carries no user signature.
+    sign_input(&fixture, &mut psbt, 0, &seckey(1), EcdsaSighashType::All);
+    let response =
+        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN)).expect("decodable request");
+    let refusal = expect_refusal(response);
+    assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
+}
+
+#[test]
+fn garbage_signature_under_user_key_is_refused() {
+    let fixture = fixture();
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    // A well-formed SIGHASH_ALL signature over the correct sighash, but made
+    // by a non-user key (index 42) while still filed under the user pubkey.
+    // This is exactly the first-light gap: any DER blob under the user key
+    // used to pass on presence alone.
+    sign_input(&fixture, &mut psbt, 0, &seckey(42), EcdsaSighashType::All);
+    let response =
+        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN)).expect("decodable request");
+    let refusal = expect_refusal(response);
+    assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
+}
+
+#[test]
+fn missing_witness_utxo_is_refused_as_psbt_inconsistent() {
+    let fixture = fixture();
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    // Sign honestly, then strip the witness_utxo: without the input amount the
+    // node cannot recompute the sighash, so it cannot verify the (present,
+    // valid) user signature. This check fires before the partial-sig check, so
+    // a decodable-but-inconsistent PSBT is refused PSBT_INCONSISTENT — the code
+    // DESIGN.md ("PSBT consistency") and policy-core already use here — not
+    // mislabelled USER_SIG_INVALID.
+    user_sign(&fixture, &mut psbt);
+    psbt.inputs[0].witness_utxo = None;
+    let response =
+        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN)).expect("decodable request");
+    let refusal = expect_refusal(response);
+    assert_eq!(refusal.code, RefusalCode::PsbtInconsistent);
+    assert_eq!(refusal.check, "user_signature");
 }
 
 #[test]
