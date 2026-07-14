@@ -1,0 +1,11 @@
+[package]
+name = "vault-node"
+description = "Federation signer node: one key, one policy engine, POST /sign + GET /events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

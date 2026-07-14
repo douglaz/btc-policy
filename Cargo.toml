@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/policy-core",
+    "crates/vault-proto",
+    "crates/vault-node",
+    "crates/vault-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"

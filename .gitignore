@@ -1,0 +1,6 @@
+/target
+/repos/
+/.rb-lite/
+/.ralph-burning/
+result
+*.log

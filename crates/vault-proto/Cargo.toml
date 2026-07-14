@@ -1,0 +1,11 @@
+[package]
+name = "vault-proto"
+description = "Shared protocol vocabulary: tx commitment, refusal codes, /sign and /events wire DTOs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

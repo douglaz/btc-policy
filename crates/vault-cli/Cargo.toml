@@ -1,0 +1,15 @@
+[package]
+name = "vault-cli"
+description = "Coordinator + demo runner: builds PSBTs, fans out to nodes, pulls events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "btc-vault"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
