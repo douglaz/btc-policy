@@ -49,9 +49,35 @@ the escape sweep cancels). Resolve: either bind those fields into the commitment
 document why pending-identity is safe without them.
 
 ## V0-4 — dual PINs + duress response + lockdown
-Real duress_response ∈ {lockdown, sweep_and_lockdown}; lockdown persisted on
-disk surviving restart; FRAUD_SUSPECTED refusals; duress PIN wire-identical to
-normal. ADR-0008. Two-transaction ceremony already in the wire shape.
+**BLOCKED pending duress-redesign decisions (2026-07-14 conversation).** Do not
+launch until resolved and ADR-0008 is updated.
+
+Emerging redesign (supersedes ADR-0008's instant sweep + instant lockdown):
+- **Duress is silent and deferred.** An observable countermeasure endangers a
+  hostage, so the duress PIN does nothing observable at entry — it *schedules*
+  the escape sweep AND lockdown to fire together after a delay, invisible on
+  chain until then. Buys the person time to reach safety.
+- **Two escape timings, by threat model:** *race/rotate* (remote attacker, no
+  hostage — watchtower or manual) stays **instant**; *duress* (hostage present)
+  is **delayed + silent**. Same destination, opposite timing.
+- **Abortable during the window** via the normal PIN — safe because the response
+  is silent (attacker doesn't know there's anything to force a stand-down of),
+  and in the sweep case the funds haven't moved yet either.
+- Known limit to document: under duress the attacker may control the coordinator
+  (the victim's laptop), which can decline to broadcast a scheduled sweep —
+  a v1 untrusted-coordinator / node-driven-broadcast concern, not solved in MVP.
+
+Open decisions before this can be specced:
+1. Duress delay = reuse `hold_secs`, or a separate `duress_delay_secs` (rec:
+   separate, same default — the escape-to-safety horizon ≠ the fraud-notice
+   horizon).
+2. Confirm the delayed+silent-duress vs instant-race split.
+3. Plain `lockdown` mode (no sweep): instant freeze (funds unprotected during any
+   delay) vs the hostage-silence tension — pick per threat model.
+
+Still in scope regardless: dual PINs (second factor on every spend, wire-
+identical duress vs normal), lockdown persisted on disk surviving restart,
+FRAUD_SUSPECTED refusals as cover story.
 
 ## V0-5 — verified change + PSBT consistency + descriptor allowlist
 policy-core: verified-change via own-descriptor re-derivation at bounded index;
