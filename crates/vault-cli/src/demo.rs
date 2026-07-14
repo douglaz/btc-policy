@@ -37,6 +37,13 @@ const NORMAL_PIN: &str = "246802";
 const DURESS_PIN: &str = "135791";
 const NODE_COUNT: usize = 5;
 const QUORUM: usize = 3;
+/// The baked policy identifier every commitment carries (policy never changes).
+const POLICY_VERSION: u32 = 1;
+/// Node-enforced cap on coordinator-proposed expiry (DESIGN.md config schema).
+const MAX_COMMITMENT_AGE_SECS: u64 = 172_800;
+/// The expiry the coordinator proposes on each spend: an hour out, well inside
+/// the node's cap.
+const COMMITMENT_TTL_SECS: u64 = 3_600;
 /// Coins sent into the vault.
 const FUND: Amount = Amount::from_sat(1_000_000_000);
 /// Act one pays this to the hot wallet; the rest returns to the vault.
@@ -191,6 +198,8 @@ fn act_one(
         psbt: honest.to_string(),
         escape_psbt: escape.to_string(),
         pin: NORMAL_PIN.into(),
+        expiry: commitment_expiry()?,
+        policy_version: POLICY_VERSION,
     };
     let mut node_signed = Vec::new();
     for node in nodes {
@@ -269,6 +278,8 @@ fn act_two(
         psbt: theft.to_string(),
         escape_psbt: escape.to_string(),
         pin: NORMAL_PIN.into(),
+        expiry: commitment_expiry()?,
+        policy_version: POLICY_VERSION,
     };
     let mut refusals = 0;
     for node in nodes {
@@ -408,6 +419,13 @@ fn summarize(response: &SignResponse) -> String {
     serde_json::to_string(response).unwrap_or_else(|_| format!("{response:?}"))
 }
 
+/// A coordinator-proposed commitment expiry: the current wall clock plus the
+/// TTL. Each node re-checks it against its own clock and cap.
+fn commitment_expiry() -> Result<u64, Error> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    Ok(now + COMMITMENT_TTL_SECS)
+}
+
 // ---------------------------------------------------------------------------
 // Node processes
 
@@ -437,6 +455,8 @@ impl NodeProcess {
              descriptor = \"{descriptor}\"\n\
              allowlist = [{}]\n\
              hold_secs = 0\n\
+             max_commitment_age_secs = {MAX_COMMITMENT_AGE_SECS}\n\
+             policy_version = {POLICY_VERSION}\n\
              pin_normal_hash = \"{}\"\n\
              pin_duress_hash = \"{}\"\n",
             actor.seckey.display_secret(),

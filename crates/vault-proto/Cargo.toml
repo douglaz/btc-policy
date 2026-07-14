@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+# Already a workspace dependency (built for every other crate); reused here
+# only for `hashes::sha256` to compute the commitment id — no new crate lands
+# in the dependency graph.
+bitcoin = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

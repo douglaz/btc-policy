@@ -6,7 +6,89 @@
 //! Refusals are policy *outcomes*, not transport errors: nodes answer them
 //! with HTTP 200. Only input the node cannot decode earns a 400.
 
+use bitcoin::hashes::{sha256, Hash};
 use serde::{Deserialize, Serialize};
+
+/// The exact-transaction binding a node evaluates and signs against
+/// (DESIGN.md, "Transaction commitment"; CONTEXT.md "Commitment"). Built
+/// identically on coordinator and node from the same PSBT + config, it keys
+/// the anti-replay log by content — **never** by outpoint set, so an RBF
+/// replacement or rebroadcast is a fresh commitment, not a blocked replay.
+///
+/// The fields are plain owned types (not `bitcoin` types) so the struct is
+/// serde-native without pulling in `bitcoin`'s serde feature; the canonical
+/// byte encoding lives in [`Commitment::canonical_bytes`], not in serde.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Commitment {
+    /// Hash of the vault descriptor: which vault this spend belongs to.
+    pub wallet_id: [u8; 32],
+    /// Every input the transaction spends, in transaction order.
+    pub inputs: Vec<CommitmentInput>,
+    /// Every output the transaction pays, in transaction order.
+    pub outputs: Vec<CommitmentOutput>,
+    /// Absolute fee in satoshis (Σ input value − Σ output value).
+    pub fee: u64,
+    /// Coordinator-proposed expiry (unix seconds); the node caps it against
+    /// its own clock so a hostile coordinator can't inflate retention.
+    pub expiry: u64,
+    /// The baked-at-setup policy identifier (policy never changes).
+    pub policy_version: u32,
+}
+
+/// One transaction input, by outpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitmentInput {
+    /// Previous-output txid as its raw 32 bytes.
+    pub txid: [u8; 32],
+    /// Previous-output index.
+    pub vout: u32,
+}
+
+/// One transaction output, by scriptPubKey and amount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitmentOutput {
+    /// Raw scriptPubKey bytes.
+    pub script_pubkey: Vec<u8>,
+    /// Amount in satoshis.
+    pub amount: u64,
+}
+
+impl Commitment {
+    /// The deterministic, byte-identical encoding both sides hash. Every field
+    /// is written at a fixed width, big-endian, with explicit length prefixes,
+    /// so the bytes are unambiguous and two constructions of the same logical
+    /// commitment produce identical output. The encoding is greenfield until
+    /// v1 (DESIGN.md, "Wire format is greenfield until v1").
+    ///
+    /// Crate-private: the cross-crate contract is delivered through
+    /// [`Commitment::commitment_id`]; nothing outside this crate hashes the
+    /// bytes directly, so the encoding is not (yet) public surface.
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.wallet_id);
+        out.extend_from_slice(&(self.inputs.len() as u32).to_be_bytes());
+        for input in &self.inputs {
+            out.extend_from_slice(&input.txid);
+            out.extend_from_slice(&input.vout.to_be_bytes());
+        }
+        out.extend_from_slice(&(self.outputs.len() as u32).to_be_bytes());
+        for output in &self.outputs {
+            out.extend_from_slice(&(output.script_pubkey.len() as u32).to_be_bytes());
+            out.extend_from_slice(&output.script_pubkey);
+            out.extend_from_slice(&output.amount.to_be_bytes());
+        }
+        out.extend_from_slice(&self.fee.to_be_bytes());
+        out.extend_from_slice(&self.expiry.to_be_bytes());
+        out.extend_from_slice(&self.policy_version.to_be_bytes());
+        out
+    }
+
+    /// Lowercase-hex SHA-256 of [`Commitment::canonical_bytes`]. This is the
+    /// key the anti-replay log records verdicts under.
+    pub fn commitment_id(&self) -> String {
+        sha256::Hash::hash(&self.canonical_bytes()).to_string()
+    }
+}
 
 /// Body of `POST /sign`. Every submission carries both the primary PSBT and
 /// the user-signed escape variant (same-inputs sweep to the escape wallet),
@@ -20,6 +102,13 @@ pub struct SignRequest {
     /// PIN in plaintext (hash-compared on the node; ADR-0008 accepts this for MVP).
     #[serde(default)]
     pub pin: String,
+    /// Coordinator-proposed commitment expiry (unix seconds). The node caps it
+    /// against its own clock and `max_commitment_age_secs` (DESIGN.md).
+    #[serde(default)]
+    pub expiry: u64,
+    /// Baked policy identifier, bound into the commitment (policy never changes).
+    #[serde(default)]
+    pub policy_version: u32,
 }
 
 /// The three `/sign` outcomes. Serializes to exactly the DESIGN.md wire shapes:
@@ -86,14 +175,85 @@ mod tests {
             psbt: "cHNidP8B".into(),
             escape_psbt: "cHNidP8C".into(),
             pin: "482913".into(),
+            expiry: 1_752_500_000,
+            policy_version: 1,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert_eq!(
             json,
-            r#"{"psbt":"cHNidP8B","escape_psbt":"cHNidP8C","pin":"482913"}"#
+            r#"{"psbt":"cHNidP8B","escape_psbt":"cHNidP8C","pin":"482913","expiry":1752500000,"policy_version":1}"#
         );
         let back: SignRequest = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, req);
+    }
+
+    /// A commitment with distinct, non-trivial data in every field, built twice
+    /// from the same logical inputs (helper below).
+    fn sample_commitment(outputs: Vec<CommitmentOutput>) -> Commitment {
+        Commitment {
+            wallet_id: [0x11; 32],
+            inputs: vec![
+                CommitmentInput {
+                    txid: [0x22; 32],
+                    vout: 0,
+                },
+                CommitmentInput {
+                    txid: [0x33; 32],
+                    vout: 7,
+                },
+            ],
+            outputs,
+            fee: 10_000,
+            expiry: 1_752_500_000,
+            policy_version: 1,
+        }
+    }
+
+    fn hot_output() -> CommitmentOutput {
+        CommitmentOutput {
+            script_pubkey: vec![0x00, 0x14, 0xAB, 0xCD],
+            amount: 99_990_000,
+        }
+    }
+
+    #[test]
+    fn commitment_serialization_is_deterministic() {
+        // Two independent constructions of the same logical commitment.
+        let a = sample_commitment(vec![hot_output()]);
+        let b = sample_commitment(vec![hot_output()]);
+        assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+        assert_eq!(a.commitment_id(), b.commitment_id());
+        // The id is a 32-byte hash rendered as lowercase hex.
+        assert_eq!(a.commitment_id().len(), 64);
+    }
+
+    #[test]
+    fn commitment_survives_serde_json() {
+        let commitment = sample_commitment(vec![hot_output()]);
+        let json = serde_json::to_string(&commitment).expect("serialize");
+        let back: Commitment = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, commitment);
+        // Serde is a transport, not the identity: the recovered value hashes
+        // to the same commitment id.
+        assert_eq!(back.commitment_id(), commitment.commitment_id());
+    }
+
+    #[test]
+    fn commitment_is_not_keyed_by_outpoint_set() {
+        // Same inputs (outpoints), different outputs and fee: an RBF-style
+        // replacement. It MUST hash to a different id, so the log never blocks
+        // a legitimate replacement (DESIGN.md, "anti-replay log").
+        let original = sample_commitment(vec![hot_output()]);
+        let mut replacement = sample_commitment(vec![CommitmentOutput {
+            script_pubkey: vec![0x00, 0x14, 0xAB, 0xCD],
+            amount: 99_980_000, // fee bump: less to the destination
+        }]);
+        replacement.fee = 20_000;
+        assert_eq!(
+            original.inputs, replacement.inputs,
+            "the two txs spend the identical outpoints"
+        );
+        assert_ne!(original.commitment_id(), replacement.commitment_id());
     }
 
     #[test]

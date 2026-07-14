@@ -363,6 +363,7 @@ dependencies = [
 name = "vault-proto"
 version = "0.0.1"
 dependencies = [
+ "bitcoin",
  "serde",
  "serde_json",
 ]

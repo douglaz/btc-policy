@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vault_proto::SignRequest;
 
@@ -49,7 +49,14 @@ fn respond(stream: &mut TcpStream, node: &Node) -> (u16, String) {
         Ok(sign_request) => sign_request,
         Err(e) => return (400, error_body(&format!("cannot decode request body: {e}"))),
     };
-    match handle_sign(node, &sign_request) {
+    // The node's OWN clock caps the coordinator-proposed expiry and drives
+    // anti-replay pruning. A clock before the epoch is impossible in practice;
+    // treating it as 0 fails safe (every commitment reads as expired).
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match handle_sign(node, &sign_request, now) {
         Ok(response) => match serde_json::to_string(&response) {
             Ok(body) => (200, body),
             Err(e) => (500, error_body(&format!("cannot encode response: {e}"))),

@@ -6,7 +6,9 @@
 //! lockdown, watchtower duty, and `GET /events` are v0 work.
 
 pub mod http;
+mod replay;
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
@@ -16,8 +18,11 @@ use bitcoin::sighash::SighashCache;
 use bitcoin::{EcdsaSighashType, Psbt, PublicKey, ScriptBuf};
 use miniscript::descriptor::WshInner;
 use miniscript::{Descriptor, Terminal};
+use replay::ReplayLog;
 use serde::Deserialize;
-use vault_proto::{Refusal, RefusalCode, SignRequest, SignResponse};
+use vault_proto::{
+    Commitment, CommitmentInput, CommitmentOutput, Refusal, RefusalCode, SignRequest, SignResponse,
+};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -40,6 +45,14 @@ pub struct ConfigFile {
     /// re-derivation is v0 work).
     pub allowlist: Vec<String>,
     pub hold_secs: u64,
+    /// Node-enforced cap on the coordinator-proposed commitment expiry: the
+    /// node refuses any expiry beyond `now + max_commitment_age_secs` by its
+    /// OWN clock, so a hostile coordinator cannot inflate the replay log's
+    /// retention (DESIGN.md config schema; "Transaction commitment").
+    pub max_commitment_age_secs: u64,
+    /// The baked-at-setup policy identifier, bound into every commitment
+    /// (policy is immutable, so this never changes).
+    pub policy_version: u32,
     /// Lowercase hex SHA-256 of each enrolled PIN (argon2 comes with the
     /// real setup ceremony later).
     pub pin_normal_hash: String,
@@ -56,6 +69,14 @@ pub struct Node {
     check_params: policy_core::CheckParams,
     pin_normal_hash: String,
     pin_duress_hash: String,
+    /// Hash of this node's descriptor: the `wallet_id` bound into every
+    /// commitment.
+    wallet_id: [u8; 32],
+    policy_version: u32,
+    max_commitment_age_secs: u64,
+    /// Anti-replay log. The `/sign` server is single-threaded; `RefCell`
+    /// provides the interior mutability needed by the handler's `&Node`.
+    replay_log: RefCell<ReplayLog>,
 }
 
 impl Node {
@@ -82,6 +103,10 @@ impl Node {
         let witness_script = descriptor
             .explicit_script()
             .map_err(|e| format!("descriptor has no witness script: {e}"))?;
+        // wallet_id binds a commitment to this vault. Hash the descriptor's
+        // canonical string (checksum included) so coordinator and node — which
+        // parse the same descriptor — derive the same id.
+        let wallet_id = sha256::Hash::hash(descriptor.to_string().as_bytes()).to_byte_array();
         let mut allowed_spks = BTreeSet::new();
         for hex in &config.allowlist {
             let spk = ScriptBuf::from_hex(hex)
@@ -100,6 +125,10 @@ impl Node {
             },
             pin_normal_hash: config.pin_normal_hash.to_lowercase(),
             pin_duress_hash: config.pin_duress_hash.to_lowercase(),
+            wallet_id,
+            policy_version: config.policy_version,
+            max_commitment_age_secs: config.max_commitment_age_secs,
+            replay_log: RefCell::new(ReplayLog::default()),
         })
     }
 }
@@ -137,9 +166,30 @@ fn first_light_user_key_of(descriptor: &Descriptor<PublicKey>) -> Result<PublicK
     Ok(*user)
 }
 
-/// Handle one `/sign` submission. `Err(BadRequest)` means undecodable input
-/// (HTTP 400); every policy outcome — signed or refused — is `Ok`.
-pub fn handle_sign(node: &Node, request: &SignRequest) -> Result<SignResponse, BadRequest> {
+/// Handle one `/sign` submission. `now` is unix seconds by the node's own
+/// clock (a parameter, never a system-clock read, so the anti-replay and
+/// expiry logic is deterministically testable). `Err(BadRequest)` means
+/// undecodable input (HTTP 400); every policy outcome — signed or refused —
+/// is `Ok`.
+///
+/// Ordering (DESIGN.md, "Transaction commitment" + anti-replay log):
+///  1. PIN — before anything is signed or recorded (ADR-0008). A bad PIN is
+///     never logged: the PIN is not part of the commitment, so recording it
+///     would wrongly replay a `BAD_PIN` refusal for the same transaction
+///     resubmitted with the correct PIN.
+///  2. decode both PSBTs (needed to build the commitment).
+///  3. compute the `commitment_id` binding this decision to the exact tx.
+///  4. idempotency — an identical, unexpired resubmission returns the recorded
+///     verdict without re-evaluating.
+///  5. node-capped expiry check against the node's own clock.
+///  6. the V0-1 checks (user-signature verification, then policy-core).
+///  7. record the verdict — only when the commitment fully determines it (see
+///     [`is_recordable_verdict`]) — then answer.
+pub fn handle_sign(
+    node: &Node,
+    request: &SignRequest,
+    now: u64,
+) -> Result<SignResponse, BadRequest> {
     // 1. PIN, before anything else: no valid PIN, nothing is ever signed
     //    (ADR-0008). At first light a duress PIN is verified and accepted
     //    exactly like the normal one — the duress *response* is v0 work,
@@ -159,26 +209,157 @@ pub fn handle_sign(node: &Node, request: &SignRequest) -> Result<SignResponse, B
     // ADR-0008); first light runs no further checks on it.
     decode_psbt(&request.escape_psbt, "escape_psbt")?;
 
-    // 3. The user's partial signature must cryptographically verify on every
-    //    input against the node's own recomputed sighash — presence of a
-    //    partial_sig is never enough (DESIGN.md, "Sighash enforcement"). This
-    //    subsumes the "no output mutation after authorization" check: any
-    //    mutation after signing changes the sighash and invalidates the very
-    //    signature the node verifies. Runs before policy-core and signing:
-    //    only if every input passes does the node proceed.
-    if let Err(response) = verify_user_signatures(node, &psbt) {
-        return Ok(response);
+    // 3. Bind this decision to the exact transaction. The commitment carries
+    //    this node's OWN baked `policy_version` (from config, not the request):
+    //    the node always evaluates and signs against its own static policy, so
+    //    the request's `policy_version` is coordinator metadata that cannot
+    //    change what gets signed and needs no separate match check here.
+    let commitment = commitment_of(node, &psbt, request.expiry);
+    let commitment_id = commitment.commitment_id();
+
+    // 4. Anti-replay log: prune expired entries (retention is bounded by each
+    //    entry's expiry), then return idempotently for an identical, unexpired
+    //    resubmission. Keyed by commitment hash — an RBF replacement has a
+    //    different id and is never blocked here.
+    {
+        let mut log = node.replay_log.borrow_mut();
+        log.prune(now);
+        if let Some(recorded) = log.get(&commitment_id, now) {
+            return Ok(recorded);
+        }
     }
 
-    // 4. The first-light policy checks (destination allowlist, fee cap).
-    if let Err(v) = policy_core::evaluate(&psbt, &node.check_params) {
-        return Ok(refusal(map_policy_code(v.code), v.check, v.detail));
+    // 5. Node-capped expiry, against the node's OWN clock: refuse an already-
+    //    expired commitment, and refuse one whose expiry runs past the node's
+    //    retention cap so a hostile coordinator can't inflate the log. An
+    //    out-of-window commitment is NOT recorded — its expiry can't bound
+    //    retention.
+    if request.expiry <= now || request.expiry > now.saturating_add(node.max_commitment_age_secs) {
+        return Ok(refusal(
+            RefusalCode::CommitmentExpired,
+            "commitment_expiry",
+            format!(
+                "expiry {} is outside the acceptance window (now {now}, max age {}s)",
+                request.expiry, node.max_commitment_age_secs
+            ),
+        ));
     }
 
-    // 5. hold_secs = 0: sign at first submission (ADR-0004's instant path).
-    match add_node_signatures(node, &mut psbt) {
-        Ok(()) => Ok(SignResponse::Signed(psbt.to_string())),
-        Err(detail) => Ok(refusal(RefusalCode::PsbtInconsistent, "signing", detail)),
+    // 6 + 7. Evaluate (user-signature verification, then policy-core, then
+    // signing), record the verdict, and answer. The log is an idempotency and
+    // audit record: an identical commitment resubmitted before expiry gets the
+    // same answer without re-evaluation. Only verdicts the commitment fully
+    // determines are recorded — a signature- or PSBT-structure-dependent
+    // refusal is left unrecorded so the same commitment resubmitted with a
+    // corrected signature is re-evaluated, not answered from a stale refusal
+    // (the log does not defend the signature; DESIGN.md, "What the anti-replay
+    // log is — and is not").
+    let verdict = evaluate_and_sign(node, &mut psbt);
+    if is_recordable_verdict(&verdict) {
+        node.replay_log
+            .borrow_mut()
+            .record(commitment_id, request.expiry, verdict.clone());
+    }
+    Ok(verdict)
+}
+
+/// Build the [`Commitment`] for `psbt` under this node's wallet, at the
+/// coordinator-proposed `expiry`. The fee is `Σ input value − Σ output value`,
+/// taking input values from each `witness_utxo` (v0 trusts the PSBT's prevout
+/// data — regtest, honest coordinator; DESIGN.md, per-node chain backend).
+/// It is computed saturating and never fails: an inconsistent PSBT (missing
+/// `witness_utxo`, outputs exceeding inputs) still gets a stable commitment id
+/// here and its refusal downstream — and any change to a prevout amount yields
+/// a different fee, hence a different id.
+fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
+    let inputs = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|txin| CommitmentInput {
+            txid: txin.previous_output.txid.to_byte_array(),
+            vout: txin.previous_output.vout,
+        })
+        .collect();
+    let outputs = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .map(|txout| CommitmentOutput {
+            script_pubkey: txout.script_pubkey.as_bytes().to_vec(),
+            amount: txout.value.to_sat(),
+        })
+        .collect();
+    let total_in = psbt
+        .inputs
+        .iter()
+        .filter_map(|input| input.witness_utxo.as_ref())
+        .fold(0u64, |acc, utxo| acc.saturating_add(utxo.value.to_sat()));
+    let total_out = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .fold(0u64, |acc, txout| acc.saturating_add(txout.value.to_sat()));
+    Commitment {
+        wallet_id: node.wallet_id,
+        inputs,
+        outputs,
+        fee: total_in.saturating_sub(total_out),
+        expiry,
+        policy_version: node.policy_version,
+    }
+}
+
+/// The V0-1 evaluation: verify the user's signatures, run policy-core, and —
+/// on success — add this node's signatures (`hold_secs = 0`, ADR-0004's
+/// instant path). Returns the verdict to record and answer with.
+fn evaluate_and_sign(node: &Node, psbt: &mut Psbt) -> SignResponse {
+    // The user's partial signature must cryptographically verify on every
+    // input against the node's own recomputed sighash — presence of a
+    // partial_sig is never enough (DESIGN.md, "Sighash enforcement"). This
+    // subsumes the "no output mutation after authorization" check: any
+    // mutation after signing changes the sighash and invalidates the very
+    // signature the node verifies.
+    if let Err(response) = verify_user_signatures(node, psbt) {
+        return response;
+    }
+    // The first-light policy checks (destination allowlist, fee cap).
+    if let Err(v) = policy_core::evaluate(psbt, &node.check_params) {
+        return refusal(map_policy_code(v.code), v.check, v.detail);
+    }
+    match add_node_signatures(node, psbt) {
+        Ok(()) => SignResponse::Signed(psbt.to_string()),
+        Err(detail) => refusal(RefusalCode::PsbtInconsistent, "signing", detail),
+    }
+}
+
+/// Whether `verdict` may be recorded in the anti-replay log for idempotent
+/// replay. The log is keyed by `commitment_id`, which binds only the logical
+/// spend (wallet, outpoints, outputs, fee, expiry, policy_version) — never the
+/// witness data. So only verdicts that data fully determines are safe to
+/// replay:
+///
+/// - `Signed` — a valid user signature existed for this exact commitment;
+///   replaying the recorded signed PSBT is the idempotency job.
+/// - `DEST_NOT_ALLOWED` / `FEE_EXCEEDS_CAP` — the two policy refusals that turn
+///   solely on outputs and fee, both bound by the commitment.
+///
+/// Signature- and PSBT-structure-dependent refusals (`USER_SIG_INVALID`,
+/// `BAD_SIGHASH`, `PSBT_INCONSISTENT`) are NOT recorded: the commitment does
+/// not bind the signature or `witness_utxo` presence they turn on, so an
+/// identical commitment resubmitted with a corrected signature would otherwise
+/// replay a stale refusal and block an honest spend. The log does not defend
+/// the signature — V0-1's sighash binding does (DESIGN.md, "What the
+/// anti-replay log is — and is not"). `Pending` is unreachable at first light
+/// (`hold_secs = 0`) and never recorded here.
+fn is_recordable_verdict(verdict: &SignResponse) -> bool {
+    match verdict {
+        SignResponse::Signed(_) => true,
+        SignResponse::Refusal(refusal) => matches!(
+            refusal.code,
+            RefusalCode::DestNotAllowed | RefusalCode::FeeExceedsCap
+        ),
+        SignResponse::Pending(_) => false,
     }
 }
 
