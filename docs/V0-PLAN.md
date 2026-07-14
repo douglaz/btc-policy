@@ -36,6 +36,18 @@ Per-destination-class routing: hot = hold_secs pending then sign on
 re-submission; escape/refresh = instant. Pending state on the commitment log.
 Escape sweep double-spends a pending spend's inputs (implicit cancel). ADR-0004.
 
+**Decide here (carried from V0-2):** whether the commitment must bind the full
+unsigned transaction — `version`, `nLockTime`, per-input `nSequence` — not just
+outpoints/outputs/fee. In V0-2 it does NOT (design-defined field set;
+SIGHASH_ALL binds them for the *signature*, and only commitment-determined
+verdicts are cached, so a collision is provably harmless there). Under the Hold,
+a *pending* spend is identified by commitment across two submissions, so a
+collision between two economically-identical txs that differ only in
+locktime/sequence becomes load-bearing (which one is "the" pending tx, which one
+the escape sweep cancels). Resolve: either bind those fields into the commitment
+(and update DESIGN.md's commitment field list + the gstack design-of-record), or
+document why pending-identity is safe without them.
+
 ## V0-4 — dual PINs + duress response + lockdown
 Real duress_response ∈ {lockdown, sweep_and_lockdown}; lockdown persisted on
 disk surviving restart; FRAUD_SUSPECTED refusals; duress PIN wire-identical to
