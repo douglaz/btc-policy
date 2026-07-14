@@ -10,6 +10,10 @@ name = "btc-vault"
 path = "src/main.rs"
 
 [dependencies]
+bitcoin = { workspace = true }
+miniscript = { workspace = true }
+serde_json = { workspace = true }
+vault-proto = { path = "../vault-proto" }
 
 [lints]
 workspace = true
