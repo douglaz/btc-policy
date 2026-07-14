@@ -16,17 +16,18 @@ use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::absolute::LockTime;
+use bitcoin::bip32::{Xpriv, Xpub};
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
 use bitcoin::transaction::Version;
 use bitcoin::{
-    Amount, CompressedPublicKey, EcdsaSighashType, Network, OutPoint, Psbt, PublicKey, ScriptBuf,
-    Sequence, Transaction, TxIn, TxOut, Witness,
+    Amount, CompressedPublicKey, EcdsaSighashType, Network, NetworkKind, OutPoint, Psbt, PublicKey,
+    ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 use miniscript::psbt::PsbtExt;
-use miniscript::Descriptor;
+use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::json;
 use vault_proto::{RefusalCode, SignRequest, SignResponse};
 
@@ -44,6 +45,11 @@ const MAX_COMMITMENT_AGE_SECS: u64 = 172_800;
 /// The expiry the coordinator proposes on each spend: an hour out, well inside
 /// the node's cap.
 const COMMITMENT_TTL_SECS: u64 = 3_600;
+/// Bound on the node's own-descriptor / allowlist derivation scans.
+const MAX_DERIVATION_INDEX: u32 = 100;
+/// The (non-zero) index the honest spend pays the hot wallet at — a freshly
+/// derived address, proving the allowlist is a descriptor, not a fixed address.
+const HOT_INDEX: u32 = 5;
 /// Coins sent into the vault.
 const FUND: Amount = Amount::from_sat(1_000_000_000);
 /// Act one pays this to the hot wallet; the rest returns to the vault.
@@ -68,8 +74,15 @@ pub fn run_first_light() -> Result<(), Error> {
     let node_actors: Vec<Actor> = (0..NODE_COUNT)
         .map(|_| Actor::random(&secp, &mut urandom))
         .collect::<Result<_, _>>()?;
-    let hot_spk = p2wpkh_spk(&Actor::random(&secp, &mut urandom)?);
-    let escape_spk = p2wpkh_spk(&Actor::random(&secp, &mut urandom)?);
+    // Hot and escape wallets are ranged xpub descriptors, so every spend pays a
+    // freshly derived address instead of a reused fixed one (DESIGN.md,
+    // "Destination allowlist"). The honest spend pays the hot wallet at a
+    // non-zero index; the escape variant sweeps to the escape wallet's index 0.
+    let hot_wallet = Wallet::random(&secp, &mut urandom)?;
+    let escape_wallet = Wallet::random(&secp, &mut urandom)?;
+    let hot_spk = hot_wallet.address_spk(&secp, HOT_INDEX)?;
+    let escape_spk = escape_wallet.address_spk(&secp, 0)?;
+    // The attacker's destination is a raw key that derives from no descriptor.
     let attacker_spk = p2wpkh_spk(&Actor::random(&secp, &mut urandom)?);
 
     // The first-light vault: user key AND 3-of-5 node keys, P2WSH, no
@@ -117,7 +130,8 @@ pub fn run_first_light() -> Result<(), Error> {
             ports[1 + index],
             actor,
             &descriptor_str,
-            &[&hot_spk, &escape_spk],
+            &[&hot_wallet.descriptor, &escape_wallet.descriptor],
+            &escape_wallet.descriptor,
         )?);
     }
     for node in &mut nodes {
@@ -337,6 +351,42 @@ fn p2wpkh_spk(actor: &Actor) -> ScriptBuf {
     ScriptBuf::new_p2wpkh(&CompressedPublicKey(actor.pubkey.inner).wpubkey_hash())
 }
 
+/// A ranged single-sig destination wallet: a `wpkh(<xpub>/*)` descriptor from a
+/// throwaway master key, from which the coordinator derives a fresh address per
+/// index. This is the shape of a hot/escape allowlist entry (DESIGN.md config
+/// schema); the node stores only the descriptor string and re-derives.
+struct Wallet {
+    /// The canonical descriptor string (with checksum) placed in the node config.
+    descriptor: String,
+    parsed: Descriptor<DescriptorPublicKey>,
+}
+
+impl Wallet {
+    fn random(
+        secp: &Secp256k1<bitcoin::secp256k1::All>,
+        urandom: &mut File,
+    ) -> Result<Wallet, Error> {
+        let mut seed = [0u8; 32];
+        urandom.read_exact(&mut seed)?;
+        let xpriv = Xpriv::new_master(NetworkKind::Test, &seed)?;
+        let xpub = Xpub::from_priv(secp, &xpriv);
+        let parsed = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({xpub}/*)"))?;
+        Ok(Wallet {
+            descriptor: parsed.to_string(),
+            parsed,
+        })
+    }
+
+    /// The scriptPubKey of this wallet's address at `index`.
+    fn address_spk(
+        &self,
+        secp: &Secp256k1<bitcoin::secp256k1::All>,
+        index: u32,
+    ) -> Result<ScriptBuf, Error> {
+        Ok(self.parsed.derived_descriptor(secp, index)?.script_pubkey())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PSBT plumbing
 
@@ -445,15 +495,18 @@ impl NodeProcess {
         port: u16,
         actor: &Actor,
         descriptor: &str,
-        allowlist: &[&ScriptBuf],
+        allowlist: &[&str],
+        escape_descriptor: &str,
     ) -> Result<NodeProcess, Error> {
         let allowlist_toml: Vec<String> =
-            allowlist.iter().map(|spk| format!("\"{spk:x}\"")).collect();
+            allowlist.iter().map(|desc| format!("\"{desc}\"")).collect();
         let config = format!(
             "listen_port = {port}\n\
              node_seckey = \"{}\"\n\
              descriptor = \"{descriptor}\"\n\
              allowlist = [{}]\n\
+             escape_descriptor = \"{escape_descriptor}\"\n\
+             max_derivation_index = {MAX_DERIVATION_INDEX}\n\
              hold_secs = 0\n\
              max_commitment_age_secs = {MAX_COMMITMENT_AGE_SECS}\n\
              policy_version = {POLICY_VERSION}\n\

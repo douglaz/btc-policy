@@ -3,6 +3,7 @@
 use std::str::FromStr;
 
 use bitcoin::absolute::LockTime;
+use bitcoin::bip32::{DerivationPath, Fingerprint};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
@@ -11,7 +12,7 @@ use bitcoin::{
     Amount, EcdsaSighashType, OutPoint, Psbt, PublicKey, ScriptBuf, Sequence, Transaction, TxIn,
     TxOut, Txid, WScriptHash, Witness,
 };
-use miniscript::Descriptor;
+use miniscript::{Descriptor, DescriptorPublicKey};
 use vault_node::{handle_sign, Node};
 use vault_proto::{RefusalCode, SignRequest, SignResponse};
 
@@ -24,6 +25,8 @@ const MAX_AGE: u64 = 172_800;
 /// A well-inside-the-window expiry for the honest-path requests.
 const EXPIRY: u64 = NOW + 3_600;
 const POLICY_VERSION: u32 = 1;
+/// The node's bounded derivation-index scan for these handler tests.
+const MAX_DERIV: u32 = 20;
 
 fn seckey(index: u8) -> SecretKey {
     SecretKey::from_slice(&[index; 32]).expect("32 nonzero bytes")
@@ -58,19 +61,44 @@ fn held_fixture(hold_secs: u64) -> Fixture {
     build_fixture(hold_secs, true)
 }
 
+/// A single-key `wpkh(<pubkey>)` destination descriptor and the scriptPubKey it
+/// derives — a definite (non-wildcard) allowlist entry, enough to exercise the
+/// handler's descriptor membership without an xpub. `derives_within`'s bounded
+/// scan over ranged descriptors is covered in policy-core's own tests.
+fn wpkh_dest(key_index: u8) -> (String, ScriptBuf) {
+    let secp = Secp256k1::new();
+    let descriptor =
+        Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({})", pubkey(&secp, key_index)))
+            .expect("valid wpkh descriptor");
+    let spk = descriptor
+        .derived_descriptor(&secp, 0)
+        .expect("derivable")
+        .script_pubkey();
+    (descriptor.to_string(), spk)
+}
+
+fn hot_dest() -> (String, ScriptBuf) {
+    wpkh_dest(10)
+}
+
+fn escape_dest() -> (String, ScriptBuf) {
+    wpkh_dest(11)
+}
+
 /// User key is index 1; the five node keys are 2..=6; the Node under test
-/// holds key 2. The hot and escape scriptPubKeys are both allowlisted (so an
-/// escape sweep passes the destination check); `configure_escape` additionally
-/// names the escape spk in config so the node can route it as the escape class.
+/// holds key 2. The hot and escape wallets are both allowlisted descriptors (so
+/// an escape sweep passes the destination check); `configure_escape`
+/// additionally names the escape descriptor in config so the node can route it
+/// as the escape class.
 fn build_fixture(hold_secs: u64, configure_escape: bool) -> Fixture {
     let descriptor_str = descriptor_str();
     let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str).expect("valid descriptor");
-    let hot_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xAA; 32]));
-    let escape_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xBB; 32]));
+    let (hot_desc, hot_spk) = hot_dest();
+    let (escape_desc, escape_spk) = escape_dest();
     let config = config_text(
         &descriptor_str,
-        &hot_spk,
-        &escape_spk,
+        &hot_desc,
+        &escape_desc,
         hold_secs,
         MAX_AGE,
         configure_escape,
@@ -86,22 +114,22 @@ fn build_fixture(hold_secs: u64, configure_escape: bool) -> Fixture {
 
 fn config_text(
     descriptor_str: &str,
-    hot_spk: &ScriptBuf,
-    escape_spk: &ScriptBuf,
+    hot_desc: &str,
+    escape_desc: &str,
     hold_secs: u64,
     max_commitment_age_secs: u64,
     configure_escape: bool,
     allow_escape: bool,
 ) -> String {
     let escape_line = if configure_escape {
-        format!("escape_spk = \"{escape_spk:x}\"\n")
+        format!("escape_descriptor = \"{escape_desc}\"\n")
     } else {
         String::new()
     };
     let allowlist = if allow_escape {
-        format!("\"{hot_spk:x}\", \"{escape_spk:x}\"")
+        format!("\"{hot_desc}\", \"{escape_desc}\"")
     } else {
-        format!("\"{hot_spk:x}\"")
+        format!("\"{hot_desc}\"")
     };
     format!(
         "listen_port = 7000\n\
@@ -109,6 +137,7 @@ fn config_text(
          descriptor = \"{descriptor_str}\"\n\
          allowlist = [{allowlist}]\n\
          {escape_line}\
+         max_derivation_index = {MAX_DERIV}\n\
          hold_secs = {hold_secs}\n\
          max_commitment_age_secs = {max_commitment_age_secs}\n\
          policy_version = {POLICY_VERSION}\n\
@@ -127,12 +156,12 @@ fn fixture_config(
     allow_escape: bool,
 ) -> String {
     let descriptor_str = descriptor_str();
-    let hot_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xAA; 32]));
-    let escape_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xBB; 32]));
+    let (hot_desc, _) = hot_dest();
+    let (escape_desc, _) = escape_dest();
     config_text(
         &descriptor_str,
-        &hot_spk,
-        &escape_spk,
+        &hot_desc,
+        &escape_desc,
         hold_secs,
         max_commitment_age_secs,
         configure_escape,
@@ -346,10 +375,7 @@ fn missing_witness_utxo_is_refused_as_psbt_inconsistent() {
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     // Sign honestly, then strip the witness_utxo: without the input amount the
     // node cannot recompute the sighash, so it cannot verify the (present,
-    // valid) user signature. This check fires before the partial-sig check, so
-    // a decodable-but-inconsistent PSBT is refused PSBT_INCONSISTENT — the code
-    // DESIGN.md ("PSBT consistency") and policy-core already use here — not
-    // mislabelled USER_SIG_INVALID.
+    // valid) user signature.
     user_sign(&fixture, &mut psbt);
     psbt.inputs[0].witness_utxo = None;
     let response =
@@ -403,6 +429,46 @@ fn non_allowlisted_destination_is_refused_through_the_handler() {
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::DestNotAllowed);
     assert_eq!(refusal.check, "destination_allowlist");
+}
+
+#[test]
+fn input_not_deriving_from_the_vault_is_unknown_input() {
+    let fixture = fixture();
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    // Repoint the prevout scriptPubKey to one the vault descriptor cannot
+    // derive. The value is unchanged, so the P2WSH sighash — and thus the user
+    // signature — still verifies; only input ownership fails.
+    let foreign = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0x33; 32]));
+    if let Some(utxo) = psbt.inputs[0].witness_utxo.as_mut() {
+        utxo.script_pubkey = foreign;
+    }
+    let response =
+        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let refusal = expect_refusal(response);
+    assert_eq!(refusal.code, RefusalCode::UnknownInput);
+    assert_eq!(refusal.check, "input_ownership");
+}
+
+#[test]
+fn labeled_change_that_does_not_derive_is_change_not_derivable_through_the_handler() {
+    let fixture = fixture();
+    // An output paying a non-derivable script, but MARKED as change with a
+    // fabricated bip32 hint — the theft vector. The node must re-derive and
+    // refuse ChangeNotDerivable rather than trust the label.
+    let theft = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xEE; 32]));
+    let mut psbt = vault_psbt(&fixture, vec![(theft, 99_990_000)]);
+    let secp = Secp256k1::new();
+    psbt.outputs[0].bip32_derivation.insert(
+        pubkey(&secp, 1).inner,
+        (Fingerprint::default(), DerivationPath::master()),
+    );
+    user_sign(&fixture, &mut psbt);
+    let response =
+        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let refusal = expect_refusal(response);
+    assert_eq!(refusal.code, RefusalCode::ChangeNotDerivable);
+    assert_eq!(refusal.check, "verified_change");
 }
 
 #[test]
@@ -589,7 +655,7 @@ fn expect_config_error(raw: String) -> String {
 fn nonzero_hold_requires_an_escape_spk() {
     let err = expect_config_error(fixture_config(HOLD, MAX_AGE, false, true));
     assert!(
-        err.contains("escape_spk is required"),
+        err.contains("escape_descriptor is required"),
         "unexpected config error: {err}"
     );
 }
@@ -598,7 +664,7 @@ fn nonzero_hold_requires_an_escape_spk() {
 fn escape_spk_must_also_be_allowlisted() {
     let err = expect_config_error(fixture_config(HOLD, MAX_AGE, true, false));
     assert!(
-        err.contains("escape_spk must also be present in allowlist"),
+        err.contains("escape_descriptor must also be present in allowlist"),
         "unexpected config error: {err}"
     );
 }

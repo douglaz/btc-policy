@@ -1,8 +1,10 @@
 //! vault-node: one federation key, one policy engine, `POST /sign`.
 //!
-//! Scope so far (see docs/DESIGN.md "Milestones"): PIN verification, the two
-//! policy-core checks, user partial-signature verification, the anti-replay
-//! log, and the Hold (ADR-0004) — hot-wallet spends wait `hold_secs` as pending
+//! Scope so far (see docs/DESIGN.md "Milestones"): PIN verification, the
+//! descriptor-derived policy-core checks (input ownership, destination
+//! allowlist, verified change, PSBT consistency, fee cap), user
+//! partial-signature verification, the anti-replay log, and the Hold
+//! (ADR-0004) — hot-wallet spends wait `hold_secs` as pending
 //! spends before the node signs, while escape sweeps and refresh self-spends
 //! sign instantly. Duress actions, lockdown, watchtower duty, and `GET /events`
 //! remain v0 work.
@@ -11,7 +13,6 @@ pub mod http;
 mod replay;
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use bitcoin::hashes::{sha256, Hash};
@@ -19,7 +20,7 @@ use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
 use bitcoin::{EcdsaSighashType, Psbt, PublicKey, ScriptBuf};
 use miniscript::descriptor::WshInner;
-use miniscript::{Descriptor, Terminal};
+use miniscript::{Descriptor, DescriptorPublicKey, Terminal};
 use replay::{PendingLog, ReplayLog};
 use serde::Deserialize;
 use vault_proto::{
@@ -44,17 +45,21 @@ pub struct ConfigFile {
     pub node_seckey: String,
     /// The node's own copy of the vault descriptor.
     pub descriptor: String,
-    /// Allowlisted destination scriptPubKeys, hex (baked; descriptor
-    /// re-derivation is v0 work).
+    /// Allowlisted destination WALLETS as descriptors (hot + escape), never
+    /// fixed addresses: an output is allowed when its script re-derives from one
+    /// of these within `max_derivation_index` (DESIGN.md, "Destination
+    /// allowlist"; CONTEXT.md, "Allowlist").
     pub allowlist: Vec<String>,
-    /// The escape wallet's scriptPubKey, hex. Named apart from the allowlist so
-    /// the node can tell an escape sweep (instant) from a hot-wallet spend (the
-    /// Hold applies); it must ALSO be an allowlist entry so the sweep passes the
-    /// destination check. Optional: with `hold_secs = 0` every class signs
-    /// instantly, so first light leaves it unset (descriptor-derived class is
-    /// V0-5 work).
+    /// The escape wallet's descriptor. Named apart from the allowlist so the
+    /// node can tell an escape sweep (instant) from a hot-wallet spend (the Hold
+    /// applies); its descriptor must ALSO appear in `allowlist` so the sweep
+    /// passes the destination check. Optional: with `hold_secs = 0` every class
+    /// signs instantly, so first light may leave it unset.
     #[serde(default)]
-    pub escape_spk: Option<String>,
+    pub escape_descriptor: Option<String>,
+    /// Bound on own-descriptor / allowlist derivation scans (DESIGN.md config
+    /// schema, `max_derivation_index`).
+    pub max_derivation_index: u32,
     pub hold_secs: u64,
     /// Node-enforced cap on the coordinator-proposed commitment expiry: the
     /// node refuses any expiry beyond `now + max_commitment_age_secs` by its
@@ -89,10 +94,10 @@ pub struct Node {
     /// as pending and signed only when re-submitted after this many seconds.
     /// `0` signs on first submission (first light; keeps the demo one-shot).
     hold_secs: u64,
-    /// The escape wallet's scriptPubKey when configured. A spend whose every
-    /// non-change output pays it is an escape sweep and skips the Hold. `None`
-    /// (first light) ⇒ no spend is escape-class, harmless when `hold_secs = 0`.
-    escape_spk: Option<ScriptBuf>,
+    /// The escape wallet's descriptor when configured. A spend whose every
+    /// non-change output re-derives from it is an escape sweep and skips the
+    /// Hold. `None` ⇒ no spend is escape-class, harmless when `hold_secs = 0`.
+    escape_descriptor: Option<Descriptor<DescriptorPublicKey>>,
     /// Anti-replay log. The `/sign` server is single-threaded; `RefCell`
     /// provides the interior mutability needed by the handler's `&Node`.
     replay_log: RefCell<ReplayLog>,
@@ -115,7 +120,14 @@ impl Node {
         let seckey = SecretKey::from_str(&config.node_seckey)
             .map_err(|e| format!("bad node_seckey: {e}"))?;
         let pubkey = PublicKey::new(seckey.public_key(&secp));
+        // The vault descriptor is parsed twice, on purpose: as concrete
+        // `PublicKey` for the witness script + user-key extraction + sighash
+        // (the first-light vault is definite), and as `DescriptorPublicKey` for
+        // the bounded re-derivation primitive (input ownership + verified
+        // change). Both parses are of the same string, so they cannot disagree.
         let descriptor = Descriptor::<PublicKey>::from_str(&config.descriptor)
+            .map_err(|e| format!("bad descriptor: {e}"))?;
+        let vault = Descriptor::<DescriptorPublicKey>::from_str(&config.descriptor)
             .map_err(|e| format!("bad descriptor: {e}"))?;
         let user_pubkey = first_light_user_key_of(&descriptor)?;
         let witness_script = descriptor
@@ -125,18 +137,18 @@ impl Node {
         // canonical string (checksum included) so coordinator and node — which
         // parse the same descriptor — derive the same id.
         let wallet_id = sha256::Hash::hash(descriptor.to_string().as_bytes()).to_byte_array();
-        let mut allowed_spks = BTreeSet::new();
-        for hex in &config.allowlist {
-            let spk = ScriptBuf::from_hex(hex)
-                .map_err(|e| format!("bad allowlist scriptPubKey {hex}: {e}"))?;
-            allowed_spks.insert(spk);
+        let mut allowed = Vec::new();
+        for entry in &config.allowlist {
+            let descriptor = Descriptor::<DescriptorPublicKey>::from_str(entry)
+                .map_err(|e| format!("bad allowlist descriptor {entry}: {e}"))?;
+            allowed.push(descriptor);
         }
-        let escape_spk = config
-            .escape_spk
+        let escape_descriptor = config
+            .escape_descriptor
             .as_deref()
-            .map(ScriptBuf::from_hex)
+            .map(Descriptor::<DescriptorPublicKey>::from_str)
             .transpose()
-            .map_err(|e| format!("bad escape_spk: {e}"))?;
+            .map_err(|e| format!("bad escape_descriptor: {e}"))?;
         if config.hold_secs >= config.max_commitment_age_secs {
             return Err(format!(
                 "max_commitment_age_secs ({}) must exceed hold_secs ({})",
@@ -144,12 +156,16 @@ impl Node {
             )
             .into());
         }
-        if let Some(escape_spk) = &escape_spk {
-            if !allowed_spks.contains(escape_spk) {
-                return Err("escape_spk must also be present in allowlist".into());
+        if let Some(escape) = &escape_descriptor {
+            // Descriptor membership: the escape wallet must be an allowlist entry
+            // so its sweep passes the destination check (canonical-string equality
+            // covers checksum/format normalization).
+            let escape_canonical = escape.to_string();
+            if !allowed.iter().any(|d| d.to_string() == escape_canonical) {
+                return Err("escape_descriptor must also be present in allowlist".into());
             }
         } else if config.hold_secs > 0 {
-            return Err("escape_spk is required when hold_secs is nonzero".into());
+            return Err("escape_descriptor is required when hold_secs is nonzero".into());
         }
         Ok(Node {
             listen_port: config.listen_port,
@@ -158,8 +174,9 @@ impl Node {
             user_pubkey,
             witness_script,
             check_params: policy_core::CheckParams {
-                vault_spk: descriptor.script_pubkey(),
-                allowed_spks,
+                vault,
+                allowed,
+                max_derivation_index: config.max_derivation_index,
             },
             pin_normal_hash: config.pin_normal_hash.to_lowercase(),
             pin_duress_hash: config.pin_duress_hash.to_lowercase(),
@@ -167,7 +184,7 @@ impl Node {
             policy_version: config.policy_version,
             max_commitment_age_secs: config.max_commitment_age_secs,
             hold_secs: config.hold_secs,
-            escape_spk,
+            escape_descriptor,
             replay_log: RefCell::new(ReplayLog::default()),
             pending_log: RefCell::new(PendingLog::default()),
         })
@@ -418,7 +435,10 @@ fn verify_spend(node: &Node, psbt: &Psbt) -> Result<(), SignResponse> {
     // mutation after signing changes the sighash and invalidates the very
     // signature the node verifies.
     verify_user_signatures(node, psbt)?;
-    // The first-light policy checks (destination allowlist, fee cap).
+    // The policy-core checks: input ownership, destination allowlist +
+    // verified change, and the fee cap — all descriptor-derived. `evaluate`
+    // also keeps its own consistency precondition for direct policy-core
+    // callers.
     if let Err(v) = policy_core::evaluate(psbt, &node.check_params) {
         return Err(refusal(map_policy_code(v.code), v.check, v.detail));
     }
@@ -441,35 +461,42 @@ fn record_verdict(node: &Node, commitment_id: &str, expiry: u64, verdict: &SignR
 /// bypass the allowlist or fee cap.
 #[derive(Debug, PartialEq, Eq)]
 enum DestClass {
-    /// Every non-change output pays the escape wallet — the incident sweep.
-    /// Signs instantly: the escape sweep is the implicit cancel of any pending
-    /// spend, so it must never itself be held.
+    /// Every non-change output re-derives from the escape wallet's descriptor —
+    /// the incident sweep. Signs instantly: the escape sweep is the implicit
+    /// cancel of any pending spend, so it must never itself be held.
     Escape,
-    /// Self-spend: every output pays the vault's own scriptPubKey (a refresh
-    /// resetting the recovery timelock). Signs instantly.
+    /// Self-spend: every output re-derives from the vault's own descriptor (a
+    /// refresh resetting the recovery timelock). Signs instantly.
     Refresh,
     /// Pays the hot wallet (anything else). The Hold applies.
     Hot,
 }
 
 /// Classify `psbt` by destination (see [`DestClass`]). "Change" is a self-pay
-/// back to the vault's own scriptPubKey; the class turns on the non-change
-/// outputs. With no escape wallet configured (first light) nothing is
-/// escape-class, which is harmless when `hold_secs = 0`.
+/// that re-derives from the vault's own descriptor; the class turns on the
+/// non-change outputs. Membership is decided by the same bounded re-derivation
+/// primitive as the policy checks ([`policy_core::derives_within`]), never by
+/// literal scriptPubKey comparison. With no escape descriptor configured
+/// nothing is escape-class, which is harmless when `hold_secs = 0`.
 fn destination_class(node: &Node, psbt: &Psbt) -> DestClass {
-    let vault_spk = &node.check_params.vault_spk;
+    let vault = &node.check_params.vault;
+    let max = node.check_params.max_derivation_index;
     let mut non_change = psbt
         .unsigned_tx
         .output
         .iter()
-        .filter(|output| output.script_pubkey != *vault_spk)
+        .filter(|output| !policy_core::derives_within(vault, output.script_pubkey.as_script(), max))
         .peekable();
     if non_change.peek().is_none() {
-        // Every output pays the vault back: a refresh self-spend.
+        // Every output re-derives from the vault: a refresh self-spend.
         return DestClass::Refresh;
     }
-    match &node.escape_spk {
-        Some(escape_spk) if non_change.all(|output| output.script_pubkey == *escape_spk) => {
+    match &node.escape_descriptor {
+        Some(escape)
+            if non_change.all(|output| {
+                policy_core::derives_within(escape, output.script_pubkey.as_script(), max)
+            }) =>
+        {
             DestClass::Escape
         }
         _ => DestClass::Hot,
@@ -484,23 +511,31 @@ fn destination_class(node: &Node, psbt: &Psbt) -> DestClass {
 ///
 /// - `Signed` — a valid user signature existed for this exact commitment;
 ///   replaying the recorded signed PSBT is the idempotency job.
-/// - `DEST_NOT_ALLOWED` / `FEE_EXCEEDS_CAP` — the two policy refusals that turn
-///   solely on outputs and fee, both bound by the commitment.
+/// - `DEST_NOT_ALLOWED` / `CHANGE_NOT_DERIVABLE` / `FEE_EXCEEDS_CAP` — the
+///   policy refusals that turn solely on the outputs and fee the commitment
+///   binds. Because the outputs are commitment-bound and derive from neither the
+///   allowlist nor the vault, the same commitment can NEVER become a signature,
+///   so caching the refusal cannot block an honest spend. (An untrusted bip32
+///   change label only decides `DEST_NOT_ALLOWED` vs `CHANGE_NOT_DERIVABLE`;
+///   both are refusals, so replaying either stays safe.)
 ///
-/// Signature- and PSBT-structure-dependent refusals (`USER_SIG_INVALID`,
-/// `BAD_SIGHASH`, `PSBT_INCONSISTENT`) are NOT recorded: the commitment does
-/// not bind the signature or `witness_utxo` presence they turn on, so an
-/// identical commitment resubmitted with a corrected signature would otherwise
-/// replay a stale refusal and block an honest spend. The log does not defend
-/// the signature — V0-1's sighash binding does (DESIGN.md, "What the
-/// anti-replay log is — and is not"). `Pending` lives in the pending log (the
-/// Hold timer), never the anti-replay log, so it is never recorded here.
+/// Refusals that depend on data the commitment does NOT bind — the signature
+/// (`USER_SIG_INVALID`, `BAD_SIGHASH`), the PSBT structure (`PSBT_INCONSISTENT`),
+/// or the untrusted `witness_utxo` prevout script (`UNKNOWN_INPUT`) — are NOT
+/// recorded: an identical commitment resubmitted with corrected witness data
+/// could legitimately sign, so caching would otherwise replay a stale refusal
+/// and block an honest spend. The log does not defend the signature — V0-1's
+/// sighash binding does (DESIGN.md, "What the anti-replay log is — and is not").
+/// `Pending` lives in the pending log (the Hold timer), never the anti-replay
+/// log, so it is never recorded here.
 fn is_recordable_verdict(verdict: &SignResponse) -> bool {
     match verdict {
         SignResponse::Signed(_) => true,
         SignResponse::Refusal(refusal) => matches!(
             refusal.code,
-            RefusalCode::DestNotAllowed | RefusalCode::FeeExceedsCap
+            RefusalCode::DestNotAllowed
+                | RefusalCode::ChangeNotDerivable
+                | RefusalCode::FeeExceedsCap
         ),
         SignResponse::Pending(_) => false,
     }
@@ -520,7 +555,9 @@ fn refusal(code: RefusalCode, check: &str, detail: String) -> SignResponse {
 
 fn map_policy_code(code: policy_core::ViolationCode) -> RefusalCode {
     match code {
+        policy_core::ViolationCode::UnknownInput => RefusalCode::UnknownInput,
         policy_core::ViolationCode::DestNotAllowed => RefusalCode::DestNotAllowed,
+        policy_core::ViolationCode::ChangeNotDerivable => RefusalCode::ChangeNotDerivable,
         policy_core::ViolationCode::FeeExceedsCap => RefusalCode::FeeExceedsCap,
         policy_core::ViolationCode::PsbtInconsistent => RefusalCode::PsbtInconsistent,
     }
