@@ -1,9 +1,11 @@
 //! vault-node: one federation key, one policy engine, `POST /sign`.
 //!
-//! First-light scope (see docs/DESIGN.md "Milestones"): PIN verification,
-//! the two policy-core checks, user partial-signature verification, and node
-//! signing at first submission (`hold_secs = 0`). The Hold, duress actions,
-//! lockdown, watchtower duty, and `GET /events` are v0 work.
+//! Scope so far (see docs/DESIGN.md "Milestones"): PIN verification, the two
+//! policy-core checks, user partial-signature verification, the anti-replay
+//! log, and the Hold (ADR-0004) — hot-wallet spends wait `hold_secs` as pending
+//! spends before the node signs, while escape sweeps and refresh self-spends
+//! sign instantly. Duress actions, lockdown, watchtower duty, and `GET /events`
+//! remain v0 work.
 
 pub mod http;
 mod replay;
@@ -18,10 +20,11 @@ use bitcoin::sighash::SighashCache;
 use bitcoin::{EcdsaSighashType, Psbt, PublicKey, ScriptBuf};
 use miniscript::descriptor::WshInner;
 use miniscript::{Descriptor, Terminal};
-use replay::ReplayLog;
+use replay::{PendingLog, ReplayLog};
 use serde::Deserialize;
 use vault_proto::{
-    Commitment, CommitmentInput, CommitmentOutput, Refusal, RefusalCode, SignRequest, SignResponse,
+    Commitment, CommitmentInput, CommitmentOutput, Pending, Refusal, RefusalCode, SignRequest,
+    SignResponse,
 };
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -44,6 +47,14 @@ pub struct ConfigFile {
     /// Allowlisted destination scriptPubKeys, hex (baked; descriptor
     /// re-derivation is v0 work).
     pub allowlist: Vec<String>,
+    /// The escape wallet's scriptPubKey, hex. Named apart from the allowlist so
+    /// the node can tell an escape sweep (instant) from a hot-wallet spend (the
+    /// Hold applies); it must ALSO be an allowlist entry so the sweep passes the
+    /// destination check. Optional: with `hold_secs = 0` every class signs
+    /// instantly, so first light leaves it unset (descriptor-derived class is
+    /// V0-5 work).
+    #[serde(default)]
+    pub escape_spk: Option<String>,
     pub hold_secs: u64,
     /// Node-enforced cap on the coordinator-proposed commitment expiry: the
     /// node refuses any expiry beyond `now + max_commitment_age_secs` by its
@@ -74,9 +85,21 @@ pub struct Node {
     wallet_id: [u8; 32],
     policy_version: u32,
     max_commitment_age_secs: u64,
+    /// The Hold for hot-class spends (ADR-0004): a hot-wallet spend is recorded
+    /// as pending and signed only when re-submitted after this many seconds.
+    /// `0` signs on first submission (first light; keeps the demo one-shot).
+    hold_secs: u64,
+    /// The escape wallet's scriptPubKey when configured. A spend whose every
+    /// non-change output pays it is an escape sweep and skips the Hold. `None`
+    /// (first light) ⇒ no spend is escape-class, harmless when `hold_secs = 0`.
+    escape_spk: Option<ScriptBuf>,
     /// Anti-replay log. The `/sign` server is single-threaded; `RefCell`
     /// provides the interior mutability needed by the handler's `&Node`.
     replay_log: RefCell<ReplayLog>,
+    /// Hold timers for hot-class pending spends, keyed by `commitment_id`
+    /// (timer-only; see [`replay::PendingLog`]). Same single-threaded `RefCell`
+    /// discipline as `replay_log`.
+    pending_log: RefCell<PendingLog>,
 }
 
 impl Node {
@@ -88,11 +111,6 @@ impl Node {
 
     pub fn from_toml_str(raw: &str) -> Result<Node, Error> {
         let config: ConfigFile = toml::from_str(raw).map_err(|e| format!("bad config: {e}"))?;
-        if config.hold_secs != 0 {
-            return Err("hold_secs must be 0: the Hold (ADR-0004) is v0 work, \
-                 not implemented at first light"
-                .into());
-        }
         let secp = Secp256k1::new();
         let seckey = SecretKey::from_str(&config.node_seckey)
             .map_err(|e| format!("bad node_seckey: {e}"))?;
@@ -113,6 +131,26 @@ impl Node {
                 .map_err(|e| format!("bad allowlist scriptPubKey {hex}: {e}"))?;
             allowed_spks.insert(spk);
         }
+        let escape_spk = config
+            .escape_spk
+            .as_deref()
+            .map(ScriptBuf::from_hex)
+            .transpose()
+            .map_err(|e| format!("bad escape_spk: {e}"))?;
+        if config.hold_secs >= config.max_commitment_age_secs {
+            return Err(format!(
+                "max_commitment_age_secs ({}) must exceed hold_secs ({})",
+                config.max_commitment_age_secs, config.hold_secs
+            )
+            .into());
+        }
+        if let Some(escape_spk) = &escape_spk {
+            if !allowed_spks.contains(escape_spk) {
+                return Err("escape_spk must also be present in allowlist".into());
+            }
+        } else if config.hold_secs > 0 {
+            return Err("escape_spk is required when hold_secs is nonzero".into());
+        }
         Ok(Node {
             listen_port: config.listen_port,
             seckey,
@@ -128,7 +166,10 @@ impl Node {
             wallet_id,
             policy_version: config.policy_version,
             max_commitment_age_secs: config.max_commitment_age_secs,
+            hold_secs: config.hold_secs,
+            escape_spk,
             replay_log: RefCell::new(ReplayLog::default()),
+            pending_log: RefCell::new(PendingLog::default()),
         })
     }
 }
@@ -167,12 +208,12 @@ fn first_light_user_key_of(descriptor: &Descriptor<PublicKey>) -> Result<PublicK
 }
 
 /// Handle one `/sign` submission. `now` is unix seconds by the node's own
-/// clock (a parameter, never a system-clock read, so the anti-replay and
-/// expiry logic is deterministically testable). `Err(BadRequest)` means
-/// undecodable input (HTTP 400); every policy outcome — signed or refused —
-/// is `Ok`.
+/// clock (a parameter, never a system-clock read, so the anti-replay, expiry,
+/// and Hold logic is deterministically testable). `Err(BadRequest)` means
+/// undecodable input (HTTP 400); every policy outcome — signed, pending, or
+/// refused — is `Ok`.
 ///
-/// Ordering (DESIGN.md, "Transaction commitment" + anti-replay log):
+/// Ordering (DESIGN.md, "Transaction commitment" + anti-replay log + Hold):
 ///  1. PIN — before anything is signed or recorded (ADR-0008). A bad PIN is
 ///     never logged: the PIN is not part of the commitment, so recording it
 ///     would wrongly replay a `BAD_PIN` refusal for the same transaction
@@ -182,9 +223,17 @@ fn first_light_user_key_of(descriptor: &Descriptor<PublicKey>) -> Result<PublicK
 ///  4. idempotency — an identical, unexpired resubmission returns the recorded
 ///     verdict without re-evaluating.
 ///  5. node-capped expiry check against the node's own clock.
-///  6. the V0-1 checks (user-signature verification, then policy-core).
-///  7. record the verdict — only when the commitment fully determines it (see
-///     [`is_recordable_verdict`]) — then answer.
+///  6. validate: user-signature verification, then policy-core. A refusal here
+///     is final — an INVALID submission is refused, never held. Validation
+///     precedes the Hold precisely so the pending log only ever holds spends
+///     that would otherwise be signed (DESIGN.md, "the log IS the hold timer";
+///     the demo's non-allowlisted theft is refused, not queued as pending).
+///  7. the Hold (ADR-0004): route the now-valid spend by destination class. A
+///     hot-wallet spend inside its window is recorded as a pending timer and
+///     answered `Pending`; escape sweeps, refresh self-spends, elapsed holds,
+///     and `hold_secs = 0` fall through to sign.
+///  8. sign, record the verdict — only when the commitment fully determines it
+///     (see [`is_recordable_verdict`]) — then answer.
 pub fn handle_sign(
     node: &Node,
     request: &SignRequest,
@@ -220,7 +269,8 @@ pub fn handle_sign(
     // 4. Anti-replay log: prune expired entries (retention is bounded by each
     //    entry's expiry), then return idempotently for an identical, unexpired
     //    resubmission. Keyed by commitment hash — an RBF replacement has a
-    //    different id and is never blocked here.
+    //    different id and is never blocked here. Prune the pending log on the
+    //    same schedule so its Hold timers stay bounded too.
     {
         let mut log = node.replay_log.borrow_mut();
         log.prune(now);
@@ -228,6 +278,7 @@ pub fn handle_sign(
             return Ok(recorded);
         }
     }
+    node.pending_log.borrow_mut().prune(now);
 
     // 5. Node-capped expiry, against the node's OWN clock: refuse an already-
     //    expired commitment, and refuse one whose expiry runs past the node's
@@ -245,21 +296,67 @@ pub fn handle_sign(
         ));
     }
 
-    // 6 + 7. Evaluate (user-signature verification, then policy-core, then
-    // signing), record the verdict, and answer. The log is an idempotency and
-    // audit record: an identical commitment resubmitted before expiry gets the
-    // same answer without re-evaluation. Only verdicts the commitment fully
-    // determines are recorded — a signature- or PSBT-structure-dependent
-    // refusal is left unrecorded so the same commitment resubmitted with a
-    // corrected signature is re-evaluated, not answered from a stale refusal
-    // (the log does not defend the signature; DESIGN.md, "What the anti-replay
-    // log is — and is not").
-    let verdict = evaluate_and_sign(node, &mut psbt);
-    if is_recordable_verdict(&verdict) {
-        node.replay_log
-            .borrow_mut()
-            .record(commitment_id, request.expiry, verdict.clone());
+    // 6. Validate the spend (user-signature verification, then policy-core)
+    //    WITHOUT signing yet. A refusal here is final and is recorded exactly as
+    //    in V0-2: only verdicts the commitment fully determines are logged, so a
+    //    signature- or PSBT-structure-dependent refusal stays unrecorded and an
+    //    identical commitment resubmitted with a corrected signature is
+    //    re-evaluated, not answered from a stale refusal (the log does not
+    //    defend the signature; DESIGN.md, "What the anti-replay log is — and is
+    //    not"). An invalid submission is never held: the pending log holds only
+    //    spends that would otherwise be signed.
+    if let Err(refused) = verify_spend(node, &psbt) {
+        record_verdict(node, &commitment_id, request.expiry, &refused);
+        return Ok(refused);
     }
+
+    // 7. The Hold (ADR-0004). The spend is valid; route it by destination
+    //    class. A hot-wallet spend inside its window is recorded as a pending
+    //    timer (first_seen only — see PendingLog) and answered Pending; escape
+    //    sweeps, refresh self-spends, elapsed holds, and hold_secs = 0 fall
+    //    through to signing. Classification only routes: the checks above ran
+    //    for every class, so a generous class can never bypass them.
+    if destination_class(node, &psbt) == DestClass::Hot {
+        let recorded_first_seen = node.pending_log.borrow().first_seen(&commitment_id, now);
+        let first_seen = recorded_first_seen.unwrap_or(now);
+        let elapsed = now.saturating_sub(first_seen);
+        let hold_expires_at = first_seen.saturating_add(node.hold_secs);
+        if request.expiry <= hold_expires_at {
+            return Ok(refusal(
+                RefusalCode::CommitmentExpired,
+                "commitment_expiry",
+                format!(
+                    "expiry {} does not outlive the Hold window (first_seen {first_seen}, hold_secs {}s)",
+                    request.expiry, node.hold_secs
+                ),
+            ));
+        }
+        if elapsed < node.hold_secs {
+            // Inside the Hold. Start the timer on genuine first sight only
+            // (reading first_seen above guarantees it never resets), then
+            // answer Pending with the time left.
+            if recorded_first_seen.is_none() {
+                node.pending_log
+                    .borrow_mut()
+                    .record(commitment_id.clone(), now, request.expiry);
+            }
+            return Ok(SignResponse::Pending(Pending {
+                commitment_id,
+                first_seen,
+                // elapsed < hold_secs in this branch, so the difference is exact.
+                remaining_secs: node.hold_secs - elapsed,
+            }));
+        }
+    }
+
+    // 8. Sign the PSBT in hand (re-verified in step 6), record the verdict,
+    //    and answer. Reached by escape/refresh, an elapsed hot-class Hold, or
+    //    hold_secs = 0.
+    let verdict = match add_node_signatures(node, &mut psbt) {
+        Ok(()) => SignResponse::Signed(psbt.to_string()),
+        Err(detail) => refusal(RefusalCode::PsbtInconsistent, "signing", detail),
+    };
+    record_verdict(node, &commitment_id, request.expiry, &verdict);
     Ok(verdict)
 }
 
@@ -310,26 +407,72 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
     }
 }
 
-/// The V0-1 evaluation: verify the user's signatures, run policy-core, and —
-/// on success — add this node's signatures (`hold_secs = 0`, ADR-0004's
-/// instant path). Returns the verdict to record and answer with.
-fn evaluate_and_sign(node: &Node, psbt: &mut Psbt) -> SignResponse {
+/// The V0-1 validation: verify the user's signatures, then run policy-core.
+/// Does NOT sign — signing is deferred (handler step 8) so a hot-class spend
+/// can be held first (ADR-0004). `Err` carries the wire refusal to return.
+fn verify_spend(node: &Node, psbt: &Psbt) -> Result<(), SignResponse> {
     // The user's partial signature must cryptographically verify on every
     // input against the node's own recomputed sighash — presence of a
     // partial_sig is never enough (DESIGN.md, "Sighash enforcement"). This
     // subsumes the "no output mutation after authorization" check: any
     // mutation after signing changes the sighash and invalidates the very
     // signature the node verifies.
-    if let Err(response) = verify_user_signatures(node, psbt) {
-        return response;
-    }
+    verify_user_signatures(node, psbt)?;
     // The first-light policy checks (destination allowlist, fee cap).
     if let Err(v) = policy_core::evaluate(psbt, &node.check_params) {
-        return refusal(map_policy_code(v.code), v.check, v.detail);
+        return Err(refusal(map_policy_code(v.code), v.check, v.detail));
     }
-    match add_node_signatures(node, psbt) {
-        Ok(()) => SignResponse::Signed(psbt.to_string()),
-        Err(detail) => refusal(RefusalCode::PsbtInconsistent, "signing", detail),
+    Ok(())
+}
+
+/// Record `verdict` under `commitment_id` in the anti-replay log, but only when
+/// the commitment fully determines it (see [`is_recordable_verdict`]).
+fn record_verdict(node: &Node, commitment_id: &str, expiry: u64, verdict: &SignResponse) {
+    if is_recordable_verdict(verdict) {
+        node.replay_log
+            .borrow_mut()
+            .record(commitment_id.to_string(), expiry, verdict.clone());
+    }
+}
+
+/// The destination class of a spend, read from its outputs (ADR-0004, "Policy
+/// model → Hold"). This only ROUTES the Hold; every class still runs the full
+/// sig + policy checks before signing, so a generous classification can never
+/// bypass the allowlist or fee cap.
+#[derive(Debug, PartialEq, Eq)]
+enum DestClass {
+    /// Every non-change output pays the escape wallet — the incident sweep.
+    /// Signs instantly: the escape sweep is the implicit cancel of any pending
+    /// spend, so it must never itself be held.
+    Escape,
+    /// Self-spend: every output pays the vault's own scriptPubKey (a refresh
+    /// resetting the recovery timelock). Signs instantly.
+    Refresh,
+    /// Pays the hot wallet (anything else). The Hold applies.
+    Hot,
+}
+
+/// Classify `psbt` by destination (see [`DestClass`]). "Change" is a self-pay
+/// back to the vault's own scriptPubKey; the class turns on the non-change
+/// outputs. With no escape wallet configured (first light) nothing is
+/// escape-class, which is harmless when `hold_secs = 0`.
+fn destination_class(node: &Node, psbt: &Psbt) -> DestClass {
+    let vault_spk = &node.check_params.vault_spk;
+    let mut non_change = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .filter(|output| output.script_pubkey != *vault_spk)
+        .peekable();
+    if non_change.peek().is_none() {
+        // Every output pays the vault back: a refresh self-spend.
+        return DestClass::Refresh;
+    }
+    match &node.escape_spk {
+        Some(escape_spk) if non_change.all(|output| output.script_pubkey == *escape_spk) => {
+            DestClass::Escape
+        }
+        _ => DestClass::Hot,
     }
 }
 
@@ -350,8 +493,8 @@ fn evaluate_and_sign(node: &Node, psbt: &mut Psbt) -> SignResponse {
 /// identical commitment resubmitted with a corrected signature would otherwise
 /// replay a stale refusal and block an honest spend. The log does not defend
 /// the signature — V0-1's sighash binding does (DESIGN.md, "What the
-/// anti-replay log is — and is not"). `Pending` is unreachable at first light
-/// (`hold_secs = 0`) and never recorded here.
+/// anti-replay log is — and is not"). `Pending` lives in the pending log (the
+/// Hold timer), never the anti-replay log, so it is never recorded here.
 fn is_recordable_verdict(verdict: &SignResponse) -> bool {
     match verdict {
         SignResponse::Signed(_) => true,

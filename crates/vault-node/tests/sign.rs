@@ -33,40 +33,111 @@ fn pubkey(secp: &Secp256k1<bitcoin::secp256k1::All>, index: u8) -> PublicKey {
     PublicKey::new(seckey(index).public_key(secp))
 }
 
+fn descriptor_str() -> String {
+    let secp = Secp256k1::new();
+    let user = pubkey(&secp, 1);
+    let nodes: Vec<String> = (2..=6).map(|i| pubkey(&secp, i).to_string()).collect();
+    format!("wsh(and_v(v:pk({user}),multi(3,{})))", nodes.join(","))
+}
+
 struct Fixture {
     node: Node,
     descriptor: Descriptor<PublicKey>,
     hot_spk: ScriptBuf,
+    escape_spk: ScriptBuf,
+}
+
+/// The default (V0-1/V0-2) fixture: no Hold, escape wallet not set apart.
+fn fixture() -> Fixture {
+    build_fixture(0, false)
+}
+
+/// A fixture whose node enforces a `hold_secs` Hold and knows its escape
+/// wallet — the V0-3 class-routing setup.
+fn held_fixture(hold_secs: u64) -> Fixture {
+    build_fixture(hold_secs, true)
 }
 
 /// User key is index 1; the five node keys are 2..=6; the Node under test
-/// holds key 2.
-fn fixture() -> Fixture {
-    let secp = Secp256k1::new();
-    let user = pubkey(&secp, 1);
-    let nodes: Vec<String> = (2..=6).map(|i| pubkey(&secp, i).to_string()).collect();
-    let descriptor_str = format!("wsh(and_v(v:pk({user}),multi(3,{})))", nodes.join(","));
+/// holds key 2. The hot and escape scriptPubKeys are both allowlisted (so an
+/// escape sweep passes the destination check); `configure_escape` additionally
+/// names the escape spk in config so the node can route it as the escape class.
+fn build_fixture(hold_secs: u64, configure_escape: bool) -> Fixture {
+    let descriptor_str = descriptor_str();
     let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str).expect("valid descriptor");
     let hot_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xAA; 32]));
-    let config = format!(
+    let escape_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xBB; 32]));
+    let config = config_text(
+        &descriptor_str,
+        &hot_spk,
+        &escape_spk,
+        hold_secs,
+        MAX_AGE,
+        configure_escape,
+        true,
+    );
+    Fixture {
+        node: Node::from_toml_str(&config).expect("valid config"),
+        descriptor,
+        hot_spk,
+        escape_spk,
+    }
+}
+
+fn config_text(
+    descriptor_str: &str,
+    hot_spk: &ScriptBuf,
+    escape_spk: &ScriptBuf,
+    hold_secs: u64,
+    max_commitment_age_secs: u64,
+    configure_escape: bool,
+    allow_escape: bool,
+) -> String {
+    let escape_line = if configure_escape {
+        format!("escape_spk = \"{escape_spk:x}\"\n")
+    } else {
+        String::new()
+    };
+    let allowlist = if allow_escape {
+        format!("\"{hot_spk:x}\", \"{escape_spk:x}\"")
+    } else {
+        format!("\"{hot_spk:x}\"")
+    };
+    format!(
         "listen_port = 7000\n\
          node_seckey = \"{}\"\n\
          descriptor = \"{descriptor_str}\"\n\
-         allowlist = [\"{hot_spk:x}\"]\n\
-         hold_secs = 0\n\
-         max_commitment_age_secs = {MAX_AGE}\n\
+         allowlist = [{allowlist}]\n\
+         {escape_line}\
+         hold_secs = {hold_secs}\n\
+         max_commitment_age_secs = {max_commitment_age_secs}\n\
          policy_version = {POLICY_VERSION}\n\
          pin_normal_hash = \"{}\"\n\
          pin_duress_hash = \"{}\"\n",
         seckey(2).display_secret(),
         sha256::Hash::hash(NORMAL_PIN.as_bytes()),
         sha256::Hash::hash(DURESS_PIN.as_bytes()),
-    );
-    Fixture {
-        node: Node::from_toml_str(&config).expect("valid config"),
-        descriptor,
-        hot_spk,
-    }
+    )
+}
+
+fn fixture_config(
+    hold_secs: u64,
+    max_commitment_age_secs: u64,
+    configure_escape: bool,
+    allow_escape: bool,
+) -> String {
+    let descriptor_str = descriptor_str();
+    let hot_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xAA; 32]));
+    let escape_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xBB; 32]));
+    config_text(
+        &descriptor_str,
+        &hot_spk,
+        &escape_spk,
+        hold_secs,
+        max_commitment_age_secs,
+        configure_escape,
+        allow_escape,
+    )
 }
 
 /// A `count`-input PSBT spending the vault to `outputs`, witness data filled.
@@ -484,5 +555,198 @@ fn a_replacement_spending_the_same_inputs_is_not_blocked_by_the_log() {
     assert!(
         matches!(response, SignResponse::Signed(_)),
         "a replacement is a new commitment and must be evaluated afresh, got {response:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// V0-3: the Hold — per-destination-class routing (ADR-0004)
+
+/// A Hold long enough to observe, comfortably inside the retention cap.
+const HOLD: u64 = 3_600;
+
+/// A held-test request whose commitment expiry sits at the node's cap — far
+/// beyond any Hold these tests exercise, so re-submission after the window is
+/// never mistaken for an expired commitment.
+fn held_request(psbt: &Psbt) -> SignRequest {
+    request_at(psbt, NORMAL_PIN, NOW + MAX_AGE)
+}
+
+fn expect_pending(response: SignResponse) -> vault_proto::Pending {
+    match response {
+        SignResponse::Pending(pending) => pending,
+        other => panic!("expected pending, got {other:?}"),
+    }
+}
+
+fn expect_config_error(raw: String) -> String {
+    match Node::from_toml_str(&raw) {
+        Ok(_) => panic!("config must be rejected"),
+        Err(err) => err.to_string(),
+    }
+}
+
+#[test]
+fn nonzero_hold_requires_an_escape_spk() {
+    let err = expect_config_error(fixture_config(HOLD, MAX_AGE, false, true));
+    assert!(
+        err.contains("escape_spk is required"),
+        "unexpected config error: {err}"
+    );
+}
+
+#[test]
+fn escape_spk_must_also_be_allowlisted() {
+    let err = expect_config_error(fixture_config(HOLD, MAX_AGE, true, false));
+    assert!(
+        err.contains("escape_spk must also be present in allowlist"),
+        "unexpected config error: {err}"
+    );
+}
+
+#[test]
+fn max_commitment_age_must_exceed_hold() {
+    let err = expect_config_error(fixture_config(HOLD, HOLD, true, true));
+    assert!(
+        err.contains("max_commitment_age_secs") && err.contains("must exceed hold_secs"),
+        "unexpected config error: {err}"
+    );
+}
+
+#[test]
+fn hot_class_first_submission_is_pending_for_the_full_hold() {
+    let fixture = held_fixture(HOLD);
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    let response =
+        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
+    let pending = expect_pending(response);
+    assert_eq!(pending.first_seen, NOW);
+    assert_eq!(
+        pending.remaining_secs, HOLD,
+        "first sight must report the whole Hold as remaining"
+    );
+}
+
+#[test]
+fn resubmission_before_the_window_is_still_pending_with_less_time() {
+    let fixture = held_fixture(HOLD);
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    let req = held_request(&psbt);
+
+    let first = handle_sign(&fixture.node, &req, NOW).expect("decodable request");
+    assert_eq!(expect_pending(first).remaining_secs, HOLD);
+
+    // Half the Hold later the same commitment is still inside its window. The
+    // timer keeps the original first_seen, so remaining_secs has shrunk.
+    let later = NOW + HOLD / 2;
+    let pending =
+        expect_pending(handle_sign(&fixture.node, &req, later).expect("decodable request"));
+    assert_eq!(pending.first_seen, NOW, "the Hold timer must not reset");
+    assert_eq!(pending.remaining_secs, HOLD - HOLD / 2);
+}
+
+#[test]
+fn resubmission_at_or_after_the_window_is_signed() {
+    let fixture = held_fixture(HOLD);
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    let req = held_request(&psbt);
+
+    assert!(matches!(
+        handle_sign(&fixture.node, &req, NOW).expect("decodable request"),
+        SignResponse::Pending(_)
+    ));
+    // Exactly at first_seen + hold_secs the window has elapsed: the node signs
+    // the PSBT in hand (re-verified), contributing its own partial signature.
+    let response = handle_sign(&fixture.node, &req, NOW + HOLD).expect("decodable request");
+    let SignResponse::Signed(signed) = response else {
+        panic!("the Hold has elapsed; the node must sign, got {response:?}");
+    };
+    let signed = Psbt::from_str(&signed).expect("valid returned psbt");
+    let secp = Secp256k1::new();
+    assert!(
+        signed.inputs[0]
+            .partial_sigs
+            .contains_key(&pubkey(&secp, 2)),
+        "node must contribute its own partial signature after the Hold"
+    );
+}
+
+#[test]
+fn escape_class_sweep_signs_instantly_despite_a_hold() {
+    let fixture = held_fixture(HOLD);
+    // Every non-change output pays the escape wallet: an escape sweep, which is
+    // the implicit cancel and must never be held.
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.escape_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    let response =
+        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
+    assert!(
+        matches!(response, SignResponse::Signed(_)),
+        "an escape sweep is instant even under a Hold, got {response:?}"
+    );
+}
+
+#[test]
+fn refresh_self_spend_signs_instantly_despite_a_hold() {
+    let fixture = held_fixture(HOLD);
+    let vault_spk = fixture.descriptor.script_pubkey();
+    // Every output pays the vault back: a refresh self-spend.
+    let mut psbt = vault_psbt(&fixture, vec![(vault_spk, 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    let response =
+        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
+    assert!(
+        matches!(response, SignResponse::Signed(_)),
+        "a refresh self-spend is instant even under a Hold, got {response:?}"
+    );
+}
+
+#[test]
+fn an_invalid_hot_spend_is_refused_not_held() {
+    let fixture = held_fixture(HOLD);
+    // A hot-class spend with NO user signature. It fails validation, so the
+    // response is a Refusal — not Pending. A held spend answers Pending, so a
+    // Refusal here proves the invalid submission was never recorded as pending
+    // (the pending log holds only spends that would otherwise be signed).
+    let psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    let response =
+        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
+    let refusal = expect_refusal(response);
+    assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
+}
+
+#[test]
+fn hot_spend_expiring_at_the_hold_boundary_is_refused_not_pending() {
+    let fixture = held_fixture(HOLD);
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    // Expiry is exclusive. If expiry == first_seen + hold_secs, the spend will
+    // be expired exactly when the Hold elapses, so recording Pending would
+    // promise a signature that can never be returned.
+    let response = handle_sign(
+        &fixture.node,
+        &request_at(&psbt, NORMAL_PIN, NOW + HOLD),
+        NOW,
+    )
+    .expect("decodable request");
+    let refusal = expect_refusal(response);
+    assert_eq!(refusal.code, RefusalCode::CommitmentExpired);
+}
+
+#[test]
+fn a_hot_spend_signs_instantly_when_hold_is_zero() {
+    // hold_secs = 0 is the first-light configuration: the hot class exists but
+    // the Hold is a no-op, so the spend signs on first submission. No pending
+    // entry is created (the demo stays one-shot).
+    let fixture = held_fixture(0);
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    let response =
+        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
+    assert!(
+        matches!(response, SignResponse::Signed(_)),
+        "hold_secs = 0 signs the hot spend on first submission, got {response:?}"
     );
 }

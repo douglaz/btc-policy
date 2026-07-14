@@ -51,6 +51,59 @@ impl ReplayLog {
     }
 }
 
+/// One hot-class commitment's Hold timer (ADR-0004), retained until expiry.
+///
+/// **Timer-only by design** — this stores when the commitment was first seen,
+/// **never the PSBT**. This resolves the V0-2 commitment/tx-identity question:
+/// on re-submission the node re-verifies the resubmitted PSBT in full (PIN,
+/// user-sig/sighash, policy) and signs the PSBT *in hand*, never a stored one.
+/// So two economically-identical transactions that collide on `commitment_id`
+/// (they can differ only in version/nLockTime/nSequence, none of which the
+/// commitment binds) stay harmless: whichever is resubmitted after the window
+/// is the one freshly verified and signed. Nothing recorded here can be
+/// replayed into a signature — the timer only decides *when* signing is
+/// allowed, not *what* gets signed.
+struct PendingEntry {
+    /// Unix seconds when this node first saw the commitment; the Hold's start.
+    first_seen: u64,
+    /// The commitment's expiry (unix seconds); the prune horizon, exactly as
+    /// [`ReplayLog`] uses it.
+    expiry: u64,
+}
+
+/// In-memory Hold timers: `commitment_id -> first_seen`. A sibling of
+/// [`ReplayLog`] with the same expiry-pruned, `now`-as-a-parameter discipline,
+/// so every Hold path is deterministically testable.
+#[derive(Default)]
+pub(crate) struct PendingLog {
+    entries: HashMap<String, PendingEntry>,
+}
+
+impl PendingLog {
+    /// The `first_seen` recorded for `commitment_id` if a live (unexpired at
+    /// `now`) pending entry exists. An expired entry reads as absent.
+    pub(crate) fn first_seen(&self, commitment_id: &str, now: u64) -> Option<u64> {
+        self.entries
+            .get(commitment_id)
+            .filter(|entry| entry.expiry > now)
+            .map(|entry| entry.first_seen)
+    }
+
+    /// Start `commitment_id`'s Hold timer at `first_seen`, retained until
+    /// `expiry`. The handler calls this only on genuine first sight (it reads
+    /// [`PendingLog::first_seen`] first), so the timer never resets on
+    /// re-submission.
+    pub(crate) fn record(&mut self, commitment_id: String, first_seen: u64, expiry: u64) {
+        self.entries
+            .insert(commitment_id, PendingEntry { first_seen, expiry });
+    }
+
+    /// Drop every timer whose commitment has expired, bounding retention.
+    pub(crate) fn prune(&mut self, now: u64) {
+        self.entries.retain(|_, entry| entry.expiry > now);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +149,19 @@ mod tests {
 
         // Once every entry has expired, pruning empties the log.
         log.prune(2_000);
+        assert_eq!(log.entries.len(), 0);
+    }
+
+    #[test]
+    fn pending_records_first_seen_and_expires_like_the_replay_log() {
+        let mut log = PendingLog::default();
+        log.record("abc".into(), 500, 1_000);
+        // Readable while unexpired, absent once expiry has passed.
+        assert_eq!(log.first_seen("abc", 600), Some(500));
+        assert_eq!(log.first_seen("abc", 1_000), None);
+        assert_eq!(log.first_seen("def", 600), None);
+        // Pruning at expiry drops it, keeping the map bounded.
+        log.prune(1_000);
         assert_eq!(log.entries.len(), 0);
     }
 }
