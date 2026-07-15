@@ -29,8 +29,12 @@ Any t of the n Vault nodes (default 3-of-5). Every quorum has run the policy che
 _Avoid_: majority, threshold (as a noun for the group)
 
 **Coordinator**:
-The vault-cli process that builds PSBTs, fans them out to nodes, collects signatures, finalizes, and broadcasts. Trusted in the MVP; holds no keys that can move funds alone.
-_Avoid_: server, orchestrator, wallet app
+The vault-cli process. An **untrusted relay** (ADR-0010): it operates the User key, relays {spend intent, user signatures, PIN} to the nodes, and pulls Alerts. It does NOT assemble signatures, finalize, or broadcast — the Nodes do. A compromised Coordinator can only censor, never steal or control broadcast.
+_Avoid_: server, orchestrator, wallet app, assembler
+
+**Node channel**:
+The authenticated node-to-node channel (ADR-0011) over which Nodes exchange partial signatures and coordinate broadcast. Carries signatures and assembly only — never Policy. Revises the former "no intra-node communication" rule: Nodes are policy-isolated, not network-isolated.
+_Avoid_: gossip, mesh (implies shared state), p2p
 
 **User key**:
 The user's own key, mandatory on every Normal-path spend (hardware-backed in real use; software in the regtest demo).

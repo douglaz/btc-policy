@@ -14,9 +14,33 @@ V0-3  the Hold (two-phase signing)               DONE (8678a45)
 V0-5  verified change + consistency + descriptor allowlist  DONE (a9d57e9)
 V0-6  chain backend + watchtower classification + /events + broadcast  DONE (595c338, primitives)
 V0-6b drive the watchtower scan in the node daemon        DONE (2ce2933)
-V0-4  dual PINs + duress + lockdown              NEXT — split into 4a/4b (see below)
+V0-8  node-to-node assembly + node broadcast; coordinator → relay  NEXT (the spine)
+V0-4a dual PINs + deferred lockdown + persistence (node-local; no channel)  → parallel to V0-8
+V0-4b duress escape (rides V0-8's assembly+broadcast; pin decides + delayed) → V0-8, V0-4a
 V0-7  proptest + full test matrix + hold-clawback demo  → all
 ```
+
+**MODEL B PIVOT (2026-07-15, user; ADR-0010/0011).** The coordinator is now an
+untrusted relay; nodes assemble + broadcast every spend over an authenticated
+node-to-node channel. This reverses "coordinator trusted in MVP" and revises
+"no intra-node comms" (nodes stay policy-isolated, not network-isolated). It
+makes the node-assembly channel the v0 spine and reshapes the normal spend path
+(first-light/demo included). What's UNAFFECTED: all node-local validation
+(V0-1 sighash, V0-2 commitment/replay, V0-3 Hold, V0-5 descriptor policy) and
+the watchtower (V0-6/6b) — those are validation, which stays node-local. What
+changes: who assembles + broadcasts (coordinator → nodes).
+
+## V0-8 — node-to-node assembly + node broadcast (NEXT, the spine)
+The founding rework. Design the node channel in detail first (ADR-0011 is a
+sketch): node identity + mutual auth (deploy-time keys), transport (v1 Tor),
+and the request-scoped partial-signature exchange + combine + broadcast. Then:
+each node builds the tx from relayed intent + its own chain view, validates,
+signs, gathers the other partials over the channel, combines, and broadcasts via
+its V0-6 chain backend. The coordinator (vault-cli) stops combining/finalizing/
+broadcasting — it relays {intent, user_sigs, pin} and pulls alerts. Rework the
+demo so nodes broadcast. Big; likely splits into V0-8a (channel: identity/auth/
+transport/exchange) and V0-8b (node-side assemble+broadcast + spend-path/demo
+rework). Keeps policy node-local; the channel carries no policy.
 
 **Reorder (2026-07-14):** V0-6 now precedes V0-4. The duress redesign (no-abort,
 node-distributed delayed broadcast — ADR-0008) means duress can't be built until
