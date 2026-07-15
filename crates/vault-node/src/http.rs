@@ -42,10 +42,20 @@ fn respond(stream: &mut TcpStream, node: &Node) -> (u16, String) {
         Ok(request) => request,
         Err(detail) => return (400, error_body(&detail)),
     };
-    if (request.method.as_str(), request.path.as_str()) != ("POST", "/sign") {
-        return (404, error_body("only POST /sign exists"));
+    // Route on (method, path). The path prefix isolates `/events` from its query
+    // string (`/events?since=`); `/sign` takes no query.
+    match (request.method.as_str(), request.path.as_str()) {
+        ("POST", "/sign") => respond_sign(node, &request.body),
+        ("GET", path) if path == "/events" || path.starts_with("/events?") => {
+            respond_events(node, path)
+        }
+        _ => (404, error_body("only POST /sign and GET /events exist")),
     }
-    let sign_request: SignRequest = match serde_json::from_slice(&request.body) {
+}
+
+/// Handle `POST /sign`.
+fn respond_sign(node: &Node, body: &[u8]) -> (u16, String) {
+    let sign_request: SignRequest = match serde_json::from_slice(body) {
         Ok(sign_request) => sign_request,
         Err(e) => return (400, error_body(&format!("cannot decode request body: {e}"))),
     };
@@ -63,6 +73,27 @@ fn respond(stream: &mut TcpStream, node: &Node) -> (u16, String) {
         },
         Err(bad_request) => (400, error_body(&bad_request.0)),
     }
+}
+
+/// Handle `GET /events?since=<cursor>` (ADR-0002 pull API): the queued alerts
+/// after `since`, plus the new cursor. A missing or unparseable `since` reads as
+/// 0 (return everything) — a fresh puller has no cursor yet.
+fn respond_events(node: &Node, path: &str) -> (u16, String) {
+    let since = parse_since(path);
+    let (alerts, cursor) = node.events(since);
+    let body = serde_json::json!({ "alerts": alerts, "cursor": cursor });
+    match serde_json::to_string(&body) {
+        Ok(body) => (200, body),
+        Err(e) => (500, error_body(&format!("cannot encode events: {e}"))),
+    }
+}
+
+/// Parse the `since` cursor from a `/events?since=<n>` path. Absent or
+/// unparseable ⇒ 0.
+fn parse_since(path: &str) -> u64 {
+    path.strip_prefix("/events?since=")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 struct Request {
@@ -137,4 +168,18 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::R
 
 fn error_body(detail: &str) -> String {
     serde_json::json!({ "error": detail }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_since;
+
+    #[test]
+    fn parse_since_reads_the_cursor_or_defaults_to_zero() {
+        assert_eq!(parse_since("/events?since=42"), 42);
+        // No query, empty query, or a non-numeric cursor all read as 0.
+        assert_eq!(parse_since("/events"), 0);
+        assert_eq!(parse_since("/events?since="), 0);
+        assert_eq!(parse_since("/events?since=abc"), 0);
+    }
 }

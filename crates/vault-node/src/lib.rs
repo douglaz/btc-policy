@@ -6,19 +6,26 @@
 //! partial-signature verification, the anti-replay log, and the Hold
 //! (ADR-0004) — hot-wallet spends wait `hold_secs` as pending
 //! spends before the node signs, while escape sweeps and refresh self-spends
-//! sign instantly. Duress actions, lockdown, watchtower duty, and `GET /events`
-//! remain v0 work.
+//! sign instantly. Watchtower duty (ADR-0001) — a callable scan pass
+//! ([`Node::watchtower_tick`]) classifies recovery-path and un-co-signed spends
+//! of the node's own chain view and queues alerts a puller reads via
+//! `GET /events` (ADR-0002); a caller drives the pass (the demo and tests today,
+//! the coordinator loop in V0-7), never a background timer. Duress actions and
+//! lockdown remain v0 work (V0-4).
 
+pub mod chain;
 pub mod http;
 mod replay;
+pub mod watchtower;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
-use bitcoin::{EcdsaSighashType, Psbt, PublicKey, ScriptBuf};
+use bitcoin::{EcdsaSighashType, Psbt, PublicKey, ScriptBuf, Txid};
 use miniscript::descriptor::WshInner;
 use miniscript::{Descriptor, DescriptorPublicKey, Terminal};
 use replay::{PendingLog, ReplayLog};
@@ -27,6 +34,9 @@ use vault_proto::{
     Commitment, CommitmentInput, CommitmentOutput, Pending, Refusal, RefusalCode, SignRequest,
     SignResponse,
 };
+
+use crate::chain::ChainBackend;
+use crate::watchtower::{Alert, AlertQueue};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -105,6 +115,16 @@ pub struct Node {
     /// (timer-only; see [`replay::PendingLog`]). Same single-threaded `RefCell`
     /// discipline as `replay_log`.
     pending_log: RefCell<PendingLog>,
+    /// The node's sign log: the txids it has co-signed (ADR-0001 watchtower
+    /// input). Because SIGHASH_ALL binds the witness to the exact transaction and
+    /// segwit txids exclude the witness, the signed tx's txid equals its unsigned
+    /// tx's txid — so a spend of a vault UTXO whose txid is absent here is one the
+    /// node never authorized (an `UnrecognizedSpend`).
+    sign_log: RefCell<HashSet<Txid>>,
+    /// Queued watchtower alerts, pulled by the coordinator via `GET /events`
+    /// (ADR-0002). Bounded, in-memory (DESIGN.md). Same single-threaded `RefCell`
+    /// discipline as the logs above.
+    alerts: RefCell<AlertQueue>,
 }
 
 impl Node {
@@ -187,7 +207,60 @@ impl Node {
             escape_descriptor,
             replay_log: RefCell::new(ReplayLog::default()),
             pending_log: RefCell::new(PendingLog::default()),
+            sign_log: RefCell::new(HashSet::new()),
+            alerts: RefCell::new(AlertQueue::new(watchtower::DEFAULT_ALERT_CAP)),
         })
+    }
+
+    /// The vault's own watched scriptPubKey(s) for the watchtower scan
+    /// (ADR-0001). The first-light vault is a single definite P2WSH, so this is
+    /// one script — the P2WSH of the node's witness script.
+    pub fn vault_scripts(&self) -> Vec<ScriptBuf> {
+        vec![ScriptBuf::new_p2wsh(&self.witness_script.wscript_hash())]
+    }
+
+    /// Run one watchtower scan pass (ADR-0001) against `backend`, classifying
+    /// every spend of the vault's watched scripts at or after `from_height` and
+    /// queueing new alerts. Returns how many NEW alerts were queued (a re-scan of
+    /// an already-alerted spend queues nothing).
+    ///
+    /// The recovery-branch script set is empty in v0 — the first-light vault has
+    /// no recovery branch — so this pass emits only `UnrecognizedSpend`;
+    /// `RecoveryPathSpend` classification lives in [`watchtower::scan`] and is
+    /// tested there. No background thread (task scope): the caller drives the tick
+    /// so it stays deterministic.
+    pub fn watchtower_tick(
+        &self,
+        backend: &dyn ChainBackend,
+        from_height: u32,
+    ) -> Result<usize, Error> {
+        let vault_scripts = self.vault_scripts();
+        let recovery_scripts: Vec<ScriptBuf> = Vec::new();
+        let alerts = {
+            let signed = self.sign_log.borrow();
+            watchtower::scan(
+                backend,
+                &vault_scripts,
+                &recovery_scripts,
+                &signed,
+                from_height,
+            )?
+        };
+        let mut queue = self.alerts.borrow_mut();
+        let mut queued = 0;
+        for alert in alerts {
+            if queue.push(alert) {
+                queued += 1;
+            }
+        }
+        Ok(queued)
+    }
+
+    /// The queued alerts after cursor `since`, plus the new cursor (the `GET
+    /// /events` pull API; ADR-0002). No loss, no duplication across successive
+    /// pulls.
+    pub fn events(&self, since: u64) -> (Vec<Alert>, u64) {
+        self.alerts.borrow().since(since)
     }
 }
 
@@ -370,7 +443,16 @@ pub fn handle_sign(
     //    and answer. Reached by escape/refresh, an elapsed hot-class Hold, or
     //    hold_secs = 0.
     let verdict = match add_node_signatures(node, &mut psbt) {
-        Ok(()) => SignResponse::Signed(psbt.to_string()),
+        Ok(()) => {
+            // Record the co-signed txid for the watchtower (ADR-0001): a later
+            // on-chain spend with this txid is one the node authorized, not an
+            // alert. The txid is taken from the unsigned tx — segwit excludes the
+            // witness, so it is the txid the signed tx will broadcast under.
+            node.sign_log
+                .borrow_mut()
+                .insert(psbt.unsigned_tx.compute_txid());
+            SignResponse::Signed(psbt.to_string())
+        }
         Err(detail) => refusal(RefusalCode::PsbtInconsistent, "signing", detail),
     };
     record_verdict(node, &commitment_id, request.expiry, &verdict);
@@ -670,4 +752,142 @@ fn add_node_signatures(node: &Node, psbt: &mut Psbt) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod watchtower_wiring {
+    //! Node-level wiring: an honest `/sign` records its txid in the sign log, so
+    //! the watchtower recognizes that spend and alerts (through `events`) only on
+    //! vault spends the node never co-signed. Classification and cursor edge cases
+    //! live in `watchtower`'s own tests; this proves the `Node` glue.
+
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+    use bitcoin::sighash::SighashCache;
+    use bitcoin::transaction::Version;
+    use bitcoin::{
+        Amount, EcdsaSighashType, OutPoint, Psbt, PublicKey, ScriptBuf, Sequence, Transaction,
+        TxIn, TxOut, Txid, Witness,
+    };
+    use miniscript::{Descriptor, DescriptorPublicKey};
+    use std::str::FromStr;
+
+    use crate::chain::{mock::MockBackend, SpendSeen};
+    use crate::watchtower::AlertKind;
+    use crate::{handle_sign, Node};
+    use vault_proto::{SignRequest, SignResponse};
+
+    const NOW: u64 = 1_752_000_000;
+
+    fn key(i: u8) -> (SecretKey, PublicKey) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[i; 32]).expect("32 nonzero bytes");
+        (sk, PublicKey::new(sk.public_key(&secp)))
+    }
+
+    /// A 1-of-1 vault (user + one node key) that signs an honest hot spend under
+    /// `hold_secs = 0`, plus the resulting co-signed txid.
+    fn signed_node() -> (Node, Txid) {
+        let (_, user) = key(1);
+        let (nsk, node_pub) = key(2);
+        let (_, hot_key) = key(10);
+        let descriptor = format!("wsh(and_v(v:pk({user}),multi(1,{node_pub})))");
+        let hot = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({hot_key})"))
+            .expect("hot descriptor");
+        let hot_spk = hot
+            .at_derivation_index(0)
+            .expect("definite")
+            .script_pubkey();
+        let config = format!(
+            "listen_port = 7100\nnode_seckey = \"{}\"\ndescriptor = \"{descriptor}\"\n\
+             allowlist = [\"{hot}\"]\nmax_derivation_index = 5\nhold_secs = 0\n\
+             max_commitment_age_secs = 172800\npolicy_version = 1\n\
+             pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n",
+            nsk.display_secret(),
+            sha256::Hash::hash(b"1234"),
+            sha256::Hash::hash(b"9999"),
+        );
+        let node = Node::from_toml_str(&config).expect("valid config");
+
+        let vault_spk = node.vault_scripts()[0].clone();
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                script_pubkey: hot_spk,
+                value: Amount::from_sat(99_990_000),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("unsigned tx");
+        let value = Amount::from_sat(100_000_000);
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            script_pubkey: vault_spk,
+            value,
+        });
+        psbt.inputs[0].witness_script = Some(node.witness_script.clone());
+        let sighash = SighashCache::new(&psbt.unsigned_tx)
+            .p2wsh_signature_hash(0, &node.witness_script, value, EcdsaSighashType::All)
+            .expect("sighash");
+        let secp = Secp256k1::new();
+        let signature = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &key(1).0);
+        psbt.inputs[0].partial_sigs.insert(
+            user,
+            bitcoin::ecdsa::Signature {
+                signature,
+                sighash_type: EcdsaSighashType::All,
+            },
+        );
+        let request = SignRequest {
+            psbt: psbt.to_string(),
+            escape_psbt: psbt.to_string(),
+            pin: "1234".into(),
+            expiry: NOW + 3_600,
+            policy_version: 1,
+        };
+        let SignResponse::Signed(_) = handle_sign(&node, &request, NOW).expect("decodable") else {
+            panic!("the honest hot spend must sign");
+        };
+        (node, psbt.unsigned_tx.compute_txid())
+    }
+
+    fn vault_spend(node: &Node, spend_txid: Txid) -> SpendSeen {
+        SpendSeen {
+            spend_txid,
+            outpoint: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            script: node.vault_scripts()[0].clone(),
+        }
+    }
+
+    #[test]
+    fn a_co_signed_spend_is_recognized_and_an_unknown_one_alerts_through_events() {
+        let (node, cosigned) = signed_node();
+
+        // The co-signed spend on chain is recognized: nothing queued.
+        let known = MockBackend {
+            spends: vec![vault_spend(&node, cosigned)],
+            ..Default::default()
+        };
+        assert_eq!(node.watchtower_tick(&known, 0).expect("scan"), 0);
+        assert!(node.events(0).0.is_empty());
+
+        // A vault spend the node never co-signed is an UnrecognizedSpend.
+        let foreign = Txid::from_byte_array([0xAB; 32]);
+        let unknown = MockBackend {
+            spends: vec![vault_spend(&node, foreign)],
+            ..Default::default()
+        };
+        assert_eq!(node.watchtower_tick(&unknown, 0).expect("scan"), 1);
+        let (alerts, cursor) = node.events(0);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, AlertKind::UnrecognizedSpend);
+        assert_eq!(alerts[0].spend_txid, foreign.to_string());
+        assert_eq!(cursor, 1);
+    }
 }
