@@ -6,7 +6,7 @@ Repo: btc-policy (local)
 Status: APPROVED (spend-path + duress architecture SUPERSEDED — see below)
 Mode: Builder
 
-> **⚠️ SUPERSEDED SECTIONS (2026-07-15, Model B).** [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md) is the source of truth for the spend path and duress. It reverses two decisions this doc still states as locked: nodes now **coordinate signature assembly + broadcast among themselves** (not "no intra-node communication, ever"), and the **coordinator is a pure relay, trusted only until the wrench attack** (not the trusted assembler/broadcaster). Wherever this doc has the coordinator collecting/finalizing/broadcasting, or says nodes make no outbound connections, or lists "no intra-node communication" / "coordinator trusted in MVP" as locked — ADR-0012 supersedes it. The policy/Hold/watchtower/recovery/wallet-topology content below is unaffected.
+> **⚠️ SUPERSEDED SECTIONS (2026-07-15, Model B).** [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md) is the source of truth for the spend path and duress. It reverses two decisions this doc still states as locked: nodes now **coordinate signature assembly + broadcast among themselves** (not "no intra-node communication, ever"), and the **coordinator is a pure relay, trusted only until the wrench attack** (not the trusted assembler/broadcaster). Wherever this doc has the coordinator collecting/finalizing/broadcasting, or says nodes make no outbound connections, or lists "no intra-node communication" / "coordinator trusted in MVP" as locked — ADR-0012 supersedes it. Also revised by ADR-0012: the **watchtower recognition criterion** (a node recognizes a spend it **validated**, not one it **co-signed** — the "co-signed" wording below is corrected inline), and the **duress model** (the old "answer pending then broadcast the escape and/or lockdown" is replaced by the arm → armed → fire-at-`T` → lockdown state machine). The policy/Hold/recovery/wallet-topology content below, and the watchtower's dual-role + recovery-path detection, are unaffected.
 
 ## Problem Statement
 
@@ -178,10 +178,13 @@ descriptor = "wpkh([escape]xpub.../<0;1>/*)"  # the escape cold wallet — MANDA
    outright: nodes hold no recovery keys and never co-sign that
    path. No node trusts any summary.
 5. Normal PIN + re-submission after the Hold → node signs the hot
-   tx. Duress PIN → node answers `pending` identically, then
-   executes duress_response (broadcast the escape variant and/or
-   enter lockdown). Escape- and refresh-class spends skip the Hold
-   and sign at step 4.
+   tx. Duress PIN → [SUPERSEDED by ADR-0012 — the node ARMS the
+   user-signed escape and holds it silently until T, then broadcasts
+   + locks down (arm → armed → fire-at-T → lockdown); it does NOT
+   broadcast on submission. Original text:] node answers `pending`
+   identically, then executes duress_response (broadcast the escape
+   variant and/or enter lockdown). Escape- and refresh-class spends
+   skip the Hold and sign at step 4.
 6. [SUPERSEDED by ADR-0012 — nodes assemble the t partials over the node channel and broadcast; the coordinator does NOT collect/finalize/broadcast. Original text follows for history:] Coordinator collects t node signatures, finalizes, broadcasts —
    and between submissions polls GET /events on every node for
    pending spends, alerts, sign-log reconciliation, and liveness.
@@ -234,7 +237,7 @@ The complete system is four wallets/keysets plus four mechanisms (locked 2026-07
 
 Mechanisms:
 
-- **Watchtower** (v0; ADR-0001/0002): every node, against its own chain view — alerts on (a) any recovery-path spend and (b) any vault UTXO spend it never co-signed. The coordinator pulls alerts and additionally reconciles node sign-logs against its own spend history to catch spends it didn't initiate.
+- **Watchtower** (v0; ADR-0001/0002, **recognition criterion revised by [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md)**): every node, against its own chain view — alerts on (a) any recovery-path spend and (b) any vault UTXO spend it never **validated** (saw and policy-checked the request) — NOT "never co-signed", which false-alarms on the n−t nodes that legitimately don't sign each spend. The coordinator pulls alerts and additionally reconciles node sign-logs against its own spend history to catch spends it didn't initiate.
 - **Coin refresh**: a self-spend resets a coin's relative timelock. It runs through the normal path, so it **requires the user's hardware key** — the CLI batches and prepares refresh PSBTs; the user signs on a ~90-day cadence. Full automation is impossible by construction; the cadence is a UX parameter, not an implementation detail.
 - **Rotate flow**: normal-path sweep of everything to the escape wallet after a compromise signal (stolen user key, compromised node, recovery-key race). Funding a successor vault happens from the escape wallet at leisure. Pre-generating a successor-vault descriptor and allowlisting it directly is a possible v2 refinement; the MVP keeps the escape wallet as the single incident destination.
 - **Descriptor backup**: the full vault descriptor (all pubkeys). Without it, even valid recovery keys cannot find or spend the coins. Public-ish data — back it up promiscuously (paper, every node, the coordinator, alongside each recovery key). Also powers watch-only wallets and the watchtower.
@@ -262,7 +265,8 @@ An *unauthorized* recovery-path spend (stolen recovery keys) is answered by the 
 | Lost federation (3+ dead — incl. accumulated reboot deaths, ADR-0007) | coordinator liveness polling | wait out timelock, recovery sweep (rotate earlier, at 1–2 dead) | recovery |
 | Death/incapacity | heirs | same | recovery |
 | Hot wallet compromised | user/wallet | stop paying it; rotate when convenient (allowlist is immutable) | normal |
-| Coordinator lost | user | rebuild from descriptor backup; no funds at risk | — |
+| Coordinator lost (data only) | user | rebuild from descriptor backup; no funds at risk | — |
+| Coordinator **auth-key** lost (ADR-0012) | user | normal path BRICKED — the pubkey is pinned in the immutable manifest, so every future request (spend, refresh, escape) is rejected; only exit is the recovery timelock. Needs a backup/rotation story. | recovery |
 
 ## Open Questions
 
