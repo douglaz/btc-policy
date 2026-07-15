@@ -12,8 +12,9 @@ V0-1  sighash + real user-sig verification      DONE (b5a4247)
 V0-2  commitment struct + anti-replay log        DONE (ce932fa)
 V0-3  the Hold (two-phase signing)               DONE (8678a45)
 V0-5  verified change + consistency + descriptor allowlist  DONE (a9d57e9)
-V0-6  chain-backend seam + watchtower + /events + node broadcast  NEXT
-V0-4  dual PINs + duress + lockdown              → V0-6 (needs node broadcast), V0-3, V0-2
+V0-6  chain backend + watchtower classification + /events + broadcast  DONE (595c338, primitives)
+V0-6b drive the watchtower scan in the node daemon        NEXT (small)
+V0-4  dual PINs + duress + lockdown              → V0-6 (broadcast, done), V0-3, V0-2
 V0-7  proptest + full test matrix + hold-clawback demo  → all
 ```
 
@@ -57,6 +58,22 @@ locktime/sequence becomes load-bearing (which one is "the" pending tx, which one
 the escape sweep cancels). Resolve: either bind those fields into the commitment
 (and update DESIGN.md's commitment field list + the gstack design-of-record), or
 document why pending-identity is safe without them.
+
+## V0-6b — drive the watchtower scan in the node daemon (NEXT, small)
+V0-6 delivered the watchtower as a caller-driven `watchtower_tick` pass; in the
+running daemon nothing calls it, so `GET /events` is always empty in production
+(a gap in the V0-6 task spec — the node-side scan driver belongs in the daemon,
+not the coordinator). This task adds the minimal driver:
+- A node-config field for the chain-backend endpoint (bitcoind RPC URL); the demo
+  wires each node's config to the regtest node.
+- A minimal periodic scan thread in the daemon that calls `watchtower_tick`,
+  tracking the last-scanned height (advance the cursor; don't re-scan from 0) so
+  overlapping scans and the dedup set behave. Keep it a thin loop, not a
+  scheduler.
+- Test: the daemon, given a mock/regtest backend, drives a scan and a spend shows
+  up via `GET /events` without an explicit test call.
+Independent of V0-4 (which needs only the broadcast primitive, already done); run
+before the core-proven gate so the watchtower is real before real sats.
 
 ## V0-4 — dual PINs + duress response + lockdown (after V0-6)
 Design LOCKED 2026-07-14; full detail in ADR-0008. Build after V0-6 (needs node
