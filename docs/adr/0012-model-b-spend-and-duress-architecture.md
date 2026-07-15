@@ -1,6 +1,6 @@
 # Model B: node-assembled spends + the duress architecture (consolidated)
 
-Status: accepted 2026-07-15 (user design session). This ADR is the **authoritative, self-contained** spec for the Model-B spend path and the duress mechanism. It consolidates and supersedes the relevant parts of ADR-0008 (duress), ADR-0010 (coordinator relay), and ADR-0011 (node channel); those remain as decision records but this ADR is the source of truth. It also revises ADR-0001 (watchtower) and ADR-0002 (alert delivery) as noted, and reverses two earlier locked invariants ("coordinator trusted in MVP", "no intra-node communication, ever").
+Status: **LOCKED** 2026-07-15 (user design session + four adversarial review rounds; user deferred the final lock decision). No theft path (confirmed by two independent models), no silence break (after the dynamic-`T` fix), and every escape-invalidation vector reduces to the already-accepted denial class (funds always safe → recovery/lockdown). The remaining items are implementation details and denial residuals to be **verified empirically** by the V0-4 adversarial regtest harness, not by further paper review. This ADR is the **authoritative, self-contained** spec for the Model-B spend path and the duress mechanism. It consolidates and supersedes the relevant parts of ADR-0008 (duress), ADR-0010 (coordinator relay), and ADR-0011 (node channel); those remain as decision records but this ADR is the source of truth. It also revises ADR-0001 (watchtower) and ADR-0002 (alert delivery) as noted, and reverses two earlier locked invariants ("coordinator trusted in MVP", "no intra-node communication, ever").
 
 ## Threat model (precise — everything below depends on it)
 
@@ -90,7 +90,7 @@ Defenses (make Direction 3 as strong as it can be):
 
 ## How this answers the three-model review (2026-07-15)
 
-This ADR was itself re-reviewed by two models (2026-07-15) and NOT cleared on the first pass — several duress criticals survived and are being worked one at a time (see below). Progress log:
+This ADR was hardened across four adversarial review rounds (2026-07-15); each round's criticals were resolved one at a time until the design converged to LOCKED (no theft, no silence break, denial-only residuals). Progress log:
 
 - **Resolved cleanly:** normal-spend exact-tx (user-signs-first freezes the bytes); "nodes build from intent" for the escape (nodes VALIDATE the provided user-signed escape, don't build it — dissolves the cross-node determinism critical); escape freshness/staleness + dust-DoS (fresh-at-wrench escape, mandatory in every request, no stored standby, lenient coverage → stragglers to recovery); reboot-mid-assembly (assemble the complete escape immediately on arm and persist the *complete* tx); split-lockdown (channel propagation); **one-compromised-node duress trigger (coordinator request-signing — a rogue node can't forge a coordinator-signed fresh request).**
 - **Accepted (Direction 3):** pin substitution by a *pre-wrench-compromised* coordinator — nullifies duress, mitigated by host hardening + reproducible builds, not fully closed (device-bound pin is the hardware-gated true fix).

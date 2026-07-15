@@ -28,7 +28,8 @@ the watchtower (V0-6/6b) — those are validation, which stays node-local. What
 changes: who assembles + broadcasts (coordinator → nodes).
 
 ## V0-8 — node-to-node assembly + node broadcast (NEXT, the spine)
-**Spec: [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md) — the source of truth. Full Model B locked (not hybrid).**
+**Spec: [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md) — the source of truth. Full Model B + the duress architecture are LOCKED (2026-07-15, after four adversarial review rounds: no theft, no silence break, denial-only residuals).**
+**Split confirmed — start with V0-8a (the channel), then V0-8b (node-side assemble+broadcast + spend-path/demo rework). V0-4's duress state machine rides on V0-8b and carries the adversarial regtest harness that empirically verifies ADR-0012's denial residuals (toxic-parent, in-flight-refresh, two-spend-probe, escape-class+refresh).**
 The founding rework. Design the node channel in detail first (ADR-0011 is a
 sketch): node identity + mutual auth (deploy-time keys), transport (v1 Tor),
 and the request-scoped partial-signature exchange + combine + broadcast. Then:
