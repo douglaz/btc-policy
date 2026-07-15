@@ -103,8 +103,10 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
 - Full Model B: nodes assemble + broadcast EVERY spend over the node channel;
   coordinator is a pure relay (trusted until the wrench, never persists the pin).
 - Dual PINs every spend (ephemeral, never logged — the substitution defense).
-- Escape is deterministic, **node-built** (parameterless full-sweep), user-signed,
-  stored as a refreshed standby. The coordinator never touches it.
+- Escape is **coordinator-composed + user-signed, mandatory in every request**;
+  nodes **VALIDATE** it (destination = escape descriptor, value-coverage ≥
+  threshold, feerate ≥ floor) — they do NOT build it, and there is NO stored
+  standby (per ADR-0012 — this line previously described the superseded design).
 - Duress state machine: arm (+propagate to peers +persist) → armed (silent,
   freezes hot-class completion) → fire at T (broadcast + re-broadcast) → lockdown
   (terminal, recovery-path exit). `duress_delay_secs` is the hostage-safety window.

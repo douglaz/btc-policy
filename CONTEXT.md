@@ -113,7 +113,7 @@ The incident response: sweep everything through the Normal path to the Escape wa
 _Avoid_: key rotation (alone), migration
 
 **Watchtower**:
-A monitoring role performed by every Vault node (ADR-0001): alerts on any Recovery-path spend and any vault spend the node never co-signed.
+A monitoring role performed by every Vault node (ADR-0001/0012): alerts on any Recovery-path spend (branch-identifiable on-chain) and any vault spend the node never **validated** (saw and policy-checked the request) — NOT "never co-signed" (in t-of-n, n−t nodes legitimately don't sign each spend). Continues during Lockdown and on keyless-rebooted nodes.
 _Avoid_: monitor (alone), watchtower service
 
 **Soft vault**:
