@@ -1,5 +1,8 @@
 # Duress PINs: every spend ceremony carries a silent panic path
 
+> **The mechanism is consolidated into [ADR-0012](0012-model-b-spend-and-duress-architecture.md), which is the source of truth** for the duress state machine (arm → armed/silent-freeze → fire → lockdown), the node-assembled deterministic escape, and the corrected threat model. This ADR remains for the dual-PIN and lockdown rationale; where it says the coordinator assembles/distributes the escape, 0012 supersedes it (nodes do). Read 0012.
+
+
 Every `/sign` submission requires a PIN. Two are enrolled at setup (hashes in each node's static config): the normal PIN authorizes the requested spend; the duress PIN triggers the vault's configured duress response. Entering either is externally identical, and the two must be deliberately distinct (never typo-neighbors — a false trigger costs a recovery ceremony under sealed nodes, ADR-0005).
 
 Every vault→hot spend is a two-transaction ceremony: the user signs the hot transaction AND an escape-sweep variant on the hardware device, every time, as normalized routine — so under coercion, signing the escape transaction raises no suspicion. The PIN entered at submission decides which one the nodes act on.

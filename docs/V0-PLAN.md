@@ -31,6 +31,7 @@ the watchtower (V0-6/6b) — those are validation, which stays node-local. What
 changes: who assembles + broadcasts (coordinator → nodes).
 
 ## V0-8 — node-to-node assembly + node broadcast (NEXT, the spine)
+**Spec: [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md) — the source of truth. Full Model B locked (not hybrid).**
 The founding rework. Design the node channel in detail first (ADR-0011 is a
 sketch): node identity + mutual auth (deploy-time keys), transport (v1 Tor),
 and the request-scoped partial-signature exchange + combine + broadcast. Then:
@@ -101,23 +102,17 @@ before the core-proven gate so the watchtower is real before real sats.
 
 ## V0-4 — dual PINs + duress response + lockdown (after V0-6)
 Design LOCKED 2026-07-14; full detail in ADR-0008. Build after V0-6 (needs node
-broadcast). Summary of the locked shape:
-- Dual PINs on every `/sign` (second factor; wire-identical duress vs normal;
-  deliberately distinct, enforced at enrollment).
-- Duress is **silent + deferred**: the PIN schedules escape sweep + lockdown to
-  fire together after `duress_delay_secs` (separate from `hold_secs`; `0`
-  allowed = instant). Nothing observable at entry; nodes behave normally during
-  the window; lockdown fires at T+delay to preserve silence.
-- **Sign now, broadcast later**: coordinator assembles the fully-signed escape tx
-  at entry and distributes the complete tx to all n nodes; each node broadcasts
-  via its V0-6 chain backend at T+delay. Robust — coordinator not needed after
-  entry; all n nodes must be suppressed to stop it.
-- **No abort**: nothing halts it once entered (max coercion-resistance). Accepted
-  cost: a mis-entered duress PIN is unstoppable → funds to escape (recoverable).
-- Lockdown persisted on disk, survives restart, no reset on sealed nodes (exit =
-  recovery path). FRAUD_SUSPECTED refusals as cover story.
-- Two escape timings coexist: duress = delayed/silent; manual rotate / watchtower
-  race = instant.
+broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md) — the source of truth; the earlier bullets here (coordinator-assembled escape) are SUPERSEDED.** Locked shape (per ADR-0012):
+- Full Model B: nodes assemble + broadcast EVERY spend over the node channel;
+  coordinator is a pure relay (trusted until the wrench, never persists the pin).
+- Dual PINs every spend (ephemeral, never logged — the substitution defense).
+- Escape is deterministic, **node-built** (parameterless full-sweep), user-signed,
+  stored as a refreshed standby. The coordinator never touches it.
+- Duress state machine: arm (+propagate to peers +persist) → armed (silent,
+  freezes hot-class completion) → fire at T (broadcast + re-broadcast) → lockdown
+  (terminal, recovery-path exit). `duress_delay_secs` is the hostage-safety window.
+- No abort. Accepted residuals: total coordinator censorship, sustained fee spike,
+  compromised-node duress detection (silence model A). All are denial, never theft.
 
 ## V0-5 — verified change + PSBT consistency + descriptor allowlist
 policy-core: verified-change via own-descriptor re-derivation at bounded index;

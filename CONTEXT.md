@@ -17,7 +17,7 @@ The vault spend path requiring 2-of-3 Recovery keys after a relative timelock. U
 _Avoid_: emergency path, backup path
 
 **Federation**:
-The set of n Vault nodes collectively. Nodes never communicate with each other.
+The set of n Vault nodes collectively. Nodes coordinate signature assembly + broadcast over the Node channel (ADR-0011/0012) but share no Policy state — policy-isolated, not network-isolated.
 _Avoid_: cluster, cosigners
 
 **Vault node**:

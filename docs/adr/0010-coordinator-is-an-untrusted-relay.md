@@ -1,5 +1,7 @@
 # The coordinator is an untrusted relay; nodes assemble and broadcast
 
+> **Consolidated into [ADR-0012](0012-model-b-spend-and-duress-architecture.md), which is the source of truth.** Two corrections since this was written: the coordinator is **trusted until the wrench attack**, not untrusted-always (it never persists the pin, so a wrench-moment compromise can't substitute it); and "can only censor" is imprecise — a hostile coordinator can also selectively deliver (defeated by channel propagation) and totally drop (an accepted residual). Read 0012.
+
 Reverses the earlier "coordinator trusted in MVP" decision (2026-07-14, user — Model B). The coordinator no longer combines partial signatures, finalizes, or broadcasts anything. It operates the user key (producing the user signatures), relays `{spend intent, user_sigs, pin}` to the nodes, and pulls alerts (ADR-0002). That is all it does.
 
 The nodes assemble and broadcast **every** spend themselves: each node independently builds the transaction from the relayed intent + its own chain view, validates it against policy, signs its partial, gathers the other nodes' partials over the node-to-node channel (ADR-0011), combines into the complete tx, and broadcasts via its own chain backend (V0-6).

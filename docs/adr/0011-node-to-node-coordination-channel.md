@@ -1,5 +1,8 @@
 # The node-to-node coordination channel (revising "no intra-node comms, ever")
 
+> **Consolidated into [ADR-0012](0012-model-b-spend-and-duress-architecture.md), which is the source of truth** for identity (RAM-only key endorsed by the node signing key), the signing-oracle prohibition, message binding, and DoS. Read 0012.
+
+
 Model B (ADR-0010) requires nodes to assemble the t-of-n signatures themselves, which is only possible if nodes talk to each other. This revises the founding invariant *"no intra-node communication, ever"* to: **nodes coordinate signature assembly and broadcast among themselves over an authenticated channel, and share no policy state.**
 
 The revision is deliberately narrow in *what* the channel carries, which is the security-relevant axis:
