@@ -20,10 +20,7 @@ V0-4b duress escape (rides V0-8's assembly+broadcast; pin decides + delayed) →
 V0-7  proptest + full test matrix + hold-clawback demo  → all
 ```
 
-**MODEL B PIVOT (2026-07-15, user; ADR-0010/0011).** The coordinator is now an
-untrusted relay; nodes assemble + broadcast every spend over an authenticated
-node-to-node channel. This reverses "coordinator trusted in MVP" and revises
-"no intra-node comms" (nodes stay policy-isolated, not network-isolated). It
+**MODEL B PIVOT (2026-07-15, user; authoritative spec: [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md)).** The coordinator is a relay, **trusted until the wrench attack, untrusted after** (never persists the pin); nodes assemble + broadcast every spend over an authenticated node-to-node channel, and nodes **validate** the coordinator-composed, user-signed txs rather than building them. This reverses "coordinator trusted in MVP" and revises "no intra-node comms" (nodes stay policy-isolated, not network-isolated). The full duress architecture + all re-review resolutions live in ADR-0012. It
 makes the node-assembly channel the v0 spine and reshapes the normal spend path
 (first-light/demo included). What's UNAFFECTED: all node-local validation
 (V0-1 sighash, V0-2 commitment/replay, V0-3 Hold, V0-5 descriptor policy) and
@@ -35,7 +32,7 @@ changes: who assembles + broadcasts (coordinator → nodes).
 The founding rework. Design the node channel in detail first (ADR-0011 is a
 sketch): node identity + mutual auth (deploy-time keys), transport (v1 Tor),
 and the request-scoped partial-signature exchange + combine + broadcast. Then:
-each node builds the tx from relayed intent + its own chain view, validates,
+each node VALIDATES the coordinator-composed, user-signed tx against its own chain view + policy (it does NOT build it — ADR-0012),
 signs, gathers the other partials over the channel, combines, and broadcasts via
 its V0-6 chain backend. The coordinator (vault-cli) stops combining/finalizing/
 broadcasting — it relays {intent, user_sigs, pin} and pulls alerts. Rework the

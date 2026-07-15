@@ -1,5 +1,8 @@
 # Alerts are pulled by the coordinator, not pushed by nodes
 
+> **Context under [ADR-0012](0012-model-b-spend-and-duress-architecture.md):** this still holds for v0 (coordinator trusted pre-wrench delivers alerts honestly; during a wrench you already know). Under the untrusted-post-wrench coordinator, alert delivery is single-point-suppressible only in a narrow simultaneous quorum+coordinator compromise; per-node alert push is a *possible* v1 hardening, not committed.
+
+
 Nodes make no outbound connections. Each vault node queues its alerts (watchtower hits, refusals) and its log locally and exposes them on a pull endpoint; the coordinator polls all nodes and surfaces alerts to the user. The coordinator is trusted for this, as it is for spend orchestration in the MVP.
 
 ## Considered Options

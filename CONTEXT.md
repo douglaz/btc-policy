@@ -29,7 +29,7 @@ Any t of the n Vault nodes (default 3-of-5). Every quorum has run the policy che
 _Avoid_: majority, threshold (as a noun for the group)
 
 **Coordinator**:
-The vault-cli process. An **untrusted relay** (ADR-0010): it operates the User key, relays {spend intent, user signatures, PIN} to the nodes, and pulls Alerts. It does NOT assemble signatures, finalize, or broadcast — the Nodes do. A compromised Coordinator can only censor, never steal or control broadcast.
+The vault-cli process. A relay, **trusted until the wrench attack, untrusted after** (ADR-0010/0012): it operates the User key, composes normal-spend txs (frozen by the user's signature), relays coordinator-signed `{pin, spend tx, escape tx}` to the nodes, and pulls Alerts. It does NOT assemble signatures, finalize, or broadcast — the Nodes do. A post-wrench Coordinator can censor or selectively deliver, never steal or control broadcast; a *pre-wrench-compromised* one can substitute the pin (Direction-3 residual). Never persists the pin.
 _Avoid_: server, orchestrator, wallet app, assembler
 
 **Node channel**:

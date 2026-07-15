@@ -2,7 +2,7 @@
 
 Once a vault node is provisioned and configured, the deployer seals the host: SSH is uninstalled, no administrative access path remains, and the node's only surfaces are its API (`/sign`, event pull) and its chain backend. There is deliberately no reset, no reconfiguration, no upgrade-in-place — any change to the federation means rotating to a new vault.
 
-This makes duress lockdown irreversible by anyone, including the legitimate owner: a locked federation's only exit is the recovery path (timelock + 2-of-3 recovery keys). Coercion has no reset to demand, no operator to threaten, and a 90-day clock during which the victim can reach safety.
+This makes duress lockdown irreversible by anyone, including the legitimate owner: a locked federation's only exit is the recovery path (timelock + 2-of-3 recovery keys). Coercion has no reset to demand, no operator to threaten, and the configured recovery timelock (180-day default) during which the victim can reach safety.
 
 ## Consequences
 
