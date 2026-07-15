@@ -12,4 +12,4 @@ There is no separate watchtower service and the coordinator is not trusted with 
 
 ## Consequences
 
-- The node's role is "signer + sentinel"; nodes queue alerts locally for the coordinator to pull (ADR-0002 — nodes make no outbound connections).
+- The node's role is "signer + sentinel"; nodes queue alerts locally for the coordinator to pull (ADR-0002 — nodes make no outbound connections). [Under Model B (ADR-0012), nodes make outbound peer + broadcast connections; "no outbound" applied to the pre-Model-B design.]

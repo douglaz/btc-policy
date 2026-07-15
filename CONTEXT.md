@@ -1,6 +1,6 @@
 # Federated Policy Vault
 
-Self-hosted Bitcoin custody: a user hardware key plus a t-of-n federation of policy-enforcing signer nodes, with a timelocked recovery path. This glossary is the ubiquitous language; the design doc lives at `~/.gstack/projects/btc-policy/user-unknown-design-20260713-004036.md`.
+Self-hosted Bitcoin custody: a user hardware key plus a t-of-n federation of policy-enforcing signer nodes, with a timelocked recovery path. This glossary is the ubiquitous language; the design doc lives in-repo at [`docs/DESIGN.md`](docs/DESIGN.md), and [ADR-0012](docs/adr/0012-model-b-spend-and-duress-architecture.md) + [ADR-0013](docs/adr/0013-concrete-protocol-schemas.md) are the authoritative spec for the spend path + duress.
 
 ## Language
 
@@ -56,6 +56,10 @@ _Avoid_: rules, validation (alone)
 The per-node TOML file parameterizing the Policy checks. Written once at setup, immutable forever; changing it means a new Vault.
 _Avoid_: settings, policy file
 
+**Manifest**:
+The immutable per-vault record, written once at setup, hash-pinned, distributed to every Node and backed up with the Descriptor backup (ADR-0013 §4). Pins the canonical vault descriptor, the Coordinator auth pubkey, and every Node's channel identity (signing pubkey, channel pubkey, transport endpoints) — the root of both channel and coordinator trust. Immutable: any change is a new Vault.
+_Avoid_: config (use Policy config), registry, membership file
+
 **Allowlist**:
 The Policy config's set of permitted destination wallets — descriptors with a bounded index, never fixed addresses. Contains at minimum the Hot wallet and the Escape wallet.
 _Avoid_: whitelist, address list
@@ -73,8 +77,12 @@ The 2-of-3 cold keys that can spend the Recovery path. Not a funded wallet — a
 _Avoid_: recovery wallet, cold keys (alone)
 
 **Duress PIN**:
-The second of two enrolled PINs; submitting it with any spend triggers the vault's duress response (Lockdown or escape sweep + Lockdown) while looking identical to normal authorization. Presented externally as automated fraud prevention, never as a duress signal.
+The second of two enrolled PINs; submitting it with any spend triggers the vault's duress response — a **single mandatory mechanism** (ADR-0012): the node silently **arms** the always-present, user-signed Escape, **holds** silently through `[arm, T]` (refusing any hot-class spend in that window), the **Escape fires at T**, then **Lockdown**. The Escape sweep is not optional — every request carries a mandatory escape, so duress always resolves to escape-then-lockdown, not "lockdown or maybe a sweep." Looks identical to normal authorization; presented externally as automated fraud prevention, never as a duress signal.
 _Avoid_: panic code, secondary PIN
+
+**Pin-independent ingress**:
+The silence-load-bearing rule that **every** request — normal or duress — makes a Node do **identical observable work** (coordinator-auth + freshness check, validate both the spend and the mandatory escape, sign both partials, persist, propagate to peers); the pin only flips an **internal** fire bit — *which* transaction eventually broadcasts and *when* (ADR-0012). Because latency, peer-visible "seen this request" state, and telemetry are identical under both PINs, an attacker holding no compromised Node cannot read the duress bit.
+_Avoid_: constant-time path, duress branch (there is no separate duress branch)
 
 **Lockdown**:
 The state in which every node refuses all signing (`FRAUD_SUSPECTED`), persisted on disk, surviving reboots, with no reset on Sealed nodes — the only exit is the Recovery path.
@@ -88,12 +96,16 @@ _Avoid_: locked (use Lockdown for signing state), hardened
 The per-destination-class waiting period between a spend's first submission and node signing (hot wallet: D, default 24h; Escape wallet and Refresh: none). Off-chain, enforced independently by each node. Not the Recovery-path timelock.
 _Avoid_: delay, timelock (for this), cooldown
 
+**Transaction class**:
+The category a Node derives locally from a spend's **outputs**, never trusted from a Coordinator label (ADR-0013 §3). **escape-class** = *every* output pays the Escape descriptor; **refresh-class** = every output pays the vault descriptor; **hot-class** = anything else (any output to the Hot allowlist, vault change permitted alongside). Mixed-class spends are **rejected** (`PSBT_INCONSISTENT`) — closing the 99%-to-hot + dust-to-escape misclassification. Class drives behavior: hot = Hold then sign; escape = complete immediately (under either pin); refresh = instant, pin-less, bounded.
+_Avoid_: destination type, output kind, spend purpose (the non-authoritative coordinator hint)
+
 **Pending spend**:
 A Commitment a node has recorded but not yet signed, waiting out its Hold; visible to the Coordinator via pull. Cancelled implicitly by any confirmed conflicting spend (in anger: the escape sweep).
 _Avoid_: queued transaction, unconfirmed spend
 
 **Commitment**:
-The exact-transaction binding a node evaluates and signs against: wallet id, outpoints, outputs, fee, expiry, policy version. Defined in vault-proto.
+The exact-transaction binding a node evaluates and signs against: wallet id, version, outpoints, per-input nSequence, outputs, fee, nLockTime, expiry, policy version — the version, nLockTime, and every input's nSequence are bound too, so two distinct transactions can never share a commitment id (ADR-0012 / ADR-0013 §2). Defined in vault-proto.
 _Avoid_: authorization, intent, summary
 
 **Alert**:
