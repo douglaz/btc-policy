@@ -105,7 +105,7 @@ A node's structured decision not to sign, carrying a machine-readable code and r
 _Avoid_: rejection, error (for policy outcomes)
 
 **Refresh**:
-A Normal-path self-spend that resets a coin's recovery timelock. Requires the User key; the Coordinator only prepares it.
+A Normal-path self-spend (vault → vault) that resets a coin's recovery timelock. Carries **no pin** (not a duress surface) and is **subordinate to pending spends** — while any Normal-path spend is pending, a refresh queues behind it (ADR-0012). Requires the User key; the Coordinator only prepares it.
 _Avoid_: rollover, renewal
 
 **Rotate**:
