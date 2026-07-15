@@ -13,8 +13,8 @@ V0-2  commitment struct + anti-replay log        DONE (ce932fa)
 V0-3  the Hold (two-phase signing)               DONE (8678a45)
 V0-5  verified change + consistency + descriptor allowlist  DONE (a9d57e9)
 V0-6  chain backend + watchtower classification + /events + broadcast  DONE (595c338, primitives)
-V0-6b drive the watchtower scan in the node daemon        NEXT (small)
-V0-4  dual PINs + duress + lockdown              → V0-6 (broadcast, done), V0-3, V0-2
+V0-6b drive the watchtower scan in the node daemon        DONE (2ce2933)
+V0-4  dual PINs + duress + lockdown              NEXT — split into 4a/4b (see below)
 V0-7  proptest + full test matrix + hold-clawback demo  → all
 ```
 
