@@ -25,6 +25,10 @@ fn run() -> Result<(), vault_node::Error> {
     // v0 nodes bind loopback only (DESIGN.md, node API access control).
     let listener = TcpListener::bind(("127.0.0.1", node.listen_port))
         .map_err(|e| format!("cannot bind 127.0.0.1:{}: {e}", node.listen_port))?;
+    // If a chain backend is configured, drive the watchtower (ADR-0001, V0-6b):
+    // one background thread scanning this node's own chain view on an interval,
+    // queueing alerts that surface through GET /events.
+    node.spawn_watchtower();
     println!("vault-node listening on 127.0.0.1:{}", node.listen_port);
     http::serve(listener, &node);
     Ok(())

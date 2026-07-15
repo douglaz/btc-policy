@@ -53,6 +53,11 @@ pub trait ChainBackend {
     /// returning its txid. A malformed transaction is an `Err`, never a panic.
     fn broadcast(&self, raw_tx: &[u8]) -> Result<Txid, Error>;
 
+    /// The height of this node's chain tip. The watchtower driver (V0-6b) reads
+    /// it to advance its scan cursor past already-scanned blocks instead of
+    /// re-scanning from height 0 every pass.
+    fn tip_height(&self) -> Result<u32, Error>;
+
     /// Spends of any of `scripts` observed in blocks at or after `from_height`,
     /// against this node's own chain data.
     fn spends_of(&self, scripts: &[ScriptBuf], from_height: u32) -> Result<Vec<SpendSeen>, Error>;
@@ -109,6 +114,13 @@ impl ChainBackend for BitcoindBackend {
             .map_err(|e| format!("sendrawtransaction returned a bad txid: {e}").into())
     }
 
+    fn tip_height(&self) -> Result<u32, Error> {
+        Ok(self
+            .call("getblockcount", json!([]))?
+            .as_u64()
+            .ok_or("getblockcount: not a number")? as u32)
+    }
+
     fn spends_of(&self, scripts: &[ScriptBuf], from_height: u32) -> Result<Vec<SpendSeen>, Error> {
         // Scan blocks from `from_height` to the tip; a watched script is spent
         // when some input's prevout carries it. `getblock` verbosity 3 (Core v25+)
@@ -116,10 +128,7 @@ impl ChainBackend for BitcoindBackend {
         // needed. Bounded work on regtest; the Core/Electrum/filter tradeoff for
         // real networks is v1 (T6).
         let watched: HashSet<&ScriptBuf> = scripts.iter().collect();
-        let tip = self
-            .call("getblockcount", json!([]))?
-            .as_u64()
-            .ok_or("getblockcount: not a number")? as u32;
+        let tip = self.tip_height()?;
         let mut seen = Vec::new();
         for height in from_height..=tip {
             let hash = self.call("getblockhash", json!([height]))?;
@@ -212,13 +221,24 @@ pub(crate) mod mock {
     use super::{ChainBackend, SpendSeen};
     use crate::Error;
 
-    /// Records every broadcast and replays a canned spend set to the scan. The
-    /// canned spends are returned verbatim regardless of `scripts`/`from_height`;
-    /// each spend's `script` is what the watchtower classifies against.
+    /// Records every broadcast and replays a canned spend set to the scan. Each
+    /// spend's `script` is what the watchtower classifies against.
+    ///
+    /// For the watchtower-driver tests the mock models block height: `tip` is the
+    /// reported chain tip and `spend_block` is the height the canned spends sit
+    /// at, so `spends_of` returns them only when the requested `from_height`
+    /// still covers that block. The defaults (`tip = 0`, `spend_block = 0`) make
+    /// a `from_height = 0` scan return every canned spend, matching the simple
+    /// classification/cursor tests. `scanned_from` records each `from_height` the
+    /// driver asked for, so a test can prove the cursor advanced instead of
+    /// re-scanning from 0.
     #[derive(Default)]
     pub(crate) struct MockBackend {
         pub spends: Vec<SpendSeen>,
         pub broadcasts: RefCell<Vec<Vec<u8>>>,
+        pub tip: u32,
+        pub spend_block: u32,
+        pub scanned_from: RefCell<Vec<u32>>,
     }
 
     impl ChainBackend for MockBackend {
@@ -231,12 +251,24 @@ pub(crate) mod mock {
             Ok(tx.compute_txid())
         }
 
+        fn tip_height(&self) -> Result<u32, Error> {
+            Ok(self.tip)
+        }
+
         fn spends_of(
             &self,
             _scripts: &[ScriptBuf],
-            _from_height: u32,
+            from_height: u32,
         ) -> Result<Vec<SpendSeen>, Error> {
-            Ok(self.spends.clone())
+            self.scanned_from.borrow_mut().push(from_height);
+            // The canned spends live in `spend_block`; a scan whose cursor has
+            // advanced past it sees nothing, so a re-alert can only come from a
+            // cursor that failed to advance (never dedup).
+            if from_height <= self.spend_block {
+                Ok(self.spends.clone())
+            } else {
+                Ok(Vec::new())
+            }
         }
     }
 }

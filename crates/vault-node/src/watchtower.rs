@@ -8,10 +8,18 @@
 //!
 //! A co-signed spend of the vault raises nothing — it is exactly what the node
 //! authorized. Alerts are pulled by the coordinator (ADR-0002); nodes never push.
-//! The scan is a callable pass, not a background thread, so callers can drive it
-//! deterministically.
+//!
+//! The classification [`scan`] is a callable pass, deterministic and driven by a
+//! caller (the tests). In the running daemon a thin loop drives it: each node is
+//! its own watchtower (ADR-0001), so [`spawn_driver`] spawns ONE background
+//! thread that runs a pass every [`SCAN_INTERVAL`], advancing a height cursor so
+//! each pass scans only new blocks and writing into the same alert queue
+//! `GET /events` reads.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use bitcoin::{ScriptBuf, Txid};
 use serde::Serialize;
@@ -106,6 +114,89 @@ pub fn scan(
     Ok(classify(&spends, &recovery, signed_txids))
 }
 
+/// Interval between watchtower scan passes in the daemon driver. A `const`, not a
+/// config knob — small so a regtest spend surfaces quickly (DESIGN.md keeps the
+/// v0 watchtower deliberately minimal).
+pub const SCAN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Outcome of one [`scan_pass`]: how many new alerts it queued and the cursor to
+/// carry into the next pass.
+pub(crate) struct ScanOutcome {
+    pub(crate) new_alerts: usize,
+    pub(crate) next_from: u32,
+}
+
+/// One scan pass, shared by the daemon driver and the callable
+/// [`Node::watchtower_tick`](crate::Node::watchtower_tick) so tests and
+/// production run ONE code path: read the tip, snapshot the sign log, run the
+/// [`scan`] classification over `vault_scripts` at or after `from_height`, and
+/// queue the new alerts. Returns the new-alert count and the next cursor —
+/// `tip + 1`, so the following pass skips the blocks this one covered (the height
+/// advance is the primary de-duplication; the queue guards the small overlap a
+/// racing block can leave). When the cursor is already caught up, the scan range
+/// is empty and the cursor remains caught up — never a re-scan from 0.
+///
+/// The sign log is snapshotted (and its lock released) before the possibly-slow
+/// backend fetch, so a concurrent `/sign` is never blocked on chain I/O. The
+/// vault has no recovery branch in v0, so the recovery script set is empty here
+/// (see [`scan`]).
+pub(crate) fn scan_pass(
+    backend: &dyn ChainBackend,
+    vault_scripts: &[ScriptBuf],
+    sign_log: &Mutex<HashSet<Txid>>,
+    alerts: &Mutex<AlertQueue>,
+    from_height: u32,
+) -> Result<ScanOutcome, Error> {
+    let tip = backend.tip_height()?;
+    let signed = sign_log.lock().expect("sign_log lock poisoned").clone();
+    let new_alerts = scan(backend, vault_scripts, &[], &signed, from_height)?;
+    let mut queue = alerts.lock().expect("alerts lock poisoned");
+    let mut queued = 0;
+    for alert in new_alerts {
+        if queue.push(alert) {
+            queued += 1;
+        }
+    }
+    Ok(ScanOutcome {
+        new_alerts: queued,
+        next_from: tip + 1,
+    })
+}
+
+/// Spawn the daemon watchtower driver (ADR-0001, V0-6b): ONE background thread
+/// that runs a [`scan_pass`] every [`SCAN_INTERVAL`], carrying a height cursor
+/// between passes so it advances instead of re-scanning from 0. `sign_log` and
+/// `alerts` are the node's shared watchtower state — the same handles the `/sign`
+/// server writes/reads, so a spend the node co-signs is recognized and alerts
+/// surface through `GET /events`.
+///
+/// The first pass runs immediately (before the first sleep). A failed pass is
+/// logged and the cursor is left unadvanced, so the next pass retries the same
+/// range and no block is skipped on a transient backend error.
+pub fn spawn_driver(
+    backend: Box<dyn ChainBackend + Send>,
+    vault_scripts: Vec<ScriptBuf>,
+    sign_log: Arc<Mutex<HashSet<Txid>>>,
+    alerts: Arc<Mutex<AlertQueue>>,
+) {
+    thread::spawn(move || {
+        let mut from_height = 0u32;
+        loop {
+            match scan_pass(
+                backend.as_ref(),
+                &vault_scripts,
+                &sign_log,
+                &alerts,
+                from_height,
+            ) {
+                Ok(outcome) => from_height = outcome.next_from,
+                Err(e) => eprintln!("watchtower scan pass failed (cursor {from_height}): {e}"),
+            }
+            thread::sleep(SCAN_INTERVAL);
+        }
+    });
+}
+
 /// Bounded, in-memory alert queue with a monotonic cursor (ADR-0002). Each alert
 /// gets a strictly increasing sequence number; `since` returns everything past a
 /// cursor with no loss and no duplication. Bounded so a noisy chain cannot grow
@@ -177,6 +268,7 @@ mod tests {
     use super::*;
     use crate::chain::mock::MockBackend;
     use bitcoin::hashes::Hash;
+    use std::time::Instant;
 
     fn txid(byte: u8) -> Txid {
         Txid::from_byte_array([byte; 32])
@@ -338,5 +430,129 @@ mod tests {
         let (retained, _) = queue.since(0);
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].spend_txid, txid(1).to_string());
+    }
+
+    // -- the daemon driver (V0-6b) ------------------------------------------
+
+    #[test]
+    fn the_driver_thread_scans_and_surfaces_an_alert_without_an_explicit_tick() {
+        // A backend reporting an un-co-signed vault spend; the driver — nothing
+        // else — must surface it through the shared queue.
+        let vault = script(0x01);
+        let backend = MockBackend {
+            spends: vec![spend(0xAA, 0x01)],
+            tip: 1,
+            ..Default::default()
+        };
+        let sign_log = Arc::new(Mutex::new(HashSet::new()));
+        let alerts = Arc::new(Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP)));
+
+        spawn_driver(
+            Box::new(backend),
+            vec![vault],
+            Arc::clone(&sign_log),
+            Arc::clone(&alerts),
+        );
+
+        // The first pass runs immediately; poll (bounded) until it appears — no
+        // test ever calls scan/tick, proving the driver drives.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(alert) = alerts.lock().expect("alerts lock").since(0).0.first() {
+                assert_eq!(alert.kind, AlertKind::UnrecognizedSpend);
+                assert_eq!(alert.spend_txid, txid(0xAA).to_string());
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the driver thread must surface the alert without an explicit tick"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn the_height_cursor_advances_so_the_second_pass_scans_only_new_blocks() {
+        // The spend sits in block 5 and the chain tip is 5.
+        let vault = script(0x01);
+        let mut backend = MockBackend {
+            spends: vec![spend(0xAA, 0x01)],
+            tip: 5,
+            spend_block: 5,
+            ..Default::default()
+        };
+        let sign_log = Mutex::new(HashSet::new());
+        let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
+        let scripts = std::slice::from_ref(&vault);
+
+        // First pass scans 0..=5, alerts the spend, advances the cursor to 6.
+        let outcome = scan_pass(&backend, scripts, &sign_log, &alerts, 0).expect("first pass");
+        assert_eq!(outcome.next_from, 6);
+        assert_eq!(outcome.new_alerts, 1);
+        assert_eq!(alerts.lock().expect("alerts lock").since(0).0.len(), 1);
+
+        // A new empty block arrives; the second pass scans only the new range.
+        backend.tip = 6;
+        let outcome = scan_pass(&backend, scripts, &sign_log, &alerts, outcome.next_from)
+            .expect("second pass");
+        assert_eq!(outcome.next_from, 7);
+        assert_eq!(outcome.new_alerts, 0);
+
+        // The cursor advanced (0 then 6, never a re-scan from 0), and the spend
+        // in the already-scanned block 5 is not re-alerted — via the height
+        // advance, not the queue's dedup (the backend returns nothing past it).
+        assert_eq!(*backend.scanned_from.borrow(), vec![0, 6]);
+        assert_eq!(alerts.lock().expect("alerts lock").since(0).0.len(), 1);
+    }
+
+    #[test]
+    fn the_shared_state_is_safe_under_a_concurrent_signer_and_scanner() {
+        // Two threads on the SAME shared handles. The scanner is the driver's
+        // work — read the sign log, write the alert queue. The main thread drives
+        // the exact shared-state touchpoints of the other two routes: `/sign`
+        // writes the sign log (`sign_log.lock().insert`, lib.rs handler step 8)
+        // and `/events` reads the queue (`alerts.lock().since`, `Node::events`).
+        // Every access goes through a `Mutex`, so the two threads serialize with
+        // no data race — a `RefCell` here would not even compile across threads,
+        // and that this does (and stays consistent under contention) is the proof.
+        let vault = script(0x01);
+        let sign_log = Arc::new(Mutex::new(HashSet::new()));
+        let alerts = Arc::new(Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP)));
+
+        let scanner = {
+            let sign_log = Arc::clone(&sign_log);
+            let alerts = Arc::clone(&alerts);
+            let vault = vault.clone();
+            // The spend's txid (0xFF) is one the signer below never records
+            // (it inserts only 0x00..=0x07), so it is always unrecognized and the
+            // final count is race-independent.
+            thread::spawn(move || {
+                let backend = MockBackend {
+                    spends: vec![spend(0xFF, 0x01)],
+                    tip: 1,
+                    ..Default::default()
+                };
+                let scripts = std::slice::from_ref(&vault);
+                for _ in 0..8 {
+                    scan_pass(&backend, scripts, &sign_log, &alerts, 0).expect("scan pass");
+                }
+            })
+        };
+
+        // Concurrently exercise the `/sign` write path and the `/events` read path.
+        for n in 0..8u32 {
+            sign_log
+                .lock()
+                .expect("sign_log lock")
+                .insert(txid((n % 251) as u8));
+            let _ = alerts.lock().expect("alerts lock").since(0);
+        }
+        scanner.join().expect("scanner thread must not panic");
+
+        // The one unrecognized spend surfaced exactly once across repeated passes and
+        // the concurrent signer — locking + dedup held.
+        let (queued, _) = alerts.lock().expect("alerts lock").since(0);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].spend_txid, txid(0xFF).to_string());
     }
 }

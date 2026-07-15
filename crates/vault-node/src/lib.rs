@@ -9,9 +9,10 @@
 //! sign instantly. Watchtower duty (ADR-0001) — a callable scan pass
 //! ([`Node::watchtower_tick`]) classifies recovery-path and un-co-signed spends
 //! of the node's own chain view and queues alerts a puller reads via
-//! `GET /events` (ADR-0002); a caller drives the pass (the demo and tests today,
-//! the coordinator loop in V0-7), never a background timer. Duress actions and
-//! lockdown remain v0 work (V0-4).
+//! `GET /events` (ADR-0002). The classification stays a deterministic callable
+//! pass for tests, and in the running daemon a thin background thread drives it
+//! on a fixed interval ([`Node::spawn_watchtower`], V0-6b) — each node is its own
+//! watchtower. Duress actions and lockdown remain v0 work (V0-4).
 
 pub mod chain;
 pub mod http;
@@ -20,7 +21,9 @@ pub mod watchtower;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
@@ -35,7 +38,7 @@ use vault_proto::{
     SignResponse,
 };
 
-use crate::chain::ChainBackend;
+use crate::chain::{BitcoindBackend, ChainBackend};
 use crate::watchtower::{Alert, AlertQueue};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -83,6 +86,24 @@ pub struct ConfigFile {
     /// real setup ceremony later).
     pub pin_normal_hash: String,
     pub pin_duress_hash: String,
+    /// Optional chain-backend endpoint for the watchtower driver (ADR-0001,
+    /// V0-6b). Absent ⇒ the daemon runs no scan thread (unit tests and nodes
+    /// without a reachable bitcoind still load). Present ⇒ the daemon spawns one
+    /// background thread scanning this bitcoind on a fixed interval.
+    #[serde(default)]
+    pub chain_backend: Option<ChainBackendConfig>,
+}
+
+/// The bitcoind JSON-RPC endpoint the watchtower driver scans, exactly what
+/// [`BitcoindBackend`] needs (DESIGN.md, "Per-node chain backend").
+#[derive(Debug, Deserialize)]
+pub struct ChainBackendConfig {
+    /// bitcoind JSON-RPC socket address, e.g. `"127.0.0.1:18443"` (loopback
+    /// regtest).
+    pub rpc_addr: String,
+    /// base64 of `<user>:<password>` for HTTP Basic auth — the regtest cookie,
+    /// base64-encoded, as the `Authorization: Basic` header carries it.
+    pub auth: String,
 }
 
 /// A running node's validated state.
@@ -119,12 +140,19 @@ pub struct Node {
     /// input). Because SIGHASH_ALL binds the witness to the exact transaction and
     /// segwit txids exclude the witness, the signed tx's txid equals its unsigned
     /// tx's txid — so a spend of a vault UTXO whose txid is absent here is one the
-    /// node never authorized (an `UnrecognizedSpend`).
-    sign_log: RefCell<HashSet<Txid>>,
+    /// node never authorized (an `UnrecognizedSpend`). Shared behind a `Mutex`
+    /// (not the per-`/sign` `RefCell` used for the logs above): the `/sign` server
+    /// writes it and the background watchtower thread reads it (V0-6b).
+    sign_log: Arc<Mutex<HashSet<Txid>>>,
     /// Queued watchtower alerts, pulled by the coordinator via `GET /events`
-    /// (ADR-0002). Bounded, in-memory (DESIGN.md). Same single-threaded `RefCell`
-    /// discipline as the logs above.
-    alerts: RefCell<AlertQueue>,
+    /// (ADR-0002). Bounded, in-memory (DESIGN.md). Shared behind a `Mutex`: the
+    /// background watchtower thread writes it and `/events` reads it (V0-6b).
+    alerts: Arc<Mutex<AlertQueue>>,
+    /// Parsed chain-backend endpoint (rpc socket + base64 auth) for the
+    /// watchtower driver, if configured. `None` ⇒ no scan thread. Held so the
+    /// daemon can build the backend and spawn the driver after load
+    /// ([`Node::spawn_watchtower`]).
+    chain_backend: Option<(SocketAddr, String)>,
 }
 
 impl Node {
@@ -187,6 +215,17 @@ impl Node {
         } else if config.hold_secs > 0 {
             return Err("escape_descriptor is required when hold_secs is nonzero".into());
         }
+        // Parse the optional watchtower endpoint now so a bad address fails at
+        // load, not silently at the first scan.
+        let chain_backend = config
+            .chain_backend
+            .as_ref()
+            .map(|cb| {
+                SocketAddr::from_str(&cb.rpc_addr)
+                    .map(|addr| (addr, cb.auth.clone()))
+                    .map_err(|e| format!("bad chain_backend.rpc_addr {:?}: {e}", cb.rpc_addr))
+            })
+            .transpose()?;
         Ok(Node {
             listen_port: config.listen_port,
             seckey,
@@ -207,8 +246,9 @@ impl Node {
             escape_descriptor,
             replay_log: RefCell::new(ReplayLog::default()),
             pending_log: RefCell::new(PendingLog::default()),
-            sign_log: RefCell::new(HashSet::new()),
-            alerts: RefCell::new(AlertQueue::new(watchtower::DEFAULT_ALERT_CAP)),
+            sign_log: Arc::new(Mutex::new(HashSet::new())),
+            alerts: Arc::new(Mutex::new(AlertQueue::new(watchtower::DEFAULT_ALERT_CAP))),
+            chain_backend,
         })
     }
 
@@ -224,43 +264,55 @@ impl Node {
     /// queueing new alerts. Returns how many NEW alerts were queued (a re-scan of
     /// an already-alerted spend queues nothing).
     ///
-    /// The recovery-branch script set is empty in v0 — the first-light vault has
-    /// no recovery branch — so this pass emits only `UnrecognizedSpend`;
+    /// This is the SAME pass the daemon's background driver runs — both go
+    /// through [`watchtower::scan_pass`] over this node's shared sign log and
+    /// alert queue — so tests and production exercise one code path. The
+    /// recovery-branch script set is empty in v0 (the first-light vault has no
+    /// recovery branch), so this pass emits only `UnrecognizedSpend`;
     /// `RecoveryPathSpend` classification lives in [`watchtower::scan`] and is
-    /// tested there. No background thread (task scope): the caller drives the tick
-    /// so it stays deterministic.
+    /// tested there.
     pub fn watchtower_tick(
         &self,
         backend: &dyn ChainBackend,
         from_height: u32,
     ) -> Result<usize, Error> {
-        let vault_scripts = self.vault_scripts();
-        let recovery_scripts: Vec<ScriptBuf> = Vec::new();
-        let alerts = {
-            let signed = self.sign_log.borrow();
-            watchtower::scan(
-                backend,
-                &vault_scripts,
-                &recovery_scripts,
-                &signed,
-                from_height,
-            )?
-        };
-        let mut queue = self.alerts.borrow_mut();
-        let mut queued = 0;
-        for alert in alerts {
-            if queue.push(alert) {
-                queued += 1;
-            }
-        }
-        Ok(queued)
+        watchtower::scan_pass(
+            backend,
+            &self.vault_scripts(),
+            &self.sign_log,
+            &self.alerts,
+            from_height,
+        )
+        .map(|outcome| outcome.new_alerts)
     }
 
     /// The queued alerts after cursor `since`, plus the new cursor (the `GET
     /// /events` pull API; ADR-0002). No loss, no duplication across successive
     /// pulls.
     pub fn events(&self, since: u64) -> (Vec<Alert>, u64) {
-        self.alerts.borrow().since(since)
+        self.alerts
+            .lock()
+            .expect("alerts lock poisoned")
+            .since(since)
+    }
+
+    /// If a chain backend is configured, spawn the background watchtower driver
+    /// (ADR-0001, V0-6b). Otherwise this is a no-op. The daemon calls this once
+    /// after [`Node::load`]. The thread shares this node's sign log and alert
+    /// queue, so co-signed spends are recognized and alerts surface through
+    /// `GET /events`. Unit tests build a `Node` without a chain backend and so
+    /// never start a thread.
+    pub fn spawn_watchtower(&self) {
+        let Some((addr, auth)) = self.chain_backend.clone() else {
+            return;
+        };
+        let backend = BitcoindBackend::new(addr, auth);
+        watchtower::spawn_driver(
+            Box::new(backend),
+            self.vault_scripts(),
+            Arc::clone(&self.sign_log),
+            Arc::clone(&self.alerts),
+        );
     }
 }
 
@@ -449,7 +501,8 @@ pub fn handle_sign(
             // alert. The txid is taken from the unsigned tx — segwit excludes the
             // witness, so it is the txid the signed tx will broadcast under.
             node.sign_log
-                .borrow_mut()
+                .lock()
+                .expect("sign_log lock poisoned")
                 .insert(psbt.unsigned_tx.compute_txid());
             SignResponse::Signed(psbt.to_string())
         }

@@ -132,6 +132,10 @@ pub fn run_first_light() -> Result<(), Error> {
             &descriptor_str,
             &[&hot_wallet.descriptor, &escape_wallet.descriptor],
             &escape_wallet.descriptor,
+            // Each node drives its own watchtower against this regtest bitcoind
+            // (ADR-0001, V0-6b).
+            bitcoind.rpc_addr(),
+            bitcoind.auth(),
         )?);
     }
     for node in &mut nodes {
@@ -497,9 +501,13 @@ impl NodeProcess {
         descriptor: &str,
         allowlist: &[&str],
         escape_descriptor: &str,
+        bitcoind_rpc_addr: SocketAddr,
+        bitcoind_auth: &str,
     ) -> Result<NodeProcess, Error> {
         let allowlist_toml: Vec<String> =
             allowlist.iter().map(|desc| format!("\"{desc}\"")).collect();
+        // The `[chain_backend]` table drives the node's watchtower thread; it
+        // comes last because a TOML table header ends the top-level section.
         let config = format!(
             "listen_port = {port}\n\
              node_seckey = \"{}\"\n\
@@ -511,7 +519,10 @@ impl NodeProcess {
              max_commitment_age_secs = {MAX_COMMITMENT_AGE_SECS}\n\
              policy_version = {POLICY_VERSION}\n\
              pin_normal_hash = \"{}\"\n\
-             pin_duress_hash = \"{}\"\n",
+             pin_duress_hash = \"{}\"\n\
+             \n[chain_backend]\n\
+             rpc_addr = \"{bitcoind_rpc_addr}\"\n\
+             auth = \"{bitcoind_auth}\"\n",
             actor.seckey.display_secret(),
             allowlist_toml.join(", "),
             sha256::Hash::hash(NORMAL_PIN.as_bytes()),

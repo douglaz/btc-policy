@@ -75,6 +75,18 @@ impl Bitcoind {
         Ok(())
     }
 
+    /// The JSON-RPC socket address, so each node's watchtower can scan this same
+    /// regtest bitcoind (V0-6b).
+    pub fn rpc_addr(&self) -> SocketAddr {
+        self.rpc_addr
+    }
+
+    /// base64 of the regtest cookie (`__cookie__:<password>`), populated once
+    /// `start` has read the cookie file. Handed to each node's watchtower config.
+    pub fn auth(&self) -> &str {
+        &self.auth
+    }
+
     pub fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
         let request = json!({
             "jsonrpc": "1.0",
