@@ -26,13 +26,20 @@ V0-10 recovery-path construction + operations  (was OUTSIDE the graph — ADR-00
 **MODEL B PIVOT (2026-07-15, user; authoritative spec: [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md)).** The coordinator is a relay, **trusted until the wrench attack, untrusted after** (never persists the pin); nodes assemble + broadcast every spend over an authenticated node-to-node channel, and nodes **validate** the coordinator-composed, user-signed txs rather than building them. This reverses "coordinator trusted in MVP" and revises "no intra-node comms" (nodes stay policy-isolated, not network-isolated). The full duress architecture + all re-review resolutions live in ADR-0012. It
 makes the node-assembly channel the v0 spine and reshapes the normal spend path
 (first-light/demo included). What's UNAFFECTED: node-local validation
-(V0-1 sighash, V0-3 Hold, V0-5 descriptor policy) and
+(V0-1 sighash, V0-5 descriptor policy) and
 the watchtower (V0-6/6b) — those are validation, which stays node-local. What
 changes: who assembles + broadcasts (coordinator → nodes). **Correction
 (ADR-0012/0013 §2): the earlier "V0-2 commitment/replay is unaffected by Model B"
 claim is now FALSE — the commitment must additionally bind `version`, `nLockTime`,
 and every input `nSequence`, which V0-2 did not. A migration is required, tracked
-as V0-2b below.**
+as V0-2b below.** **Correction (ADR-0012 "Model-B Hold lifecycle"): the earlier
+"V0-3 Hold is unaffected by Model B" claim is now FALSE too** (same shape as the
+V0-2 correction above, so V0-3 Hold is removed from the UNAFFECTED list). Under
+Model B the Hold is **node-driven**: each node **signs its partial at INGRESS**
+(pin-independent) and **combines + broadcasts at Hold-expiry with NO coordinator
+re-submission** — NOT V0-3's re-submit-to-sign two-phase shape. V0-3's Hold
+*duration + pending/first-seen accounting* survive, but its **signing shape is
+reworked in V0-8 (spine) / V0-4 (duress)**; ADR-0004 is bannered accordingly.
 
 ## V0-8 — node-to-node assembly + node broadcast (NEXT, the spine)
 **Spec: [ADR-0012](adr/0012-model-b-spend-and-duress-architecture.md) + [ADR-0013](adr/0013-concrete-protocol-schemas.md) — the source of truth. Full Model B + the duress architecture are in HARDENING (2026-07-15): four adversarial rounds + a fresh-eyes whole-spec pass established no theft path and (after this pass's fixes) no silence break; a final fresh-eyes re-review gates the lock.**

@@ -45,8 +45,8 @@ Ambiguous on its own — always qualify. Three distinct meanings exist: Spending
 _Avoid_: unqualified "policy"
 
 **Spending policy**:
-The on-chain rules compiled into the vault's Miniscript descriptor, enforced by Bitcoin consensus.
-_Avoid_: script (alone), contract
+The on-chain rules expressed in the vault's Miniscript descriptor — a **fixed, hand-written template** (keys substituted at setup; ADR-0013 §1), enforced by Bitcoin consensus. rust-miniscript parses and satisfies the descriptor but is **not** a runtime policy compiler.
+_Avoid_: script (alone), contract, compiled (the descriptor is hand-written, not policy-compiled)
 
 **Policy checks**:
 The off-chain PSBT checks every Vault node runs before signing (allowlist, fee cap, input ownership, sighash, consistency). Implemented by policy-core; unrelated to rust-miniscript's `policy` module.

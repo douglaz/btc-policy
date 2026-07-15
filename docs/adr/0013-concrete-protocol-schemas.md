@@ -13,7 +13,7 @@ or( and( pk(USER), thresh(t, NODE_1, …, NODE_n) ),          # normal branch
 
 - Wrapped `wsh(...)`, P2WSH, SIGHASH_ALL. `t`-of-`n` default **3-of-5**; permitted `n` ∈ [3, 15], `t` ∈ [2, n] (bounded so the witness stays standard). Recovery is fixed **2-of-3**.
 - `TIMELOCK` is a **BIP68 relative** `older(...)` value in **512-second units** (not "days"); the **180-day default** = `⌈180·86400 / 512⌉ = 30375` (the descriptor stores the exact integer, never an approximation). This is the recovery-branch relative-lock; it is unrelated to (and must stay ≫) the ~90-day refresh cadence, so a coin is always re-armed well before its recovery branch matures.
-- The **canonical descriptor string (with checksum) is frozen in the per-vault manifest** (§4). Every node parses it with rust-miniscript and asserts its own derived descriptor equals the manifest's **byte-for-byte**; a mismatch is a fatal config error, not a refusal. rust-miniscript is authoritative for parsing, satisfaction (witness construction), and branch recognition; the per-node PSBT checks (policy-core) are hand-rolled scriptPubKey re-derivation, **not** miniscript satisfaction.
+- The policy form above is not itself the on-chain script. The **exact `wsh(<typed miniscript>)` string is produced once at setup by a PINNED construction** — compiling the fixed template above with a **pinned rust-miniscript version**, which chooses the concrete `and_v`/`or_*`/`thresh`/`multi` fragments and wrappers deterministically — and that exact string (with checksum) is **frozen in the per-vault manifest** (§4). This is not a *runtime* policy compiler (the compile happens once, at setup, and the output is frozen); "fixed hand-written template" and "compiled once at setup" are the same artifact — the point is the fragment is **pinned and identical for all nodes**, never re-derived per-node. Every node parses the frozen string with the same pinned rust-miniscript and asserts its own derived descriptor equals the manifest's **byte-for-byte**; a mismatch is a fatal config error, not a refusal. rust-miniscript is authoritative for parsing, satisfaction (witness construction), and branch recognition; the per-node PSBT checks (policy-core) are hand-rolled scriptPubKey re-derivation, **not** miniscript satisfaction. The setup reference records the exact fragment string for the default 3-of-5/2-of-3/180d template so it is reproducible.
 - Setup **rejects any descriptor outside this template** (exactly one `USER` key on the normal branch, one `thresh` of node keys, one recovery branch of the fixed shape). Key order is canonical (lexicographic by compressed pubkey hex within each `thresh`), origins/derivation-paths required, wildcard `/*` ranged.
 
 ## 2. Tagged request schema (resolves "every request has an escape" vs pin-less refresh)
@@ -31,12 +31,13 @@ RefreshRequest{ refresh: Psbt,             /* no escape, NO pin */ nonce, expiry
 
 ## 3. Transaction-class predicate (node-derived, normative)
 
-Computed by each node from the **spend transaction's outputs**, never from a coordinator label (the envelope `spend_purpose` is a non-authoritative hint):
+Computed by each node from the **spend transaction's outputs**, never from a coordinator label (the envelope `spend_purpose` is a non-authoritative hint). **Vault-change outputs** (outputs paying the vault descriptor) are permitted in every class and are *excluded* from classification; the class is decided by the **destination** (non-vault-change) outputs:
 
-- **escape-class** iff **every** output pays the escape descriptor (bounded index).
-- **refresh-class** iff **every** output pays the vault descriptor.
-- **hot-class** otherwise (any output to a hot-allowlist descriptor; vault change permitted alongside).
-- **Mixed classes are rejected** (`PSBT_INCONSISTENT`). In particular a spend mixing hot + escape outputs is *not* escape-class — it is rejected — closing the 99%-to-hot + dust-to-escape misclassification duress-bypass.
+- **refresh-class** iff **every** output pays the vault descriptor (a pure self-spend, no destination output at all).
+- **escape-class** iff every *destination* output pays the escape descriptor (vault change allowed alongside).
+- **hot-class** iff every *destination* output pays a hot-allowlist descriptor (vault change allowed).
+- **Mixed → rejected** (`PSBT_INCONSISTENT`): destination outputs spanning more than one of {hot, escape} — closing the 99%-to-hot + dust-to-escape misclassification duress-bypass — and any destination output matching *no* allowlisted descriptor (that is the ordinary allowlist refusal).
+- **A SpendRequest whose spend classifies refresh-class is rejected** (`PSBT_INCONSISTENT`) — a pure self-spend belongs in a pin-less `RefreshRequest` (§2), not a pinned SpendRequest; this removes the "SpendRequest that is really a refresh — honor the pin? ignore it?" ambiguity.
 
 Class → behavior: hot = Hold then sign; escape = complete immediately under either pin (+ duress also schedules lockdown + residual sweep at T); refresh = instant, pin-less, bounded (§6).
 
@@ -59,6 +60,8 @@ manifest_hash = H(canonical_bytes(Manifest))
 ```
 
 Each node's `channel_pubkey` is **endorsed by that node's Bitcoin signing key** over a domain-separated `(wallet_id, manifest_hash, node_id, channel_pubkey, protocol_version, transport_endpoints)` (ADR-0012 channel identity), so peers accept a channel identity only if a federation signing key vouches for it and the coordinator cannot mint/impersonate a node. The channel key itself is RAM-only, re-derived at startup (ADR-0007); the manifest pins only its public half.
+
+**Trust establishment (the root — re-review: this was undefined).** The manifest is not *signed* by an external authority; it is **agreed at the setup ceremony** and then frozen. Concretely: setup collects each node's signing pubkey + channel-key endorsement and the coordinator auth pubkey, assembles the `Manifest`, computes `manifest_hash`, and **provisions every node with that exact `manifest_hash`** as sealed config (ADR-0005 sealing). Thereafter a node trusts the coordinator auth key **because** its pubkey is in the manifest whose hash the node was sealed with, and trusts a peer channel identity **because** it is endorsed by a signing key in that same manifest. The manifest_hash is the single root every other trust decision chains to; it is included in the config (`manifest_hash`, §5) and in every channel endorsement's domain separator, so a manifest from a different vault cannot be substituted. Backed up alongside the descriptor (public-ish; needed to reconstruct/verify, not secret).
 
 ## 5. Policy config schema (per node, immutable; superset of DESIGN's TOML)
 
@@ -85,7 +88,7 @@ channel { peers: [{node_id, channel_pubkey, endpoints}], per_peer_quota, session
 
 ## 6. Precise numeric definitions
 
-- **Coverage**: measured as **Σ input value swept to the escape descriptor** (value leaving the vault into escape), as a fraction of the node's own **confirmed + vault-authorized-unconfirmed** vault balance (ADR-0012 build-over-mempool). Threshold `escape_coverage_pct` (default 95). **Arm keys off coverage of the CONFIRMED set alone** (deterministic — ADR-0012 arm-on-validity); unconfirmed value is a fire-time best-effort add.
+- **Coverage**: measured as **Σ OUTPUT value paying the escape descriptor** — what actually *lands in the escape wallet*, NOT input value (re-review fix: input-value coverage would let a hostile-at-wrench coordinator pass a 95%-of-inputs escape that burns most of it to fee and delivers little to escape). As a fraction of the node's own **confirmed + vault-authorized-unconfirmed** vault balance (ADR-0012 build-over-mempool). Threshold `escape_coverage_pct` (default 95). Measuring on *outputs* **implicitly caps the escape fee** at `(100 − escape_coverage_pct)%` of the swept value (since Σescape-outputs + fee = Σinputs), so no separate escape fee-ceiling is needed — the ≥95% output-coverage IS the ≤5% fee cap. **Coverage is NOT an arm gate** (ADR-0012 arm-on-duress-pin-alone); it is a **fire-time** check that only determines whether the sweep succeeds. Any escape rejected on coverage still leaves the node frozen + locked down at T (funds → recovery).
   - *Class-aware*: hot-class ⇒ escape supersedes the frozen spend, coverage = escape alone; escape-class ⇒ escape inputs **disjoint** from the completed spend, coverage = (completed escape-class spend ∪ residual escape).
 - **Feerate floor** (`escape_feerate_floor`): a **static** sats/vB value in config (not a live estimate — static keeps the arm predicate deterministic across nodes; ADR-0012 defers the live/mempool feerate to fire-time). The fixed-panic-fee rebroadcast loop uses the escape's own (≥ floor) feerate.
 - **ε** (`epsilon_secs`): a small bounded margin (default e.g. 60) subtracted in `T = min(first_seen + duress_delay_secs, earliest pending hot Hold-expiry − ε)`, so the escape fires strictly before a frozen spend would settle even under per-node clock skew.

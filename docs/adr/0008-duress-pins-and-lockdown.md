@@ -12,6 +12,8 @@ The duress response is a per-vault, creation-time choice:
 - `lockdown` — nodes sign nothing and refuse everything onward.
 - `sweep_and_lockdown` (recommended default) — the escape sweep plus lockdown.
 
+> **Retracted by [ADR-0012](0012-model-b-spend-and-duress-architecture.md) (and [ADR-0013](0013-concrete-protocol-schemas.md) §5).** This creation-time `duress_response` choice is retired: duress is a **single mandatory mechanism** — the escape is **mandatory in every SpendRequest** and duress **always resolves to escape-fires-at-T-then-lockdown**. The "lockdown-only" toggle no longer exists (and is absent from the authoritative node config, ADR-0013 §5).
+
 **Silent, deferred, sign-now/broadcast-later, node-distributed, no abort** (revised 2026-07-14, superseding the original "instant sweep + instant lockdown"):
 
 - **Silent and deferred.** An observable countermeasure endangers a hostage, so the duress PIN does NOTHING observable at entry. It schedules the escape sweep and lockdown to fire together after `duress_delay_secs` (a per-vault config value, decoupled from `hold_secs`; `0` is allowed = instant). During `[T, T+delay]` the nodes behave normally, so nothing on-chain or in node responses reveals the pending response.
