@@ -548,7 +548,11 @@ fn handle_sign_after_lock(
 }
 
 /// Build the [`Commitment`] for `psbt` under this node's wallet, at the
-/// coordinator-proposed `expiry`. The fee is `Σ input value − Σ output value`,
+/// coordinator-proposed `expiry`. Every transaction-identifying field —
+/// `version`, `lock_time`, each input's outpoint and `sequence`, and the
+/// outputs — is read from the node's OWN unsigned tx, so the commitment binds
+/// the exact transaction (ADR-0012): two txs differing in any of them get
+/// distinct ids. The fee is `Σ input value − Σ output value`,
 /// taking input values from each `witness_utxo` (v0 trusts the PSBT's prevout
 /// data — regtest, honest coordinator; DESIGN.md, per-node chain backend).
 /// It is computed saturating and never fails: an inconsistent PSBT (missing
@@ -563,6 +567,9 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
         .map(|txin| CommitmentInput {
             txid: txin.previous_output.txid.to_byte_array(),
             vout: txin.previous_output.vout,
+            // Read this input's nSequence from the node's OWN copy of the
+            // unsigned tx (ADR-0012) — never a coordinator-supplied summary.
+            sequence: txin.sequence.to_consensus_u32(),
         })
         .collect();
     let outputs = psbt
@@ -586,6 +593,10 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
         .fold(0u64, |acc, txout| acc.saturating_add(txout.value.to_sat()));
     Commitment {
         wallet_id: node.wallet_id,
+        // nVersion and nLockTime, read from the node's own unsigned tx so the
+        // commitment binds the exact transaction (ADR-0012).
+        version: psbt.unsigned_tx.version.0,
+        lock_time: psbt.unsigned_tx.lock_time.to_consensus_u32(),
         inputs,
         outputs,
         fee: total_in.saturating_sub(total_out),
@@ -681,9 +692,9 @@ fn destination_class(node: &Node, psbt: &Psbt) -> DestClass {
 
 /// Whether `verdict` may be recorded in the anti-replay log for idempotent
 /// replay. The log is keyed by `commitment_id`, which binds only the logical
-/// spend (wallet, outpoints, outputs, fee, expiry, policy_version) — never the
-/// witness data. So only verdicts that data fully determines are safe to
-/// replay:
+/// spend (wallet, version, lock time, outpoints + sequences, outputs, fee,
+/// expiry, policy_version) — never the witness data. So only verdicts that
+/// data fully determines are safe to replay:
 ///
 /// - `Signed` — a valid user signature existed for this exact commitment;
 ///   replaying the recorded signed PSBT is the idempotency job.
@@ -1076,6 +1087,85 @@ pub(crate) mod test_support {
             policy_version: 1,
         };
         (node, request)
+    }
+}
+
+#[cfg(test)]
+mod commitment_parity_tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::Sequence;
+
+    #[test]
+    fn commitment_serialization_round_trips_and_id_is_stable() {
+        // T4 round-trip: the canonical encoding is deterministic and total, so
+        // a commitment that is serialized and deserialized re-derives the
+        // identical `commitment_id`. (A hand-copied "coordinator" builder was
+        // dropped in review — with no independent producer before V0-8 it only
+        // tested a copy against itself; the real coordinator-vs-node parity
+        // test lands in V0-8a where vault-cli first builds a Commitment. The
+        // three mutation tests below carry the load-bearing proof that each new
+        // tx field changes the id.)
+        let (node, request) = test_support::node_and_valid_request();
+        let psbt = Psbt::from_str(&request.psbt).expect("coordinator PSBT");
+        let built = commitment_of(&node, &psbt, request.expiry);
+        let id = built.commitment_id();
+
+        let json = serde_json::to_string(&built).expect("serialize commitment");
+        let restored: Commitment = serde_json::from_str(&json).expect("deserialize commitment");
+
+        assert_eq!(
+            restored, built,
+            "serde round-trip must preserve the commitment value"
+        );
+        assert_eq!(
+            restored.commitment_id(),
+            id,
+            "serde round-trip must preserve the canonical commitment id"
+        );
+    }
+
+    #[test]
+    fn changing_only_tx_version_changes_the_commitment_id() {
+        let (node, request) = test_support::node_and_valid_request();
+        let base = Psbt::from_str(&request.psbt).expect("coordinator PSBT");
+        let mut variant = base.clone();
+        variant.unsigned_tx.version = Version::ONE;
+
+        assert_ne!(
+            commitment_of(&node, &base, request.expiry).commitment_id(),
+            commitment_of(&node, &variant, request.expiry).commitment_id(),
+            "nVersion must change the commitment id"
+        );
+    }
+
+    #[test]
+    fn changing_only_lock_time_changes_the_commitment_id() {
+        let (node, request) = test_support::node_and_valid_request();
+        let base = Psbt::from_str(&request.psbt).expect("coordinator PSBT");
+        let mut variant = base.clone();
+        variant.unsigned_tx.lock_time = LockTime::from_consensus(500_000);
+
+        assert_ne!(
+            commitment_of(&node, &base, request.expiry).commitment_id(),
+            commitment_of(&node, &variant, request.expiry).commitment_id(),
+            "nLockTime must change the commitment id"
+        );
+    }
+
+    #[test]
+    fn changing_only_one_input_sequence_changes_the_commitment_id() {
+        let (node, request) = test_support::node_and_valid_request();
+        let base = Psbt::from_str(&request.psbt).expect("coordinator PSBT");
+        let mut variant = base.clone();
+        variant.unsigned_tx.input[0].sequence = Sequence::from_consensus(0xffff_fffd);
+
+        assert_ne!(
+            commitment_of(&node, &base, request.expiry).commitment_id(),
+            commitment_of(&node, &variant, request.expiry).commitment_id(),
+            "a single input's nSequence must change the commitment id"
+        );
     }
 }
 

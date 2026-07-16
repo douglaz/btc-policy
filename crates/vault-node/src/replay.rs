@@ -80,12 +80,12 @@ impl ReplayLog {
 /// **never the PSBT**. This resolves the V0-2 commitment/tx-identity question:
 /// on re-submission the node re-verifies the resubmitted PSBT in full (PIN,
 /// user-sig/sighash, policy) and signs the PSBT *in hand*, never a stored one.
-/// So two economically-identical transactions that collide on `commitment_id`
-/// (they can differ only in version/nLockTime/nSequence, none of which the
-/// commitment binds) stay harmless: whichever is resubmitted after the window
-/// is the one freshly verified and signed. Nothing recorded here can be
-/// replayed into a signature — the timer only decides *when* signing is
-/// allowed, not *what* gets signed.
+/// The commitment binds every field of the exact unsigned transaction,
+/// including version, nLockTime, and each input's nSequence, so distinct
+/// transactions cannot share a timer. On re-submission the node still verifies
+/// and signs the PSBT in hand; nothing recorded here can be replayed into a
+/// signature — the timer only decides *when* signing is allowed, not *what*
+/// gets signed.
 struct PendingEntry {
     /// Unix seconds when this node first saw the commitment; the Hold's start.
     first_seen: u64,
