@@ -39,25 +39,38 @@ Computed by each node from the **spend transaction's outputs**, never from a coo
 - **Mixed → rejected** (`PSBT_INCONSISTENT`): destination outputs spanning more than one of {hot, escape} — closing the 99%-to-hot + dust-to-escape misclassification duress-bypass — and any destination output matching *no* allowlisted descriptor (that is the ordinary allowlist refusal).
 - **A SpendRequest whose spend classifies refresh-class is rejected** (`PSBT_INCONSISTENT`) — a pure self-spend belongs in a pin-less `RefreshRequest` (§2), not a pinned SpendRequest; this removes the "SpendRequest that is really a refresh — honor the pin? ignore it?" ambiguity.
 
-Class → behavior: hot = Hold then sign; escape = complete immediately under either pin (+ duress also schedules lockdown + residual sweep at T); refresh = instant, pin-less, bounded (§6).
+Class → behavior: hot = **sign at ingress, hold the partial, combine + broadcast at Hold expiry** (Model-B sign-at-ingress, ADR-0012 — NOT "Hold then sign"); escape = complete immediately under either pin (+ duress also schedules lockdown + residual sweep at T); refresh = instant, pin-less, bounded (§6).
 
 ## 4. Per-vault manifest (immutable; the root of channel + coord trust)
 
 Written once at setup, hash-pinned, distributed to every node and backed up with the descriptor. Immutable — any change is a new vault.
 
+Two-pass, endorsement-free hashing (the `manifest_hash` a channel endorsement
+signs cannot itself contain the endorsements):
+
 ```
-Manifest {
+BaseManifest {                     # everything EXCEPT endorsements and config_hash
   wallet_id,                       # = hash of the canonical vault descriptor
   vault_descriptor,                # canonical string with checksum (§1)
   policy_version,
+  protocol_version,                # pinned; the channel envelope check compares against this (ADR-0012)
   coordinator_auth_pubkey,         # pins the coord auth key (§2, §7)
   nodes: [ { node_id, signing_pubkey, channel_pubkey, transport_endpoints } ],
   t, n, recovery_timelock,
   hot_allowlist: [descriptor…], escape_descriptor,
-  config_hash,                     # binds the policy config (§5)
 }
-manifest_hash = H(canonical_bytes(Manifest))
+manifest_hash = H(canonical_bytes(BaseManifest))
+# THEN: each node's channel_endorsement is computed OVER manifest_hash and
+# attached alongside (never inside BaseManifest). The distributed Manifest =
+# BaseManifest + { node_id → channel_endorsement }.
 ```
+
+**`config_hash` is NOT in `BaseManifest`** (2026-07-16 fix — it would form a
+cycle: the §5 config binds `manifest_hash`, so a `config_hash` inside the
+manifest is uncomputable). The config→manifest binding is one-directional: the
+§5 config carries `manifest_hash`, and sealing (ADR-0005) provisions both
+together; `node_id` = the node's 0-based position in the descriptor's canonical
+key order (§1).
 
 Each node's `channel_pubkey` is **endorsed by that node's Bitcoin signing key** over a domain-separated `(wallet_id, manifest_hash, node_id, channel_pubkey, protocol_version, transport_endpoints)` (ADR-0012 channel identity), so peers accept a channel identity only if a federation signing key vouches for it and the coordinator cannot mint/impersonate a node. The channel key itself is RAM-only, re-derived at startup (ADR-0007); the manifest pins only its public half. `node_id` = the node's 0-based index in the descriptor's canonical (lexicographic) node-key order — derivable from the descriptor, so the node_id → descriptor-key mapping is definitionally total (2026-07-16). **Endpoints are deliberately pinned** (anti-redirection: nobody, including a compromised coordinator or a later config writer, can repoint one node's view of a peer): v0 endpoints are localhost and never change; **v1 onion addresses must be derived deterministically from node key material** — like the channel key — so they are known at the setup ceremony and stable for the node's lifetime; clearnet dynamic-IP topologies are unsupported by design (2026-07-16).
 

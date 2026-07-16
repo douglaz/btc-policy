@@ -85,7 +85,7 @@ The second of two enrolled PINs; submitting it with any spend triggers the vault
 _Avoid_: panic code, secondary PIN
 
 **Pin-independent ingress**:
-The silence-load-bearing rule that **every** request — normal or duress — makes a Node do **identical observable work** (coordinator-auth + freshness check, validate both the spend and the mandatory escape, sign both partials, persist, propagate to peers); the pin only flips an **internal** fire bit — *which* transaction eventually broadcasts and *when* (ADR-0012). Because latency, peer-visible "seen this request" state, and telemetry are identical under both PINs, an attacker holding no compromised Node cannot read the duress bit.
+The silence-load-bearing rule that **every** request — normal or duress — makes a Node do **identical observable work** (coordinator-auth + freshness check, validate both the spend and the mandatory escape, sign both partials, record in RAMDISK state, propagate to peers); the pin only flips an **internal** fire bit — *which* transaction eventually broadcasts and *when* (ADR-0012). Because latency, peer-visible "seen this request" state, and telemetry are identical under both PINs, an attacker holding no compromised Node cannot read the duress bit.
 _Avoid_: constant-time path, duress branch (there is no separate duress branch)
 
 **Lockdown**:
@@ -101,7 +101,7 @@ The per-destination-class node-driven waiting period between a spend's first sub
 _Avoid_: delay, timelock (for this), cooldown
 
 **Transaction class**:
-The category a Node derives locally from a spend's **outputs**, never trusted from a Coordinator label (ADR-0013 §3). **escape-class** = *every* output pays the Escape descriptor; **refresh-class** = every output pays the vault descriptor; **hot-class** = anything else (any output to the Hot allowlist, vault change permitted alongside). Mixed-class spends are **rejected** (`PSBT_INCONSISTENT`) — closing the 99%-to-hot + dust-to-escape misclassification. Class drives behavior: hot = Hold then sign; escape = complete immediately (under either pin); refresh = instant, pin-less, bounded.
+The category a Node derives locally from a spend's **outputs**, never trusted from a Coordinator label (ADR-0013 §3). **escape-class** = *every* output pays the Escape descriptor; **refresh-class** = every output pays the vault descriptor; **hot-class** = anything else (any output to the Hot allowlist, vault change permitted alongside). Mixed-class spends are **rejected** (`PSBT_INCONSISTENT`) — closing the 99%-to-hot + dust-to-escape misclassification. Class drives behavior: hot = sign at ingress, hold the partial, combine + broadcast at Hold expiry (Model-B, ADR-0012); escape = complete immediately (under either pin); refresh = instant, pin-less, bounded.
 _Avoid_: destination type, output kind, spend purpose (the non-authoritative coordinator hint)
 
 **Pending spend**:
@@ -129,7 +129,7 @@ The incident response: sweep everything through the Normal path to the Escape wa
 _Avoid_: key rotation (alone), migration
 
 **Watchtower**:
-A monitoring role performed by every Vault node (ADR-0001/0012): alerts on any Recovery-path spend (branch-identifiable on-chain) and any vault spend the node never **validated AND policy-ACCEPTED** (authorized / would-authorize — added or would have added its partial) — NOT merely "saw and policy-checked" (a spend a node policy-*refused* was checked but must NOT count as recognized, or a theft fanned to honest nodes would suppress its own alert), and NOT "never co-signed" (in t-of-n, n−t nodes legitimately don't sign each spend). Continues during Lockdown. A rebooted node is **dead** (tmpfs reboot-death, ADR-0007), so it performs no duty until re-provisioned — watchtower coverage is carried by the surviving nodes; a re-provisioned node starts with an empty recognition set and alerts on pre-existing spends it never accepted (safe-direction).
+A monitoring role performed by every Vault node (ADR-0001/0012): alerts on any Recovery-path spend (branch-identifiable on-chain) and any vault spend the node never **validated AND policy-ACCEPTED** (authorized / would-authorize — added or would have added its partial) — NOT merely "saw and policy-checked" (a spend a node policy-*refused* was checked but must NOT count as recognized, or a theft fanned to honest nodes would suppress its own alert), and NOT "never co-signed" (in t-of-n, n−t nodes legitimately don't sign each spend). Continues during Lockdown. A rebooted node is **permanently dead for that vault** (tmpfs reboot-death, ADR-0007 — it never rejoins the immutable Manifest); watchtower coverage is simply carried by the surviving nodes, and restoring a lost node means rotating to a successor vault, not resurrecting it.
 _Avoid_: co-sign check, monitors (alone)
 _Avoid_: monitor (alone), watchtower service
 

@@ -127,8 +127,12 @@ hold_secs = 86400                # the Hold for hot-class spends; escape/refresh
 max_commitment_age_secs = 172800 # node-enforced cap on coordinator-proposed expiry (must exceed hold_secs)
 max_derivation_index = 10000     # bound on own-descriptor derivation scans
 pin_normal_hash = "argon2id$..." # authorizes the submitted spend
-pin_duress_hash = "argon2id$..." # triggers duress_response; externally identical (ADR-0008)
-duress_response = "sweep_and_lockdown"  # or "lockdown"; chosen at vault creation
+pin_duress_hash = "argon2id$..." # triggers the duress mechanism; externally identical (ADR-0008)
+# NOTE: the `duress_response ∈ {lockdown, sweep_and_lockdown}` TOGGLE IS RETIRED
+# (ADR-0012, 2026-07-16). Duress is now a single mandatory two-track mechanism:
+# arm+freeze on the pin alone → unconditional lockdown at T → best-effort escape
+# sweep. There is no per-vault response choice. Occurrences of `duress_response`
+# below (lines ~150/187/224/262) are superseded by ADR-0012.
 
 [[allowlist]]                    # destination WALLETS: descriptors + bounded index, never fixed addresses
 descriptor = "wpkh([hot]xpub.../<0;1>/*)"     # the hot wallet — hot class: the Hold applies
