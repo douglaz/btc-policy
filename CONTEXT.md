@@ -24,6 +24,10 @@ _Avoid_: cluster, cosigners
 A daemon holding exactly one federation key and one policy engine; independently validates each PSBT against the Policy checks before signing or refusing, and performs Watchtower duty against its own chain view.
 _Avoid_: signer (alone), server, peer
 
+**Node id**:
+A Vault node's 0-based index in the vault descriptor's canonical (lexicographic-by-compressed-pubkey) node-key order. Derivable from the descriptor alone, so the node-id → descriptor-key mapping is definitionally total and unambiguous — never a separate table, never a human label. Appears in the Manifest, in every channel endorsement, and in every channel envelope.
+_Avoid_: node name, node index (alone — say which order), peer id
+
 **Quorum**:
 Any t of the n Vault nodes (default 3-of-5). Every quorum has run the policy checks by construction.
 _Avoid_: majority, threshold (as a noun for the group)
@@ -85,7 +89,7 @@ The silence-load-bearing rule that **every** request — normal or duress — ma
 _Avoid_: constant-time path, duress branch (there is no separate duress branch)
 
 **Lockdown**:
-The state in which every node refuses all signing (`FRAUD_SUSPECTED`), persisted on disk, surviving reboots, with no reset on Sealed nodes — the only exit is the Recovery path.
+The state in which every node refuses all signing (`FRAUD_SUSPECTED`), persisted for the node's lifetime (RAMDISK — never durable disk; reboot-death, 2026-07-16), with no reset on Sealed nodes — the only exit is the Recovery path. Needs no reboot survival: reboot = node death, strictly stronger than Lockdown. `/unseal` is rejected (ADR-0007), so no durable lockdown flag exists anywhere.
 _Avoid_: freeze (alone), pause
 
 **Sealed**:
