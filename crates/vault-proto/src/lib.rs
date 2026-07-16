@@ -22,6 +22,13 @@ use serde::{Deserialize, Serialize};
 pub struct Commitment {
     /// Hash of the vault descriptor: which vault this spend belongs to.
     pub wallet_id: [u8; 32],
+    /// The unsigned transaction's `version` (nVersion). Bound so two txs that
+    /// differ only in version get distinct ids (ADR-0012, "the commitment binds
+    /// the exact unsigned transaction").
+    pub version: i32,
+    /// The unsigned transaction's `nLockTime`. Bound for the same reason as
+    /// [`Commitment::version`].
+    pub lock_time: u32,
     /// Every input the transaction spends, in transaction order.
     pub inputs: Vec<CommitmentInput>,
     /// Every output the transaction pays, in transaction order.
@@ -42,6 +49,9 @@ pub struct CommitmentInput {
     pub txid: [u8; 32],
     /// Previous-output index.
     pub vout: u32,
+    /// This input's `nSequence`. Bound so two txs that differ only in a single
+    /// input's sequence get distinct ids (ADR-0012).
+    pub sequence: u32,
 }
 
 /// One transaction output, by scriptPubKey and amount.
@@ -66,10 +76,15 @@ impl Commitment {
     pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.wallet_id);
+        // Header region: the transaction-level fields (nVersion, nLockTime).
+        out.extend_from_slice(&self.version.to_be_bytes());
+        out.extend_from_slice(&self.lock_time.to_be_bytes());
         out.extend_from_slice(&(self.inputs.len() as u32).to_be_bytes());
         for input in &self.inputs {
             out.extend_from_slice(&input.txid);
             out.extend_from_slice(&input.vout.to_be_bytes());
+            // Each input's nSequence, alongside its outpoint.
+            out.extend_from_slice(&input.sequence.to_be_bytes());
         }
         out.extend_from_slice(&(self.outputs.len() as u32).to_be_bytes());
         for output in &self.outputs {
@@ -192,14 +207,18 @@ mod tests {
     fn sample_commitment(outputs: Vec<CommitmentOutput>) -> Commitment {
         Commitment {
             wallet_id: [0x11; 32],
+            version: 2,
+            lock_time: 500_001,
             inputs: vec![
                 CommitmentInput {
                     txid: [0x22; 32],
                     vout: 0,
+                    sequence: 0xffff_fffd,
                 },
                 CommitmentInput {
                     txid: [0x33; 32],
                     vout: 7,
+                    sequence: 0xffff_ffff,
                 },
             ],
             outputs,
