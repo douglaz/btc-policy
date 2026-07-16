@@ -95,7 +95,16 @@ refresh_min_interval_secs,         # e.g. 2_592_000 (~30d) — §6
 refresh_max_feerate,               # tight refresh fee cap — §6
 pin_attempt_budget { max_attempts, window_secs, backoff_schedule, lockout_secs },  # §7
 coordinator_auth_pubkey, manifest_hash,
-channel { peers: [{node_id, signing_pubkey, channel_pubkey, channel_endorsement, endpoints}], per_peer_quota, per_send_deadline_secs, max_msg_bytes },   # v0-provisional to V0-9; NO session (per-message signed envelopes) — hence per-send, not session, deadline (2026-07-16)
+[channel] {                        # OPTIONAL block (2026-07-16 codex audit): ABSENT ⇒ absent-channel mode — /channel not mounted, no manifest/bijection/endorsement invariants run, node behaves as pre-channel (so `demo first-light`, which does not use the channel, passes channel-less WITHOUT editing the demo). PRESENT ⇒ all invariants apply and /channel is mounted. v0-provisional to V0-9. NO session (per-message signed envelopes) — per-send, not session, deadline.
+  node_id,                         # this node's id
+  nodes: [{node_id, signing_pubkey, channel_pubkey, channel_endorsement, endpoints}],  # FULL membership, all n, INCLUDING self (manifest hash needs all n; self-inclusion removes "does peers contain me?"). `endpoints` is plural (a node may advertise clearnet + onion) — matches the endorsement/manifest `transport_endpoints`; the config field is the same plural list, not a singular `endpoint`.
+  max_active_candidates,           # default 1024
+  max_candidate_store_bytes,       # default 67_108_864 (64 MiB)
+  per_peer_quota_per_min,          # default 600
+  max_concurrent_channel_requests, # pre-auth global bound, default 64
+  max_msg_bytes,                   # default 1_048_576 (1 MiB)
+  max_response_bytes,              # outbound read bound, default 65_536
+  per_send_deadline_secs },        # default 5
 [chain_backend] rpc_addr, auth
 ```
 
