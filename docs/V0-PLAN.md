@@ -69,7 +69,7 @@ rework). Keeps policy node-local; the channel carries no policy.
   rides. Shared with V0-4. (ADR-0012.)
 - **Per-vault manifest + full node config schema** — the immutable, hash-pinned manifest (ADR-0013 §4:
   wallet_id, canonical descriptor, `coordinator_auth_pubkey`, per-node signing+channel pubkeys with
-  endorsements, t/n, allowlist, escape descriptor, config_hash) and the security-load-bearing config
+  endorsements, t/n, allowlist, escape descriptor) and the security-load-bearing config
   superset (ADR-0013 §5). The channel-identity auth + coord-sig freshness check both read from it. Shared
   with provisioning (V0-9).
 
@@ -247,7 +247,7 @@ The manifest is the **root of channel + coordinator trust**, so it is load-beari
 - **Per-vault manifest (ADR-0013 §4):** written once at setup, hash-pinned, distributed to every node +
   backed up with the descriptor; **immutable** (any change = a new vault). Fields: wallet_id, canonical
   `vault_descriptor`, policy_version, `coordinator_auth_pubkey`, per-node {signing_pubkey, channel_pubkey,
-  transport_endpoints}, t/n, recovery_timelock, hot_allowlist, escape_descriptor, config_hash. Each
+  transport_endpoints}, t/n, recovery_timelock, hot_allowlist, escape_descriptor. Each
   `channel_pubkey` **endorsed by that node's Bitcoin signing key** over a domain-separated tuple (ADR-0012
   channel identity) so the coordinator cannot mint/impersonate a node. Shared with V0-8.
 - **Full node config schema (ADR-0013 §5):** the security-load-bearing superset of DESIGN's TOML — pin
