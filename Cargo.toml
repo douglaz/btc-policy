@@ -18,6 +18,11 @@ miniscript = "12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# The vault-node async base (V0-8a0): tokio runtime + axum HTTP. Feature set is
+# deliberately narrow — the next milestones (V0-8a channel, V0-8b/V0-4 timers)
+# add reqwest/etc., not this task.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 
 [workspace.lints.clippy]
 unwrap_used = "warn"

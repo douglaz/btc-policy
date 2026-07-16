@@ -11,6 +11,8 @@ miniscript = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
 policy-core = { path = "../policy-core" }
 vault-proto = { path = "../vault-proto" }
 

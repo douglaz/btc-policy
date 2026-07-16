@@ -214,7 +214,7 @@ fn post_json(addr: SocketAddr, body: &str, auth: &str) -> Result<String, Error> 
 pub(crate) mod mock {
     //! A mock chain backend for the unit tests — no bitcoind, no sockets.
 
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     use bitcoin::{consensus, ScriptBuf, Transaction, Txid};
 
@@ -232,13 +232,17 @@ pub(crate) mod mock {
     /// classification/cursor tests. `scanned_from` records each `from_height` the
     /// driver asked for, so a test can prove the cursor advanced instead of
     /// re-scanning from 0.
+    ///
+    /// Interior mutability is a `Mutex` (not a `RefCell`) so the mock is
+    /// `Send + Sync`: the async watchtower driver (V0-6b) runs each scan pass on
+    /// `spawn_blocking`, which requires a `Send + Sync` backend.
     #[derive(Default)]
     pub(crate) struct MockBackend {
         pub spends: Vec<SpendSeen>,
-        pub broadcasts: RefCell<Vec<Vec<u8>>>,
+        pub broadcasts: Mutex<Vec<Vec<u8>>>,
         pub tip: u32,
         pub spend_block: u32,
-        pub scanned_from: RefCell<Vec<u32>>,
+        pub scanned_from: Mutex<Vec<u32>>,
     }
 
     impl ChainBackend for MockBackend {
@@ -247,7 +251,10 @@ pub(crate) mod mock {
             // (no panic) — and so the returned txid is the real one.
             let tx: Transaction = consensus::deserialize(raw_tx)
                 .map_err(|e| format!("malformed transaction: {e}"))?;
-            self.broadcasts.borrow_mut().push(raw_tx.to_vec());
+            self.broadcasts
+                .lock()
+                .expect("broadcasts lock")
+                .push(raw_tx.to_vec());
             Ok(tx.compute_txid())
         }
 
@@ -260,7 +267,10 @@ pub(crate) mod mock {
             _scripts: &[ScriptBuf],
             from_height: u32,
         ) -> Result<Vec<SpendSeen>, Error> {
-            self.scanned_from.borrow_mut().push(from_height);
+            self.scanned_from
+                .lock()
+                .expect("scanned_from lock")
+                .push(from_height);
             // The canned spends live in `spend_block`; a scan whose cursor has
             // advanced past it sees nothing, so a re-alert can only come from a
             // cursor that failed to advance (never dedup).
@@ -310,7 +320,11 @@ mod tests {
         let txid = backend.broadcast(&raw).expect("valid tx broadcasts");
         assert_eq!(txid, tx.compute_txid());
         assert_eq!(
-            backend.broadcasts.borrow().as_slice(),
+            backend
+                .broadcasts
+                .lock()
+                .expect("broadcasts lock")
+                .as_slice(),
             &[raw],
             "the backend must record the exact raw tx it was handed"
         );
@@ -326,7 +340,11 @@ mod tests {
             "a malformed tx must be an Err, not a panic"
         );
         assert!(
-            backend.broadcasts.borrow().is_empty(),
+            backend
+                .broadcasts
+                .lock()
+                .expect("broadcasts lock")
+                .is_empty(),
             "a rejected tx is never recorded as broadcast"
         );
     }
