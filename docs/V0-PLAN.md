@@ -176,8 +176,9 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
   threshold, feerate ≥ floor) — they do NOT build it, and there is NO stored
   standby (per ADR-0012 — this line previously described the superseded design).
 - Duress state machine: arm (+propagate to peers +persist) → armed (silent,
-  freezes hot-class completion) → fire at T (broadcast + re-broadcast) → lockdown
-  (terminal, recovery-path exit). `duress_delay_secs` is the hostage-safety window.
+  freezes hot-class completion) → **unconditional lockdown at T** (terminal,
+  recovery-path exit), **THEN a best-effort sweep** (combine + re-broadcast; may
+  fail → funds stay frozen → recovery). `duress_delay_secs` is the hostage-safety window.
 - No abort. Accepted residuals: total coordinator censorship, sustained fee spike,
   compromised-node duress detection (silence model A). All are denial, never theft.
 
@@ -194,10 +195,14 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
 - **Durable ARMING state + unconditional Lockdown-at-T on every failure branch** — persist the armed bit
   + `T`; enter Lockdown at `T` even if fire/broadcast fails (not only after confirm); the pin is **never
   persisted in the envelope** (ADR-0012 duress state machine).
-- **Arm on the user-signed escape's validity ALONE** (deterministic: user sig over exact bytes + all
-  outputs to the escape descriptor + class-aware coverage of the **confirmed** set ≥ threshold); **defer**
-  the mempool-dependent checks (`testmempoolaccept` on the package, unconfirmed coverage, live feerate) to
-  **fire-time**, so chain-view skew can't drop the armed set below `t` (ADR-0012).
+- **Two-track duress state machine — arm is keyed on the valid DURESS PIN ALONE** (unconditional,
+  chain-view-independent): a valid coordinator-authenticated duress pin **freezes hot-class finalization +
+  schedules lockdown at T**, with **NO** coverage / feerate / `testmempoolaccept` / mempool judgment at arm
+  at all — so backend chain-view skew (tip lag, reorg, propagation) cannot split the armed set below `t`
+  (this is the arm-split conditional-theft fix). Escape admissibility (class-aware coverage, feerate floor,
+  package `testmempoolaccept`) is **ENTIRELY a fire-time check** that gates only whether the best-effort
+  sweep fires; a sweep that fails still leaves the node frozen + locked down → recovery. See ADR-0012
+  "Duress state machine (per node) — normative".
 - **Per-node pin-attempt budget protocol** (durable count/window/backoff/lockout; no cross-node accounting;
   lockout ≠ Lockdown) — shared with V0-1 (ADR-0013 §7).
 

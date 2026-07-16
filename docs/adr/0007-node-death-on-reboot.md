@@ -1,5 +1,7 @@
 # A rebooted node is a dead node (MVP)
 
+> **Banner (ADR-0012 revises this; reconciliation tracked to V0-4).** ADR-0012's duress reboot model needs the daemon to survive reboot **running-but-signing-keyless**, with the **duress schedule + this node's own escape partial persisted to disk** — an at-rest artifact this ADR's "reboot = keyless death" did not contemplate. The *signing* key still dies on reboot (no at-rest signing secret); what persists is the schedule + escape partial, so a rebooted armed node **re-arms and joins the fire-time combine**, it does not sign fresh. V0-4 picks between adopting this and keeping strict reboot-death; **safety holds either way** — under strict reboot-death a rebooted armed node contributes no partial → lockdown-only → recovery (fewer sweeps, still no theft). See ADR-0012's "Persistence & reboot" invariant.
+
 Node keys exist only in memory on sealed hosts (ADR-0005), so any reboot — host maintenance, kernel panic, provider migration — permanently kills that node. The MVP accepts this rather than weakening either property: no key material at rest, no admin path back in. The 3-of-5 federation is the budget: two node deaths are absorbed; the vault must be rotated before a third.
 
 ## Considered Options

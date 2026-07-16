@@ -77,7 +77,7 @@ The 2-of-3 cold keys that can spend the Recovery path. Not a funded wallet — a
 _Avoid_: recovery wallet, cold keys (alone)
 
 **Duress PIN**:
-The second of two enrolled PINs; submitting it with any spend triggers the vault's duress response — a **single mandatory mechanism** (ADR-0012): the node silently **arms** the always-present, user-signed Escape, **holds** silently through `[arm, T]` (refusing any hot-class spend in that window), the **Escape fires at T**, then **Lockdown**. The Escape sweep is not optional — every request carries a mandatory escape, so duress always resolves to escape-then-lockdown, not "lockdown or maybe a sweep." Looks identical to normal authorization; presented externally as automated fraud prevention, never as a duress signal.
+The second of two enrolled PINs; submitting it with any spend triggers the vault's duress response — a **two-track mechanism** (ADR-0012), keyed on the valid duress pin **alone**. The **safety track** silently **arms** — freezes hot-class finalization and schedules **unconditional Lockdown at T** — while the **sweep track** is **best-effort**. The node holds silently through `[arm, T]` (refusing any hot-class spend in that window); at T it **enters Lockdown unconditionally**, then attempts a best-effort sweep of the always-present, user-signed Escape. The sweep **may not fire** (coverage / feerate / `testmempoolaccept` checked at fire-time can fail) — funds then stay frozen and exit via the Recovery path. Safety (freeze + Lockdown → recovery) never depends on the sweep. Looks identical to normal authorization; presented externally as automated fraud prevention, never as a duress signal.
 _Avoid_: panic code, secondary PIN
 
 **Pin-independent ingress**:
@@ -93,7 +93,7 @@ The post-setup state of a node host: SSH uninstalled, no administrative access; 
 _Avoid_: locked (use Lockdown for signing state), hardened
 
 **Hold**:
-The per-destination-class waiting period between a spend's first submission and node signing (hot wallet: D, default 24h; Escape wallet and Refresh: none). Off-chain, enforced independently by each node. Not the Recovery-path timelock.
+The per-destination-class node-driven waiting period between a spend's first submission and its **combine + broadcast** (hot wallet: D, default 24h; Escape wallet and Refresh: none). Under Model B the node **signs its partial at ingress** (pin-independent); the Hold delays combine + broadcast, **not** signing (ADR-0012 Model-B Hold lifecycle). Off-chain, enforced independently by each node against its own clock. Not the Recovery-path timelock.
 _Avoid_: delay, timelock (for this), cooldown
 
 **Transaction class**:
@@ -101,7 +101,7 @@ The category a Node derives locally from a spend's **outputs**, never trusted fr
 _Avoid_: destination type, output kind, spend purpose (the non-authoritative coordinator hint)
 
 **Pending spend**:
-A Commitment a node has recorded but not yet signed, waiting out its Hold; visible to the Coordinator via pull. Cancelled implicitly by any confirmed conflicting spend (in anger: the escape sweep).
+A Commitment a node has recorded and **already signed at ingress** (Model B) — scheduled, its partial **held**, not yet combined + broadcast — waiting out its Hold; visible to the Coordinator via pull. Cancelled implicitly by any confirmed conflicting spend (in anger: the escape sweep).
 _Avoid_: queued transaction, unconfirmed spend
 
 **Commitment**:
