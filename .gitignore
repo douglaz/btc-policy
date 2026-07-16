@@ -5,3 +5,6 @@
 result
 *.log
 /.rb-lite-reviewers
+
+# bv (beads viewer) local config and caches
+.bv/
