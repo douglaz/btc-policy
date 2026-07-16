@@ -12,13 +12,12 @@
 //! The classification [`scan`] is a callable pass, deterministic and driven by a
 //! caller (the tests). In the running daemon a thin loop drives it: each node is
 //! its own watchtower (ADR-0001), so [`spawn_driver`] spawns ONE background
-//! thread that runs a pass every [`SCAN_INTERVAL`], advancing a height cursor so
+//! task that runs a pass every [`SCAN_INTERVAL`], advancing a height cursor so
 //! each pass scans only new blocks and writing into the same alert queue
 //! `GET /events` reads.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use bitcoin::{ScriptBuf, Txid};
@@ -163,36 +162,56 @@ pub(crate) fn scan_pass(
     })
 }
 
-/// Spawn the daemon watchtower driver (ADR-0001, V0-6b): ONE background thread
-/// that runs a [`scan_pass`] every [`SCAN_INTERVAL`], carrying a height cursor
-/// between passes so it advances instead of re-scanning from 0. `sign_log` and
-/// `alerts` are the node's shared watchtower state — the same handles the `/sign`
-/// server writes/reads, so a spend the node co-signs is recognized and alerts
-/// surface through `GET /events`.
+/// Spawn the daemon watchtower driver (ADR-0001, V0-6b): ONE background tokio
+/// task that runs a [`scan_pass`] every [`SCAN_INTERVAL`], carrying a height
+/// cursor between passes so it advances instead of re-scanning from 0.
+/// `sign_log` and `alerts` are the node's shared watchtower state — the same
+/// handles the `/sign` server writes/reads, so a spend the node co-signs is
+/// recognized and alerts surface through `GET /events`.
 ///
-/// The first pass runs immediately (before the first sleep). A failed pass is
-/// logged and the cursor is left unadvanced, so the next pass retries the same
-/// range and no block is skipped on a transient backend error.
+/// Each pass's [`scan_pass`] calls blocking bitcoind JSON-RPC (`chain.rs`), so
+/// it runs on `spawn_blocking`: a slow RPC never stalls the async runtime and so
+/// never delays `/events`. The first tick fires immediately. A failed pass is
+/// logged and the cursor left unadvanced, so the next pass retries the same
+/// range and no block is skipped on a transient backend error. Must be called
+/// from within a tokio runtime (the daemon calls it from `#[tokio::main]`).
 pub fn spawn_driver(
-    backend: Box<dyn ChainBackend + Send>,
+    backend: Arc<dyn ChainBackend + Send + Sync>,
     vault_scripts: Vec<ScriptBuf>,
     sign_log: Arc<Mutex<HashSet<Txid>>>,
     alerts: Arc<Mutex<AlertQueue>>,
 ) {
-    thread::spawn(move || {
+    let vault_scripts = Arc::new(vault_scripts);
+    tokio::spawn(async move {
         let mut from_height = 0u32;
+        let mut ticker = tokio::time::interval(SCAN_INTERVAL);
         loop {
-            match scan_pass(
-                backend.as_ref(),
-                &vault_scripts,
-                &sign_log,
-                &alerts,
-                from_height,
-            ) {
-                Ok(outcome) => from_height = outcome.next_from,
-                Err(e) => eprintln!("watchtower scan pass failed (cursor {from_height}): {e}"),
+            ticker.tick().await; // the first tick completes immediately
+            let backend = Arc::clone(&backend);
+            let vault_scripts = Arc::clone(&vault_scripts);
+            let sign_log = Arc::clone(&sign_log);
+            let alerts = Arc::clone(&alerts);
+            let pass = tokio::task::spawn_blocking(move || {
+                scan_pass(
+                    backend.as_ref(),
+                    &vault_scripts,
+                    &sign_log,
+                    &alerts,
+                    from_height,
+                )
+            })
+            .await;
+            match pass {
+                Ok(Ok(outcome)) => from_height = outcome.next_from,
+                Ok(Err(e)) => eprintln!("watchtower scan pass failed (cursor {from_height}): {e}"),
+                Err(join_error) => {
+                    eprintln!("watchtower scan task panicked (cursor {from_height}): {join_error}")
+                }
             }
-            thread::sleep(SCAN_INTERVAL);
+            // Schedule from pass completion, preserving the old
+            // sleep-at-loop-end cadence. `MissedTickBehavior::Delay` alone
+            // still permits one immediately-ready tick after a slow pass.
+            ticker.reset();
         }
     });
 }
@@ -268,6 +287,7 @@ mod tests {
     use super::*;
     use crate::chain::mock::MockBackend;
     use bitcoin::hashes::Hash;
+    use std::thread;
     use std::time::Instant;
 
     fn txid(byte: u8) -> Txid {
@@ -434,8 +454,8 @@ mod tests {
 
     // -- the daemon driver (V0-6b) ------------------------------------------
 
-    #[test]
-    fn the_driver_thread_scans_and_surfaces_an_alert_without_an_explicit_tick() {
+    #[tokio::test]
+    async fn the_driver_task_scans_and_surfaces_an_alert_without_an_explicit_tick() {
         // A backend reporting an un-co-signed vault spend; the driver — nothing
         // else — must surface it through the shared queue.
         let vault = script(0x01);
@@ -448,13 +468,13 @@ mod tests {
         let alerts = Arc::new(Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP)));
 
         spawn_driver(
-            Box::new(backend),
+            Arc::new(backend),
             vec![vault],
             Arc::clone(&sign_log),
             Arc::clone(&alerts),
         );
 
-        // The first pass runs immediately; poll (bounded) until it appears — no
+        // The first tick fires immediately; poll (bounded) until it appears — no
         // test ever calls scan/tick, proving the driver drives.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -465,9 +485,9 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "the driver thread must surface the alert without an explicit tick"
+                "the driver task must surface the alert without an explicit tick"
             );
-            thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -501,7 +521,10 @@ mod tests {
         // The cursor advanced (0 then 6, never a re-scan from 0), and the spend
         // in the already-scanned block 5 is not re-alerted — via the height
         // advance, not the queue's dedup (the backend returns nothing past it).
-        assert_eq!(*backend.scanned_from.borrow(), vec![0, 6]);
+        assert_eq!(
+            *backend.scanned_from.lock().expect("scanned_from lock"),
+            vec![0, 6]
+        );
         assert_eq!(alerts.lock().expect("alerts lock").since(0).0.len(), 1);
     }
 

@@ -22,6 +22,21 @@ struct Entry {
     verdict: SignResponse,
 }
 
+/// The `/sign` handler's mutable state: the anti-replay log and the Hold-timer
+/// pending log, bundled under ONE lock (`Mutex<SignState>` in [`crate::Node`]).
+///
+/// The old sequential serve loop gave `handle_sign` end-to-end atomicity for
+/// free — its check-then-update sequences over these two logs could never
+/// interleave. Under axum requests are concurrent, so the two logs move under a
+/// single lock held across the whole `handle_sign` call. Two SEPARATE locks are
+/// forbidden: an interleaved check/update between two concurrent identical
+/// requests would corrupt replay semantics, so both logs must move together.
+#[derive(Default)]
+pub(crate) struct SignState {
+    pub(crate) replay: ReplayLog,
+    pub(crate) pending: PendingLog,
+}
+
 /// In-memory anti-replay log: `commitment_id -> recorded verdict`.
 #[derive(Default)]
 pub(crate) struct ReplayLog {
@@ -48,6 +63,14 @@ impl ReplayLog {
     /// Drop every entry whose expiry has passed, bounding retention time.
     pub(crate) fn prune(&mut self, now: u64) {
         self.entries.retain(|_, entry| entry.expiry > now);
+    }
+
+    /// Number of recorded verdicts. Test-only: the concurrency and no-cancel
+    /// regressions assert exactly one entry is recorded (no double-accept, no
+    /// ghost half-run).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -101,6 +124,12 @@ impl PendingLog {
     /// Drop every timer whose commitment has expired, bounding retention.
     pub(crate) fn prune(&mut self, now: u64) {
         self.entries.retain(|_, entry| entry.expiry > now);
+    }
+
+    /// Number of live Hold timers. Test-only (see [`ReplayLog::len`]).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 

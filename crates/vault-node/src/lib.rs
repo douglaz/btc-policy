@@ -10,20 +10,20 @@
 //! ([`Node::watchtower_tick`]) classifies recovery-path and un-co-signed spends
 //! of the node's own chain view and queues alerts a puller reads via
 //! `GET /events` (ADR-0002). The classification stays a deterministic callable
-//! pass for tests, and in the running daemon a thin background thread drives it
+//! pass for tests, and in the running daemon a thin background task drives it
 //! on a fixed interval ([`Node::spawn_watchtower`], V0-6b) — each node is its own
 //! watchtower. Duress actions and lockdown remain v0 work (V0-4).
 
 pub mod chain;
-pub mod http;
 mod replay;
+pub mod server;
 pub mod watchtower;
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
@@ -31,7 +31,7 @@ use bitcoin::sighash::SighashCache;
 use bitcoin::{EcdsaSighashType, Psbt, PublicKey, ScriptBuf, Txid};
 use miniscript::descriptor::WshInner;
 use miniscript::{Descriptor, DescriptorPublicKey, Terminal};
-use replay::{PendingLog, ReplayLog};
+use replay::{ReplayLog, SignState};
 use serde::Deserialize;
 use vault_proto::{
     Commitment, CommitmentInput, CommitmentOutput, Pending, Refusal, RefusalCode, SignRequest,
@@ -87,9 +87,9 @@ pub struct ConfigFile {
     pub pin_normal_hash: String,
     pub pin_duress_hash: String,
     /// Optional chain-backend endpoint for the watchtower driver (ADR-0001,
-    /// V0-6b). Absent ⇒ the daemon runs no scan thread (unit tests and nodes
+    /// V0-6b). Absent ⇒ the daemon runs no scan task (unit tests and nodes
     /// without a reachable bitcoind still load). Present ⇒ the daemon spawns one
-    /// background thread scanning this bitcoind on a fixed interval.
+    /// background task scanning this bitcoind on a fixed interval.
     #[serde(default)]
     pub chain_backend: Option<ChainBackendConfig>,
 }
@@ -129,27 +129,32 @@ pub struct Node {
     /// non-change output re-derives from it is an escape sweep and skips the
     /// Hold. `None` ⇒ no spend is escape-class, harmless when `hold_secs = 0`.
     escape_descriptor: Option<Descriptor<DescriptorPublicKey>>,
-    /// Anti-replay log. The `/sign` server is single-threaded; `RefCell`
-    /// provides the interior mutability needed by the handler's `&Node`.
-    replay_log: RefCell<ReplayLog>,
-    /// Hold timers for hot-class pending spends, keyed by `commitment_id`
-    /// (timer-only; see [`replay::PendingLog`]). Same single-threaded `RefCell`
-    /// discipline as `replay_log`.
-    pending_log: RefCell<PendingLog>,
+    /// The `/sign` handler's replay log AND Hold-timer pending log under ONE
+    /// lock (see [`replay::SignState`]). `/sign` is serialized BY DESIGN: the
+    /// axum migration buys ISOLATION of `/sign` from `/events` (and, in V0-8a,
+    /// `/channel`) — those keep their own locks below — NOT sign-vs-sign
+    /// throughput. Two `/sign` requests still run one-at-a-time: the whole
+    /// `handle_sign` call runs under this lock, so the check-then-update
+    /// sequences over the two logs never interleave, exactly as the old
+    /// sequential serve loop guaranteed. Splitting these into two locks is
+    /// FORBIDDEN — interleaved check/update between two concurrent identical
+    /// requests would corrupt replay semantics.
+    sign_state: Mutex<SignState>,
     /// The node's sign log: the txids it has co-signed (ADR-0001 watchtower
     /// input). Because SIGHASH_ALL binds the witness to the exact transaction and
     /// segwit txids exclude the witness, the signed tx's txid equals its unsigned
     /// tx's txid — so a spend of a vault UTXO whose txid is absent here is one the
     /// node never authorized (an `UnrecognizedSpend`). Shared behind a `Mutex`
-    /// (not the per-`/sign` `RefCell` used for the logs above): the `/sign` server
-    /// writes it and the background watchtower thread reads it (V0-6b).
+    /// (not the per-`/sign` `SignState` lock used for the logs above): the
+    /// `/sign` handler writes it and the background watchtower task reads it
+    /// (V0-6b).
     sign_log: Arc<Mutex<HashSet<Txid>>>,
     /// Queued watchtower alerts, pulled by the coordinator via `GET /events`
     /// (ADR-0002). Bounded, in-memory (DESIGN.md). Shared behind a `Mutex`: the
-    /// background watchtower thread writes it and `/events` reads it (V0-6b).
+    /// background watchtower task writes it and `/events` reads it (V0-6b).
     alerts: Arc<Mutex<AlertQueue>>,
     /// Parsed chain-backend endpoint (rpc socket + base64 auth) for the
-    /// watchtower driver, if configured. `None` ⇒ no scan thread. Held so the
+    /// watchtower driver, if configured. `None` ⇒ no scan task. Held so the
     /// daemon can build the backend and spawn the driver after load
     /// ([`Node::spawn_watchtower`]).
     chain_backend: Option<(SocketAddr, String)>,
@@ -244,8 +249,7 @@ impl Node {
             max_commitment_age_secs: config.max_commitment_age_secs,
             hold_secs: config.hold_secs,
             escape_descriptor,
-            replay_log: RefCell::new(ReplayLog::default()),
-            pending_log: RefCell::new(PendingLog::default()),
+            sign_state: Mutex::new(SignState::default()),
             sign_log: Arc::new(Mutex::new(HashSet::new())),
             alerts: Arc::new(Mutex::new(AlertQueue::new(watchtower::DEFAULT_ALERT_CAP))),
             chain_backend,
@@ -298,17 +302,17 @@ impl Node {
 
     /// If a chain backend is configured, spawn the background watchtower driver
     /// (ADR-0001, V0-6b). Otherwise this is a no-op. The daemon calls this once
-    /// after [`Node::load`]. The thread shares this node's sign log and alert
-    /// queue, so co-signed spends are recognized and alerts surface through
-    /// `GET /events`. Unit tests build a `Node` without a chain backend and so
-    /// never start a thread.
+    /// after [`Node::load`], from within the tokio runtime. The task shares this
+    /// node's sign log and alert queue, so co-signed spends are recognized and
+    /// alerts surface through `GET /events`. Unit tests build a `Node` without a
+    /// chain backend and so never start a task.
     pub fn spawn_watchtower(&self) {
         let Some((addr, auth)) = self.chain_backend.clone() else {
             return;
         };
         let backend = BitcoindBackend::new(addr, auth);
         watchtower::spawn_driver(
-            Box::new(backend),
+            Arc::new(backend),
             self.vault_scripts(),
             Arc::clone(&self.sign_log),
             Arc::clone(&self.alerts),
@@ -381,6 +385,40 @@ pub fn handle_sign(
     request: &SignRequest,
     now: u64,
 ) -> Result<SignResponse, BadRequest> {
+    handle_sign_after_lock(node, request, || now)
+}
+
+/// Handle an HTTP sign submission using the node's clock, read only after the
+/// sign-state lock so queued time cannot stale expiry or Hold checks.
+pub(crate) fn handle_sign_now(
+    node: &Node,
+    request: &SignRequest,
+) -> Result<SignResponse, BadRequest> {
+    handle_sign_after_lock(node, request, || {
+        // Before the epoch is impossible in practice; treating it as 0 fails
+        // safe because every real commitment then reads as expired.
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
+}
+
+fn handle_sign_after_lock(
+    node: &Node,
+    request: &SignRequest,
+    clock: impl FnOnce() -> u64,
+) -> Result<SignResponse, BadRequest> {
+    // The whole call runs under ONE lock over the replay + pending logs
+    // (`Mutex<SignState>`), reproducing the atomicity the old sequential serve
+    // loop gave for free: two concurrent `/sign` requests execute one-at-a-time
+    // and their check-then-update sequences never interleave. This serializes
+    // `/sign` against `/sign` BY DESIGN — the async migration isolates `/sign`
+    // from `/events` (and, in V0-8a, `/channel`), which keep their own locks,
+    // not sign-vs-sign throughput.
+    let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
+    let now = clock();
+
     // 1. PIN, before anything else: no valid PIN, nothing is ever signed
     //    (ADR-0008). At first light a duress PIN is verified and accepted
     //    exactly like the normal one — the duress *response* is v0 work,
@@ -413,14 +451,11 @@ pub fn handle_sign(
     //    resubmission. Keyed by commitment hash — an RBF replacement has a
     //    different id and is never blocked here. Prune the pending log on the
     //    same schedule so its Hold timers stay bounded too.
-    {
-        let mut log = node.replay_log.borrow_mut();
-        log.prune(now);
-        if let Some(recorded) = log.get(&commitment_id, now) {
-            return Ok(recorded);
-        }
+    state.replay.prune(now);
+    if let Some(recorded) = state.replay.get(&commitment_id, now) {
+        return Ok(recorded);
     }
-    node.pending_log.borrow_mut().prune(now);
+    state.pending.prune(now);
 
     // 5. Node-capped expiry, against the node's OWN clock: refuse an already-
     //    expired commitment, and refuse one whose expiry runs past the node's
@@ -448,7 +483,7 @@ pub fn handle_sign(
     //    not"). An invalid submission is never held: the pending log holds only
     //    spends that would otherwise be signed.
     if let Err(refused) = verify_spend(node, &psbt) {
-        record_verdict(node, &commitment_id, request.expiry, &refused);
+        record_verdict(&mut state.replay, &commitment_id, request.expiry, &refused);
         return Ok(refused);
     }
 
@@ -459,7 +494,7 @@ pub fn handle_sign(
     //    through to signing. Classification only routes: the checks above ran
     //    for every class, so a generous class can never bypass them.
     if destination_class(node, &psbt) == DestClass::Hot {
-        let recorded_first_seen = node.pending_log.borrow().first_seen(&commitment_id, now);
+        let recorded_first_seen = state.pending.first_seen(&commitment_id, now);
         let first_seen = recorded_first_seen.unwrap_or(now);
         let elapsed = now.saturating_sub(first_seen);
         let hold_expires_at = first_seen.saturating_add(node.hold_secs);
@@ -478,8 +513,8 @@ pub fn handle_sign(
             // (reading first_seen above guarantees it never resets), then
             // answer Pending with the time left.
             if recorded_first_seen.is_none() {
-                node.pending_log
-                    .borrow_mut()
+                state
+                    .pending
                     .record(commitment_id.clone(), now, request.expiry);
             }
             return Ok(SignResponse::Pending(Pending {
@@ -508,7 +543,7 @@ pub fn handle_sign(
         }
         Err(detail) => refusal(RefusalCode::PsbtInconsistent, "signing", detail),
     };
-    record_verdict(node, &commitment_id, request.expiry, &verdict);
+    record_verdict(&mut state.replay, &commitment_id, request.expiry, &verdict);
     Ok(verdict)
 }
 
@@ -581,12 +616,18 @@ fn verify_spend(node: &Node, psbt: &Psbt) -> Result<(), SignResponse> {
 }
 
 /// Record `verdict` under `commitment_id` in the anti-replay log, but only when
-/// the commitment fully determines it (see [`is_recordable_verdict`]).
-fn record_verdict(node: &Node, commitment_id: &str, expiry: u64, verdict: &SignResponse) {
+/// the commitment fully determines it (see [`is_recordable_verdict`]). Takes the
+/// already-locked replay log (the handler holds the one `SignState` lock across
+/// its whole run), so recording stays inside the same critical section as the
+/// idempotency check above it.
+fn record_verdict(
+    replay: &mut ReplayLog,
+    commitment_id: &str,
+    expiry: u64,
+    verdict: &SignResponse,
+) {
     if is_recordable_verdict(verdict) {
-        node.replay_log
-            .borrow_mut()
-            .record(commitment_id.to_string(), expiry, verdict.clone());
+        replay.record(commitment_id.to_string(), expiry, verdict.clone());
     }
 }
 
@@ -942,5 +983,134 @@ mod watchtower_wiring {
         assert_eq!(alerts[0].kind, AlertKind::UnrecognizedSpend);
         assert_eq!(alerts[0].spend_txid, foreign.to_string());
         assert_eq!(cursor, 1);
+    }
+}
+
+/// Shared test fixtures: a signable node and a valid `SignRequest`. Used by the
+/// `server` HTTP regression tests, which drive the real handler over a real
+/// socket (so the handler reads the system clock, unlike the direct-call unit
+/// tests that pass a fixed `now`). Mirrors `watchtower_wiring::signed_node`'s
+/// vault.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn key(i: u8) -> (SecretKey, PublicKey) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[i; 32]).expect("32 nonzero bytes");
+        (sk, PublicKey::new(sk.public_key(&secp)))
+    }
+
+    /// A 1-of-1 vault (user key + one node key, `hold_secs = 0`) bound to
+    /// `listen_port = 0`, plus a valid hot-spend `SignRequest` that `handle_sign`
+    /// signs on first submission. The request's `expiry` is set against the REAL
+    /// clock and sits well inside `max_commitment_age_secs`.
+    pub(crate) fn node_and_valid_request() -> (Node, SignRequest) {
+        let (_, user) = key(1);
+        let (nsk, node_pub) = key(2);
+        let (_, hot_key) = key(10);
+        let descriptor = format!("wsh(and_v(v:pk({user}),multi(1,{node_pub})))");
+        let hot = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({hot_key})"))
+            .expect("hot descriptor");
+        let hot_spk = hot
+            .at_derivation_index(0)
+            .expect("definite")
+            .script_pubkey();
+        let config = format!(
+            "listen_port = 0\nnode_seckey = \"{}\"\ndescriptor = \"{descriptor}\"\n\
+             allowlist = [\"{hot}\"]\nmax_derivation_index = 5\nhold_secs = 0\n\
+             max_commitment_age_secs = 172800\npolicy_version = 1\n\
+             pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n",
+            nsk.display_secret(),
+            sha256::Hash::hash(b"1234"),
+            sha256::Hash::hash(b"9999"),
+        );
+        let node = Node::from_toml_str(&config).expect("valid config");
+        let vault_spk = node.vault_scripts()[0].clone();
+        let value = Amount::from_sat(100_000_000);
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                script_pubkey: hot_spk,
+                value: Amount::from_sat(99_990_000),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("unsigned tx");
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            script_pubkey: vault_spk,
+            value,
+        });
+        psbt.inputs[0].witness_script = Some(node.witness_script.clone());
+        let sighash = SighashCache::new(&psbt.unsigned_tx)
+            .p2wsh_signature_hash(0, &node.witness_script, value, EcdsaSighashType::All)
+            .expect("sighash");
+        let secp = Secp256k1::new();
+        let signature = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &key(1).0);
+        psbt.inputs[0].partial_sigs.insert(
+            user,
+            bitcoin::ecdsa::Signature {
+                signature,
+                sighash_type: EcdsaSighashType::All,
+            },
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let request = SignRequest {
+            psbt: psbt.to_string(),
+            escape_psbt: psbt.to_string(),
+            pin: "1234".into(),
+            expiry: now + 3_600,
+            policy_version: 1,
+        };
+        (node, request)
+    }
+}
+
+#[cfg(test)]
+mod sign_clock_tests {
+    use super::{handle_sign_after_lock, test_support::node_and_valid_request};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn queued_sign_reads_the_clock_only_after_acquiring_sign_state() {
+        let (node, request) = node_and_valid_request();
+        let now = request.expiry;
+        let node = Arc::new(node);
+        let worker_node = Arc::clone(&node);
+        let state = node.sign_state.lock().expect("sign_state lock");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (clock_tx, clock_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("worker started");
+            handle_sign_after_lock(&worker_node, &request, || {
+                clock_tx.send(()).expect("clock read");
+                now
+            })
+        });
+
+        started_rx.recv().expect("worker start");
+        assert!(clock_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(state);
+        clock_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("clock read after lock");
+        worker
+            .join()
+            .expect("worker thread")
+            .expect("valid request");
     }
 }
