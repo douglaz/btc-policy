@@ -25,7 +25,7 @@ A daemon holding exactly one federation key and one policy engine; independently
 _Avoid_: signer (alone), server, peer
 
 **Node id**:
-A Vault node's 0-based index in the vault descriptor's canonical (lexicographic-by-compressed-pubkey) node-key order. Derivable from the descriptor alone, so the node-id → descriptor-key mapping is definitionally total and unambiguous — never a separate table, never a human label. Appears in the Manifest, in every channel endorsement, and in every channel envelope.
+A Vault node's 0-based position in the vault descriptor's canonical node-key order — **lexicographic over the full key-expression string** (`[origin]xpub/path/*`), NOT by derived compressed pubkey (which is index-dependent; ADR-0013 §1). Computed identically by every party from the frozen descriptor string alone, so the node-id → descriptor-key mapping is a total, unambiguous bijection — never a separate table, never a human label. Appears in the Manifest, in every channel endorsement, and in every channel envelope.
 _Avoid_: node name, node index (alone — say which order), peer id
 
 **Quorum**:
@@ -129,7 +129,8 @@ The incident response: sweep everything through the Normal path to the Escape wa
 _Avoid_: key rotation (alone), migration
 
 **Watchtower**:
-A monitoring role performed by every Vault node (ADR-0001/0012): alerts on any Recovery-path spend (branch-identifiable on-chain) and any vault spend the node never **validated** (saw and policy-checked the request) — NOT "never co-signed" (in t-of-n, n−t nodes legitimately don't sign each spend). Continues during Lockdown and on keyless-rebooted nodes.
+A monitoring role performed by every Vault node (ADR-0001/0012): alerts on any Recovery-path spend (branch-identifiable on-chain) and any vault spend the node never **validated AND policy-ACCEPTED** (authorized / would-authorize — added or would have added its partial) — NOT merely "saw and policy-checked" (a spend a node policy-*refused* was checked but must NOT count as recognized, or a theft fanned to honest nodes would suppress its own alert), and NOT "never co-signed" (in t-of-n, n−t nodes legitimately don't sign each spend). Continues during Lockdown. A rebooted node is **dead** (tmpfs reboot-death, ADR-0007), so it performs no duty until re-provisioned — watchtower coverage is carried by the surviving nodes; a re-provisioned node starts with an empty recognition set and alerts on pre-existing spends it never accepted (safe-direction).
+_Avoid_: co-sign check, monitors (alone)
 _Avoid_: monitor (alone), watchtower service
 
 **Soft vault**:

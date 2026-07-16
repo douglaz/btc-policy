@@ -17,7 +17,7 @@ Repo: btc-policy (local)
 ## Key Interactions to Verify
 - Honest spend end-to-end on regtest: build hot tx + escape variant → user signs both → PIN → fan out to 5 nodes → all pending → re-submit after Hold → collect 3-of-5 → finalize → broadcast → confirm.
 - Hold semantics: hot-class pending at first submission; re-submission before D → still pending; after D → signed; escape and refresh classes sign instantly with no pending phase.
-- Duress: duress PIN → wire response byte-identical to normal pending; configured duress_response executes (escape broadcast and/or lockdown); lockdown persists across node restart; all subsequent submissions → FRAUD_SUSPECTED.
+- Duress: duress PIN → wire response byte-identical to normal pending; configured duress_response executes (escape broadcast and/or lockdown); lockdown holds for the node's lifetime, and a rebooted node is DEAD — bare machine requiring full re-provisioning, never a node that comes back locked-down (RAMDISK deployment, ADR-0007; reboot-death/tmpfs, 2026-07-16); all subsequent submissions → FRAUD_SUSPECTED.
 - Escape-sweep cancel: escape sweep confirms → conflicting pending spend can never complete (inputs gone); node prunes it.
 - PIN gate: missing/wrong PIN → BAD_PIN, nothing signed, ever.
 - Log reconciliation: a sign event pulled from a node that the coordinator didn't originate → user-facing alert.

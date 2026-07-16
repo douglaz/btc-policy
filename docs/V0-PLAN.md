@@ -16,7 +16,7 @@ V0-5  verified change + consistency + descriptor allowlist  DONE (a9d57e9)
 V0-6  chain backend + watchtower classification + /events + broadcast  DONE (595c338, primitives)
 V0-6b drive the watchtower scan in the node daemon        DONE (2ce2933)
 V0-8  node-to-node assembly + node broadcast; coordinator → relay  NEXT (the spine)
-V0-4a dual PINs + deferred lockdown + persistence (node-local; no channel)  → parallel to V0-8
+V0-4a dual PINs + deferred lockdown, RAMDISK state (reboot-death/tmpfs, 2026-07-16; node-local; no channel)  → parallel to V0-8
 V0-4b duress escape (rides V0-8's assembly+broadcast; pin decides + delayed) → V0-8, V0-4a
 V0-7  proptest + full test matrix + hold-clawback demo  → all
 V0-9  provisioning: manifest + config schema + coord auth-key backup  → feeds V0-8 (ADR-0013 §4/§5/§7)
@@ -64,7 +64,7 @@ rework). Keeps policy node-local; the channel carries no policy.
 
 **Newly-specified mechanisms to build here (fresh-eyes review; ADR-0012/0013):**
 - **Pin-independent ingress** (identical per-request work: validate both spend + escape, sign both
-  partials, persist, propagate to all peers; pin sets only an internal fire bit; **combine-at-broadcast**,
+  partials, record in RAMDISK state (reboot-death/tmpfs, 2026-07-16 — no persisted partials), propagate to all peers; pin sets only an internal fire bit; **combine-at-broadcast**,
   no pre-assembled escape on the response path) — the silence-load-bearing ingress shape every request
   rides. Shared with V0-4. (ADR-0012.)
 - **Per-vault manifest + full node config schema** — the immutable, hash-pinned manifest (ADR-0013 §4:
@@ -92,8 +92,10 @@ in first-light — do first.
 
 **Follow-up — per-node pin-attempt budget (ADR-0013 §7; shared with V0-4).** The
 pin hash-compare (constant-time) lives alongside user-sig verification; guard online
-guessing with a durable **per-node** budget: failed-compare count over `window_secs`,
-`backoff_schedule`, then `lockout_secs` (persisted across reboots). No cross-node
+guessing with a **per-node** budget: failed-compare count over `window_secs`,
+`backoff_schedule`, then `lockout_secs` (RAMDISK/node-lifetime — the tmpfs deployment
+means a reboot destroys the budget AND the signing key alike, so no reset-by-reboot;
+reboot-death/tmpfs, 2026-07-16). No cross-node
 accounting (the channel forbids shared mutable state); per-node suffices because the
 pin is the same value everywhere. Lockout is a transient rate-limit, **not** Lockdown.
 
@@ -175,7 +177,7 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
   nodes **VALIDATE** it (destination = escape descriptor, value-coverage ≥
   threshold, feerate ≥ floor) — they do NOT build it, and there is NO stored
   standby (per ADR-0012 — this line previously described the superseded design).
-- Duress state machine: arm (+propagate to peers +persist) → armed (silent,
+- Duress state machine: arm (+propagate to peers +record in RAMDISK state — reboot-death/tmpfs, 2026-07-16) → armed (silent,
   freezes hot-class completion) → **unconditional lockdown at T** (terminal,
   recovery-path exit), **THEN a best-effort sweep** (combine + re-broadcast; may
   fail → funds stay frozen → recovery). `duress_delay_secs` is the hostage-safety window.
@@ -185,16 +187,18 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
 **Newly-specified mechanisms to build (fresh-eyes review; ADR-0012/0013):**
 - **Pin-independent ingress** (silence-load-bearing) — every request, normal or duress, does
   identical observable work: coord-auth + freshness, validate BOTH the spend and the always-present
-  escape, sign both partials, persist, and propagate to all peers; the pin (constant-time hash-compare)
+  escape, sign both partials, record in RAMDISK state (reboot-death/tmpfs, 2026-07-16), and propagate to all peers; the pin (constant-time hash-compare)
   flips only an **internal** fire bit. **Combine-at-broadcast** (do not pre-assemble the escape on the
   response path). Shared with V0-8. (ADR-0012.)
 - **Node-derived transaction-class predicate + reject-mixed (ADR-0013 §3; shared with V0-5)** — class
   comes from the spend's **outputs**, never a coordinator label: escape-class iff *every* output pays the
   escape descriptor, refresh-class iff every output pays the vault descriptor, else hot-class; **mixed →
   reject (`PSBT_INCONSISTENT`)** (closes the 99%-hot + dust-to-escape bypass).
-- **Durable ARMING state + unconditional Lockdown-at-T on every failure branch** — persist the armed bit
-  + `T`; enter Lockdown at `T` even if fire/broadcast fails (not only after confirm); the pin is **never
-  persisted in the envelope** (ADR-0012 duress state machine).
+- **RAMDISK ARMING state + unconditional Lockdown-at-T on every failure branch** (reboot-death/tmpfs,
+  2026-07-16) — hold the armed bit + `T` in RAMDISK node state, no persistence: a rebooted armed node is
+  DEAD and contributes no partial; the surviving armed set fires the sweep at `T` if ≥ t remain, else
+  lockdown-only → recovery (ADR-0007); enter Lockdown at `T` even if fire/broadcast fails (not only after
+  confirm); the pin is **never persisted in the envelope** (ADR-0012 duress state machine).
 - **Two-track duress state machine — arm is keyed on the valid DURESS PIN ALONE** (unconditional,
   chain-view-independent): a valid coordinator-authenticated duress pin **freezes hot-class finalization +
   schedules lockdown at T**, with **NO** coverage / feerate / `testmempoolaccept` / mempool judgment at arm
@@ -203,8 +207,9 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
   package `testmempoolaccept`) is **ENTIRELY a fire-time check** that gates only whether the best-effort
   sweep fires; a sweep that fails still leaves the node frozen + locked down → recovery. See ADR-0012
   "Duress state machine (per node) — normative".
-- **Per-node pin-attempt budget protocol** (durable count/window/backoff/lockout; no cross-node accounting;
-  lockout ≠ Lockdown) — shared with V0-1 (ADR-0013 §7).
+- **Per-node pin-attempt budget protocol** (RAMDISK/node-lifetime count/window/backoff/lockout —
+  reboot-death/tmpfs, 2026-07-16; no cross-node accounting; lockout ≠ Lockdown) — shared with V0-1
+  (ADR-0013 §7).
 
 ## V0-5 — verified change + PSBT consistency + descriptor allowlist
 policy-core: verified-change via own-descriptor re-derivation at bounded index;
