@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -15,6 +15,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use vault_proto::SignRequest;
 
+use crate::channel::{self, ChannelReply, RejectReason};
 use crate::{handle_sign_now, Node};
 
 /// Unchanged 1 MiB cap applied before axum buffers a request body.
@@ -24,11 +25,24 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// header-read deadline is deferred v1 hardening.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound the pre-auth `/channel` body read so an incomplete or slow body cannot pin
+/// a concurrency permit indefinitely. The permit is acquired BEFORE the body is
+/// buffered; without this deadline a peer that promises a body (Content-Length) and
+/// never sends it holds its permit forever, and `max_concurrent_channel_requests`
+/// such connections exhaust §8's pre-auth concurrency guard — turning the DoS
+/// *guard* into a DoS *vector* (every legitimate peer 429'd with no signature
+/// required). A complete envelope (≤ `max_msg_bytes`) over a healthy transport
+/// arrives well within this; a body that does not is a stalled peer we shed.
+const CHANNEL_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The deadline is state so the no-cancel test can force its path.
 #[derive(Clone)]
 struct AppState {
     node: Arc<Node>,
     handler_timeout: Duration,
+    /// Deadline for buffering a `/channel` body while its pre-auth permit is held
+    /// (see [`CHANNEL_BODY_READ_TIMEOUT`]). State so a test can force the path fast.
+    channel_body_timeout: Duration,
     #[cfg(test)]
     sign_entered: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -48,17 +62,42 @@ pub(crate) fn app_with_timeout(node: Arc<Node>, handler_timeout: Duration) -> Ro
     router(AppState {
         node,
         handler_timeout,
+        channel_body_timeout: CHANNEL_BODY_READ_TIMEOUT,
         #[cfg(test)]
         sign_entered: None,
     })
 }
 
+/// Build the app with an explicit `/channel` body-read deadline (the permit-pinning
+/// test forces the timeout path fast).
+#[cfg(test)]
+pub(crate) fn app_with_channel_body_timeout(
+    node: Arc<Node>,
+    channel_body_timeout: Duration,
+) -> Router {
+    router(AppState {
+        node,
+        handler_timeout: HANDLER_TIMEOUT,
+        channel_body_timeout,
+        sign_entered: None,
+    })
+}
+
 fn router(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/sign", post(sign))
-        .route("/events", get(events))
-        // The body limit applies to every route (only `/sign` carries a body,
-        // but a global limit is the safe default).
+        .route("/events", get(events));
+    // `/channel` is mounted ONLY in channel mode (absent `[channel]` ⇒ the route
+    // does not exist, so a request 404s and the node behaves exactly as today).
+    // Its body limit is disabled here so the handler can enforce its OWN
+    // `max_msg_bytes` cap and answer a TAGGED `REJECTED`/400 for an oversized body
+    // (the channel surface is uniformly tagged), instead of axum's untagged 413.
+    if state.node.channel.is_some() {
+        router = router.route("/channel", post(channel).layer(DefaultBodyLimit::disable()));
+    }
+    router
+        // The global 1 MiB body limit applies to `/sign` (413 preserved) and
+        // `/events`; `/channel` overrides it above.
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -68,6 +107,7 @@ fn app_with_sign_entry(node: Arc<Node>, sign_entered: std::sync::mpsc::Sender<()
     router(AppState {
         node,
         handler_timeout: HANDLER_TIMEOUT,
+        channel_body_timeout: CHANNEL_BODY_READ_TIMEOUT,
         sign_entered: Some(sign_entered),
     })
 }
@@ -126,6 +166,84 @@ async fn events(State(state): State<AppState>, uri: Uri) -> Response {
             &format!("cannot encode events: {e}"),
         ),
     }
+}
+
+/// `POST /channel`: one signed envelope in, one tagged JSON reply out (§5b). The
+/// verify-and-store work runs on `spawn_blocking` (secp verification is CPU-bound),
+/// so a saturated channel load does not starve `/events` or the watchtower tick —
+/// the isolation the async migration bought. Layered DoS guards: a pre-auth global
+/// concurrency bound (RATE_LIMITED when saturated) and a per-`max_msg_bytes` body
+/// cap (tagged REJECTED/OVERSIZED_BODY), before any crypto.
+async fn channel(State(state): State<AppState>, body: Body) -> Response {
+    let Some(ch) = state.node.channel.as_ref() else {
+        // Unreachable — the route is mounted only when `channel.is_some()`.
+        return error_response(StatusCode::NOT_FOUND, "channel not configured");
+    };
+    // Pre-auth: bound concurrent `/channel` work so forged traffic cannot burn CPU
+    // or a victim peer's quota unboundedly.
+    let permit = match ch.concurrency().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return channel_response(ChannelReply::RateLimited {
+                retry_after_secs: 1,
+            })
+        }
+    };
+    // Pre-auth: read at most `max_msg_bytes` AND within a bounded deadline while the
+    // permit is held. An oversized body is a TAGGED reject; a body that does not
+    // arrive in time is shed as RATE_LIMITED so a stalled/incomplete peer cannot pin
+    // the permit indefinitely (else the pre-auth concurrency guard is exhaustible).
+    let bytes = match tokio::time::timeout(
+        state.channel_body_timeout,
+        to_bytes(body, ch.max_msg_bytes()),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
+            drop(permit);
+            return channel_response(ChannelReply::Rejected(RejectReason::OversizedBody));
+        }
+        Err(_elapsed) => {
+            drop(permit);
+            return channel_response(ChannelReply::RateLimited {
+                retry_after_secs: 1,
+            });
+        }
+    };
+    let node = Arc::clone(&state.node);
+    let outcome = tokio::task::spawn_blocking(move || {
+        // Hold the pre-auth permit until ingest actually finishes — move it INTO the
+        // job, not just the handler future. `spawn_blocking` detaches: if the
+        // connection task is cancelled while we await the JoinHandle (a peer that
+        // completes a body, then disconnects), the handler future drops, but this
+        // CPU-bound job keeps running. Releasing the permit with the handler future
+        // would let such a peer queue more detached verification jobs than
+        // `max_concurrent_channel_requests`, defeating §8's pre-auth concurrency guard
+        // and exhausting the blocking pool. Tying the permit to the job caps in-flight
+        // work at the bound regardless of cancellation.
+        let _permit = permit;
+        node.channel
+            .as_ref()
+            .expect("channel mounted")
+            .ingest(&bytes, channel::unix_now())
+    })
+    .await;
+    match outcome {
+        Ok(reply) => channel_response(reply),
+        // The blocking task panicked (a bug, never an input): 500, not a hang.
+        Err(_join_error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "channel task failed unexpectedly",
+        ),
+    }
+}
+
+/// Render a [`ChannelReply`] as its fixed `(status, JSON body)` (§5b).
+fn channel_response(reply: ChannelReply) -> Response {
+    let (code, body) = reply.http();
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    json_response(status, body)
 }
 
 /// Absent/unparseable cursors read 0; only `since=<n>` is recognized.

@@ -15,6 +15,7 @@
 //! watchtower. Duress actions and lockdown remain v0 work (V0-4).
 
 pub mod chain;
+pub mod channel;
 mod replay;
 pub mod server;
 pub mod watchtower;
@@ -39,7 +40,7 @@ use vault_proto::{
 };
 
 use crate::chain::{BitcoindBackend, ChainBackend};
-use crate::watchtower::{Alert, AlertQueue};
+use crate::watchtower::{AlertQueue, Event};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -92,6 +93,13 @@ pub struct ConfigFile {
     /// background task scanning this bitcoind on a fixed interval.
     #[serde(default)]
     pub chain_backend: Option<ChainBackendConfig>,
+    /// Optional node-to-node channel config (V0-8a; ADR-0013 §5). **Absent ⇒
+    /// absent-channel mode**: `/channel` is NOT mounted, NO manifest/bijection/
+    /// endorsement invariants run, and the node behaves exactly as pre-channel (so
+    /// `demo first-light`, which does not use the channel, keeps passing WITHOUT
+    /// editing the demo). Present ⇒ every invariant applies and `/channel` mounts.
+    #[serde(default)]
+    pub channel: Option<channel::ChannelConfig>,
 }
 
 /// The bitcoind JSON-RPC endpoint the watchtower driver scans, exactly what
@@ -158,6 +166,11 @@ pub struct Node {
     /// daemon can build the backend and spawn the driver after load
     /// ([`Node::spawn_watchtower`]).
     chain_backend: Option<(SocketAddr, String)>,
+    /// The node-to-node channel runtime (V0-8a), built from the sealed manifest
+    /// when `[channel]` is present. `None` ⇒ absent-channel mode: `/channel` is
+    /// not mounted and no channel invariant runs. Read by the `/channel` route and
+    /// the `/sign`-path candidate-registry funnel.
+    pub(crate) channel: Option<channel::ChannelState>,
 }
 
 impl Node {
@@ -183,6 +196,10 @@ impl Node {
         let vault = Descriptor::<DescriptorPublicKey>::from_str(&config.descriptor)
             .map_err(|e| format!("bad descriptor: {e}"))?;
         let user_pubkey = first_light_user_key_of(&descriptor)?;
+        // The federation node keys, for the channel manifest's node_id ↔
+        // descriptor-key bijection (§1). Extracted here while the concrete
+        // descriptor is in scope; unused in absent-channel mode.
+        let node_keys = first_light_node_keys_of(&descriptor)?;
         let witness_script = descriptor
             .explicit_script()
             .map_err(|e| format!("descriptor has no witness script: {e}"))?;
@@ -231,6 +248,27 @@ impl Node {
                     .map_err(|e| format!("bad chain_backend.rpc_addr {:?}: {e}", cb.rpc_addr))
             })
             .transpose()?;
+        // The alert queue is shared with the channel so freshness-reject events
+        // surface through the same `GET /events` path (codex I2).
+        let alerts = Arc::new(Mutex::new(AlertQueue::new(watchtower::DEFAULT_ALERT_CAP)));
+        // Build the channel runtime iff `[channel]` is present. Every §2 startup
+        // invariant runs inside `build`; a failure is a fatal config error here,
+        // never a runtime refusal.
+        let channel = config
+            .channel
+            .as_ref()
+            .map(|cfg| {
+                channel::ChannelState::build(
+                    cfg,
+                    &seckey,
+                    pubkey,
+                    wallet_id,
+                    &node_keys,
+                    config.listen_port,
+                    Arc::clone(&alerts),
+                )
+            })
+            .transpose()?;
         Ok(Node {
             listen_port: config.listen_port,
             seckey,
@@ -251,8 +289,9 @@ impl Node {
             escape_descriptor,
             sign_state: Mutex::new(SignState::default()),
             sign_log: Arc::new(Mutex::new(HashSet::new())),
-            alerts: Arc::new(Mutex::new(AlertQueue::new(watchtower::DEFAULT_ALERT_CAP))),
+            alerts,
             chain_backend,
+            channel,
         })
     }
 
@@ -290,10 +329,11 @@ impl Node {
         .map(|outcome| outcome.new_alerts)
     }
 
-    /// The queued alerts after cursor `since`, plus the new cursor (the `GET
+    /// The queued events after cursor `since`, plus the new cursor (the `GET
     /// /events` pull API; ADR-0002). No loss, no duplication across successive
-    /// pulls.
-    pub fn events(&self, since: u64) -> (Vec<Alert>, u64) {
+    /// pulls. Carries watchtower alerts and — under `[channel]` — channel
+    /// freshness-reject events, both through the one queue (codex I2).
+    pub fn events(&self, since: u64) -> (Vec<Event>, u64) {
         self.alerts
             .lock()
             .expect("alerts lock poisoned")
@@ -351,6 +391,31 @@ fn first_light_user_key_of(descriptor: &Descriptor<PublicKey>) -> Result<PublicK
         return Err(template_err());
     };
     Ok(*user)
+}
+
+/// Extract the federation node keys (the `multi(t, node...)` keys) from the
+/// first-light descriptor template — the descriptor-canonical key set the channel
+/// manifest's `node_id` bijection is defined over (§1). Returned in descriptor
+/// order; the channel derives the canonical (lexicographic) order itself.
+fn first_light_node_keys_of(descriptor: &Descriptor<PublicKey>) -> Result<Vec<PublicKey>, Error> {
+    let template_err = || -> Error {
+        "descriptor does not match the first-light template \
+         wsh(and_v(v:pk(USER),multi(t,...)))"
+            .into()
+    };
+    let Descriptor::Wsh(wsh) = descriptor else {
+        return Err(template_err());
+    };
+    let WshInner::Ms(ms) = wsh.as_inner() else {
+        return Err(template_err());
+    };
+    let Terminal::AndV(_left, right) = &ms.node else {
+        return Err(template_err());
+    };
+    let Terminal::Multi(thresh) = &right.node else {
+        return Err(template_err());
+    };
+    Ok(thresh.data().to_vec())
 }
 
 /// Handle one `/sign` submission. `now` is unix seconds by the node's own
@@ -456,6 +521,13 @@ fn handle_sign_after_lock(
         return Ok(recorded);
     }
     state.pending.prune(now);
+    // Prune expired channel candidates on the SAME sweep the replay/pending logs
+    // run on (§5): a candidate and its stored partials evict when its commitment
+    // expires. (`/channel` lookup also evicts expired candidates, so an idle node
+    // that never runs this sweep still rejects them.)
+    if let Some(channel) = &node.channel {
+        channel.prune_store(now);
+    }
 
     // 5. Node-capped expiry, against the node's OWN clock: refuse an already-
     //    expired commitment, and refuse one whose expiry runs past the node's
@@ -517,12 +589,17 @@ fn handle_sign_after_lock(
                     .pending
                     .record(commitment_id.clone(), now, request.expiry);
             }
-            return Ok(SignResponse::Pending(Pending {
-                commitment_id,
+            let pending = SignResponse::Pending(Pending {
+                commitment_id: commitment_id.clone(),
                 first_seen,
                 // elapsed < hold_secs in this branch, so the difference is exact.
                 remaining_secs: node.hold_secs - elapsed,
-            }));
+            });
+            // §4 registry funnel: an accepted-but-Pending hot spend registers a
+            // candidate at ingress, so a fast peer's partial arriving during our
+            // Hold verifies instead of bouncing as unknown-candidate.
+            register_verdict(node, &psbt, &commitment_id, request.expiry, &pending);
+            return Ok(pending);
         }
     }
 
@@ -544,7 +621,53 @@ fn handle_sign_after_lock(
         Err(detail) => refusal(RefusalCode::PsbtInconsistent, "signing", detail),
     };
     record_verdict(&mut state.replay, &commitment_id, request.expiry, &verdict);
+    // §4 registry funnel: an instantly-signed spend registers its candidate (with
+    // this node's own partial already present); a signing refusal never registers.
+    register_verdict(node, &psbt, &commitment_id, request.expiry, &verdict);
     Ok(verdict)
+}
+
+/// The §4 candidate-registry funnel: on a non-refused `/sign` verdict (Pending or
+/// Signed, NEVER Refusal) build this node's canonical candidate and reserve a
+/// store slot. Absent-channel mode ⇒ a no-op. At capacity the candidate is simply
+/// not inserted (logged) and the `/sign` verdict/response is unchanged — capacity
+/// gates the registry slot, not the sign decision (§5).
+fn register_verdict(
+    node: &Node,
+    psbt: &Psbt,
+    commitment_id: &str,
+    expiry: u64,
+    verdict: &SignResponse,
+) {
+    if !matches!(verdict, SignResponse::Signed(_) | SignResponse::Pending(_)) {
+        return;
+    }
+    let Some(channel) = &node.channel else {
+        return;
+    };
+    // Keep this node's own real signature in the candidate only when it actually
+    // signed (a `Signed` verdict); a `Pending` candidate carries no self signature,
+    // so any self entry in the request PSBT is a coordinator forgery to be stripped.
+    let node_signed = matches!(verdict, SignResponse::Signed(_));
+    match channel::Candidate::build(
+        psbt,
+        commitment_id,
+        expiry,
+        &node.witness_script,
+        &node.user_pubkey,
+        &node.pubkey,
+        node_signed,
+    ) {
+        Ok(candidate) => {
+            if matches!(
+                channel.register_candidate(candidate),
+                channel::RegisterOutcome::AtCapacity
+            ) {
+                eprintln!("channel: candidate {commitment_id} not registered — store at capacity");
+            }
+        }
+        Err(e) => eprintln!("channel: cannot build candidate {commitment_id}: {e}"),
+    }
 }
 
 /// Build the [`Commitment`] for `psbt` under this node's wallet, at the
@@ -991,8 +1114,8 @@ mod watchtower_wiring {
         assert_eq!(node.watchtower_tick(&unknown, 0).expect("scan"), 1);
         let (alerts, cursor) = node.events(0);
         assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].kind, AlertKind::UnrecognizedSpend);
-        assert_eq!(alerts[0].spend_txid, foreign.to_string());
+        assert_eq!(alerts[0].watchtower().kind, AlertKind::UnrecognizedSpend);
+        assert_eq!(alerts[0].watchtower().spend_txid, foreign.to_string());
         assert_eq!(cursor, 1);
     }
 }
