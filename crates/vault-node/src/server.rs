@@ -13,10 +13,10 @@ use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use vault_proto::SignRequest;
+use vault_proto::TaggedRequest;
 
 use crate::channel::{self, ChannelReply, RejectReason};
-use crate::{handle_sign_now, Node};
+use crate::{handle_refresh_now, handle_sign_now, Node};
 
 /// Unchanged 1 MiB cap applied before axum buffers a request body.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -112,11 +112,11 @@ fn app_with_sign_entry(node: Arc<Node>, sign_entered: std::sync::mpsc::Sender<()
     })
 }
 
-/// Byte-compatible `/sign`: 200 verdict JSON or 400 error JSON. Synchronous
-/// policy/secp work runs off-runtime. A timed-out client stops waiting, but its
-/// accepted job must finish and commit for idempotent resubmission.
+/// Tagged `/sign`: Spend and Refresh arms return 200 verdict JSON or 400 error
+/// JSON. Synchronous policy/secp work runs off-runtime. A timed-out client stops
+/// waiting, but its accepted job must finish and commit for idempotent resubmission.
 async fn sign(State(state): State<AppState>, body: Bytes) -> Response {
-    let request: SignRequest = match serde_json::from_slice(&body) {
+    let request: TaggedRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(e) => {
             return error_response(
@@ -133,7 +133,10 @@ async fn sign(State(state): State<AppState>, body: Bytes) -> Response {
     // `/sign` is serialized BY DESIGN by one `Mutex<SignState>` across the whole
     // call. Dropping a timed-out JoinHandle detaches rather than aborts the job,
     // preventing half-mutated ghost state. The clock is read after that lock.
-    let job = tokio::task::spawn_blocking(move || handle_sign_now(&node, &request));
+    let job = tokio::task::spawn_blocking(move || match request {
+        TaggedRequest::Spend(request) => handle_sign_now(&node, &request),
+        TaggedRequest::Refresh(request) => handle_refresh_now(&node, &request),
+    });
     match tokio::time::timeout(state.handler_timeout, job).await {
         Ok(Ok(Ok(response))) => match serde_json::to_string(&response) {
             Ok(json) => json_response(StatusCode::OK, json),
@@ -285,7 +288,7 @@ mod parse_since_tests {
 mod tests {
     use super::*;
     use crate::chain::{ChainBackend, SpendSeen};
-    use crate::test_support::node_and_valid_request;
+    use crate::test_support::{node_and_valid_request, valid_refresh_request};
     use crate::watchtower::{self, Alert, AlertKind};
     use crate::Error;
     use bitcoin::{ScriptBuf, Txid};
@@ -293,7 +296,7 @@ mod tests {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Instant;
     use tokio::task::spawn_blocking;
-    use vault_proto::SignResponse;
+    use vault_proto::{SignRequest, SignResponse, TaggedRequest};
 
     /// Send a `Connection: close` request and read its full response. Oversized
     /// requests tolerate axum closing before the client finishes writing.
@@ -358,6 +361,10 @@ mod tests {
 
     fn post(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
         send(addr, &post_head(path, body.len()), body.as_bytes(), false)
+    }
+
+    fn spend_body(request: &SignRequest) -> String {
+        serde_json::to_string(&TaggedRequest::Spend(request.clone())).expect("encode spend arm")
     }
 
     fn post_bytes(addr: SocketAddr, path: &str, body: &[u8]) -> (u16, String) {
@@ -425,13 +432,50 @@ mod tests {
     async fn post_sign_valid_body_returns_200_and_signed_json() {
         let (node, request) = node_and_valid_request();
         let addr = spawn_app(app(Arc::new(node))).await;
-        let body = serde_json::to_string(&request).expect("encode request");
+        let body = spend_body(&request);
         let (status, resp) = spawn_blocking(move || post(addr, "/sign", &body))
             .await
             .expect("client task");
         assert_eq!(status, 200);
         let parsed: SignResponse = serde_json::from_str(&resp).expect("decode response");
         assert!(matches!(parsed, SignResponse::Signed(_)), "got {parsed:?}");
+    }
+
+    /// The Refresh arm crosses the same auth + freshness ingress as Spend, then
+    /// returns a structured non-signing refusal until its burn bounds land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn post_sign_authenticates_then_refuses_the_refresh_arm() {
+        let (node, spend) = node_and_valid_request();
+        let refresh = valid_refresh_request(&node, &spend, "refresh-over-http");
+        let addr = spawn_app(app(Arc::new(node))).await;
+        let body = serde_json::to_string(&TaggedRequest::Refresh(refresh.clone()))
+            .expect("encode refresh arm");
+
+        let (status, response) = spawn_blocking(move || post(addr, "/sign", &body))
+            .await
+            .expect("refresh client");
+        assert_eq!(status, 200, "a policy refusal is an outcome: {response}");
+        let refusal: SignResponse = serde_json::from_str(&response).expect("refusal json");
+        assert!(matches!(
+            refusal,
+            SignResponse::Refusal(refusal)
+                if refusal.code == vault_proto::RefusalCode::RefreshUnsupported
+        ));
+
+        // The authentic request consumed its nonce before the unsupported-policy
+        // outcome, proving the HTTP arm did not bypass the freshness gate.
+        let replay_body = serde_json::to_string(&TaggedRequest::Refresh(refresh))
+            .expect("encode replayed refresh arm");
+        let (status, response) = spawn_blocking(move || post(addr, "/sign", &replay_body))
+            .await
+            .expect("refresh replay client");
+        assert_eq!(status, 200);
+        let refusal: SignResponse = serde_json::from_str(&response).expect("replay refusal json");
+        assert!(matches!(
+            refusal,
+            SignResponse::Refusal(refusal)
+                if refusal.code == vault_proto::RefusalCode::NonceReplayed
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -512,13 +556,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn two_identical_concurrent_signs_stay_consistent() {
+    async fn two_concurrent_signs_of_one_commitment_stay_consistent() {
         let (node, request) = node_and_valid_request();
         let node = Arc::new(node);
         let addr = spawn_app(app(node.clone())).await;
-        let body = serde_json::to_string(&request).expect("encode request");
 
-        let (b1, b2) = (body.clone(), body);
+        // The SAME commitment sent twice concurrently, as a coordinator racing its
+        // own retry does it: identical spend, but a fresh single-use nonce (and so
+        // a fresh coord_sig) per transmission — a re-sent nonce is a replay by
+        // definition (ADR-0013 §2) and would be refused at ingress instead of
+        // exercising the anti-replay log this test is about.
+        let mut second = request.clone();
+        crate::test_support::coord_sign(&mut second, "concurrent-retry");
+        let b1 = spend_body(&request);
+        let b2 = spend_body(&second);
         let one = spawn_blocking(move || post(addr, "/sign", &b1));
         let two = spawn_blocking(move || post(addr, "/sign", &b2));
         let (status1, resp1) = one.await.expect("client one");
@@ -557,7 +608,7 @@ mod tests {
         });
         held_rx.recv().expect("lock held");
 
-        let body = serde_json::to_string(&request).expect("encode request");
+        let body = spend_body(&request);
         let inflight = spawn_blocking(move || post(addr, "/sign", &body));
         // An OS thread waits for explicit handler entry, then times /events with
         // a socket deadline. It releases sign-state on every outcome, so an
@@ -661,7 +712,14 @@ mod tests {
         // Force timeout, then resubmit through the same node with a real deadline.
         let fast = spawn_app(app_with_timeout(node.clone(), Duration::ZERO)).await;
         let normal = spawn_app(app_with_timeout(node.clone(), Duration::from_secs(30))).await;
-        let body = serde_json::to_string(&request).expect("encode request");
+        let body = spend_body(&request);
+        // The resubmit is the real coordinator retry: the same commitment under a
+        // fresh single-use nonce + coord_sig (ADR-0013 §2). Idempotency is keyed on
+        // the commitment, not the transmission, so this still returns the ONE
+        // recorded verdict rather than signing twice.
+        let mut retry = request.clone();
+        crate::test_support::coord_sign(&mut retry, "resubmit-after-408");
+        let retry_body = spend_body(&retry);
 
         // Blocking inside handle_sign makes the 408 deterministic.
         let gate = node.clone();
@@ -706,7 +764,7 @@ mod tests {
         );
 
         // The resubmit returns the recorded Signed verdict.
-        let (status, resp) = spawn_blocking(move || post(normal, "/sign", &body))
+        let (status, resp) = spawn_blocking(move || post(normal, "/sign", &retry_body))
             .await
             .expect("resubmit client");
         assert_eq!(status, 200);

@@ -1,5 +1,5 @@
 //! `demo first-light`: the internal checkpoint from DESIGN.md — the smallest
-//! end-to-end run of the real two-phase `{psbt, escape_psbt, pin}` protocol.
+//! end-to-end run of the real coordinator-authenticated tagged request protocol.
 //!
 //! Act one: an honest, user-signed, PIN-carrying spend to the allowlisted hot
 //! wallet is signed by all 5 nodes; 3 signatures are combined, finalized,
@@ -19,6 +19,7 @@ use bitcoin::absolute::LockTime;
 use bitcoin::bip32::{Xpriv, Xpub};
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
 use bitcoin::transaction::Version;
@@ -29,7 +30,7 @@ use bitcoin::{
 use miniscript::psbt::PsbtExt;
 use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::json;
-use vault_proto::{RefusalCode, SignRequest, SignResponse};
+use vault_proto::{RefusalCode, SignRequest, SignResponse, TaggedRequest};
 
 use crate::bitcoind::Bitcoind;
 use crate::http::{self, Error};
@@ -74,6 +75,13 @@ pub fn run_first_light() -> Result<(), Error> {
     let node_actors: Vec<Actor> = (0..NODE_COUNT)
         .map(|_| Actor::random(&secp, &mut urandom))
         .collect::<Result<_, _>>()?;
+    // The coordinator auth keypair (ADR-0013 §2): ONE root, generated once here,
+    // provisioned into every node's per-vault config below (and therefore the
+    // channel manifest whenever channel mode is enabled), and signing every
+    // request the demo acts relay. Regtest provisioning — no SSH; the real
+    // ceremony is later V0-9.
+    let coordinator = Coordinator::random(&secp, &mut urandom)?;
+    let coord_auth_pubkey = coordinator.pubkey.to_string();
     // Hot and escape wallets are ranged xpub descriptors, so every spend pays a
     // freshly derived address instead of a reused fixed one (DESIGN.md,
     // "Destination allowlist"). The honest spend pays the hot wallet at a
@@ -132,6 +140,9 @@ pub fn run_first_light() -> Result<(), Error> {
             &descriptor_str,
             &[&hot_wallet.descriptor, &escape_wallet.descriptor],
             &escape_wallet.descriptor,
+            // The one coordinator auth root, provisioned identically into every
+            // node's per-vault config (ADR-0013 §2/§4).
+            &coord_auth_pubkey,
             // Each node drives its own watchtower against this regtest bitcoind
             // (ADR-0001, V0-6b).
             bitcoind.rpc_addr(),
@@ -154,6 +165,7 @@ pub fn run_first_light() -> Result<(), Error> {
         &mining_address,
         &nodes,
         &user,
+        &coordinator,
         &witness_script,
         &vault_utxo,
         &vault_spk,
@@ -164,6 +176,7 @@ pub fn run_first_light() -> Result<(), Error> {
         &secp,
         &nodes,
         &user,
+        &coordinator,
         &witness_script,
         &spend_tx,
         &vault_spk,
@@ -185,6 +198,7 @@ fn act_one(
     mining_address: &str,
     nodes: &[NodeProcess],
     user: &Actor,
+    coordinator: &Coordinator,
     witness_script: &ScriptBuf,
     vault_utxo: &Utxo,
     vault_spk: &ScriptBuf,
@@ -212,13 +226,27 @@ fn act_one(
     sign_all_inputs(secp, &mut honest, user, witness_script)?;
     sign_all_inputs(secp, &mut escape, user, witness_script)?;
 
-    let request = SignRequest {
+    let body = SignRequest {
         psbt: honest.to_string(),
         escape_psbt: escape.to_string(),
         pin: NORMAL_PIN.into(),
+        nonce: String::new(),
         expiry: commitment_expiry()?,
         policy_version: POLICY_VERSION,
+        coord_sig: String::new(),
     };
+
+    // Before the honest relay: the trust root itself. This same, otherwise
+    // PERFECTLY valid spend — allowlisted destination, real user signature, real
+    // PIN — signed by a coordinator outside the nodes' configured root — must be
+    // refused by every node (ADR-0013 §2). Nothing but the coordinator identity
+    // differs, so COORD_AUTH_INVALID (never DEST_NOT_ALLOWED or BAD_PIN) is proof
+    // the configured root is what refused it.
+    foreign_coordinator_is_refused(secp, nodes, &body)?;
+
+    // The real coordinator authenticates the request it relays (fresh nonce +
+    // signature over the canonical bytes) so every node admits it past the gate.
+    let request = coordinator.authorize(secp, body)?;
     let mut node_signed = Vec::new();
     for node in nodes {
         match node.sign(&request)? {
@@ -267,6 +295,7 @@ fn act_two(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
     nodes: &[NodeProcess],
     user: &Actor,
+    coordinator: &Coordinator,
     witness_script: &ScriptBuf,
     spend_tx: &Transaction,
     vault_spk: &ScriptBuf,
@@ -292,13 +321,21 @@ fn act_two(
     sign_all_inputs(secp, &mut theft, user, witness_script)?;
     sign_all_inputs(secp, &mut escape, user, witness_script)?;
 
-    let request = SignRequest {
-        psbt: theft.to_string(),
-        escape_psbt: escape.to_string(),
-        pin: NORMAL_PIN.into(),
-        expiry: commitment_expiry()?,
-        policy_version: POLICY_VERSION,
-    };
+    // The theft is a genuine coordinator-authenticated request too (the attacker
+    // holds the user key and PIN); only the destination allowlist stops it, and it
+    // must first pass the coord-auth gate to reach that policy refusal.
+    let request = coordinator.authorize(
+        secp,
+        SignRequest {
+            psbt: theft.to_string(),
+            escape_psbt: escape.to_string(),
+            pin: NORMAL_PIN.into(),
+            nonce: String::new(),
+            expiry: commitment_expiry()?,
+            policy_version: POLICY_VERSION,
+            coord_sig: String::new(),
+        },
+    )?;
     let mut refusals = 0;
     for node in nodes {
         match node.sign(&request)? {
@@ -322,6 +359,44 @@ fn act_two(
         }
     }
     println!("  ACT TWO OK — {refusals}/{NODE_COUNT} nodes refused with DEST_NOT_ALLOWED");
+    Ok(())
+}
+
+/// The coordinator trust root, demonstrated against the live federation: a
+/// request signed by a coordinator that is NOT the one provisioned into the
+/// nodes' configured trust root is refused by EVERY node with
+/// `COORD_AUTH_INVALID` (ADR-0013 §2). `body` is an otherwise-valid spend, so this
+/// isolates coordinator authentication as the sole reason for the refusal — the
+/// property V0-8b's Model-B spend path authenticates against.
+fn foreign_coordinator_is_refused(
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    nodes: &[NodeProcess],
+    body: &SignRequest,
+) -> Result<(), Error> {
+    // A coordinator the vault was never sealed to: a different key, but one that
+    // signs the canonical bytes just as correctly as the real one.
+    let foreign = Coordinator::random(secp, &mut File::open("/dev/urandom")?)?;
+    let request = foreign.authorize(secp, body.clone())?;
+    let mut refusals = 0;
+    for node in nodes {
+        match node.sign(&request)? {
+            SignResponse::Refusal(refusal) if refusal.code == RefusalCode::CoordAuthInvalid => {
+                refusals += 1;
+            }
+            other => {
+                return Err(format!(
+                    "node {} did not refuse a foreign coordinator with COORD_AUTH_INVALID: {}",
+                    node.number(),
+                    summarize(&other)
+                )
+                .into())
+            }
+        }
+    }
+    println!(
+        "  trust root OK — {refusals}/{NODE_COUNT} nodes refused a coordinator \
+         outside their configured trust root with COORD_AUTH_INVALID"
+    );
     Ok(())
 }
 
@@ -353,6 +428,55 @@ impl Actor {
 
 fn p2wpkh_spk(actor: &Actor) -> ScriptBuf {
     ScriptBuf::new_p2wpkh(&CompressedPublicKey(actor.pubkey.inner).wpubkey_hash())
+}
+
+/// The coordinator's authentication identity (ADR-0013 §2). Generated ONCE for
+/// the demo vault; its public half is provisioned into every node's per-vault
+/// config (`coordinator_auth_pubkey`) and is the channel-manifest input when that
+/// mode is enabled. Its secret half signs every request the coordinator relays,
+/// so each node authenticates a request before evaluating it. Rotation would be
+/// a new vault (ADR-0013 §7), so the demo never rotates it.
+struct Coordinator {
+    seckey: SecretKey,
+    pubkey: PublicKey,
+}
+
+impl Coordinator {
+    fn random(
+        secp: &Secp256k1<bitcoin::secp256k1::All>,
+        urandom: &mut File,
+    ) -> Result<Coordinator, Error> {
+        let actor = Actor::random(secp, urandom)?;
+        Ok(Coordinator {
+            seckey: actor.seckey,
+            pubkey: actor.pubkey,
+        })
+    }
+
+    /// Turn an unauthenticated spend body into a coordinator-authenticated request:
+    /// attach a fresh single-use nonce and the coordinator's signature over the
+    /// canonical request bytes (ADR-0013 §2). Every node admits it past its gate.
+    fn authorize(
+        &self,
+        secp: &Secp256k1<bitcoin::secp256k1::All>,
+        mut request: SignRequest,
+    ) -> Result<SignRequest, Error> {
+        request.nonce = fresh_nonce()?;
+        // `coord_request()` selects the signed fields; coord_sig is excluded from
+        // its own preimage, so it needs no clearing before the digest.
+        let digest = request.coord_request().auth_digest();
+        let sig = secp.sign_ecdsa(&Message::from_digest(digest), &self.seckey);
+        request.coord_sig = sig.serialize_der().to_lower_hex_string();
+        Ok(request)
+    }
+}
+
+/// A fresh 32-byte random nonce as lowercase hex — single-use per request so a
+/// node rejects any replay (ADR-0013 §2/§3).
+fn fresh_nonce() -> Result<String, Error> {
+    let mut bytes = [0u8; 32];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.to_lower_hex_string())
 }
 
 /// A ranged single-sig destination wallet: a `wpkh(<xpub>/*)` descriptor from a
@@ -501,6 +625,7 @@ impl NodeProcess {
         descriptor: &str,
         allowlist: &[&str],
         escape_descriptor: &str,
+        coord_auth_pubkey: &str,
         bitcoind_rpc_addr: SocketAddr,
         bitcoind_auth: &str,
     ) -> Result<NodeProcess, Error> {
@@ -508,6 +633,8 @@ impl NodeProcess {
             allowlist.iter().map(|desc| format!("\"{desc}\"")).collect();
         // The `[chain_backend]` table drives the node's watchtower thread; it
         // comes last because a TOML table header ends the top-level section.
+        // `coordinator_auth_pubkey` is the trust root (ADR-0013 §2/§4): the same
+        // key in every node's config, turning on the coord-auth gate.
         let config = format!(
             "listen_port = {port}\n\
              node_seckey = \"{}\"\n\
@@ -520,6 +647,7 @@ impl NodeProcess {
              policy_version = {POLICY_VERSION}\n\
              pin_normal_hash = \"{}\"\n\
              pin_duress_hash = \"{}\"\n\
+             coordinator_auth_pubkey = \"{coord_auth_pubkey}\"\n\
              \n[chain_backend]\n\
              rpc_addr = \"{bitcoind_rpc_addr}\"\n\
              auth = \"{bitcoind_auth}\"\n",
@@ -582,7 +710,7 @@ impl NodeProcess {
     }
 
     fn sign(&self, request: &SignRequest) -> Result<SignResponse, Error> {
-        let body = serde_json::to_string(request)?;
+        let body = serde_json::to_string(&TaggedRequest::Spend(request.clone()))?;
         let response = http::post_json(self.addr(), "/sign", &body, None, Duration::from_secs(30))?;
         if response.status != 200 {
             return Err(format!(

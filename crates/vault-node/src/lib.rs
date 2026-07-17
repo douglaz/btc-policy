@@ -27,16 +27,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+use bitcoin::hex::FromHex;
+use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
 use bitcoin::{EcdsaSighashType, Psbt, PublicKey, ScriptBuf, Txid};
 use miniscript::descriptor::WshInner;
 use miniscript::{Descriptor, DescriptorPublicKey, Terminal};
-use replay::{ReplayLog, SignState};
+use replay::{NonceDecision, NonceLog, ReplayLog, SignState, MAX_COORD_NONCE_BYTES};
 use serde::Deserialize;
 use vault_proto::{
-    Commitment, CommitmentInput, CommitmentOutput, Pending, Refusal, RefusalCode, SignRequest,
-    SignResponse,
+    Commitment, CommitmentInput, CommitmentOutput, CoordRequest, Pending, RefreshRequest, Refusal,
+    RefusalCode, SignRequest, SignResponse,
 };
 
 use crate::chain::{BitcoindBackend, ChainBackend};
@@ -87,6 +88,25 @@ pub struct ConfigFile {
     /// real setup ceremony later).
     pub pin_normal_hash: String,
     pub pin_duress_hash: String,
+    /// The coordinator's 33-byte compressed authentication pubkey: the mandatory
+    /// per-vault trust root every request authenticates against (ADR-0013 §2/§4).
+    /// Channel mode includes this same value in its base-manifest hash; when an
+    /// `expected_manifest_hash` is provisioned, a changed key fails startup.
+    /// Operationally, **rotation is a new vault** — this code has no in-place
+    /// rotation mechanism (ADR-0013 §7).
+    ///
+    /// **Mandatory, deliberately un-defaulted**: every node is configured with
+    /// exactly one coordinator, so `/sign` always enforces the coordinator-auth +
+    /// freshness gate at ingress. ADR-0013 §2 states the rule unconditionally
+    /// ("nodes reject any request not validly coord-signed and fresh"), and unlike
+    /// `[channel]` — which §5 marks OPTIONAL — this field has no absent mode; it is
+    /// required exactly as `pin_normal_hash` is. A `#[serde(default)]` would not be
+    /// fail-open (the length check in [`Node::from_toml_str`] rejects the empty
+    /// string an omitted field would produce), but it would move the "there is no
+    /// coordinator-less node" rule out of the type and onto a guard several lines
+    /// away, and it would answer a config that never mentions the field with a
+    /// complaint about a malformed key instead of naming what is missing.
+    pub coordinator_auth_pubkey: String,
     /// Optional chain-backend endpoint for the watchtower driver (ADR-0001,
     /// V0-6b). Absent ⇒ the daemon runs no scan task (unit tests and nodes
     /// without a reachable bitcoind still load). Present ⇒ the daemon spawns one
@@ -124,6 +144,15 @@ pub struct Node {
     check_params: policy_core::CheckParams,
     pin_normal_hash: String,
     pin_duress_hash: String,
+    /// The coordinator authentication pubkey this node is sealed to (ADR-0013
+    /// §2): every `/sign` request must be validly coord-signed, carry a fresh
+    /// nonce, and fall inside the expiry window before the PIN is even consulted.
+    /// Not optional — a node is always configured with exactly one coordinator.
+    /// Channel mode includes this value in its manifest hash, and a provisioned
+    /// `expected_manifest_hash` seals that hash at startup. The specified key
+    /// lifecycle treats a change as a new vault rather than in-place rotation
+    /// (§4/§7).
+    coordinator_auth: PublicKey,
     /// Hash of this node's descriptor: the `wallet_id` bound into every
     /// commitment.
     wallet_id: [u8; 32],
@@ -186,6 +215,19 @@ impl Node {
         let seckey = SecretKey::from_str(&config.node_seckey)
             .map_err(|e| format!("bad node_seckey: {e}"))?;
         let pubkey = PublicKey::new(seckey.public_key(&secp));
+        // The coordinator authentication pubkey this vault is configured with
+        // (ADR-0013 §2). Parsed once here; it arms the `/sign` coord-auth gate and
+        // is folded into the channel manifest hash below. Mandatory: a node with no pinned
+        // coordinator could authenticate nothing, so an unparseable — or, via
+        // serde, an absent — key is a fatal config error, never a silent no-gate.
+        if config.coordinator_auth_pubkey.len() != 66 {
+            return Err(
+                "bad coordinator_auth_pubkey: expected a 33-byte compressed secp256k1 public key"
+                    .into(),
+            );
+        }
+        let coordinator_auth = PublicKey::from_str(&config.coordinator_auth_pubkey)
+            .map_err(|e| format!("bad coordinator_auth_pubkey: {e}"))?;
         // The vault descriptor is parsed twice, on purpose: as concrete
         // `PublicKey` for the witness script + user-key extraction + sighash
         // (the first-light vault is definite), and as `DescriptorPublicKey` for
@@ -200,6 +242,71 @@ impl Node {
         // descriptor-key bijection (§1). Extracted here while the concrete
         // descriptor is in scope; unused in absent-channel mode.
         let node_keys = first_light_node_keys_of(&descriptor)?;
+        // The coordinator is a DISTINCT role from the two the descriptor names:
+        // its key authorizes *requests*, the user key authorizes *spends*, and the
+        // federation keys *sign* them. Reusing one key across two roles silently
+        // voids that separation — whoever holds that role's secret could then mint
+        // coordinator-authenticated requests, which is precisely what this trust
+        // root exists to prevent (a compromised node must not be able to
+        // manufacture coordinator requests, ADR-0013 §2/§4). The collapse is
+        // invisible at runtime: every gate still passes, so nothing else would
+        // ever report it. No deployment needs the reuse — one human may hold two
+        // roles, but a second keypair is free — so a collision is a fatal
+        // provisioning error, caught here with the config's other cross-field
+        // invariants rather than trusted to the setup ceremony.
+        //
+        // All three checks below compare the curve point (`.inner`), never
+        // `bitcoin::PublicKey`, which also compares its compressed-encoding flag:
+        // roles are identities on the curve, and an encoding must not disguise
+        // reuse. No key reaching these checks can currently be uncompressed — the
+        // length check above pins the coordinator key to 33 bytes, and `wsh()`
+        // rejects uncompressed keys when the descriptor parses — so this is one
+        // rule stated once for all three, not a live gap in any of them.
+        if coordinator_auth.inner == user_pubkey.inner {
+            return Err(
+                "coordinator_auth_pubkey must not be the descriptor's user key: the coordinator \
+                 authorizes requests and the user authorizes spends, so one key for both lets the \
+                 user key mint its own coordinator requests"
+                    .into(),
+            );
+        }
+        if node_keys
+            .iter()
+            .any(|key| key.inner == coordinator_auth.inner)
+        {
+            return Err(
+                "coordinator_auth_pubkey must not be one of the descriptor's federation node \
+                 keys: one key for both roles lets a single compromised node mint coordinator \
+                 requests to its peers"
+                    .into(),
+            );
+        }
+        // The channel identity is not a fourth independent key: `derive_channel_seckey`
+        // is a deterministic, publicly-known function of the federation seckey, so
+        // holding a node's signing key IS holding its channel key. A coordinator key
+        // equal to a channel pubkey therefore collapses the same two roles the check
+        // above rejects — it just spells the node's key differently. `ChannelState::build`
+        // catches this for every node in the manifest, but only `[channel]` mode has a
+        // manifest, so without this an absent-channel node accepts the collapse.
+        // A node holds only its OWN seckey, so its own derived key is the only one it
+        // can check here — which makes this a tripwire, not the complete check. The
+        // reused node always refuses to boot (every node is provisioned with the same
+        // vault-wide coordinator key), but the other n−1 cannot detect the collapse and
+        // a quorum survives one dead node, so an operator who ignores the dead node
+        // keeps a federation that honors requests minted by its key holder. The residual
+        // is bounded — coordinator auth is one gate, and the user signature and PIN
+        // still gate signing — and `[channel]` mode's `ChannelState::build` is the
+        // complete check, because only it has the manifest to check peers against.
+        if channel::channel_pubkey_of(&channel::derive_channel_seckey(&seckey)).inner
+            == coordinator_auth.inner
+        {
+            return Err(
+                "coordinator_auth_pubkey must not be this node's derived channel key: the \
+                 channel key is derived from the node's federation seckey, so one key for both \
+                 roles lets this node mint coordinator requests for the whole vault"
+                    .into(),
+            );
+        }
         let witness_script = descriptor
             .explicit_script()
             .map_err(|e| format!("descriptor has no witness script: {e}"))?;
@@ -265,6 +372,10 @@ impl Node {
                     wallet_id,
                     &node_keys,
                     config.listen_port,
+                    // The coordinator key is part of the hashed manifest (ADR-0013
+                    // §4), so the node's manifest_hash binds the vault's one
+                    // coordinator: a different key is a different vault (§7).
+                    coordinator_auth,
                     Arc::clone(&alerts),
                 )
             })
@@ -282,6 +393,7 @@ impl Node {
             },
             pin_normal_hash: config.pin_normal_hash.to_lowercase(),
             pin_duress_hash: config.pin_duress_hash.to_lowercase(),
+            coordinator_auth,
             wallet_id,
             policy_version: config.policy_version,
             max_commitment_age_secs: config.max_commitment_age_secs,
@@ -425,25 +537,26 @@ fn first_light_node_keys_of(descriptor: &Descriptor<PublicKey>) -> Result<Vec<Pu
 /// refused — is `Ok`.
 ///
 /// Ordering (DESIGN.md, "Transaction commitment" + anti-replay log + Hold):
-///  1. PIN — before anything is signed or recorded (ADR-0008). A bad PIN is
-///     never logged: the PIN is not part of the commitment, so recording it
-///     would wrongly replay a `BAD_PIN` refusal for the same transaction
-///     resubmitted with the correct PIN.
+///  0. coordinator authentication + freshness — before the PIN; an authentic
+///     request consumes its nonce even when a later check refuses it.
+///  1. PIN — before anything is signed or any transaction decision is recorded
+///     (ADR-0008). A bad PIN verdict is never logged: the PIN is not part of the
+///     commitment, so recording it would wrongly replay a `BAD_PIN` refusal for
+///     the same transaction resubmitted with the correct PIN.
 ///  2. decode both PSBTs (needed to build the commitment).
 ///  3. compute the `commitment_id` binding this decision to the exact tx.
 ///  4. idempotency — an identical, unexpired resubmission returns the recorded
 ///     verdict without re-evaluating.
-///  5. node-capped expiry check against the node's own clock.
-///  6. validate: user-signature verification, then policy-core. A refusal here
+///  5. validate: user-signature verification, then policy-core. A refusal here
 ///     is final — an INVALID submission is refused, never held. Validation
 ///     precedes the Hold precisely so the pending log only ever holds spends
 ///     that would otherwise be signed (DESIGN.md, "the log IS the hold timer";
 ///     the demo's non-allowlisted theft is refused, not queued as pending).
-///  7. the Hold (ADR-0004): route the now-valid spend by destination class. A
+///  6. the Hold (ADR-0004): route the now-valid spend by destination class. A
 ///     hot-wallet spend inside its window is recorded as a pending timer and
 ///     answered `Pending`; escape sweeps, refresh self-spends, elapsed holds,
 ///     and `hold_secs = 0` fall through to sign.
-///  8. sign, record the verdict — only when the commitment fully determines it
+///  7. sign, record the verdict — only when the commitment fully determines it
 ///     (see [`is_recordable_verdict`]) — then answer.
 pub fn handle_sign(
     node: &Node,
@@ -469,6 +582,45 @@ pub(crate) fn handle_sign_now(
     })
 }
 
+/// Handle one first-class, pin-less refresh request (ADR-0013 §2). It passes the
+/// identical coordinator-auth + freshness gate as a spend, then returns a
+/// structured policy refusal without signing. This is the half of the trust root
+/// a refresh authenticates against; serving the refresh is later work.
+///
+/// ADR-0012 makes a pin-less refresh conditional on burn bounds of its own because
+/// "pin-less + instant means the refresh path has neither the Hold nor the pin that
+/// ADR-0006 relies on for its burn defense": a minimum refresh interval and a tight
+/// refresh fee cap (`refresh_min_interval_secs`, `refresh_max_feerate`, ADR-0013
+/// §6), plus the rule that any pending spend blocks every refresh. None exists in
+/// [`ConfigFile`] yet, so neither HTTP nor a direct caller may obtain a signature
+/// from this handler. A valid request still consumes its nonce before receiving
+/// [`RefusalCode::RefreshUnsupported`], exactly like any later policy refusal.
+///
+/// The existing PIN-gated self-spend path remains in [`handle_sign`] until V0-8b
+/// lands the §3 request-class contract and the §6 bounds together. Keeping that
+/// legacy path avoids removing refresh capability in this trust-root-only slice.
+pub fn handle_refresh(
+    node: &Node,
+    request: &RefreshRequest,
+    now: u64,
+) -> Result<SignResponse, BadRequest> {
+    handle_refresh_after_lock(node, request, || now)
+}
+
+/// Handle an HTTP Refresh submission using the node's clock, read only after the
+/// sign-state lock so queueing cannot stale the freshness window.
+pub(crate) fn handle_refresh_now(
+    node: &Node,
+    request: &RefreshRequest,
+) -> Result<SignResponse, BadRequest> {
+    handle_refresh_after_lock(node, request, || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
+}
+
 fn handle_sign_after_lock(
     node: &Node,
     request: &SignRequest,
@@ -483,6 +635,27 @@ fn handle_sign_after_lock(
     // not sign-vs-sign throughput.
     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
     let now = clock();
+
+    // 0. Coordinator-auth + freshness gate (ADR-0013 §2/§3): every request must be
+    //    validly coord-signed over its canonical bytes by the vault's one pinned
+    //    coordinator, carry a fresh (unseen) nonce, and fall inside the expiry
+    //    window — BEFORE the PIN, so an unauthenticated caller never reaches the
+    //    PIN compare (the trust root V0-8b builds on). Runs under the one sign
+    //    lock, so the nonce check-then-record is atomic. This gate also owns the
+    //    node-capped expiry check for the whole handler, so nothing below
+    //    re-checks the window. Its stale lower bound uses the nonce log's
+    //    rollback-guarded clock (`max(high_water, now)`, [`NonceLog`]), so a clock
+    //    rollback cannot revive a pruned nonce. Its future upper bound still uses
+    //    raw `now`, preserving V0-2's exact `now + max_commitment_age_secs` cap.
+    if let Err(rejected) = verify_coord_auth(
+        node,
+        request.coord_request(),
+        &request.coord_sig,
+        now,
+        &mut state.coord_nonces,
+    ) {
+        return Ok(rejected);
+    }
 
     // 1. PIN, before anything else: no valid PIN, nothing is ever signed
     //    (ADR-0008). At first light a duress PIN is verified and accepted
@@ -529,23 +702,7 @@ fn handle_sign_after_lock(
         channel.prune_store(now);
     }
 
-    // 5. Node-capped expiry, against the node's OWN clock: refuse an already-
-    //    expired commitment, and refuse one whose expiry runs past the node's
-    //    retention cap so a hostile coordinator can't inflate the log. An
-    //    out-of-window commitment is NOT recorded — its expiry can't bound
-    //    retention.
-    if request.expiry <= now || request.expiry > now.saturating_add(node.max_commitment_age_secs) {
-        return Ok(refusal(
-            RefusalCode::CommitmentExpired,
-            "commitment_expiry",
-            format!(
-                "expiry {} is outside the acceptance window (now {now}, max age {}s)",
-                request.expiry, node.max_commitment_age_secs
-            ),
-        ));
-    }
-
-    // 6. Validate the spend (user-signature verification, then policy-core)
+    // 5. Validate the spend (user-signature verification, then policy-core)
     //    WITHOUT signing yet. A refusal here is final and is recorded exactly as
     //    in V0-2: only verdicts the commitment fully determines are logged, so a
     //    signature- or PSBT-structure-dependent refusal stays unrecorded and an
@@ -559,8 +716,8 @@ fn handle_sign_after_lock(
         return Ok(refused);
     }
 
-    // 7. The Hold (ADR-0004). The spend is valid; route it by destination
-    //    class. A hot-wallet spend inside its window is recorded as a pending
+    // 6. The Hold (ADR-0004). The spend is valid; route it by destination class.
+    //    A hot-wallet spend inside its window is recorded as a pending
     //    timer (first_seen only — see PendingLog) and answered Pending; escape
     //    sweeps, refresh self-spends, elapsed holds, and hold_secs = 0 fall
     //    through to signing. Classification only routes: the checks above ran
@@ -603,7 +760,7 @@ fn handle_sign_after_lock(
         }
     }
 
-    // 8. Sign the PSBT in hand (re-verified in step 6), record the verdict,
+    // 7. Sign the PSBT in hand (re-verified in step 5), record the verdict,
     //    and answer. Reached by escape/refresh, an elapsed hot-class Hold, or
     //    hold_secs = 0.
     let verdict = match add_node_signatures(node, &mut psbt) {
@@ -625,6 +782,40 @@ fn handle_sign_after_lock(
     // this node's own partial already present); a signing refusal never registers.
     register_verdict(node, &psbt, &commitment_id, request.expiry, &verdict);
     Ok(verdict)
+}
+
+fn handle_refresh_after_lock(
+    node: &Node,
+    request: &RefreshRequest,
+    clock: impl FnOnce() -> u64,
+) -> Result<SignResponse, BadRequest> {
+    // Refreshes share the same serialized SignState as spends, so consuming the
+    // nonce remains atomic with every other request at ingress.
+    let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
+    let now = clock();
+
+    if let Err(rejected) = verify_coord_auth(
+        node,
+        request.coord_request(),
+        &request.coord_sig,
+        now,
+        &mut state.coord_nonces,
+    ) {
+        return Ok(rejected);
+    }
+
+    // Preserve the transport boundary: a signed but undecodable PSBT is still a
+    // bad request (HTTP 400), not an unsupported policy outcome.
+    decode_psbt(&request.refresh_psbt, "refresh_psbt")?;
+
+    // Deliberately non-signing until all ADR-0013 §6 bounds exist. This refusal
+    // lives inside the core handler so HTTP, channel propagation, and embedders
+    // cannot bypass it by calling the exported API directly.
+    Ok(refusal(
+        RefusalCode::RefreshUnsupported,
+        "refresh_bounds",
+        "refresh is not served until its minimum interval, fee cap, and pending-spend bounds are implemented".into(),
+    ))
 }
 
 /// The §4 candidate-registry funnel: on a non-refused `/sign` verdict (Pending or
@@ -725,6 +916,108 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
         fee: total_in.saturating_sub(total_out),
         expiry,
         policy_version: node.policy_version,
+    }
+}
+
+/// The coordinator-auth + freshness gate (ADR-0013 §2/§3): the ingress check
+/// EVERY request passes BEFORE the PIN. A request is rejected unless it is validly
+/// coord-signed over its canonical bytes against the node's configured
+/// `coordinator_auth_pubkey`, carries a nonce this node has not seen, and has an
+/// expiry that is neither past nor beyond `now + max_commitment_age_secs`. `Err`
+/// carries the wire refusal. There is no un-gated mode: the key is mandatory
+/// config, so an unauthenticated caller never reaches the PIN, let alone a signer.
+///
+/// The `coord_sig` binds every field of the canonical [`vault_proto::CoordRequest`]
+/// variant (spend/escape/pin or refresh, plus nonce, expiry, policy_version), so
+/// tampering with any of them fails verification here; the nonce is single-use,
+/// so a captured request cannot be replayed once recorded. `nonces` is taken under
+/// the one `/sign` lock, making the seen-check and record atomic with the rest of
+/// the handler.
+///
+/// Order matters: freshness state changes ONLY after the signature verifies, so a
+/// caller without the coordinator key cannot advance its monotonic clock or grow
+/// the bounded nonce log.
+///
+/// The nonce and expiry come from `request` itself ([`CoordRequest::nonce`] /
+/// [`CoordRequest::expiry`]), never as parameters beside it: taking them
+/// separately would let this gate check freshness on values other than the ones
+/// `coord_sig` authenticated. `coord_sig` is a parameter because it is the one
+/// field that is NOT part of its own preimage.
+fn verify_coord_auth(
+    node: &Node,
+    request: CoordRequest<'_>,
+    coord_sig: &str,
+    now: u64,
+    nonces: &mut NonceLog,
+) -> Result<(), SignResponse> {
+    // Authentication: coord_sig must ECDSA-verify over the canonical request bytes
+    // against the configured coordinator_auth_pubkey. An absent, non-hex, or
+    // non-DER signature is an authentication failure like any other.
+    let digest = request.auth_digest();
+    let der = Vec::<u8>::from_hex(coord_sig).map_err(|_| {
+        refusal(
+            RefusalCode::CoordAuthInvalid,
+            "coord_sig",
+            "coord_sig is not hex".into(),
+        )
+    })?;
+    let sig = Signature::from_der(&der).map_err(|_| {
+        refusal(
+            RefusalCode::CoordAuthInvalid,
+            "coord_sig",
+            "coord_sig is not a DER ECDSA signature".into(),
+        )
+    })?;
+    Secp256k1::verification_only()
+        .verify_ecdsa(
+            &Message::from_digest(digest),
+            &sig,
+            &node.coordinator_auth.inner,
+        )
+        .map_err(|_| {
+            refusal(
+                RefusalCode::CoordAuthInvalid,
+                "coord_sig",
+                "coord_sig does not verify against the pinned coordinator_auth_pubkey".into(),
+            )
+        })?;
+    // Sender authenticated. Validate the expiry window, reject replay, enforce
+    // capacity, and consume the nonce in one operation under the sign-state lock.
+    // Pruning and the matching high-water advance through the expiries actually
+    // removed happen ONLY when the complete freshness gate accepts the request.
+    // Window, replay, and capacity refusals leave both untouched, while the mark
+    // prevents a backwards clock step from reopening a pruned nonce ([`NonceLog`]).
+    match nonces.check_and_record(
+        request.nonce(),
+        request.expiry(),
+        now,
+        node.max_commitment_age_secs,
+    ) {
+        NonceDecision::Accepted => Ok(()),
+        NonceDecision::InvalidLength => Err(refusal(
+            RefusalCode::CoordAuthInvalid,
+            "coord_nonce",
+            format!("request nonce must be 1..={MAX_COORD_NONCE_BYTES} bytes"),
+        )),
+        NonceDecision::OutsideWindow { now } => Err(refusal(
+            RefusalCode::CommitmentExpired,
+            "commitment_expiry",
+            format!(
+                "expiry {} is outside the acceptance window (now {now}, max age {}s)",
+                request.expiry(),
+                node.max_commitment_age_secs
+            ),
+        )),
+        NonceDecision::Replayed => Err(refusal(
+            RefusalCode::NonceReplayed,
+            "coord_nonce",
+            "request nonce has already been seen by this node".into(),
+        )),
+        NonceDecision::AtCapacity => Err(refusal(
+            RefusalCode::CoordNonceCapacity,
+            "coord_nonce_capacity",
+            "coordinator nonce cache is at capacity".into(),
+        )),
     }
 }
 
@@ -1031,10 +1324,12 @@ mod watchtower_wiring {
             "listen_port = 7100\nnode_seckey = \"{}\"\ndescriptor = \"{descriptor}\"\n\
              allowlist = [\"{hot}\"]\nmax_derivation_index = 5\nhold_secs = 0\n\
              max_commitment_age_secs = 172800\npolicy_version = 1\n\
-             pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n",
+             pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
+             coordinator_auth_pubkey = \"{}\"\n",
             nsk.display_secret(),
             sha256::Hash::hash(b"1234"),
             sha256::Hash::hash(b"9999"),
+            key(0xC0).1,
         );
         let node = Node::from_toml_str(&config).expect("valid config");
 
@@ -1072,13 +1367,18 @@ mod watchtower_wiring {
                 sighash_type: EcdsaSighashType::All,
             },
         );
-        let request = SignRequest {
+        let mut request = SignRequest {
             psbt: psbt.to_string(),
             escape_psbt: psbt.to_string(),
             pin: "1234".into(),
+            nonce: String::new(),
             expiry: NOW + 3_600,
             policy_version: 1,
+            coord_sig: String::new(),
         };
+        // The node is sealed to coordinator 0xC0, so the spend only reaches the
+        // signer (and thus watchtower recognition) once it is coord-authenticated.
+        crate::test_support::coord_sign(&mut request, "watchtower-wiring");
         let SignResponse::Signed(_) = handle_sign(&node, &request, NOW).expect("decodable") else {
             panic!("the honest hot spend must sign");
         };
@@ -1129,6 +1429,7 @@ mod watchtower_wiring {
 pub(crate) mod test_support {
     use super::*;
     use bitcoin::absolute::LockTime;
+    use bitcoin::hex::DisplayHex;
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1139,10 +1440,83 @@ pub(crate) mod test_support {
         (sk, PublicKey::new(sk.public_key(&secp)))
     }
 
+    /// The coordinator this fixture's vault is sealed to (ADR-0013 §2).
+    fn coord_key() -> (SecretKey, PublicKey) {
+        key(0xC0)
+    }
+
+    /// Attach a fresh `nonce` and the coordinator signature over the canonical
+    /// request bytes — exactly what vault-cli does before relaying. Every request
+    /// must clear the ingress coord-auth gate, so tests that RE-send a request
+    /// (a coordinator retrying a timed-out or lost call) re-sign with a fresh
+    /// nonce: the nonce is single-use per transmission, while idempotency lives on
+    /// the commitment, so the same spend re-sent this way still returns the one
+    /// recorded verdict from the anti-replay log.
+    pub(crate) fn coord_sign(request: &mut SignRequest, nonce: &str) {
+        request.nonce = nonce.to_string();
+        // `coord_request()` selects the signed fields; coord_sig is never part of
+        // its own preimage, so it needs no clearing before the digest.
+        let digest = request.coord_request().auth_digest();
+        let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &coord_key().0);
+        request.coord_sig = sig.serialize_der().to_lower_hex_string();
+    }
+
+    /// Refresh counterpart to [`coord_sign`]: the same coordinator key and
+    /// freshness contract, over the Refresh variant's canonical bytes.
+    pub(crate) fn coord_sign_refresh(request: &mut RefreshRequest, nonce: &str) {
+        request.nonce = nonce.to_string();
+        let digest = request.coord_request().auth_digest();
+        let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &coord_key().0);
+        request.coord_sig = sig.serialize_der().to_lower_hex_string();
+    }
+
+    fn user_sign(node: &Node, psbt: &mut Psbt) {
+        let value = psbt.inputs[0]
+            .witness_utxo
+            .as_ref()
+            .expect("witness utxo")
+            .value;
+        let sighash = SighashCache::new(&psbt.unsigned_tx)
+            .p2wsh_signature_hash(0, &node.witness_script, value, EcdsaSighashType::All)
+            .expect("sighash");
+        let signature =
+            Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &key(1).0);
+        psbt.inputs[0].partial_sigs.clear();
+        psbt.inputs[0].partial_sigs.insert(
+            node.user_pubkey,
+            bitcoin::ecdsa::Signature {
+                signature,
+                sighash_type: EcdsaSighashType::All,
+            },
+        );
+    }
+
+    /// Derive a valid pin-less refresh from the fixture spend: only the output is
+    /// changed to pay the vault, then the user and coordinator re-sign the exact
+    /// refresh bytes.
+    pub(crate) fn valid_refresh_request(
+        node: &Node,
+        spend: &SignRequest,
+        nonce: &str,
+    ) -> RefreshRequest {
+        let mut psbt = Psbt::from_str(&spend.psbt).expect("fixture psbt");
+        psbt.unsigned_tx.output[0].script_pubkey = node.vault_scripts()[0].clone();
+        user_sign(node, &mut psbt);
+        let mut request = RefreshRequest {
+            refresh_psbt: psbt.to_string(),
+            nonce: String::new(),
+            expiry: spend.expiry,
+            policy_version: spend.policy_version,
+            coord_sig: String::new(),
+        };
+        coord_sign_refresh(&mut request, nonce);
+        request
+    }
+
     /// A 1-of-1 vault (user key + one node key, `hold_secs = 0`) bound to
-    /// `listen_port = 0`, plus a valid hot-spend `SignRequest` that `handle_sign`
-    /// signs on first submission. The request's `expiry` is set against the REAL
-    /// clock and sits well inside `max_commitment_age_secs`.
+    /// `listen_port = 0`, plus a valid, coordinator-signed hot-spend `SignRequest`
+    /// that `handle_sign` signs on first submission. The request's `expiry` is set
+    /// against the REAL clock and sits well inside `max_commitment_age_secs`.
     pub(crate) fn node_and_valid_request() -> (Node, SignRequest) {
         let (_, user) = key(1);
         let (nsk, node_pub) = key(2);
@@ -1158,10 +1532,12 @@ pub(crate) mod test_support {
             "listen_port = 0\nnode_seckey = \"{}\"\ndescriptor = \"{descriptor}\"\n\
              allowlist = [\"{hot}\"]\nmax_derivation_index = 5\nhold_secs = 0\n\
              max_commitment_age_secs = 172800\npolicy_version = 1\n\
-             pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n",
+             pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
+             coordinator_auth_pubkey = \"{}\"\n",
             nsk.display_secret(),
             sha256::Hash::hash(b"1234"),
             sha256::Hash::hash(b"9999"),
+            coord_key().1,
         );
         let node = Node::from_toml_str(&config).expect("valid config");
         let vault_spk = node.vault_scripts()[0].clone();
@@ -1186,29 +1562,21 @@ pub(crate) mod test_support {
             value,
         });
         psbt.inputs[0].witness_script = Some(node.witness_script.clone());
-        let sighash = SighashCache::new(&psbt.unsigned_tx)
-            .p2wsh_signature_hash(0, &node.witness_script, value, EcdsaSighashType::All)
-            .expect("sighash");
-        let secp = Secp256k1::new();
-        let signature = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &key(1).0);
-        psbt.inputs[0].partial_sigs.insert(
-            user,
-            bitcoin::ecdsa::Signature {
-                signature,
-                sighash_type: EcdsaSighashType::All,
-            },
-        );
+        user_sign(&node, &mut psbt);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let request = SignRequest {
+        let mut request = SignRequest {
             psbt: psbt.to_string(),
             escape_psbt: psbt.to_string(),
             pin: "1234".into(),
+            nonce: String::new(),
             expiry: now + 3_600,
             policy_version: 1,
+            coord_sig: String::new(),
         };
+        coord_sign(&mut request, "test-support-first-send");
         (node, request)
     }
 }
