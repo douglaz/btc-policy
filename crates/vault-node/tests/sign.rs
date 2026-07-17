@@ -1,10 +1,12 @@
 //! Handler-level integration tests for /sign — no bitcoind, no sockets.
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::bip32::{DerivationPath, Fingerprint};
 use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
 use bitcoin::transaction::Version;
@@ -13,8 +15,8 @@ use bitcoin::{
     TxOut, Txid, WScriptHash, Witness,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
-use vault_node::{handle_sign, Node};
-use vault_proto::{RefusalCode, SignRequest, SignResponse};
+use vault_node::{handle_refresh, handle_sign, Node};
+use vault_proto::{RefreshRequest, RefusalCode, SignRequest, SignResponse};
 
 const NORMAL_PIN: &str = "1111";
 const DURESS_PIN: &str = "9999";
@@ -34,6 +36,48 @@ fn seckey(index: u8) -> SecretKey {
 
 fn pubkey(secp: &Secp256k1<bitcoin::secp256k1::All>, index: u8) -> PublicKey {
     PublicKey::new(seckey(index).public_key(secp))
+}
+
+/// The coordinator every fixture node here is sealed to (ADR-0013 §2/§4): its
+/// public half is pinned in the config `config_text` emits, its secret half signs
+/// every request, so each one clears the ingress coord-auth gate. Index 0xC0 sits
+/// clear of the vault's own keys (user 1, nodes 2..=6, hot 10, escape 11).
+fn coord_key() -> (SecretKey, PublicKey) {
+    let secp = Secp256k1::new();
+    (seckey(0xC0), pubkey(&secp, 0xC0))
+}
+
+/// Sign `req` as `sk` over the canonical request bytes under an explicit `nonce`
+/// — the coordinator's exact role (vault-cli does this before every relay).
+/// Taking the key and nonce explicitly is what lets the negative tests below sign
+/// as the WRONG coordinator, or re-use a nonce on purpose.
+fn coord_sign_as(req: &mut SignRequest, sk: &SecretKey, nonce: &str) {
+    req.nonce = nonce.to_string();
+    // coord_sig is never part of its own preimage; no clearing needed. Re-signing
+    // a request that already carries a sig therefore just overwrites it.
+    let digest = req.coord_request().auth_digest();
+    let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), sk);
+    req.coord_sig = sig.serialize_der().to_lower_hex_string();
+}
+
+/// Coord-sign `req` as the vault's pinned coordinator under a nonce unique to
+/// this call. A coordinator issues a fresh single-use nonce per **transmission**,
+/// so this is also how a test re-sends an existing request (past a Hold, or
+/// retrying a lost call): the commitment is unchanged, so the anti-replay log
+/// still returns the one recorded verdict, but the transmission is fresh.
+fn coord_sign(req: &mut SignRequest) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    coord_sign_as(req, &coord_key().0, &format!("nonce-{n}"));
+}
+
+fn coord_sign_refresh(req: &mut RefreshRequest) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    req.nonce = format!("refresh-nonce-{n}");
+    let digest = req.coord_request().auth_digest();
+    let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &coord_key().0);
+    req.coord_sig = sig.serialize_der().to_lower_hex_string();
 }
 
 fn descriptor_str() -> String {
@@ -142,10 +186,12 @@ fn config_text(
          max_commitment_age_secs = {max_commitment_age_secs}\n\
          policy_version = {POLICY_VERSION}\n\
          pin_normal_hash = \"{}\"\n\
-         pin_duress_hash = \"{}\"\n",
+         pin_duress_hash = \"{}\"\n\
+         coordinator_auth_pubkey = \"{}\"\n",
         seckey(2).display_secret(),
         sha256::Hash::hash(NORMAL_PIN.as_bytes()),
         sha256::Hash::hash(DURESS_PIN.as_bytes()),
+        coord_key().1,
     )
 }
 
@@ -261,15 +307,33 @@ fn request(psbt: &Psbt, pin: &str) -> SignRequest {
 }
 
 fn request_at(psbt: &Psbt, pin: &str, expiry: u64) -> SignRequest {
-    SignRequest {
+    let mut request = SignRequest {
         psbt: psbt.to_string(),
         // The escape variant only has to decode at first light; reusing the
         // primary PSBT keeps these handler tests self-contained.
         escape_psbt: psbt.to_string(),
         pin: pin.into(),
+        nonce: String::new(),
         expiry,
         policy_version: POLICY_VERSION,
-    }
+        coord_sig: String::new(),
+    };
+    // Every fixture node is sealed to a coordinator, so a request only reaches the
+    // policy checks these tests are about once it is coord-authenticated.
+    coord_sign(&mut request);
+    request
+}
+
+fn refresh_request(psbt: &Psbt) -> RefreshRequest {
+    let mut request = RefreshRequest {
+        refresh_psbt: psbt.to_string(),
+        nonce: String::new(),
+        expiry: EXPIRY,
+        policy_version: POLICY_VERSION,
+        coord_sig: String::new(),
+    };
+    coord_sign_refresh(&mut request);
+    request
 }
 
 fn expect_refusal(response: SignResponse) -> vault_proto::Refusal {
@@ -295,11 +359,18 @@ fn missing_pin_field_is_refused_with_bad_pin() {
     let fixture = fixture();
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
+    // The `pin` field is absent from the wire body (it defaults to empty); every
+    // OTHER field is authentic, so the request clears the coord-auth gate and the
+    // refusal that comes back is the PIN's, which is what this test is about.
     let body = serde_json::json!({
-        "psbt": psbt.to_string(),
-        "escape_psbt": psbt.to_string(),
+        "spend": psbt.to_string(),
+        "escape": psbt.to_string(),
+        "expiry": EXPIRY,
+        "policy_version": POLICY_VERSION,
     });
-    let request: SignRequest = serde_json::from_value(body).expect("missing pin defaults");
+    let mut request: SignRequest = serde_json::from_value(body).expect("missing pin defaults");
+    assert_eq!(request.pin, "", "an absent pin field must decode as empty");
+    coord_sign(&mut request);
     let response = handle_sign(&fixture.node, &request, NOW).expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::BadPin);
@@ -474,13 +545,18 @@ fn labeled_change_that_does_not_derive_is_change_not_derivable_through_the_handl
 #[test]
 fn undecodable_psbt_is_a_bad_request_not_a_refusal() {
     let fixture = fixture();
-    let request = SignRequest {
+    // Coord-signed: an authentic request whose PSBT is simply undecodable, so the
+    // 400 comes from the decode and not from the auth gate in front of it.
+    let mut request = SignRequest {
         psbt: "not base64 at all".into(),
         escape_psbt: "also not".into(),
         pin: NORMAL_PIN.into(),
+        nonce: String::new(),
         expiry: EXPIRY,
         policy_version: POLICY_VERSION,
+        coord_sig: String::new(),
     };
+    coord_sign(&mut request);
     assert!(handle_sign(&fixture.node, &request, NOW).is_err());
 }
 
@@ -539,14 +615,18 @@ fn identical_resubmission_returns_the_recorded_signed_verdict() {
     let fixture = fixture();
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let req = request(&psbt, NORMAL_PIN);
+    let mut req = request(&psbt, NORMAL_PIN);
 
     let first = handle_sign(&fixture.node, &req, NOW).expect("decodable request");
     let SignResponse::Signed(first_signed) = first else {
         panic!("first submission must sign");
     };
-    // The identical resubmission returns the recorded verdict — byte-for-byte
-    // the same signed PSBT — without re-evaluating.
+    // Resubmitting the identical COMMITMENT returns the recorded verdict —
+    // byte-for-byte the same signed PSBT — without re-evaluating. The re-send
+    // carries a fresh nonce because a nonce is single-use per transmission
+    // (ADR-0013 §2); idempotency is keyed on the commitment, not the nonce, so
+    // the two gates compose instead of colliding.
+    coord_sign(&mut req);
     let second = handle_sign(&fixture.node, &req, NOW).expect("decodable request");
     let SignResponse::Signed(second_signed) = second else {
         panic!("resubmission must replay the recorded signed verdict");
@@ -560,11 +640,13 @@ fn identical_resubmission_returns_the_recorded_refusal() {
     let theft_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xEE; 32]));
     let mut psbt = vault_psbt(&fixture, vec![(theft_spk, 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let req = request(&psbt, NORMAL_PIN);
+    let mut req = request(&psbt, NORMAL_PIN);
 
     let first = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable request"));
     assert_eq!(first.code, RefusalCode::DestNotAllowed);
-    // Resubmitting the refused commitment returns the recorded refusal.
+    // Resubmitting the refused commitment (fresh nonce, same commitment) returns
+    // the recorded refusal.
+    coord_sign(&mut req);
     let second = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable request"));
     assert_eq!(second, first);
 }
@@ -679,9 +761,17 @@ fn max_commitment_age_must_exceed_hold() {
 }
 
 #[test]
-fn hot_class_first_submission_is_pending_for_the_full_hold() {
+fn hot_class_with_vault_change_is_pending_for_the_full_hold() {
     let fixture = held_fixture(HOLD);
-    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    // Vault change is excluded from destination classification (ADR-0013 §3),
+    // so the one non-change output makes this an ordinary held hot spend.
+    let mut psbt = vault_psbt(
+        &fixture,
+        vec![
+            (fixture.hot_spk.clone(), 90_000_000),
+            (fixture.descriptor.script_pubkey(), 9_990_000),
+        ],
+    );
     user_sign(&fixture, &mut psbt);
     let response =
         handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
@@ -698,13 +788,16 @@ fn resubmission_before_the_window_is_still_pending_with_less_time() {
     let fixture = held_fixture(HOLD);
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let req = held_request(&psbt);
+    let mut req = held_request(&psbt);
 
     let first = handle_sign(&fixture.node, &req, NOW).expect("decodable request");
     assert_eq!(expect_pending(first).remaining_secs, HOLD);
 
     // Half the Hold later the same commitment is still inside its window. The
-    // timer keeps the original first_seen, so remaining_secs has shrunk.
+    // timer keeps the original first_seen, so remaining_secs has shrunk. The
+    // coordinator re-sends with a fresh nonce (single-use per transmission), which
+    // must NOT be mistaken for a new commitment and restart the Hold.
+    coord_sign(&mut req);
     let later = NOW + HOLD / 2;
     let pending =
         expect_pending(handle_sign(&fixture.node, &req, later).expect("decodable request"));
@@ -717,14 +810,16 @@ fn resubmission_at_or_after_the_window_is_signed() {
     let fixture = held_fixture(HOLD);
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let req = held_request(&psbt);
+    let mut req = held_request(&psbt);
 
     assert!(matches!(
         handle_sign(&fixture.node, &req, NOW).expect("decodable request"),
         SignResponse::Pending(_)
     ));
     // Exactly at first_seen + hold_secs the window has elapsed: the node signs
-    // the PSBT in hand (re-verified), contributing its own partial signature.
+    // the PSBT in hand (re-verified), contributing its own partial signature. The
+    // re-send past the Hold carries a fresh nonce, as a coordinator's does.
+    coord_sign(&mut req);
     let response = handle_sign(&fixture.node, &req, NOW + HOLD).expect("decodable request");
     let SignResponse::Signed(signed) = response else {
         panic!("the Hold has elapsed; the node must sign, got {response:?}");
@@ -742,9 +837,33 @@ fn resubmission_at_or_after_the_window_is_signed() {
 #[test]
 fn escape_class_sweep_signs_instantly_despite_a_hold() {
     let fixture = held_fixture(HOLD);
-    // Every non-change output pays the escape wallet: an escape sweep, which is
-    // the implicit cancel and must never be held.
+    // The canonical Rotate shape: every output pays the escape wallet, no change
+    // left behind. The implicit cancel of any pending spend, which must never be
+    // held. Kept alongside the change-bearing sweep below so both escape shapes
+    // stay covered.
     let mut psbt = vault_psbt(&fixture, vec![(fixture.escape_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    let response =
+        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
+    assert!(
+        matches!(response, SignResponse::Signed(_)),
+        "an escape sweep is instant even under a Hold, got {response:?}"
+    );
+}
+
+#[test]
+fn escape_class_with_vault_change_signs_instantly_despite_a_hold() {
+    let fixture = held_fixture(HOLD);
+    // Every non-change output pays the escape wallet. The vault output is change
+    // and excluded from destination classification (ADR-0013 §3), so this is
+    // still an escape sweep: the implicit cancel that must never be held.
+    let mut psbt = vault_psbt(
+        &fixture,
+        vec![
+            (fixture.escape_spk.clone(), 90_000_000),
+            (fixture.descriptor.script_pubkey(), 9_990_000),
+        ],
+    );
     user_sign(&fixture, &mut psbt);
     let response =
         handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
@@ -761,6 +880,8 @@ fn refresh_self_spend_signs_instantly_despite_a_hold() {
     // Every output pays the vault back: a refresh self-spend.
     let mut psbt = vault_psbt(&fixture, vec![(vault_spk, 99_990_000)]);
     user_sign(&fixture, &mut psbt);
+    // Preserve the pre-existing PIN-gated self-spend until V0-8b lands the
+    // first-class Refresh arm and its bounds as one unit.
     let response =
         handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
     assert!(
@@ -815,4 +936,373 @@ fn a_hot_spend_signs_instantly_when_hold_is_zero() {
         matches!(response, SignResponse::Signed(_)),
         "hold_secs = 0 signs the hot spend on first submission, got {response:?}"
     );
+}
+
+/// The coordinator-auth + freshness gate (ADR-0013 §2/§3): a node admits a
+/// request past the PIN only if it is validly coord-signed over its canonical
+/// bytes by the coordinator configured for that node, carries an unseen nonce, and
+/// has a fresh expiry. This is the trust root V0-8b authenticates spends against.
+///
+/// Every fixture node is sealed to [`coord_key`] — the gate is not optional — so
+/// these tests use the ordinary [`fixture`] and vary only what the coordinator
+/// does: sign as the wrong key, tamper after signing, stale the expiry, replay a
+/// nonce. `hold_secs = 0`, so an authentic request signs on first submission and
+/// the verdict shows the gate was cleared.
+mod coord_auth {
+    use super::*;
+
+    /// A user-signed hot spend, coord-signed by the vault's pinned coordinator —
+    /// the node signs it iff it authenticates.
+    fn honest_request() -> (Fixture, SignRequest) {
+        let fixture = fixture();
+        let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+        user_sign(&fixture, &mut psbt);
+        let req = request(&psbt, NORMAL_PIN);
+        (fixture, req)
+    }
+
+    #[test]
+    fn a_correctly_coord_signed_request_signs() {
+        let (fixture, req) = honest_request();
+        assert!(
+            matches!(
+                handle_sign(&fixture.node, &req, NOW).expect("decodable"),
+                SignResponse::Signed(_)
+            ),
+            "an authentic coord-signed request must reach the signer"
+        );
+    }
+
+    /// A user-signed pure self-spend, coord-signed by the vault's pinned
+    /// coordinator. The first-class arm authenticates but deliberately refuses
+    /// to sign until its ADR-0013 §6 bounds exist.
+    fn honest_refresh() -> (Fixture, RefreshRequest) {
+        let fixture = fixture();
+        let mut psbt = vault_psbt(
+            &fixture,
+            vec![(fixture.descriptor.script_pubkey(), 99_990_000)],
+        );
+        user_sign(&fixture, &mut psbt);
+        let req = refresh_request(&psbt);
+        (fixture, req)
+    }
+
+    #[test]
+    fn a_correctly_coord_signed_refresh_is_authenticated_but_not_signed() {
+        let (fixture, req) = honest_refresh();
+        let refusal =
+            expect_refusal(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
+        assert_eq!(refusal.code, RefusalCode::RefreshUnsupported);
+        assert_eq!(refusal.check, "refresh_bounds");
+    }
+
+    /// The Refresh arm authenticates against the same pinned root as a spend: a
+    /// refresh signed by a coordinator outside it is rejected, so the pin-less arm
+    /// is not a way around the trust root. The root proven here is the `fixture`
+    /// node's CONFIGURED `coordinator_auth_pubkey` — that fixture is channel-less,
+    /// so no manifest binds it; what this test pins is the gate, not the sealing
+    /// ceremony (see [`CoordRequest`] for how far the pin goes today).
+    #[test]
+    fn a_refresh_from_a_coordinator_outside_the_configured_root_is_rejected() {
+        let (fixture, mut req) = honest_refresh();
+        let digest = req.coord_request().auth_digest();
+        let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &seckey(0xC1));
+        req.coord_sig = sig.serialize_der().to_lower_hex_string();
+        let refusal =
+            expect_refusal(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
+        assert_eq!(refusal.code, RefusalCode::CoordAuthInvalid);
+    }
+
+    /// Freshness binds the Refresh arm too: the second transmission of an
+    /// authentic refresh is refused, proving the first consumed nonce state rather
+    /// than bypassing the gate on a refresh-only path.
+    #[test]
+    fn a_replayed_refresh_nonce_is_rejected() {
+        let (fixture, req) = honest_refresh();
+        let first =
+            expect_refusal(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
+        assert_eq!(first.code, RefusalCode::RefreshUnsupported);
+        let refusal =
+            expect_refusal(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
+        assert_eq!(refusal.code, RefusalCode::NonceReplayed);
+    }
+
+    /// Tampering with any coord-signed refresh field breaks the signature: the
+    /// digest covers the full canonical request, not just the PSBT.
+    #[test]
+    fn a_tampered_refresh_field_breaks_the_coord_signature() {
+        let (fixture, mut req) = honest_refresh();
+        req.expiry += 1;
+        let refusal =
+            expect_refusal(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
+        assert_eq!(refusal.code, RefusalCode::CoordAuthInvalid);
+    }
+
+    #[test]
+    fn a_request_from_a_coordinator_outside_the_configured_root_is_rejected() {
+        // The node is sealed to coordinator 0xC0; a request signed by a DIFFERENT
+        // coordinator (0xC1, not the configured one) is rejected — the exact
+        // property every node enforces (ADR-0013 §2), and the reason a coordinator
+        // cannot be swapped without minting a new vault.
+        let (fixture, mut req) = honest_request();
+        coord_sign_as(&mut req, &seckey(0xC1), "nonce-wrong-key");
+        let refusal = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::CoordAuthInvalid);
+    }
+
+    #[test]
+    fn an_unsigned_request_is_rejected_before_the_pin() {
+        // A request with no coord_sig at all never passes the gate.
+        let (fixture, mut req) = honest_request();
+        req.nonce = String::new();
+        req.coord_sig = String::new();
+        let refusal = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::CoordAuthInvalid);
+
+        // And it is rejected BEFORE the PIN: an unauthenticated caller cannot even
+        // probe the PIN, let alone reach the signer. The PIN here is deliberately
+        // WRONG, which is what makes the ordering observable — the two checks
+        // disagree about this request, so only the one that runs first can answer.
+        // `BadPin` here would mean the gate had moved after the PIN compare. (With
+        // a VALID pin both orderings return CoordAuthInvalid and the test cannot
+        // fail, which is exactly what it used to do.)
+        let (fixture2, mut req2) = honest_request();
+        req2.pin = "0000".into();
+        assert_ne!(req2.pin, NORMAL_PIN, "the pin must actually be wrong");
+        assert_ne!(req2.pin, DURESS_PIN, "the pin must actually be wrong");
+        req2.nonce = String::new();
+        req2.coord_sig = String::new();
+        let refusal2 = expect_refusal(handle_sign(&fixture2.node, &req2, NOW).expect("decodable"));
+        assert_eq!(refusal2.code, RefusalCode::CoordAuthInvalid);
+    }
+
+    #[test]
+    fn tampering_a_field_after_signing_is_rejected() {
+        // Tamper the escape PSBT after signing: coord_sig binds it, so it fails.
+        let (fixture, mut req) = honest_request();
+        req.escape_psbt = format!("{}=", req.escape_psbt);
+        let refusal = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::CoordAuthInvalid);
+
+        // Tamper the nonce after signing: the nonce is in the signed bytes too, so
+        // an attacker cannot refresh a captured request by swapping in a new nonce.
+        let (fixture2, mut req2) = honest_request();
+        req2.nonce = "nonce-tamper-swapped".into();
+        let refusal2 = expect_refusal(handle_sign(&fixture2.node, &req2, NOW).expect("decodable"));
+        assert_eq!(refusal2.code, RefusalCode::CoordAuthInvalid);
+    }
+
+    #[test]
+    fn a_stale_or_over_horizon_expiry_is_rejected() {
+        // Already past: expiry <= now. Re-signed after the edit, so this is an
+        // authentic request that is merely stale — not a signature failure.
+        let (fixture, mut past) = honest_request();
+        past.expiry = NOW - 1;
+        coord_sign(&mut past);
+        let refusal = expect_refusal(handle_sign(&fixture.node, &past, NOW).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::CommitmentExpired);
+
+        // Beyond the node's own retention cap: now + MAX_AGE + 1. A hostile
+        // coordinator cannot inflate how long the node must remember this nonce.
+        let (fixture2, mut far) = honest_request();
+        far.expiry = NOW + MAX_AGE + 1;
+        coord_sign(&mut far);
+        let refusal2 = expect_refusal(handle_sign(&fixture2.node, &far, NOW).expect("decodable"));
+        assert_eq!(refusal2.code, RefusalCode::CommitmentExpired);
+    }
+
+    #[test]
+    fn a_replayed_nonce_is_rejected() {
+        let (fixture, req) = honest_request();
+        assert!(matches!(
+            handle_sign(&fixture.node, &req, NOW).expect("decodable"),
+            SignResponse::Signed(_)
+        ));
+
+        // The identical request (same nonce, same signature) is a replay: the gate
+        // rejects it BEFORE the anti-replay log's idempotent short-circuit, because
+        // a coordinator nonce is single-use per transmission. A genuine coordinator
+        // retry re-signs with a fresh nonce and gets the recorded verdict instead
+        // (see `identical_resubmission_returns_the_recorded_signed_verdict`).
+        let refusal = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::NonceReplayed);
+    }
+
+    /// The last of the gate's five decisions to reach the wire: a full nonce
+    /// cache refuses with `COORD_NONCE_CAPACITY`. `NonceLog`'s own tests cover the
+    /// bound; this covers the decision → refusal mapping the handler owns.
+    ///
+    /// The flood is built from requests carrying a deliberately WRONG pin, which
+    /// is what makes it cheap — and is itself the ADR-0013 §7 residual in the
+    /// open: the gate consumes a nonce BEFORE the pin compare, so a request
+    /// refused later still burns a slot. `BadPin` on every fill request is
+    /// therefore an assertion, not an incidental detail.
+    #[test]
+    fn a_full_nonce_cache_refuses_with_coord_nonce_capacity() {
+        let (fixture, template) = honest_request();
+        // A bound on the cap, not the cap itself: the test must not restate the
+        // private MAX_COORD_NONCES, only outlast it.
+        const FLOOD_BOUND: usize = 16_384;
+        let mut capacity_refusal = None;
+        for i in 0..FLOOD_BOUND {
+            let mut req = template.clone();
+            req.pin = "0000".into();
+            coord_sign_as(&mut req, &coord_key().0, &format!("flood-{i}"));
+            let refusal = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable"));
+            if refusal.code == RefusalCode::CoordNonceCapacity {
+                capacity_refusal = Some(refusal);
+                break;
+            }
+            assert_eq!(
+                refusal.code,
+                RefusalCode::BadPin,
+                "until the cache fills, an authentic request is refused at the PIN — \
+                 having already spent its nonce at the gate (request {i})"
+            );
+        }
+        let refusal = capacity_refusal
+            .expect("the authenticated nonce cache must be bounded, and refuse once full");
+        assert_eq!(refusal.check, "coord_nonce_capacity");
+
+        // The cache is full, not broken: the refusal is capacity, not a
+        // misreported auth or replay failure. A fresh, authentic, correctly
+        // pinned request gets the same answer — no slot, no signature.
+        let mut honest = template.clone();
+        coord_sign_as(&mut honest, &coord_key().0, "flood-then-honest");
+        let refusal = expect_refusal(handle_sign(&fixture.node, &honest, NOW).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::CoordNonceCapacity);
+    }
+
+    #[test]
+    fn an_oversized_authenticated_nonce_is_rejected() {
+        let (fixture, mut req) = honest_request();
+        // The demo's 32 random bytes are 64 hex characters. A larger signed
+        // value must not enter the retained nonce map.
+        coord_sign_as(&mut req, &coord_key().0, &"x".repeat(65));
+        let refusal = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::CoordAuthInvalid);
+        assert_eq!(refusal.check, "coord_nonce");
+    }
+
+    #[test]
+    fn clock_rollback_cannot_reopen_a_pruned_nonce() {
+        let (fixture, mut old) = honest_request();
+        old.expiry = NOW + 100;
+        coord_sign_as(&mut old, &coord_key().0, "old-nonce");
+        assert!(matches!(
+            handle_sign(&fixture.node, &old, NOW).expect("decodable"),
+            SignResponse::Signed(_)
+        ));
+
+        // Advance authenticated node time to the old request's expiry. This
+        // prunes its nonce while admitting a distinct, later-expiring request.
+        let mut newer = old.clone();
+        newer.expiry = NOW + 200;
+        coord_sign_as(&mut newer, &coord_key().0, "new-nonce");
+        assert!(matches!(
+            handle_sign(&fixture.node, &newer, NOW + 100).expect("decodable"),
+            SignResponse::Signed(_)
+        ));
+
+        // Even if wall time steps backwards into the old request's original
+        // window, the authenticated high-water keeps that request expired.
+        let refusal =
+            expect_refusal(handle_sign(&fixture.node, &old, NOW + 50).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::CommitmentExpired);
+    }
+
+    /// The known-good fixture config with its whole `coordinator_auth_pubkey`
+    /// line replaced by `line` (which must carry its own key and newline); `""`
+    /// drops the field entirely. Everything else is the config the rest of this
+    /// file loads, so the pinned coordinator is the ONLY variable.
+    fn config_with_coord_line(line: &str) -> String {
+        let cfg = fixture_config(0, MAX_AGE, false, true);
+        let (head, tail) = cfg
+            .split_once("coordinator_auth_pubkey")
+            .expect("the fixture config pins a coordinator");
+        let rest = tail.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+        format!("{head}{line}{rest}")
+    }
+
+    #[test]
+    fn a_config_without_a_coordinator_auth_pubkey_fails_startup() {
+        // The trust root is MANDATORY, and this is what keeps the ingress gate
+        // un-bypassable: a node with no pinned coordinator could authenticate
+        // nothing, so an absent key must be fatal at STARTUP rather than yield a
+        // running node whose `/sign` gate verifies against nobody. There is no
+        // "no coordinator" mode for a request to fall into — the absent-field
+        // case is a dead config, not a permissive one. (ADR-0013 §2 states the
+        // reject-unless-coord-signed rule unconditionally; §5 marks `[channel]`
+        // optional, but never this.)
+        let err = expect_config_error(config_with_coord_line(""));
+        assert!(
+            err.contains("coordinator_auth_pubkey"),
+            "an absent coordinator_auth_pubkey must fail startup by name: {err}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_coordinator_auth_pubkey_fails_startup() {
+        // A key that does not parse is fatal at startup too — never a node that
+        // loads and then refuses (or, worse, admits) every request at runtime.
+        let err = expect_config_error(config_with_coord_line(
+            "coordinator_auth_pubkey = \"not-a-pubkey\"\n",
+        ));
+        assert!(
+            err.contains("bad coordinator_auth_pubkey"),
+            "unexpected config error: {err}"
+        );
+    }
+
+    #[test]
+    fn an_uncompressed_coordinator_auth_pubkey_fails_startup() {
+        let secp = Secp256k1::new();
+        let uncompressed = seckey(0xC0).public_key(&secp).serialize_uncompressed();
+        let err = expect_config_error(config_with_coord_line(&format!(
+            "coordinator_auth_pubkey = \"{}\"\n",
+            uncompressed.to_lower_hex_string()
+        )));
+        assert!(
+            err.contains("33-byte compressed"),
+            "unexpected config error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_coordinator_key_that_is_the_user_key_fails_startup() {
+        // The coordinator authorizes REQUESTS; the user authorizes SPENDS. One key
+        // for both roles means the user key can mint its own coordinator requests,
+        // so the gate authenticates nothing it did not already assume. Nothing at
+        // runtime would ever report this — every check still passes — so the only
+        // place to catch it is startup.
+        let secp = Secp256k1::new();
+        let err = expect_config_error(config_with_coord_line(&format!(
+            "coordinator_auth_pubkey = \"{}\"\n",
+            pubkey(&secp, 1)
+        )));
+        assert!(
+            err.contains("must not be the descriptor's user key"),
+            "unexpected config error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_coordinator_key_that_is_a_federation_node_key_fails_startup() {
+        // The isolation this trust root exists to provide: a compromised node must
+        // not be able to manufacture coordinator requests for its peers. Reusing a
+        // federation signing key as the coordinator key hands exactly that power to
+        // whichever node holds it. Checked for EVERY node key, not just this
+        // node's own — the danger is a peer minting requests at us just as much.
+        let secp = Secp256k1::new();
+        for index in 2..=6 {
+            let err = expect_config_error(config_with_coord_line(&format!(
+                "coordinator_auth_pubkey = \"{}\"\n",
+                pubkey(&secp, index)
+            )));
+            assert!(
+                err.contains("must not be one of the descriptor's federation node keys"),
+                "node key {index} must be refused as a coordinator key: {err}"
+            );
+        }
+    }
 }

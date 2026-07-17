@@ -60,7 +60,7 @@
 //! | digest (tag)                                    | preimage fields, in order (LE; `var`=u32-len+bytes; `eps`=u32-count then each `var`) |
 //! |-------------------------------------------------|-------------------------------------------------------------------------------------|
 //! | channel-key  `btc-policy/channel-key/v0`        | `node_seckey[32]` (then `‖ counter:u8` on retry)                                    |
-//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
+//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
 //! | endorsement  `btc-policy/channel-endorsement/v0`| `wallet_id[32]`, `manifest_hash[32]`, `node_id:u16`, `channel_pubkey[33]`, `protocol_version:u32`, `endpoints:eps` |
 //! | envelope     `btc-policy/channel-envelope/v0`   | `msg_type:var`, `protocol_version:u32`, `wallet_id[32]`, `manifest_hash[32]`, `sender_node_id:u16`, `recipient_node_id:u16`, `payload_b64_bytes:var`, `nonce:var`, `timestamp:u64` |
 //! | user-sig     `btc-policy/user-sig-hash/v0`      | per input in order: `user_der_sig:var`, `sighash_type:u8`                            |
@@ -80,13 +80,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use bitcoin::hashes::{sha256, Hash, HashEngine};
+use bitcoin::hashes::Hash;
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
 use bitcoin::{ecdsa, EcdsaSighashType, Psbt, PublicKey, ScriptBuf, Txid};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
+// The channel's digest and length-prefix primitives live in vault-proto and are
+// shared with the coordinator-request preimage, so the two provably cannot drift.
+use vault_proto::{push_var, tagged_hash};
 
 use crate::watchtower::{AlertQueue, FreshnessEvent, FreshnessKind};
 use crate::Error;
@@ -235,8 +238,7 @@ impl Enc {
         self
     }
     fn var(&mut self, b: &[u8]) -> &mut Enc {
-        self.u32(b.len() as u32);
-        self.0.extend_from_slice(b);
+        push_var(&mut self.0, b);
         self
     }
     fn endpoints(&mut self, eps: &[String]) -> &mut Enc {
@@ -246,16 +248,6 @@ impl Enc {
         }
         self
     }
-}
-
-/// BIP340-style tagged SHA-256: `SHA256(SHA256(tag) || SHA256(tag) || msg)`.
-fn tagged_hash(tag: &str, msg: &[u8]) -> [u8; 32] {
-    let th = sha256::Hash::hash(tag.as_bytes());
-    let mut e = sha256::Hash::engine();
-    e.input(th.as_ref());
-    e.input(th.as_ref());
-    e.input(msg);
-    sha256::Hash::from_engine(e).to_byte_array()
 }
 
 // Used by the outbound envelope/payload builders (no production caller in V0-8a).
@@ -323,7 +315,7 @@ pub(crate) fn derive_channel_seckey(node_seckey: &SecretKey) -> SecretKey {
     }
 }
 
-fn channel_pubkey_of(sk: &SecretKey) -> PublicKey {
+pub(crate) fn channel_pubkey_of(sk: &SecretKey) -> PublicKey {
     PublicKey::new(sk.public_key(&Secp256k1::signing_only()))
 }
 
@@ -338,17 +330,26 @@ struct ManifestNode {
     endpoints: Vec<String>,
 }
 
-/// Canonical bytes of the endorsement-FREE BaseManifest (§2). `channel_pubkey`
-/// IS in the hashed structure (deterministic, known at setup). v0-provisional to
-/// V0-9. `nodes` MUST be sorted by `node_id`.
+/// Canonical bytes of the provisional, endorsement-FREE BaseManifest slice
+/// (ADR-0013 §4). It still carries V0-8a's limited fields rather than the complete
+/// §4 schema: `wallet_id` transitively binds the descriptor, while
+/// `policy_version`, `hot_allowlist`, and `escape_descriptor` are not yet explicit
+/// preimage fields. Within this minimal V0-9 slice, `channel_pubkey` IS in the
+/// hashed structure (deterministic, known at setup), and
+/// `coordinator_auth_pubkey` is hashed in right after `protocol_version` as its 33
+/// compressed bytes. Every vault is sealed to exactly one coordinator, so changing
+/// that key changes `manifest_hash`, i.e. it is a new vault (§7). `nodes` MUST be
+/// sorted by `node_id`.
 fn base_manifest_bytes(
     wallet_id: &[u8; 32],
     protocol_version: u32,
+    coordinator_auth_pubkey: &PublicKey,
     nodes: &[ManifestNode],
 ) -> Vec<u8> {
     let mut e = Enc::new();
     e.fixed(wallet_id);
     e.u32(protocol_version);
+    e.fixed(&coordinator_auth_pubkey.inner.serialize());
     e.u32(nodes.len() as u32);
     for n in nodes {
         e.u16(n.node_id);
@@ -362,11 +363,12 @@ fn base_manifest_bytes(
 fn compute_manifest_hash(
     wallet_id: &[u8; 32],
     protocol_version: u32,
+    coordinator_auth_pubkey: &PublicKey,
     nodes: &[ManifestNode],
 ) -> [u8; 32] {
     tagged_hash(
         MANIFEST_TAG,
-        &base_manifest_bytes(wallet_id, protocol_version, nodes),
+        &base_manifest_bytes(wallet_id, protocol_version, coordinator_auth_pubkey, nodes),
     )
 }
 
@@ -1010,6 +1012,7 @@ pub struct ChannelState {
 impl ChannelState {
     /// Build the channel runtime, running every §2 startup invariant. Any failure
     /// is a fatal config error (returned `Err`), never a runtime refusal.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
         cfg: &ChannelConfig,
         node_seckey: &SecretKey,
@@ -1017,6 +1020,10 @@ impl ChannelState {
         wallet_id: [u8; 32],
         descriptor_node_keys: &[PublicKey],
         listen_port: u16,
+        // The one coordinator auth key this vault is sealed to (ADR-0013 §2/§4).
+        // Hashed into `manifest_hash` (via [`base_manifest_bytes`]) so the sealed
+        // manifest binds it: a different coordinator is a different vault.
+        coordinator_auth: PublicKey,
         alerts: Arc<Mutex<AlertQueue>>,
     ) -> Result<ChannelState, Error> {
         // Tokio's constructor panics above this implementation limit. Treat a
@@ -1077,6 +1084,22 @@ impl ChannelState {
                 )
                 .into());
             }
+            // Cross-role reuse is fatal here for the same reason it is for the
+            // descriptor's keys (see `Node::from_toml_str`): a node derives its
+            // channel seckey from its federation seckey, so a channel_pubkey that
+            // doubles as the coordinator auth key would let that one node mint
+            // coordinator-authenticated requests for the whole vault.
+            // `bitcoin::PublicKey` equality also compares its compressed-encoding
+            // flag, but roles are identities on the secp curve. Compare the
+            // underlying point so an uncompressed spelling cannot disguise reuse
+            // of the manifest's compressed coordinator key.
+            if channel_pk.inner == coordinator_auth.inner {
+                return Err(format!(
+                    "[channel] node {id} channel_pubkey is also the coordinator_auth_pubkey: one \
+                     key for both roles lets a single node mint coordinator requests"
+                )
+                .into());
+            }
             if entry.endpoints.is_empty() {
                 return Err(format!("[channel] node {id} has no endpoints").into());
             }
@@ -1105,7 +1128,8 @@ impl ChannelState {
             return Err("[channel] self entry signing_pubkey does not match this node's federation signing key".into());
         }
 
-        let manifest_hash = compute_manifest_hash(&wallet_id, PROTOCOL_VERSION_V0, &nodes);
+        let manifest_hash =
+            compute_manifest_hash(&wallet_id, PROTOCOL_VERSION_V0, &coordinator_auth, &nodes);
         if let Some(expected) = &cfg.expected_manifest_hash {
             let expected = from_hex_32(expected)
                 .map_err(|_| Error::from("[channel] expected_manifest_hash is not 32-byte hex"))?;
@@ -1792,6 +1816,7 @@ mod fixture {
     use super::*;
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::hex::DisplayHex;
     use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
     use bitcoin::sighash::SighashCache;
     use bitcoin::transaction::Version;
@@ -1801,6 +1826,7 @@ mod fixture {
     };
     use miniscript::{Descriptor, DescriptorPublicKey};
     use std::str::FromStr;
+    use vault_proto::SignRequest;
 
     pub(crate) fn keypair(seed: u8) -> (SecretKey, PublicKey) {
         let sk = SecretKey::from_slice(&[seed; 32]).expect("valid sk");
@@ -1823,6 +1849,12 @@ mod fixture {
     pub(crate) struct Fixture {
         pub(crate) user_sk: SecretKey,
         pub(crate) user_pk: PublicKey,
+        /// The vault's one coordinator auth identity (ADR-0013 §2/§4): its public
+        /// half is hashed into `manifest_hash` and provisioned into every config
+        /// this fixture emits; its secret half signs the requests these tests send,
+        /// so each one passes the ingress coord-auth gate.
+        pub(crate) coord_sk: SecretKey,
+        pub(crate) coord_pk: PublicKey,
         pub(crate) descriptor: String,
         pub(crate) witness_script: ScriptBuf,
         pub(crate) wallet_id: [u8; 32],
@@ -1850,6 +1882,9 @@ mod fixture {
         fn with_ports_seed(t: usize, ports: &[u16], user_seed: u8, fed_base: u8) -> Fixture {
             let n = ports.len();
             let (user_sk, user_pk) = keypair(user_seed);
+            // The coordinator this fixture's vault is sealed to. Seeded off
+            // `user_seed` so a distinct vault also has a distinct coordinator.
+            let (coord_sk, coord_pk) = keypair(user_seed.wrapping_add(0x0C));
             let feds: Vec<(SecretKey, PublicKey)> =
                 (0..n as u8).map(|i| keypair(fed_base + i)).collect();
             let node_pubkeys: Vec<String> = feds.iter().map(|(_, pk)| pk.to_string()).collect();
@@ -1895,7 +1930,8 @@ mod fixture {
                     endpoints: vec![format!("127.0.0.1:{}", ports[node_id])],
                 });
             }
-            let manifest_hash = compute_manifest_hash(&wallet_id, PROTOCOL_VERSION_V0, &nodes);
+            let manifest_hash =
+                compute_manifest_hash(&wallet_id, PROTOCOL_VERSION_V0, &coord_pk, &nodes);
 
             let mut entries = Vec::new();
             for (node_id, &fed_idx) in order.iter().enumerate() {
@@ -1923,6 +1959,8 @@ mod fixture {
             Fixture {
                 user_sk,
                 user_pk,
+                coord_sk,
+                coord_pk,
                 descriptor: canonical,
                 witness_script,
                 wallet_id,
@@ -1957,7 +1995,7 @@ mod fixture {
                 })
                 .collect();
             self.manifest_hash =
-                compute_manifest_hash(&self.wallet_id, PROTOCOL_VERSION_V0, &nodes);
+                compute_manifest_hash(&self.wallet_id, PROTOCOL_VERSION_V0, &self.coord_pk, &nodes);
             for entry in &mut self.entries {
                 let digest = endorsement_digest(
                     &self.wallet_id,
@@ -2005,7 +2043,7 @@ mod fixture {
         ) -> String {
             let e = &self.entries[self_id as usize];
             format!(
-                "listen_port = {}\nnode_seckey = \"{}\"\ndescriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nmax_commitment_age_secs = 172800\npolicy_version = 1\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\n{channel}",
+                "listen_port = {}\nnode_seckey = \"{}\"\ndescriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nmax_commitment_age_secs = 172800\npolicy_version = 1\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n{channel}",
                 self.ports[self_id as usize],
                 e.fed_sk.display_secret(),
                 self.descriptor,
@@ -2014,7 +2052,23 @@ mod fixture {
                 self.escape_desc,
                 sha256::Hash::hash(b"1234"),
                 sha256::Hash::hash(b"9999"),
+                self.coord_pk,
             )
+        }
+
+        /// Attach a fresh `nonce` and this vault's coordinator signature over the
+        /// canonical request bytes (ADR-0013 §2) — what vault-cli does before every
+        /// relay. Channel tests reach the node through the real `/sign` ingress, so
+        /// each request must clear the coord-auth gate to register a candidate.
+        /// `nonce_seed` only has to be unique per request within a test: a
+        /// coordinator nonce is single-use, so a repeat is a replay by definition.
+        pub(crate) fn coord_sign(&self, request: &mut SignRequest, nonce_seed: &str) {
+            request.nonce = nonce_seed.to_string();
+            // coord_sig is never part of its own preimage; no clearing needed.
+            let digest = request.coord_request().auth_digest();
+            let sig =
+                Secp256k1::signing_only().sign_ecdsa(&Message::from_digest(digest), &self.coord_sk);
+            request.coord_sig = sig.serialize_der().to_lower_hex_string();
         }
 
         /// A user-signed spend PSBT paying `dest_spk`, spending one vault UTXO at
@@ -2192,11 +2246,43 @@ mod golden {
                 endpoints: vec!["127.0.0.1:9001".to_string()],
             },
         ];
-        let pre = base_manifest_bytes(&wallet_id, PROTOCOL_VERSION_V0, &nodes);
-        assert_eq!(to_hex(&pre), "222222222222222222222222222222222222222222222222222222222222222200000000020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031");
+        // The frozen provisional BaseManifest-slice preimage (ADR-0013 §4):
+        // wallet_id[32], protocol_version:u32, coordinator_auth_pubkey[33],
+        // node-count:u32, then each node by id. The coordinator key is
+        // unconditional — every vault is sealed to exactly one coordinator — so
+        // it always occupies offsets 36..69.
+        let coord = pk(0xC0);
+        let bytes = base_manifest_bytes(&wallet_id, PROTOCOL_VERSION_V0, &coord, &nodes);
+        assert_eq!(to_hex(&bytes), "222222222222222222222222222222222222222222222222222222222222222200000000038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c236020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031");
         assert_eq!(
-            to_hex(&tagged_hash(MANIFEST_TAG, &pre)),
-            "53b94e258ac8ba1cffdd3fdb18748638b33962eca7b4fd7d1de88320bb66a474"
+            bytes[36..69],
+            coord.inner.serialize(),
+            "the coordinator key is hashed in right after protocol_version"
+        );
+        assert_eq!(
+            to_hex(&tagged_hash(MANIFEST_TAG, &bytes)),
+            "29d43399286922650ae70120fa4a954843a7e083c46219f999501c088f406312"
+        );
+    }
+
+    #[test]
+    fn manifest_hash_changes_when_the_coordinator_key_changes() {
+        // The acceptance property (ADR-0013 §4/§7): the coordinator_auth_pubkey is
+        // in the hashed BaseManifest, so swapping the coordinator — with the
+        // membership held identical — is a DIFFERENT vault. This is what makes
+        // "rotation = new vault" structural rather than a matter of policy.
+        let wallet_id = [0x22u8; 32];
+        let nodes = vec![ManifestNode {
+            node_id: 0,
+            signing_pubkey: pk(1),
+            channel_pubkey: pk(2),
+            endpoints: vec!["127.0.0.1:9000".to_string()],
+        }];
+        let with_a = compute_manifest_hash(&wallet_id, PROTOCOL_VERSION_V0, &pk(0xC0), &nodes);
+        let with_b = compute_manifest_hash(&wallet_id, PROTOCOL_VERSION_V0, &pk(0xC1), &nodes);
+        assert_ne!(
+            with_a, with_b,
+            "a different coordinator key ⇒ a different vault"
         );
     }
 
@@ -2434,6 +2520,101 @@ mod identity {
         let err = crate::Node::from_toml_str(&bad)
             .err()
             .expect("sealed mismatch");
+        assert!(err.to_string().contains("sealed"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn a_coordinator_key_that_is_a_peers_channel_key_is_fatal() {
+        // The channel half of the cross-role check `Node::from_toml_str` runs over
+        // the descriptor's keys. A node derives its channel seckey from its
+        // federation seckey, so a channel_pubkey doubling as the coordinator auth
+        // key hands that one node the power to mint coordinator requests for the
+        // whole vault — the exact isolation this trust root exists to provide.
+        let fx = Fixture::new(2, 3);
+        let cfg = fx.config(0, 0, "").replace(
+            &fx.coord_pk.to_string(),
+            &fx.entries[1].channel_pk.to_string(),
+        );
+        let err = crate::Node::from_toml_str(&cfg)
+            .err()
+            .expect("a channel key must be refused as the coordinator key");
+        assert!(
+            err.to_string()
+                .contains("channel_pubkey is also the coordinator_auth_pubkey"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn a_coordinator_key_that_is_the_derived_channel_key_is_fatal_without_a_channel() {
+        // Same collapse as the test above, reached with `[channel]` absent — where
+        // no manifest, and so no `ChannelState::build`, exists to catch it. The
+        // channel key is `derive_channel_seckey(node_seckey)`, a public function of
+        // the federation seckey, so pinning it as the coordinator key hands this
+        // node's holder coordinator authority over the whole vault while every
+        // gate still passes. `Node::from_toml_str` compares its own derived key
+        // unconditionally, which is what closes this in absent-channel mode.
+        let fx = Fixture::new(2, 3);
+        let cfg = fx.config_with_channel(0, 0, "").replace(
+            &fx.coord_pk.to_string(),
+            &fx.entries[0].channel_pk.to_string(),
+        );
+        assert!(
+            !cfg.contains("[channel]"),
+            "this test must exercise the absent-channel path"
+        );
+        let err = crate::Node::from_toml_str(&cfg)
+            .err()
+            .expect("the derived channel key must be refused as the coordinator key");
+        assert!(
+            err.to_string()
+                .contains("must not be this node's derived channel key"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn an_uncompressed_channel_key_cannot_disguise_coordinator_key_reuse() {
+        let fx = Fixture::new(2, 3);
+        let peer = &fx.entries[1];
+        let uncompressed_coord = fx
+            .coord_pk
+            .inner
+            .serialize_uncompressed()
+            .to_lower_hex_string();
+        let cfg =
+            fx.config(0, 0, "")
+                .replacen(&peer.channel_pk.to_string(), &uncompressed_coord, 1);
+        let err = crate::Node::from_toml_str(&cfg)
+            .err()
+            .expect("the same secp point in another encoding must be refused");
+        assert!(
+            err.to_string()
+                .contains("channel_pubkey is also the coordinator_auth_pubkey"),
+            "the cross-role identity check must run before endorsement failure: {err}"
+        );
+    }
+
+    #[test]
+    fn a_sealed_node_will_not_boot_under_a_swapped_coordinator_key() {
+        // "Rotation = new vault" (ADR-0013 §7) is ENFORCED, not just stated. The
+        // two neighbouring tests each prove one half — that the manifest hash is
+        // sensitive to the coordinator key, and that a sealed node dies on a
+        // mismatched hash — but neither composes them, and it is the composition
+        // that operators actually rely on: you cannot re-point a sealed node at a
+        // new coordinator by editing its config. Everything but the coordinator key
+        // is held identical here, so nothing else can be producing the refusal.
+        let fx = Fixture::new(2, 3);
+        let sealed = format!(
+            "expected_manifest_hash = \"{}\"\n",
+            to_hex(&fx.manifest_hash)
+        );
+        let rotated = fx
+            .config(0, 0, &sealed)
+            .replace(&fx.coord_pk.to_string(), &keypair(0xC1).1.to_string());
+        let err = crate::Node::from_toml_str(&rotated)
+            .err()
+            .expect("a sealed node must refuse a rotated coordinator key");
         assert!(err.to_string().contains("sealed"), "unexpected: {err}");
     }
 
@@ -3479,13 +3660,16 @@ mod partial {
         let sender = fx.channel_state(0);
         let node = crate::Node::from_toml_str(&fx.config(1, 10, "")).expect("config");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
-        let request = SignRequest {
+        let mut request = SignRequest {
             psbt: psbt.to_string(),
             escape_psbt: psbt.to_string(),
             pin: "1234".to_string(),
+            nonce: String::new(),
             expiry: NOW + 3_600,
             policy_version: 1,
+            coord_sig: String::new(),
         };
+        fx.coord_sign(&mut request, "pending-candidate");
         assert!(matches!(
             crate::handle_sign(&node, &request, NOW).expect("pending verdict"),
             SignResponse::Pending(_)
@@ -3509,6 +3693,8 @@ mod partial {
             ChannelReply::Accepted
         );
 
+        // Resubmitting past the Hold: same commitment, fresh nonce per send.
+        fx.coord_sign(&mut request, "pending-candidate-past-hold");
         assert!(matches!(
             crate::handle_sign(&node, &request, NOW + 10).expect("signed verdict"),
             SignResponse::Signed(_)
@@ -3537,13 +3723,16 @@ mod partial {
             .expect("original user signature")
             .signature
             .serialize_der();
-        let request = SignRequest {
+        let mut request = SignRequest {
             psbt: psbt.to_string(),
             escape_psbt: psbt.to_string(),
             pin: "1234".to_string(),
+            nonce: String::new(),
             expiry: NOW + 3_600,
             policy_version: 1,
+            coord_sig: String::new(),
         };
+        fx.coord_sign(&mut request, "changed-user-sig");
         assert!(matches!(
             crate::handle_sign(&node, &request, NOW).expect("pending verdict"),
             SignResponse::Pending(_)
@@ -3600,11 +3789,16 @@ mod partial {
                 sighash_type: EcdsaSighashType::All,
             },
         );
-        let resigned_request = SignRequest {
+        let mut resigned_request = SignRequest {
             psbt: resigned.to_string(),
             escape_psbt: resigned.to_string(),
             ..request
         };
+        // A new transmission carrying different bytes: the coordinator signs what
+        // it relays, so the re-signed PSBT gets a fresh nonce + coord_sig. (The
+        // commitment is unchanged — a user signature is not part of it — which is
+        // exactly what keeps the candidate's peer partials alive below.)
+        fx.coord_sign(&mut resigned_request, "changed-user-sig-resend");
         assert!(matches!(
             crate::handle_sign(&node, &resigned_request, NOW + 10).expect("signed verdict"),
             SignResponse::Signed(_)
@@ -3663,20 +3857,25 @@ mod partial {
                 sighash_type: EcdsaSighashType::All,
             },
         );
-        let request = SignRequest {
+        let mut request = SignRequest {
             psbt: psbt.to_string(),
             escape_psbt: psbt.to_string(),
             pin: "1234".to_string(),
+            nonce: String::new(),
             expiry: NOW + 3_600,
             policy_version: 1,
+            coord_sig: String::new(),
         };
+        fx.coord_sign(&mut request, "forged-partial-first");
         // Pending registers the candidate; the forged self entry must be stripped.
         assert!(matches!(
             crate::handle_sign(&node, &request, NOW).expect("pending verdict"),
             SignResponse::Pending(_)
         ));
         // The Hold elapses and the node signs; its OWN real partial must reach the
-        // candidate, not the coordinator's forgery.
+        // candidate, not the coordinator's forgery. Resubmitting past the Hold is a
+        // second transmission of the same commitment, so it carries a fresh nonce.
+        fx.coord_sign(&mut request, "forged-partial-past-hold");
         assert!(matches!(
             crate::handle_sign(&node, &request, NOW + 10).expect("signed verdict"),
             SignResponse::Signed(_)
@@ -3720,13 +3919,17 @@ mod partial {
             .expect("config");
         let sign = |txid: u8| {
             let psbt = fx.spend_psbt(&fx.hot_spk, txid);
-            let req = SignRequest {
+            let mut req = SignRequest {
                 psbt: psbt.to_string(),
                 escape_psbt: psbt.to_string(),
                 pin: "1234".to_string(),
+                nonce: String::new(),
                 expiry: NOW + 3_600,
                 policy_version: 1,
+                coord_sig: String::new(),
             };
+            // Distinct spends ⇒ distinct nonces: each is its own transmission.
+            fx.coord_sign(&mut req, &format!("capacity-{txid}"));
             crate::handle_sign(&node, &req, NOW).expect("decodable")
         };
         // Both spends sign; the second is not registered (store full) but its
@@ -3946,7 +4149,7 @@ mod net {
     use std::sync::Mutex as StdMutex;
 
     use crate::server;
-    use vault_proto::{SignRequest, SignResponse};
+    use vault_proto::{SignRequest, SignResponse, TaggedRequest};
 
     async fn ephemeral() -> (tokio::net::TcpListener, u16) {
         let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -3967,20 +4170,26 @@ mod net {
         tokio::spawn(server::serve(l1, Arc::clone(&node1)));
 
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
-        let req = SignRequest {
+        let mut req = SignRequest {
             psbt: psbt.to_string(),
             escape_psbt: psbt.to_string(),
             pin: "1234".to_string(),
+            nonce: String::new(),
             expiry: unix_now() + 3_600,
             policy_version: 1,
+            coord_sig: String::new(),
         };
+        // ONE coordinator signature fans to all n nodes (ADR-0013 §2 node-fan-out):
+        // the nonce log is per-node, so each node sees this nonce exactly once. A
+        // per-node signature is neither needed nor what the coordinator does.
+        fx.coord_sign(&mut req, "net-fanout");
         // Each node receives the spend via the REAL POST /sign, registering the
         // candidate (no test-only injection).
         let client = reqwest::Client::new();
         for port in [p0, p1] {
             let resp = client
                 .post(format!("http://127.0.0.1:{port}/sign"))
-                .json(&req)
+                .json(&TaggedRequest::Spend(req.clone()))
                 .send()
                 .await
                 .expect("sign send");
