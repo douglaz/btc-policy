@@ -16,7 +16,7 @@
 //! each pass scans only new blocks and writing into the same alert queue
 //! `GET /events` reads.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -62,6 +62,51 @@ impl Alert {
             spend_txid: spend.spend_txid.to_string(),
             outpoint: spend.outpoint.to_string(),
             script: spend.script.to_hex_string(),
+        }
+    }
+}
+
+/// The one channel-diagnostic event kind (V0-8a, codex I2). Its own SCREAMING_SNAKE
+/// tag so an operator tells it apart from the watchtower alerts in `/events`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FreshnessKind {
+    ChannelFreshnessReject,
+}
+
+/// A channel freshness-rejection event, surfaced through the SAME `/events` path
+/// so an operator sees WHICH peer's clock is off (and the running count + a
+/// clock-skew hint) before it is silently ejected from the combine set. It carries
+/// NO transaction fields — the watchtower alert JSON is left untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FreshnessEvent {
+    pub kind: FreshnessKind,
+    /// The authenticated peer whose envelope failed the freshness window.
+    pub peer_node_id: u16,
+    /// Running per-peer count of freshness rejections (monotonic).
+    pub reject_count: u64,
+    /// `envelope_timestamp - now` (positive ⇒ peer clock ahead, negative ⇒ behind).
+    pub skew_secs: i64,
+}
+
+/// One queued event: either a watchtower [`Alert`] (unchanged JSON) or a channel
+/// [`FreshnessEvent`]. `#[serde(untagged)]` serializes each variant AS its inner
+/// value, so an existing watchtower alert keeps its exact `{kind, spend_txid,
+/// outpoint, script}` shape while a freshness event serializes to its own object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Event {
+    Watchtower(Alert),
+    ChannelFreshness(FreshnessEvent),
+}
+
+impl Event {
+    /// Test-only downcast to the watchtower [`Alert`].
+    #[cfg(test)]
+    pub(crate) fn watchtower(&self) -> &Alert {
+        match self {
+            Event::Watchtower(a) => a,
+            Event::ChannelFreshness(_) => panic!("expected a watchtower alert"),
         }
     }
 }
@@ -223,13 +268,19 @@ pub fn spawn_driver(
 /// (acceptable for the v0 in-memory queue; DESIGN.md). A re-scan of the same
 /// retained on-chain spend never enqueues a duplicate.
 pub struct AlertQueue {
-    /// (sequence, dedupe key, alert), oldest first.
-    entries: VecDeque<(u64, String, Alert)>,
+    /// (sequence, dedupe key, event), oldest first.
+    entries: VecDeque<(u64, String, Event)>,
     /// Next sequence to assign; `next_seq - 1` is the current cursor.
     next_seq: u64,
-    /// Spends already alerted (`spend_txid:outpoint`), so repeated ticks are
-    /// idempotent — a watchtower polls the chain, so it re-sees old spends.
+    /// Events already queued (dedupe key), so repeated ticks are idempotent — a
+    /// watchtower polls the chain, so it re-sees old spends.
     seen: HashSet<String>,
+    /// Highest freshness `reject_count` ever PUBLISHED per peer. A freshness entry
+    /// can be cap-evicted from `entries` between two concurrent handlers'
+    /// publications, so the retained-entry count alone cannot keep `reject_count`
+    /// monotonic; this queue-independent high-water can. Bounded by manifest
+    /// membership `n` (one key per peer), never pruned — it IS the durable record.
+    freshness_high_water: HashMap<u16, u64>,
     cap: usize,
 }
 
@@ -239,26 +290,65 @@ impl AlertQueue {
             entries: VecDeque::new(),
             next_seq: 1,
             seen: HashSet::new(),
+            freshness_high_water: HashMap::new(),
             cap,
         }
     }
 
     /// Enqueue `alert` unless this exact spend was already alerted. Returns
-    /// whether it was newly enqueued.
+    /// whether it was newly enqueued. Watchtower alerts are drop-on-dup: re-seeing
+    /// a spend must NOT re-alert.
     pub fn push(&mut self, alert: Alert) -> bool {
         let key = format!("{}:{}", alert.spend_txid, alert.outpoint);
         if !self.seen.insert(key.clone()) {
             return false;
         }
+        self.append(key, Event::Watchtower(alert));
+        true
+    }
+
+    /// Record a channel freshness-rejection event (V0-8a). Dedupe key
+    /// `freshness:<peer>` with **replace** semantics: at most one freshness entry
+    /// per peer, refreshed to the newest sequence on each rejection so its running
+    /// `reject_count` stays monotonic and a cursor-polling client re-sees it —
+    /// while a skew-spamming peer can never grow the queue beyond `n` freshness
+    /// entries (so it cannot evict watchtower alerts unboundedly).
+    pub fn record_freshness(&mut self, event: FreshnessEvent) {
+        // Concurrent channel handlers allocate per-peer counts, then take this
+        // queue's lock separately, so a later count can be published first. Gate on
+        // the per-peer published high-water — NOT the retained queue entry — so an
+        // older publication is dropped even when its newer sibling was already
+        // cap-evicted from `entries` (which would otherwise leave the position
+        // lookup empty and let `/events` regress). Counts are strictly increasing
+        // per peer (channel.rs saturating_add from 0, first publish ≥ 1), so `<=`
+        // is exact and the 0 initial means "nothing published yet".
+        let hw = self
+            .freshness_high_water
+            .entry(event.peer_node_id)
+            .or_insert(0);
+        if event.reject_count <= *hw {
+            return;
+        }
+        *hw = event.reject_count;
+        let key = format!("freshness:{}", event.peer_node_id);
+        if let Some(pos) = self.entries.iter().position(|(_, k, _)| *k == key) {
+            self.entries.remove(pos);
+        }
+        self.seen.remove(&key);
+        self.seen.insert(key.clone());
+        self.append(key, Event::ChannelFreshness(event));
+    }
+
+    /// Assign the next sequence, enqueue, and cap-evict the oldest.
+    fn append(&mut self, key: String, event: Event) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.entries.push_back((seq, key, alert));
+        self.entries.push_back((seq, key, event));
         while self.entries.len() > self.cap {
             if let Some((_, evicted_key, _)) = self.entries.pop_front() {
                 self.seen.remove(&evicted_key);
             }
         }
-        true
     }
 
     /// Every retained alert with sequence strictly greater than `since`, plus the
@@ -266,14 +356,14 @@ impl AlertQueue {
     /// so it advances even when nothing newer is returned — a client that keeps
     /// passing the returned cursor never re-fetches and never misses (within the
     /// bound).
-    pub fn since(&self, since: u64) -> (Vec<Alert>, u64) {
-        let alerts = self
+    pub fn since(&self, since: u64) -> (Vec<Event>, u64) {
+        let events = self
             .entries
             .iter()
             .filter(|(seq, _, _)| *seq > since)
-            .map(|(_, _, alert)| alert.clone())
+            .map(|(_, _, event)| event.clone())
             .collect();
-        (alerts, self.cursor())
+        (events, self.cursor())
     }
 
     /// The current high-water cursor: the sequence a fresh pull returns up to.
@@ -393,7 +483,7 @@ mod tests {
         assert!(queue.push(alert(4)));
         let (newer, cursor3) = queue.since(cursor);
         assert_eq!(newer.len(), 1, "since=<last> returns only the newer alert");
-        assert_eq!(newer[0].spend_txid, txid(4).to_string());
+        assert_eq!(newer[0].watchtower().spend_txid, txid(4).to_string());
         assert_eq!(cursor3, 4);
     }
 
@@ -413,9 +503,11 @@ mod tests {
         // No loss: every pushed alert is delivered exactly once across pulls.
         assert_eq!(first.len() + second.len(), 8);
         // No duplication: the two pulls share no txid.
-        let seen: HashSet<_> = first.iter().map(|a| &a.spend_txid).collect();
+        let seen: HashSet<_> = first.iter().map(|a| &a.watchtower().spend_txid).collect();
         assert!(
-            second.iter().all(|a| !seen.contains(&a.spend_txid)),
+            second
+                .iter()
+                .all(|a| !seen.contains(&a.watchtower().spend_txid)),
             "an alert returned in the first pull must never repeat in the second"
         );
     }
@@ -449,7 +541,71 @@ mod tests {
         );
         let (retained, _) = queue.since(0);
         assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].spend_txid, txid(1).to_string());
+        assert_eq!(retained[0].watchtower().spend_txid, txid(1).to_string());
+    }
+
+    #[test]
+    fn an_out_of_order_freshness_publication_never_regresses_the_count() {
+        let mut queue = AlertQueue::new(DEFAULT_ALERT_CAP);
+        let event = |reject_count| FreshnessEvent {
+            kind: FreshnessKind::ChannelFreshnessReject,
+            peer_node_id: 7,
+            reject_count,
+            skew_secs: -400,
+        };
+        queue.record_freshness(event(2));
+        let cursor = queue.cursor();
+        queue.record_freshness(event(1));
+
+        let (events, after) = queue.since(0);
+        assert_eq!(after, cursor, "an obsolete publication is not appended");
+        assert!(matches!(
+            events.as_slice(),
+            [Event::ChannelFreshness(FreshnessEvent {
+                reject_count: 2,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn an_evicted_freshness_entry_still_blocks_an_older_publication() {
+        // The eviction race: a newer count is published, cap-evicted, THEN an older
+        // count arrives. Without a queue-independent high-water the position lookup
+        // finds nothing and appends the stale count, regressing `/events`.
+        let mut queue = AlertQueue::new(1);
+        let event = |reject_count| FreshnessEvent {
+            kind: FreshnessKind::ChannelFreshnessReject,
+            peer_node_id: 7,
+            reject_count,
+            skew_secs: -400,
+        };
+        queue.record_freshness(event(2));
+        // A single watchtower alert (cap == 1) evicts the freshness entry.
+        assert!(queue.push(alert(1)));
+        assert!(
+            !queue.entries.iter().any(|(_, k, _)| k == "freshness:7"),
+            "the count-2 freshness entry was cap-evicted"
+        );
+
+        // The out-of-order older publication must NOT re-enter after eviction.
+        queue.record_freshness(event(1));
+        assert!(
+            !queue.entries.iter().any(|(_, k, _)| k == "freshness:7"),
+            "a stale count-1 publication is dropped by the high-water, not re-appended"
+        );
+
+        // Forward progress still works: a genuinely newer count re-enters.
+        queue.record_freshness(event(3));
+        let published = queue.since(0).0.into_iter().find_map(|e| match e {
+            Event::ChannelFreshness(f) if f.peer_node_id == 7 => Some(f.reject_count),
+            _ => None,
+        });
+        assert_eq!(
+            published,
+            Some(3),
+            "a higher count than the high-water is published again"
+        );
     }
 
     // -- the daemon driver (V0-6b) ------------------------------------------
@@ -478,7 +634,8 @@ mod tests {
         // test ever calls scan/tick, proving the driver drives.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(alert) = alerts.lock().expect("alerts lock").since(0).0.first() {
+            if let Some(event) = alerts.lock().expect("alerts lock").since(0).0.first() {
+                let alert = event.watchtower();
                 assert_eq!(alert.kind, AlertKind::UnrecognizedSpend);
                 assert_eq!(alert.spend_txid, txid(0xAA).to_string());
                 return;
@@ -576,6 +733,6 @@ mod tests {
         // the concurrent signer — locking + dedup held.
         let (queued, _) = alerts.lock().expect("alerts lock").since(0);
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].spend_txid, txid(0xFF).to_string());
+        assert_eq!(queued[0].watchtower().spend_txid, txid(0xFF).to_string());
     }
 }

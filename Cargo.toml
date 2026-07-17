@@ -18,11 +18,17 @@ miniscript = "12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-# The vault-node async base (V0-8a0): tokio runtime + axum HTTP. Feature set is
-# deliberately narrow — the next milestones (V0-8a channel, V0-8b/V0-4 timers)
-# add reqwest/etc., not this task.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+# The vault-node async base (V0-8a0): tokio runtime + axum HTTP. `sync` (V0-8a)
+# adds the Semaphore backing the channel's pre-auth concurrency bound.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# Outbound node-to-node channel client (V0-8a; user decision 2026-07-16 — V0-8b,
+# V0-4, and v1 SOCKS/Tor reuse it). No TLS features: v0 channel is loopback HTTP,
+# so default-tls/rustls (and their C/ring deps) stay off.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# base64 is already compiled (bitcoin's `base64` feature): a direct dep here adds
+# no new transitive crate. Used for the channel envelope's opaque `payload_b64`.
+base64 = "0.22"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
