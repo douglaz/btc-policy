@@ -23,6 +23,13 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Psbt, Script};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
+pub mod template;
+
+pub use template::{
+    parse_vault_template, recovery_sequence, vault_descriptor_string, VaultTemplate, RECOVERY_KEYS,
+    RECOVERY_THRESHOLD, RECOVERY_TIMELOCK_NSEQUENCE, RECOVERY_TIMELOCK_UNITS,
+};
+
 /// Fee cap for first light: fee may not exceed this percentage of the total
 /// input value (ADR-0006 — a generous bug guard, not a security control).
 pub const MAX_FEE_PERCENT: u64 = 10;

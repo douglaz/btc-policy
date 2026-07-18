@@ -119,13 +119,22 @@ pub fn run_first_light() -> Result<(), Error> {
     // The attacker's destination is a raw key that derives from no descriptor.
     let attacker_spk = p2wpkh_spk(&Actor::random(&secp, &mut urandom)?);
 
-    // The first-light vault: user key AND 3-of-5 node keys, P2WSH, no
-    // recovery branch (the regtest demo vault is throwaway).
+    // The first-light vault: user key AND 3-of-5 node keys on the normal branch,
+    // OR the timelocked recovery branch — `older(4224679)` + a 2-of-3 recovery
+    // keyset (ADR-0013 §1, V0-10). The recovery keys are throwaway regtest keys,
+    // UNUSED on the normal path first light exercises: first light proves the
+    // recovery branch does not disturb the normal spend (the nodes still combine
+    // and broadcast the normal branch), and `demo recovery-drill` exercises the
+    // exit itself.
     let node_pubkeys: Vec<String> = node_actors.iter().map(|a| a.pubkey.to_string()).collect();
-    let descriptor_str = format!(
-        "wsh(and_v(v:pk({}),multi({QUORUM},{})))",
-        user.pubkey,
-        node_pubkeys.join(",")
+    let recovery_pubkeys: Vec<String> = (0..policy_core::RECOVERY_KEYS)
+        .map(|_| Ok(Actor::random(&secp, &mut urandom)?.pubkey.to_string()))
+        .collect::<Result<_, Error>>()?;
+    let descriptor_str = policy_core::vault_descriptor_string(
+        &user.pubkey.to_string(),
+        QUORUM,
+        &node_pubkeys,
+        &recovery_pubkeys,
     );
     let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str)?;
     let vault_spk = descriptor.script_pubkey();
@@ -514,13 +523,13 @@ fn foreign_coordinator_is_refused(
 // ---------------------------------------------------------------------------
 // Keys and destinations
 
-struct Actor {
-    seckey: SecretKey,
-    pubkey: PublicKey,
+pub(crate) struct Actor {
+    pub(crate) seckey: SecretKey,
+    pub(crate) pubkey: PublicKey,
 }
 
 impl Actor {
-    fn random(
+    pub(crate) fn random(
         secp: &Secp256k1<bitcoin::secp256k1::All>,
         urandom: &mut File,
     ) -> Result<Actor, Error> {
@@ -1051,12 +1060,12 @@ fn locate_vault_node() -> Result<PathBuf, Error> {
 // ---------------------------------------------------------------------------
 // Temp dir + port allocation
 
-struct TempDir {
-    path: PathBuf,
+pub(crate) struct TempDir {
+    pub(crate) path: PathBuf,
 }
 
 impl TempDir {
-    fn new() -> Result<TempDir, Error> {
+    pub(crate) fn new() -> Result<TempDir, Error> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
         let path = std::env::temp_dir().join(format!(
             "btc-vault-first-light-{}-{}{:09}",
@@ -1078,7 +1087,7 @@ impl Drop for TempDir {
 /// Reserve `count` distinct free loopback ports by binding them all at once,
 /// then releasing. A small race remains until the real processes bind; fine
 /// for a demo that fails loudly.
-fn free_ports(count: usize) -> Result<Vec<u16>, Error> {
+pub(crate) fn free_ports(count: usize) -> Result<Vec<u16>, Error> {
     let mut listeners = Vec::new();
     let mut ports = Vec::new();
     for _ in 0..count {

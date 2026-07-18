@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hex::{DisplayHex, FromHex};
-use bitcoin::{consensus, Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{consensus, Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Witness};
 use serde_json::{json, Value};
 
 use crate::Error;
@@ -34,16 +34,22 @@ pub struct SpendSeen {
     pub spend_txid: Txid,
     /// The watched output that was consumed (the vault UTXO).
     pub outpoint: OutPoint,
-    /// scriptPubKey of the spent output — one of the queried `scripts`. In v0 the
-    /// watchtower classifies against a DISTINCT recovery-script set, so this tells
-    /// a recovery-branch spend from a vault-path spend. NOTE for v1 (T6): the real
-    /// design puts recovery as an alternate branch inside the SAME `wsh(...)`
-    /// descriptor (DESIGN.md, Wallet Topology — recovery is "an alternate spend
-    /// path over the same coins"), so a recovery spend and a normal spend share
-    /// this prevout scriptPubKey and cannot be told apart by it; the spending
-    /// witness (which branch/keys) is the distinguishing signal. v0's recovery set
-    /// is empty (first light has no recovery branch), so this is not yet exercised.
+    /// scriptPubKey of the spent output — one of the queried `scripts`.
+    ///
+    /// The vault descriptor puts recovery as an alternate BRANCH inside the SAME
+    /// `wsh(...)` (ADR-0013 §1; DESIGN.md, Wallet Topology — recovery is "an
+    /// alternate spend path over the same coins"), so a recovery spend and a
+    /// normal spend share this prevout scriptPubKey and CANNOT be told apart by
+    /// it. The distinguishing signal is [`Self::witness`] (which script branch the
+    /// spend satisfied), not this script.
     pub script: ScriptBuf,
+    /// The witness stack of the input that spent the watched output. The
+    /// watchtower reads it to tell a recovery-branch spend from a normal-branch
+    /// spend (they share `script`): the template's top-level `or_i` puts an
+    /// explicit branch selector immediately before the witness script, so the
+    /// second-from-last element is `01` for the normal branch and EMPTY for the
+    /// recovery branch (see `watchtower::is_recovery_branch`).
+    pub witness: Witness,
 }
 
 /// One prevout as this node sees it across its confirmed chain AND its own
@@ -324,6 +330,28 @@ impl ChainBackend for BitcoindBackend {
                     }
                     let prev_txid = vin["txid"].as_str().ok_or("getblock: input has no txid")?;
                     let vout = vin["vout"].as_u64().ok_or("getblock: input has no vout")? as u32;
+                    // The spending witness (verbosity 3 inlines `txinwitness` for
+                    // segwit inputs), so the watchtower can tell WHICH branch of the
+                    // two-branch `wsh(...)` this spend took — a recovery spend and a
+                    // normal spend share the prevout script and differ only here. A
+                    // non-segwit input has no `txinwitness`; that never matches a
+                    // vault P2WSH, so an empty witness (classified as non-recovery)
+                    // is the safe default.
+                    let mut witness_items = Vec::new();
+                    for item in vin
+                        .get("txinwitness")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let hex = item
+                            .as_str()
+                            .ok_or("getblock: txinwitness item is not a string")?;
+                        witness_items.push(
+                            Vec::<u8>::from_hex(hex)
+                                .map_err(|e| format!("getblock: bad txinwitness item: {e}"))?,
+                        );
+                    }
                     seen.push(SpendSeen {
                         spend_txid: Txid::from_str(spend_txid)
                             .map_err(|e| format!("getblock: bad spend txid: {e}"))?,
@@ -333,6 +361,7 @@ impl ChainBackend for BitcoindBackend {
                             vout,
                         ),
                         script: spk,
+                        witness: Witness::from_slice(&witness_items),
                     });
                 }
             }

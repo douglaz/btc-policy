@@ -3,6 +3,7 @@
 mod bitcoind;
 mod demo;
 mod http;
+mod recovery;
 
 use std::process::ExitCode;
 
@@ -17,8 +18,15 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        ["demo", "recovery-drill"] => match recovery::run_recovery_drill() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("recovery drill FAILED: {e}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
-            eprintln!("usage: btc-vault demo first-light");
+            eprintln!("usage: btc-vault demo <first-light|recovery-drill>");
             ExitCode::from(2)
         }
     }

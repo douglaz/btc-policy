@@ -14,6 +14,10 @@ bitcoin = { workspace = true }
 miniscript = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
+# The vault descriptor template (ADR-0013 §1): the recovery-branch shape,
+# timelock constants, and the builder/parser the demo + recovery drill construct
+# against, so the CLI and every node agree on the frozen template by construction.
+policy-core = { path = "../policy-core" }
 vault-proto = { path = "../vault-proto" }
 # The demo plays the SETUP CEREMONY, which must compute `manifest_hash` and each
 # node's channel endorsement byte-identically to the nodes it provisions — a

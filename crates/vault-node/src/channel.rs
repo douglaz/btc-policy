@@ -2654,9 +2654,15 @@ mod fixture {
             let feds: Vec<(SecretKey, PublicKey)> =
                 (0..n as u8).map(|i| keypair(fed_base + i)).collect();
             let node_pubkeys: Vec<String> = feds.iter().map(|(_, pk)| pk.to_string()).collect();
-            let descriptor_str = format!(
-                "wsh(and_v(v:pk({user_pk}),multi({t},{})))",
-                node_pubkeys.join(",")
+            // Throwaway 2-of-3 recovery keyset (seeds 0x30..=0x32), off the normal
+            // path these channel tests drive. The node validates the two-branch
+            // template (ADR-0013 §1) at startup; the recovery keys never sign here.
+            let recovery: Vec<String> = (0x30u8..=0x32).map(|i| keypair(i).1.to_string()).collect();
+            let descriptor_str = policy_core::vault_descriptor_string(
+                &user_pk.to_string(),
+                t,
+                &node_pubkeys,
+                &recovery,
             );
             let descriptor =
                 Descriptor::<PublicKey>::from_str(&descriptor_str).expect("descriptor");
@@ -3330,10 +3336,19 @@ mod identity {
         // holder would otherwise authenticate as two peers and receive two quotas.
         let fx = Fixture::new(2, 3);
         let cfg = fx.config(0, 0, "");
-        let duplicate_descriptor = format!(
-            "wsh(and_v(v:pk({}),multi(2,{},{},{})))",
-            fx.user_pk, fx.entries[0].fed_pk, fx.entries[0].fed_pk, fx.entries[2].fed_pk,
-        );
+        // A two-branch template whose NORMAL branch repeats a federation key. Since
+        // V0-10 the policy-core template check rejects duplicate keys outright (the
+        // permanent trust root must have distinct keys), so the duplicate is caught
+        // at descriptor parse — earlier than, and in addition to, the node_id
+        // bijection check that remains as a backstop.
+        let recovery: Vec<String> = (0x30u8..=0x32).map(|i| keypair(i).1.to_string()).collect();
+        let dup_nodes = vec![
+            fx.entries[0].fed_pk.to_string(),
+            fx.entries[0].fed_pk.to_string(),
+            fx.entries[2].fed_pk.to_string(),
+        ];
+        let duplicate_descriptor =
+            policy_core::vault_descriptor_string(&fx.user_pk.to_string(), 2, &dup_nodes, &recovery);
         let duplicate = cfg.replacen(
             &format!("descriptor = \"{}\"", fx.descriptor),
             &format!("descriptor = \"{duplicate_descriptor}\""),
@@ -3343,7 +3358,8 @@ mod identity {
             .err()
             .expect("duplicate descriptor node keys must fail startup");
         assert!(
-            err.to_string().contains("duplicate federation node key"),
+            err.to_string().contains("appears more than once")
+                || err.to_string().contains("duplicate federation node key"),
             "unexpected error: {err}"
         );
     }
