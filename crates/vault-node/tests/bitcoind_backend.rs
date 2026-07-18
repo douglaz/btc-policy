@@ -3,10 +3,12 @@
 //!
 //!   nix develop -c cargo test -p vault-node -- --ignored
 //!
-//! It exercises the two backend methods against live chain data: `broadcast`
-//! pushes a fully-signed tx, and `spends_of` finds that spend of a watched
-//! scriptPubKey. Setup RPCs (wallet, mining) use a tiny in-test JSON-RPC client;
-//! the backend itself is the code under test.
+//! It exercises the backend against live chain data: `test_package_accept`
+//! parses Core's real `testmempoolaccept` response, `broadcast` pushes a
+//! fully-signed tx, `transaction_confirmed` distinguishes mempool from chain,
+//! and `spends_of` finds that spend of a watched scriptPubKey. Setup RPCs
+//! (wallet, mining) use a tiny in-test JSON-RPC client; the backend itself is the
+//! code under test.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
@@ -20,7 +22,7 @@ use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
 use serde_json::{json, Value};
 
-use vault_node::chain::{BitcoindBackend, ChainBackend};
+use vault_node::chain::{BitcoindBackend, ChainBackend, PackageVerdict};
 
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -70,15 +72,28 @@ fn run() -> Result<(), Error> {
     let signed_tx: Transaction = deserialize_hex(signed_hex)?;
     let raw_bytes = bitcoin::consensus::encode::serialize(&signed_tx);
 
-    // --- broadcast ---
+    // --- package acceptance + broadcast ---
     let backend = BitcoindBackend::new(node.rpc_addr, node.auth.clone());
+    assert_eq!(
+        backend.test_package_accept(std::slice::from_ref(&raw_bytes))?,
+        PackageVerdict::Accepted,
+        "the live Core response parses and admits the valid spend before broadcast"
+    );
     let spend_txid = backend.broadcast(&raw_bytes)?;
     assert_eq!(
         spend_txid,
         signed_tx.compute_txid(),
         "broadcast returns the txid"
     );
+    assert!(
+        !backend.transaction_confirmed(&spend_txid)?,
+        "mempool admission is not confirmation"
+    );
     node.call("generatetoaddress", json!([1, miner]))?;
+    assert!(
+        backend.transaction_confirmed(&spend_txid)?,
+        "the backend finds the peer copy after it moves from mempool to chain"
+    );
 
     // --- spends_of ---
     let spends = backend.spends_of(std::slice::from_ref(&watched_spk), 0)?;
@@ -88,6 +103,87 @@ fn run() -> Result<(), Error> {
         .expect("the watched script's spend must be seen");
     assert_eq!(seen.spend_txid, spend_txid);
     assert_eq!(seen.outpoint, funding_outpoint);
+
+    // --- multi-generation package topology ---
+    // Core's package policy is stricter than ordinary mempool ancestry. Build a
+    // real grandparent -> parent -> child chain with the first two generations
+    // already in this node's mempool, then probe the exact package shapes the
+    // backend may produce.
+    let chain_funding_addr = node.call_str("getnewaddress", json!([]))?;
+    let chain_funding_txid = node.call_str("sendtoaddress", json!([chain_funding_addr, 1.0]))?;
+    node.call("generatetoaddress", json!([1, miner]))?;
+    let chain_funding = node.call("getrawtransaction", json!([chain_funding_txid, true]))?;
+    let chain_vout = chain_funding["vout"]
+        .as_array()
+        .ok_or("chain funding vout")?
+        .iter()
+        .position(|output| output["value"].as_f64() == Some(1.0))
+        .ok_or("chain funding output")? as u32;
+
+    let grandparent_dest = node.call_str("getnewaddress", json!([]))?;
+    let grandparent_raw = node.call_str(
+        "createrawtransaction",
+        json!([[{"txid": chain_funding_txid, "vout": chain_vout}], {grandparent_dest: 0.999}]),
+    )?;
+    let grandparent_hex = node.call("signrawtransactionwithwallet", json!([grandparent_raw]))?
+        ["hex"]
+        .as_str()
+        .ok_or("grandparent hex")?
+        .to_string();
+    let grandparent: Transaction = deserialize_hex(&grandparent_hex)?;
+    node.call("sendrawtransaction", json!([grandparent_hex]))?;
+
+    let parent_dest = node.call_str("getnewaddress", json!([]))?;
+    let parent_raw = node.call_str(
+        "createrawtransaction",
+        json!([[{"txid": grandparent.compute_txid().to_string(), "vout": 0}], {parent_dest: 0.998}]),
+    )?;
+    let parent_hex = node.call("signrawtransactionwithwallet", json!([parent_raw]))?["hex"]
+        .as_str()
+        .ok_or("parent hex")?
+        .to_string();
+    let parent: Transaction = deserialize_hex(&parent_hex)?;
+    node.call("sendrawtransaction", json!([parent_hex]))?;
+
+    let child_dest = node.call_str("getnewaddress", json!([]))?;
+    let child_raw = node.call_str(
+        "createrawtransaction",
+        json!([[{"txid": parent.compute_txid().to_string(), "vout": 0}], {child_dest: 0.997}]),
+    )?;
+    let child_hex = node.call("signrawtransactionwithwallet", json!([child_raw]))?["hex"]
+        .as_str()
+        .ok_or("child hex")?
+        .to_string();
+    let child: Transaction = deserialize_hex(&child_hex)?;
+
+    let deep_package = [
+        bitcoin::consensus::encode::serialize(&grandparent),
+        bitcoin::consensus::encode::serialize(&parent),
+        bitcoin::consensus::encode::serialize(&child),
+    ];
+    assert!(
+        matches!(
+            backend.test_package_accept(&deep_package)?,
+            PackageVerdict::Rejected(_)
+        ),
+        "Core rejects a re-listed multi-generation mempool chain"
+    );
+    let direct_parent_package = [
+        bitcoin::consensus::encode::serialize(&parent),
+        bitcoin::consensus::encode::serialize(&child),
+    ];
+    assert!(
+        matches!(
+            backend.test_package_accept(&direct_parent_package)?,
+            PackageVerdict::Rejected(_)
+        ),
+        "Core also rejects an already-present direct parent in this package shape"
+    );
+    assert_eq!(
+        backend.test_package_accept(&[bitcoin::consensus::encode::serialize(&child)])?,
+        PackageVerdict::Accepted,
+        "the singleton child is evaluated successfully against the full in-mempool ancestry"
+    );
     Ok(())
 }
 

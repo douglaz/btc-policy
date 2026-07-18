@@ -16,7 +16,7 @@ use axum::Router;
 use vault_proto::TaggedRequest;
 
 use crate::channel::{self, ChannelReply, RejectReason};
-use crate::{handle_refresh_now, handle_sign_now, Node};
+use crate::{handle_channel_body, handle_refresh_now, handle_sign_now, propagate_outbox, Node};
 
 /// Unchanged 1 MiB cap applied before axum buffers a request body.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -49,6 +49,8 @@ struct AppState {
 
 /// Serve the one axum app (`/sign` + `/events`) over `listener`.
 pub async fn serve(listener: tokio::net::TcpListener, node: Arc<Node>) -> std::io::Result<()> {
+    node.require_channel_mode()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
     axum::serve(listener, app(node)).await
 }
 
@@ -129,25 +131,35 @@ async fn sign(State(state): State<AppState>, body: Bytes) -> Response {
     if let Some(sign_entered) = &state.sign_entered {
         let _ = sign_entered.send(());
     }
-    let node = state.node;
+    let node = Arc::clone(&state.node);
+    let propagation_node = Arc::clone(&state.node);
     // `/sign` is serialized BY DESIGN by one `Mutex<SignState>` across the whole
     // call. Dropping a timed-out JoinHandle detaches rather than aborts the job,
-    // preventing half-mutated ghost state. The clock is read after that lock.
-    let job = tokio::task::spawn_blocking(move || match request {
-        TaggedRequest::Spend(request) => handle_sign_now(&node, &request),
-        TaggedRequest::Refresh(request) => handle_refresh_now(&node, &request),
+    // preventing half-mutated ghost state. The DETACHED JOB also owns propagation:
+    // if the policy work finishes after the client deadline, it drains the outbox
+    // then, rather than letting the timeout path drain too early and strand the
+    // request on one node. The clock is read after the sign lock.
+    let job = tokio::spawn(async move {
+        let outcome = tokio::task::spawn_blocking(move || match request {
+            TaggedRequest::Spend(request) => handle_sign_now(&node, &request),
+            TaggedRequest::Refresh(request) => handle_refresh_now(&node, &request),
+        })
+        .await;
+        propagate_outbox(&propagation_node);
+        outcome
     });
-    match tokio::time::timeout(state.handler_timeout, job).await {
-        Ok(Ok(Ok(response))) => match serde_json::to_string(&response) {
+    let outcome = tokio::time::timeout(state.handler_timeout, job).await;
+    match outcome {
+        Ok(Ok(Ok(Ok(response)))) => match serde_json::to_string(&response) {
             Ok(json) => json_response(StatusCode::OK, json),
             Err(e) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("cannot encode response: {e}"),
             ),
         },
-        Ok(Ok(Err(bad_request))) => error_response(StatusCode::BAD_REQUEST, &bad_request.0),
+        Ok(Ok(Ok(Err(bad_request)))) => error_response(StatusCode::BAD_REQUEST, &bad_request.0),
         // The blocking task panicked (a bug, never an input): 500, not a hang.
-        Ok(Err(_join_error)) => error_response(
+        Ok(Ok(Err(_join_error))) | Ok(Err(_join_error)) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "sign task failed unexpectedly",
         ),
@@ -215,27 +227,38 @@ async fn channel(State(state): State<AppState>, body: Body) -> Response {
         }
     };
     let node = Arc::clone(&state.node);
-    let outcome = tokio::task::spawn_blocking(move || {
-        // Hold the pre-auth permit until ingest actually finishes — move it INTO the
-        // job, not just the handler future. `spawn_blocking` detaches: if the
-        // connection task is cancelled while we await the JoinHandle (a peer that
-        // completes a body, then disconnects), the handler future drops, but this
-        // CPU-bound job keeps running. Releasing the permit with the handler future
-        // would let such a peer queue more detached verification jobs than
-        // `max_concurrent_channel_requests`, defeating §8's pre-auth concurrency guard
-        // and exhausting the blocking pool. Tying the permit to the job caps in-flight
-        // work at the bound regardless of cancellation.
-        let _permit = permit;
-        node.channel
-            .as_ref()
-            .expect("channel mounted")
-            .ingest(&bytes, channel::unix_now())
+    let propagation_node = Arc::clone(&state.node);
+    // Own both ingest and propagation in a detached job. If the uploading peer
+    // disconnects after the body arrives, axum may cancel this handler, but an
+    // accepted request must still fan out rather than remain stranded locally.
+    let outcome = tokio::spawn(async move {
+        let outcome = tokio::task::spawn_blocking(move || {
+            // Hold the pre-auth permit until ingest actually finishes — move it INTO
+            // the job, not just the handler future. `spawn_blocking` detaches: if the
+            // connection task is cancelled while we await the JoinHandle (a peer that
+            // completes a body, then disconnects), the handler future drops, but this
+            // CPU-bound job keeps running. Releasing the permit with the handler future
+            // would let such a peer queue more detached verification jobs than
+            // `max_concurrent_channel_requests`, defeating §8's pre-auth concurrency
+            // guard and exhausting the blocking pool. Tying the permit to the job caps
+            // in-flight work at the bound regardless of cancellation.
+            let _permit = permit;
+            // `handle_channel_body`, not `channel.ingest`: a `request` envelope has to
+            // pass THIS node's own coordinator-auth + policy gates, which live on the
+            // node, not the channel (§3).
+            handle_channel_body(&node, &bytes, channel::unix_now())
+        })
+        .await;
+        // A `request` this node accepted now goes to every peer (§3), so delivery to
+        // one node reaches all — even if the inbound connection vanished meanwhile.
+        propagate_outbox(&propagation_node);
+        outcome
     })
     .await;
     match outcome {
-        Ok(reply) => channel_response(reply),
-        // The blocking task panicked (a bug, never an input): 500, not a hang.
-        Err(_join_error) => error_response(
+        Ok(Ok(reply)) => channel_response(reply),
+        // Either detached layer panicked (a bug, never an input): 500, not a hang.
+        Ok(Err(_join_error)) | Err(_join_error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "channel task failed unexpectedly",
         ),
@@ -287,11 +310,11 @@ mod parse_since_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::{ChainBackend, SpendSeen};
+    use crate::chain::{ChainBackend, PackageVerdict, Prevout, SpendSeen};
     use crate::test_support::{node_and_valid_request, valid_refresh_request};
     use crate::watchtower::{self, Alert, AlertKind};
     use crate::Error;
-    use bitcoin::{ScriptBuf, Txid};
+    use bitcoin::{OutPoint, ScriptBuf, Txid};
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
     use std::time::Instant;
@@ -426,6 +449,20 @@ mod tests {
             std::thread::sleep(self.delay);
             Ok(Vec::new())
         }
+        // This backend exists to stall the watchtower scan; the fire path is not
+        // under test here, so its three methods are unreachable stubs.
+        fn prevout(&self, _outpoint: &OutPoint) -> Result<Option<Prevout>, Error> {
+            Err("SlowBackend has no chain view".into())
+        }
+        fn mempool_transaction(&self, _txid: &Txid) -> Result<Option<Vec<u8>>, Error> {
+            Err("SlowBackend has no chain view".into())
+        }
+        fn transaction_confirmed(&self, _txid: &Txid) -> Result<bool, Error> {
+            Err("SlowBackend has no chain view".into())
+        }
+        fn test_package_accept(&self, _raw_txs: &[Vec<u8>]) -> Result<PackageVerdict, Error> {
+            Err("SlowBackend has no chain view".into())
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -438,13 +475,16 @@ mod tests {
             .expect("client task");
         assert_eq!(status, 200);
         let parsed: SignResponse = serde_json::from_str(&resp).expect("decode response");
-        assert!(matches!(parsed, SignResponse::Signed(_)), "got {parsed:?}");
+        assert!(
+            matches!(parsed, SignResponse::Accepted(_)),
+            "got {parsed:?}"
+        );
     }
 
-    /// The Refresh arm crosses the same auth + freshness ingress as Spend, then
-    /// returns a structured non-signing refusal until its burn bounds land.
+    /// The Refresh arm crosses the same auth + freshness ingress as Spend and is
+    /// served on its own terms (pin-less, instant, bounded — ADR-0013 §2/§6).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn post_sign_authenticates_then_refuses_the_refresh_arm() {
+    async fn post_sign_serves_the_refresh_arm_over_the_same_ingress() {
         let (node, spend) = node_and_valid_request();
         let refresh = valid_refresh_request(&node, &spend, "refresh-over-http");
         let addr = spawn_app(app(Arc::new(node))).await;
@@ -454,16 +494,15 @@ mod tests {
         let (status, response) = spawn_blocking(move || post(addr, "/sign", &body))
             .await
             .expect("refresh client");
-        assert_eq!(status, 200, "a policy refusal is an outcome: {response}");
-        let refusal: SignResponse = serde_json::from_str(&response).expect("refusal json");
-        assert!(matches!(
-            refusal,
-            SignResponse::Refusal(refusal)
-                if refusal.code == vault_proto::RefusalCode::RefreshUnsupported
-        ));
+        assert_eq!(status, 200, "a policy outcome is a 200: {response}");
+        let accepted: SignResponse = serde_json::from_str(&response).expect("accepted json");
+        assert!(
+            matches!(accepted, SignResponse::Accepted(_)),
+            "got {accepted:?}"
+        );
 
-        // The authentic request consumed its nonce before the unsupported-policy
-        // outcome, proving the HTTP arm did not bypass the freshness gate.
+        // The authentic request consumed its nonce before answering, proving the
+        // HTTP arm did not bypass the freshness gate.
         let replay_body = serde_json::to_string(&TaggedRequest::Refresh(refresh))
             .expect("encode replayed refresh arm");
         let (status, response) = spawn_blocking(move || post(addr, "/sign", &replay_body))
@@ -581,12 +620,16 @@ mod tests {
         assert_eq!(resp1, resp2);
         assert!(matches!(
             serde_json::from_str::<SignResponse>(&resp1).expect("decode"),
-            SignResponse::Signed(_)
+            SignResponse::Accepted(_)
         ));
-        // Exactly one verdict: no interleaved double-accept or stray Hold.
+        // Exactly one verdict and exactly one pending spend: the two concurrent
+        // sends of the same commitment did not interleave into a double-accept.
+        // (A hot-class spend is recorded pending until its commitment expires,
+        // even at `hold_secs = 0` — it is outstanding until it broadcasts, and
+        // that is what refresh subordination reads.)
         let state = node.sign_state.lock().expect("sign_state lock");
         assert_eq!(state.replay.len(), 1);
-        assert_eq!(state.pending.len(), 0);
+        assert_eq!(state.pending.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -654,7 +697,7 @@ mod tests {
         watchtower::spawn_driver(
             backend,
             node.vault_scripts(),
-            Arc::clone(&node.sign_log),
+            Arc::clone(&node.authorized),
             Arc::clone(&node.alerts),
         );
         // Keep entry wait and GET outside Tokio so an inline scan fails bounded.
@@ -770,12 +813,12 @@ mod tests {
         assert_eq!(status, 200);
         assert!(matches!(
             serde_json::from_str::<SignResponse>(&resp).expect("decode"),
-            SignResponse::Signed(_)
+            SignResponse::Accepted(_)
         ));
 
-        // Exactly one log mutation: no ghost, lost sign, or pending timer.
+        // Exactly one log mutation: no ghost, no lost or duplicated acceptance.
         let state = node.sign_state.lock().expect("sign_state lock");
         assert_eq!(state.replay.len(), 1);
-        assert_eq!(state.pending.len(), 0);
+        assert_eq!(state.pending.len(), 1);
     }
 }

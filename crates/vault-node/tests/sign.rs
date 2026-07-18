@@ -29,6 +29,9 @@ const EXPIRY: u64 = NOW + 3_600;
 const POLICY_VERSION: u32 = 1;
 /// The node's bounded derivation-index scan for these handler tests.
 const MAX_DERIV: u32 = 20;
+/// Flat fee on the fixture escape — well under the 10% cap over the 100_000_000
+/// sat per-input fixture value.
+const ESCAPE_FEE: u64 = 10_000;
 
 fn seckey(index: u8) -> SecretKey {
     SecretKey::from_slice(&[index; 32]).expect("32 nonzero bytes")
@@ -94,15 +97,15 @@ struct Fixture {
     escape_spk: ScriptBuf,
 }
 
-/// The default (V0-1/V0-2) fixture: no Hold, escape wallet not set apart.
+/// The default fixture: no Hold, so a hot-class spend's fire event is its ingress.
 fn fixture() -> Fixture {
-    build_fixture(0, false)
+    build_fixture(0)
 }
 
-/// A fixture whose node enforces a `hold_secs` Hold and knows its escape
-/// wallet — the V0-3 class-routing setup.
+/// A fixture whose node enforces a `hold_secs` Hold — a hot-class spend is
+/// accepted and signed at ingress, and fires `hold_secs` later.
 fn held_fixture(hold_secs: u64) -> Fixture {
-    build_fixture(hold_secs, true)
+    build_fixture(hold_secs)
 }
 
 /// A single-key `wpkh(<pubkey>)` destination descriptor and the scriptPubKey it
@@ -131,45 +134,26 @@ fn escape_dest() -> (String, ScriptBuf) {
 
 /// User key is index 1; the five node keys are 2..=6; the Node under test
 /// holds key 2. The hot and escape wallets are both allowlisted descriptors (so
-/// an escape sweep passes the destination check); `configure_escape`
-/// additionally names the escape descriptor in config so the node can route it
-/// as the escape class.
-fn build_fixture(hold_secs: u64, configure_escape: bool) -> Fixture {
+/// an escape sweep passes the destination check), and the escape descriptor is
+/// also named in config — mandatory since V0-8b, because every `SpendRequest`
+/// carries an escape validated against it.
+fn build_fixture(hold_secs: u64) -> Fixture {
     let descriptor_str = descriptor_str();
     let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str).expect("valid descriptor");
-    let (hot_desc, hot_spk) = hot_dest();
-    let (escape_desc, escape_spk) = escape_dest();
-    let config = config_text(
-        &descriptor_str,
-        &hot_desc,
-        &escape_desc,
-        hold_secs,
-        MAX_AGE,
-        configure_escape,
-        true,
-    );
+    let (_, hot_spk) = hot_dest();
+    let (_, escape_spk) = escape_dest();
     Fixture {
-        node: Node::from_toml_str(&config).expect("valid config"),
+        node: Node::from_toml_str(&fixture_config(hold_secs, MAX_AGE, true)).expect("valid config"),
         descriptor,
         hot_spk,
         escape_spk,
     }
 }
 
-fn config_text(
-    descriptor_str: &str,
-    hot_desc: &str,
-    escape_desc: &str,
-    hold_secs: u64,
-    max_commitment_age_secs: u64,
-    configure_escape: bool,
-    allow_escape: bool,
-) -> String {
-    let escape_line = if configure_escape {
-        format!("escape_descriptor = \"{escape_desc}\"\n")
-    } else {
-        String::new()
-    };
+fn fixture_config(hold_secs: u64, max_commitment_age_secs: u64, allow_escape: bool) -> String {
+    let descriptor_str = descriptor_str();
+    let (hot_desc, _) = hot_dest();
+    let (escape_desc, _) = escape_dest();
     let allowlist = if allow_escape {
         format!("\"{hot_desc}\", \"{escape_desc}\"")
     } else {
@@ -180,7 +164,7 @@ fn config_text(
          node_seckey = \"{}\"\n\
          descriptor = \"{descriptor_str}\"\n\
          allowlist = [{allowlist}]\n\
-         {escape_line}\
+         escape_descriptor = \"{escape_desc}\"\n\
          max_derivation_index = {MAX_DERIV}\n\
          hold_secs = {hold_secs}\n\
          max_commitment_age_secs = {max_commitment_age_secs}\n\
@@ -192,26 +176,6 @@ fn config_text(
         sha256::Hash::hash(NORMAL_PIN.as_bytes()),
         sha256::Hash::hash(DURESS_PIN.as_bytes()),
         coord_key().1,
-    )
-}
-
-fn fixture_config(
-    hold_secs: u64,
-    max_commitment_age_secs: u64,
-    configure_escape: bool,
-    allow_escape: bool,
-) -> String {
-    let descriptor_str = descriptor_str();
-    let (hot_desc, _) = hot_dest();
-    let (escape_desc, _) = escape_dest();
-    config_text(
-        &descriptor_str,
-        &hot_desc,
-        &escape_desc,
-        hold_secs,
-        max_commitment_age_secs,
-        configure_escape,
-        allow_escape,
     )
 }
 
@@ -302,33 +266,72 @@ fn user_sign(fixture: &Fixture, psbt: &mut Psbt) {
     }
 }
 
-fn request(psbt: &Psbt, pin: &str) -> SignRequest {
-    request_at(psbt, pin, EXPIRY)
-}
+impl Fixture {
+    /// A coordinator-authenticated `SpendRequest` for `psbt`, carrying the
+    /// mandatory escape a real coordinator would compose alongside it.
+    fn request(&self, psbt: &Psbt, pin: &str) -> SignRequest {
+        self.request_at(psbt, pin, EXPIRY)
+    }
 
-fn request_at(psbt: &Psbt, pin: &str, expiry: u64) -> SignRequest {
-    let mut request = SignRequest {
-        psbt: psbt.to_string(),
-        // The escape variant only has to decode at first light; reusing the
-        // primary PSBT keeps these handler tests self-contained.
-        escape_psbt: psbt.to_string(),
-        pin: pin.into(),
-        nonce: String::new(),
-        expiry,
-        policy_version: POLICY_VERSION,
-        coord_sig: String::new(),
-    };
-    // Every fixture node is sealed to a coordinator, so a request only reaches the
-    // policy checks these tests are about once it is coord-authenticated.
-    coord_sign(&mut request);
-    request
+    fn request_at(&self, psbt: &Psbt, pin: &str, expiry: u64) -> SignRequest {
+        self.request_with_escape(psbt, &self.escape_for(psbt), pin, expiry)
+    }
+
+    /// A request pairing an explicit `escape` with `spend` — for the tests that
+    /// are about the escape itself.
+    fn request_with_escape(
+        &self,
+        spend: &Psbt,
+        escape: &Psbt,
+        pin: &str,
+        expiry: u64,
+    ) -> SignRequest {
+        let mut request = SignRequest {
+            psbt: spend.to_string(),
+            escape_psbt: escape.to_string(),
+            pin: pin.into(),
+            nonce: String::new(),
+            expiry,
+            policy_version: POLICY_VERSION,
+            coord_sig: String::new(),
+        };
+        // Every fixture node is sealed to a coordinator, so a request only reaches
+        // the policy checks these tests are about once it is coord-authenticated.
+        coord_sign(&mut request);
+        request
+    }
+
+    /// The mandatory escape for `spend`: the SAME inputs swept to the escape
+    /// wallet, user-signed — the shape a real coordinator composes at the wrench,
+    /// and what the node validates (never builds).
+    fn escape_for(&self, spend: &Psbt) -> Psbt {
+        let total: u64 = spend
+            .inputs
+            .iter()
+            .filter_map(|input| input.witness_utxo.as_ref())
+            .map(|utxo| utxo.value.to_sat())
+            .sum();
+        let mut escape = vault_psbt_n(
+            self,
+            spend.unsigned_tx.input.len() as u32,
+            vec![(self.escape_spk.clone(), total.saturating_sub(ESCAPE_FEE))],
+        );
+        user_sign(self, &mut escape);
+        escape
+    }
 }
 
 fn refresh_request(psbt: &Psbt) -> RefreshRequest {
+    refresh_request_at(psbt, EXPIRY)
+}
+
+/// A coordinator-authenticated refresh whose commitment expires at `expiry` — for
+/// the tests that advance the node's clock past the default window.
+fn refresh_request_at(psbt: &Psbt, expiry: u64) -> RefreshRequest {
     let mut request = RefreshRequest {
         refresh_psbt: psbt.to_string(),
         nonce: String::new(),
-        expiry: EXPIRY,
+        expiry,
         policy_version: POLICY_VERSION,
         coord_sig: String::new(),
     };
@@ -348,8 +351,8 @@ fn wrong_pin_is_refused_with_bad_pin() {
     let fixture = fixture();
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, "0000"), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, "0000"), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::BadPin);
 }
@@ -380,8 +383,8 @@ fn missing_pin_field_is_refused_with_bad_pin() {
 fn missing_user_signature_is_refused() {
     let fixture = fixture();
     let psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
 }
@@ -395,8 +398,8 @@ fn output_mutation_after_user_signing_is_refused() {
     // changes the sighash and must invalidate the very signature the node
     // verifies (mutation is subsumed by sighash enforcement).
     psbt.unsigned_tx.output[0].value = Amount::from_sat(99_980_000);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
 }
@@ -407,8 +410,8 @@ fn wrong_sighash_type_is_refused_with_bad_sighash() {
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     // A genuine user signature, but committing to SIGHASH_NONE, not ALL.
     sign_input(&fixture, &mut psbt, 0, &seckey(1), EcdsaSighashType::None);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::BadSighash);
 }
@@ -419,8 +422,8 @@ fn missing_user_signature_on_one_of_several_inputs_is_refused() {
     let mut psbt = vault_psbt_n(&fixture, 2, vec![(fixture.hot_spk.clone(), 199_990_000)]);
     // Sign only the first input; the second carries no user signature.
     sign_input(&fixture, &mut psbt, 0, &seckey(1), EcdsaSighashType::All);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
 }
@@ -434,8 +437,8 @@ fn garbage_signature_under_user_key_is_refused() {
     // This is exactly the first-light gap: any DER blob under the user key
     // used to pass on presence alone.
     sign_input(&fixture, &mut psbt, 0, &seckey(42), EcdsaSighashType::All);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
 }
@@ -449,30 +452,38 @@ fn missing_witness_utxo_is_refused_as_psbt_inconsistent() {
     // valid) user signature.
     user_sign(&fixture, &mut psbt);
     psbt.inputs[0].witness_utxo = None;
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::PsbtInconsistent);
     assert_eq!(refusal.check, "user_signature");
 }
 
+/// The pure-relay contract (§2): an honest request is ACCEPTED, and the response
+/// carries no node signature — because no `SignResponse` variant can hold one.
+///
+/// This is the structural half of "the coordinator never finalizes". Deleting
+/// vault-cli's combine code would not be enough: as long as the response COULD
+/// carry a partial, a post-wrench coordinator could collect `t` of them and
+/// broadcast a coerced spend itself, breaking the Hold and duress silence without
+/// compromising a single node. The node signs here — it just does not tell the
+/// coordinator (the partial goes to peers, at fire; see `release_partials`).
 #[test]
-fn honest_request_is_signed_by_the_node() {
+fn an_honest_request_is_accepted_with_no_signature_in_the_response() {
     let fixture = fixture();
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
-    let SignResponse::Signed(signed) = response else {
-        panic!("expected signed_psbt, got {response:?}");
-    };
-    let signed = Psbt::from_str(&signed).expect("valid returned psbt");
-    let secp = Secp256k1::new();
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
+    let accepted = expect_accepted(response.clone());
+    assert_eq!(accepted.first_seen, NOW);
+
+    // Nothing a coordinator could finalize with: the whole serialized response
+    // carries no PSBT and no signature.
+    let json = serde_json::to_string(&response).expect("serialize");
     assert!(
-        signed.inputs[0]
-            .partial_sigs
-            .contains_key(&pubkey(&secp, 2)),
-        "node must contribute its own partial signature"
+        !json.contains("cHNidP") && !json.to_lowercase().contains("psbt"),
+        "a /sign response must never carry a node signature: {json}"
     );
 }
 
@@ -481,10 +492,10 @@ fn duress_pin_is_accepted_identically_at_first_light() {
     let fixture = fixture();
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, DURESS_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, DURESS_PIN), NOW)
+        .expect("decodable request");
     assert!(
-        matches!(response, SignResponse::Signed(_)),
+        matches!(response, SignResponse::Accepted(_)),
         "duress must answer exactly like normal (ADR-0008), got {response:?}"
     );
 }
@@ -495,8 +506,8 @@ fn non_allowlisted_destination_is_refused_through_the_handler() {
     let theft_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xEE; 32]));
     let mut psbt = vault_psbt(&fixture, vec![(theft_spk, 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::DestNotAllowed);
     assert_eq!(refusal.check, "destination_allowlist");
@@ -514,8 +525,8 @@ fn input_not_deriving_from_the_vault_is_unknown_input() {
     if let Some(utxo) = psbt.inputs[0].witness_utxo.as_mut() {
         utxo.script_pubkey = foreign;
     }
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::UnknownInput);
     assert_eq!(refusal.check, "input_ownership");
@@ -535,8 +546,8 @@ fn labeled_change_that_does_not_derive_is_change_not_derivable_through_the_handl
         (Fingerprint::default(), DerivationPath::master()),
     );
     user_sign(&fixture, &mut psbt);
-    let response =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let response = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::ChangeNotDerivable);
     assert_eq!(refusal.check, "verified_change");
@@ -569,8 +580,12 @@ fn expiry_in_the_past_is_refused_as_commitment_expired() {
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
     // expiry == NOW is already expired (the window is `now < expiry`).
-    let response = handle_sign(&fixture.node, &request_at(&psbt, NORMAL_PIN, NOW), NOW)
-        .expect("decodable request");
+    let response = handle_sign(
+        &fixture.node,
+        &fixture.request_at(&psbt, NORMAL_PIN, NOW),
+        NOW,
+    )
+    .expect("decodable request");
     let refusal = expect_refusal(response);
     assert_eq!(refusal.code, RefusalCode::CommitmentExpired);
 }
@@ -584,7 +599,7 @@ fn expiry_beyond_the_node_cap_is_refused_as_commitment_expired() {
     // the node's retention. The node caps it against its OWN clock.
     let response = handle_sign(
         &fixture.node,
-        &request_at(&psbt, NORMAL_PIN, NOW + MAX_AGE + 1),
+        &fixture.request_at(&psbt, NORMAL_PIN, NOW + MAX_AGE + 1),
         NOW,
     )
     .expect("decodable request");
@@ -600,38 +615,31 @@ fn expiry_within_the_window_is_accepted() {
     // Exactly at the cap is inside the window (`expiry <= now + max_age`).
     let response = handle_sign(
         &fixture.node,
-        &request_at(&psbt, NORMAL_PIN, NOW + MAX_AGE),
+        &fixture.request_at(&psbt, NORMAL_PIN, NOW + MAX_AGE),
         NOW,
     )
     .expect("decodable request");
     assert!(
-        matches!(response, SignResponse::Signed(_)),
+        matches!(response, SignResponse::Accepted(_)),
         "an in-window honest spend must be signed, got {response:?}"
     );
 }
 
 #[test]
-fn identical_resubmission_returns_the_recorded_signed_verdict() {
+fn identical_resubmission_returns_the_recorded_accepted_verdict() {
     let fixture = fixture();
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let mut req = request(&psbt, NORMAL_PIN);
+    let mut req = fixture.request(&psbt, NORMAL_PIN);
 
-    let first = handle_sign(&fixture.node, &req, NOW).expect("decodable request");
-    let SignResponse::Signed(first_signed) = first else {
-        panic!("first submission must sign");
-    };
-    // Resubmitting the identical COMMITMENT returns the recorded verdict —
-    // byte-for-byte the same signed PSBT — without re-evaluating. The re-send
-    // carries a fresh nonce because a nonce is single-use per transmission
-    // (ADR-0013 §2); idempotency is keyed on the commitment, not the nonce, so
-    // the two gates compose instead of colliding.
+    let first = expect_accepted(handle_sign(&fixture.node, &req, NOW).expect("decodable request"));
+    // Resubmitting the identical COMMITMENT returns the recorded verdict without
+    // re-evaluating. The re-send carries a fresh nonce because a nonce is
+    // single-use per transmission (ADR-0013 §2); idempotency is keyed on the
+    // commitment, not the nonce, so the two gates compose instead of colliding.
     coord_sign(&mut req);
-    let second = handle_sign(&fixture.node, &req, NOW).expect("decodable request");
-    let SignResponse::Signed(second_signed) = second else {
-        panic!("resubmission must replay the recorded signed verdict");
-    };
-    assert_eq!(first_signed, second_signed);
+    let second = expect_accepted(handle_sign(&fixture.node, &req, NOW).expect("decodable request"));
+    assert_eq!(first, second);
 }
 
 #[test]
@@ -640,7 +648,7 @@ fn identical_resubmission_returns_the_recorded_refusal() {
     let theft_spk = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xEE; 32]));
     let mut psbt = vault_psbt(&fixture, vec![(theft_spk, 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let mut req = request(&psbt, NORMAL_PIN);
+    let mut req = fixture.request(&psbt, NORMAL_PIN);
 
     let first = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable request"));
     assert_eq!(first.code, RefusalCode::DestNotAllowed);
@@ -659,7 +667,8 @@ fn a_signature_dependent_refusal_is_not_replayed_after_correction() {
     // signature yet → USER_SIG_INVALID. That refusal depends on witness data
     // the commitment does not bind, so it must NOT be recorded for replay.
     let first = expect_refusal(
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request"),
+        handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+            .expect("decodable request"),
     );
     assert_eq!(first.code, RefusalCode::UserSigInvalid);
 
@@ -670,11 +679,49 @@ fn a_signature_dependent_refusal_is_not_replayed_after_correction() {
     // caching a signature-dependent refusal would deadlock the honest spend
     // until expiry.
     user_sign(&fixture, &mut psbt);
-    let second =
-        handle_sign(&fixture.node, &request(&psbt, NORMAL_PIN), NOW).expect("decodable request");
+    let second = handle_sign(&fixture.node, &fixture.request(&psbt, NORMAL_PIN), NOW)
+        .expect("decodable request");
     assert!(
-        matches!(second, SignResponse::Signed(_)),
+        matches!(second, SignResponse::Accepted(_)),
         "a corrected resubmission of the same commitment must be re-evaluated, got {second:?}"
+    );
+}
+
+#[test]
+fn an_escape_refusal_is_not_cached_under_the_spend_commitment() {
+    let fixture = fixture();
+    let mut spend = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut spend);
+
+    // The spend is valid, but its first mandatory escape pays an unknown
+    // destination. DEST_NOT_ALLOWED is normally recordable when it belongs to the
+    // spend; here it belongs to a different exact-byte candidate.
+    let unknown = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([0xED; 32]));
+    let mut bad_escape = vault_psbt(&fixture, vec![(unknown, 99_990_000)]);
+    user_sign(&fixture, &mut bad_escape);
+    let first = expect_refusal(
+        handle_sign(
+            &fixture.node,
+            &fixture.request_with_escape(&spend, &bad_escape, NORMAL_PIN, EXPIRY),
+            NOW,
+        )
+        .expect("decodable request"),
+    );
+    assert_eq!(first.code, RefusalCode::DestNotAllowed);
+    assert!(first.check.starts_with("escape:"));
+
+    // Same spend commitment, corrected escape, fresh coordinator nonce. A cache
+    // keyed only by the spend must not replay the escape's old refusal.
+    let corrected = fixture.escape_for(&spend);
+    let second = handle_sign(
+        &fixture.node,
+        &fixture.request_with_escape(&spend, &corrected, NORMAL_PIN, EXPIRY),
+        NOW,
+    )
+    .expect("decodable request");
+    assert!(
+        matches!(second, SignResponse::Accepted(_)),
+        "a corrected escape must be evaluated and accepted, got {second:?}"
     );
 }
 
@@ -684,9 +731,9 @@ fn a_replacement_spending_the_same_inputs_is_not_blocked_by_the_log() {
     // Original: pays the hot wallet, gets signed and recorded.
     let mut original = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut original);
-    let signed = handle_sign(&fixture.node, &request(&original, NORMAL_PIN), NOW)
+    let accepted = handle_sign(&fixture.node, &fixture.request(&original, NORMAL_PIN), NOW)
         .expect("decodable request");
-    assert!(matches!(signed, SignResponse::Signed(_)));
+    assert!(matches!(accepted, SignResponse::Accepted(_)));
 
     // RBF-style replacement: SAME single outpoint, different fee (a fee bump),
     // still to the hot wallet. It must get a fresh evaluation — not the
@@ -698,31 +745,40 @@ fn a_replacement_spending_the_same_inputs_is_not_blocked_by_the_log() {
         "the replacement spends the identical outpoint"
     );
     user_sign(&fixture, &mut replacement);
-    let response = handle_sign(&fixture.node, &request(&replacement, NORMAL_PIN), NOW)
-        .expect("decodable request");
+    let response = handle_sign(
+        &fixture.node,
+        &fixture.request(&replacement, NORMAL_PIN),
+        NOW,
+    )
+    .expect("decodable request");
     assert!(
-        matches!(response, SignResponse::Signed(_)),
+        matches!(response, SignResponse::Accepted(_)),
         "a replacement is a new commitment and must be evaluated afresh, got {response:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// V0-3: the Hold — per-destination-class routing (ADR-0004)
+// The Hold under Model B (ADR-0012) + the class contract (ADR-0013 §3)
 
 /// A Hold long enough to observe, comfortably inside the retention cap.
 const HOLD: u64 = 3_600;
+/// The node's default `combine_slack_secs` (ADR-0013 §6). The fixture config does
+/// not set it, so these tests pin the default the node applies.
+const COMBINE_SLACK: u64 = 60;
 
-/// A held-test request whose commitment expiry sits at the node's cap — far
-/// beyond any Hold these tests exercise, so re-submission after the window is
-/// never mistaken for an expired commitment.
-fn held_request(psbt: &Psbt) -> SignRequest {
-    request_at(psbt, NORMAL_PIN, NOW + MAX_AGE)
+impl Fixture {
+    /// A held-test request whose commitment expiry sits at the node's cap — far
+    /// beyond any Hold these tests exercise, so nothing is mistaken for an
+    /// expired or too-short commitment.
+    fn held_request(&self, psbt: &Psbt) -> SignRequest {
+        self.request_at(psbt, NORMAL_PIN, NOW + MAX_AGE)
+    }
 }
 
-fn expect_pending(response: SignResponse) -> vault_proto::Pending {
+fn expect_accepted(response: SignResponse) -> vault_proto::Accepted {
     match response {
-        SignResponse::Pending(pending) => pending,
-        other => panic!("expected pending, got {other:?}"),
+        SignResponse::Accepted(accepted) => accepted,
+        other => panic!("expected accepted, got {other:?}"),
     }
 }
 
@@ -734,17 +790,25 @@ fn expect_config_error(raw: String) -> String {
 }
 
 #[test]
-fn nonzero_hold_requires_an_escape_spk() {
-    let err = expect_config_error(fixture_config(HOLD, MAX_AGE, false, true));
+fn escape_descriptor_is_required() {
+    // Every SpendRequest carries a mandatory escape validated against this
+    // descriptor, so a node without one could serve nothing. Omitting the field
+    // must fail at LOAD, not leave a node that boots and refuses everything.
+    let raw = fixture_config(HOLD, MAX_AGE, true)
+        .lines()
+        .filter(|line| !line.starts_with("escape_descriptor"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let err = expect_config_error(raw);
     assert!(
-        err.contains("escape_descriptor is required"),
+        err.contains("escape_descriptor"),
         "unexpected config error: {err}"
     );
 }
 
 #[test]
 fn escape_spk_must_also_be_allowlisted() {
-    let err = expect_config_error(fixture_config(HOLD, MAX_AGE, true, false));
+    let err = expect_config_error(fixture_config(HOLD, MAX_AGE, false));
     assert!(
         err.contains("escape_descriptor must also be present in allowlist"),
         "unexpected config error: {err}"
@@ -753,18 +817,20 @@ fn escape_spk_must_also_be_allowlisted() {
 
 #[test]
 fn max_commitment_age_must_exceed_hold() {
-    let err = expect_config_error(fixture_config(HOLD, HOLD, true, true));
+    let err = expect_config_error(fixture_config(HOLD, HOLD, true));
     assert!(
         err.contains("max_commitment_age_secs") && err.contains("must exceed hold_secs"),
         "unexpected config error: {err}"
     );
 }
 
+// -- the Model-B Hold: sign at ingress, fire at Hold expiry ------------------
+
 #[test]
-fn hot_class_with_vault_change_is_pending_for_the_full_hold() {
+fn a_held_hot_spend_is_accepted_and_signed_at_ingress_with_the_whole_hold_remaining() {
     let fixture = held_fixture(HOLD);
-    // Vault change is excluded from destination classification (ADR-0013 §3),
-    // so the one non-change output makes this an ordinary held hot spend.
+    // Vault change is excluded from classification (ADR-0013 §3), so the one
+    // non-change output makes this an ordinary held hot spend.
     let mut psbt = vault_psbt(
         &fixture,
         vec![
@@ -773,90 +839,67 @@ fn hot_class_with_vault_change_is_pending_for_the_full_hold() {
         ],
     );
     user_sign(&fixture, &mut psbt);
-    let response =
-        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
-    let pending = expect_pending(response);
-    assert_eq!(pending.first_seen, NOW);
+    let accepted = expect_accepted(
+        handle_sign(&fixture.node, &fixture.held_request(&psbt), NOW).expect("decodable request"),
+    );
+    assert_eq!(accepted.first_seen, NOW);
     assert_eq!(
-        pending.remaining_secs, HOLD,
-        "first sight must report the whole Hold as remaining"
+        accepted.remaining_secs, HOLD,
+        "first sight must report the whole Hold as remaining before the fire event"
     );
 }
 
+/// Model B: the node signs at ingress and the HOLD delays combine + broadcast,
+/// never signing (ADR-0012's Model-B Hold lifecycle). Signing only after the Hold
+/// would make signing itself a duress oracle.
+///
+/// There is no re-submission any more — the coordinator sends once, and the node
+/// schedules its own fire — so a re-send is answered idempotently from the
+/// anti-replay log rather than re-evaluated into a signature.
 #[test]
-fn resubmission_before_the_window_is_still_pending_with_less_time() {
+fn a_held_hot_spend_is_answered_idempotently_on_a_re_send() {
     let fixture = held_fixture(HOLD);
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let mut req = held_request(&psbt);
+    let mut req = fixture.held_request(&psbt);
 
-    let first = handle_sign(&fixture.node, &req, NOW).expect("decodable request");
-    assert_eq!(expect_pending(first).remaining_secs, HOLD);
+    let first = expect_accepted(handle_sign(&fixture.node, &req, NOW).expect("decodable request"));
+    assert_eq!(first.remaining_secs, HOLD);
 
-    // Half the Hold later the same commitment is still inside its window. The
-    // timer keeps the original first_seen, so remaining_secs has shrunk. The
-    // coordinator re-sends with a fresh nonce (single-use per transmission), which
-    // must NOT be mistaken for a new commitment and restart the Hold.
+    // Half the Hold later, the coordinator re-sends with a fresh nonce (single-use
+    // per transmission). Idempotency is keyed on the COMMITMENT, so this returns
+    // the one recorded verdict — the schedule the first acceptance fixed is never
+    // reset, and the node never signs twice.
     coord_sign(&mut req);
-    let later = NOW + HOLD / 2;
-    let pending =
-        expect_pending(handle_sign(&fixture.node, &req, later).expect("decodable request"));
-    assert_eq!(pending.first_seen, NOW, "the Hold timer must not reset");
-    assert_eq!(pending.remaining_secs, HOLD - HOLD / 2);
-}
-
-#[test]
-fn resubmission_at_or_after_the_window_is_signed() {
-    let fixture = held_fixture(HOLD);
-    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
-    user_sign(&fixture, &mut psbt);
-    let mut req = held_request(&psbt);
-
-    assert!(matches!(
-        handle_sign(&fixture.node, &req, NOW).expect("decodable request"),
-        SignResponse::Pending(_)
-    ));
-    // Exactly at first_seen + hold_secs the window has elapsed: the node signs
-    // the PSBT in hand (re-verified), contributing its own partial signature. The
-    // re-send past the Hold carries a fresh nonce, as a coordinator's does.
-    coord_sign(&mut req);
-    let response = handle_sign(&fixture.node, &req, NOW + HOLD).expect("decodable request");
-    let SignResponse::Signed(signed) = response else {
-        panic!("the Hold has elapsed; the node must sign, got {response:?}");
-    };
-    let signed = Psbt::from_str(&signed).expect("valid returned psbt");
-    let secp = Secp256k1::new();
-    assert!(
-        signed.inputs[0]
-            .partial_sigs
-            .contains_key(&pubkey(&secp, 2)),
-        "node must contribute its own partial signature after the Hold"
+    let second = expect_accepted(
+        handle_sign(&fixture.node, &req, NOW + HOLD / 2).expect("decodable request"),
     );
+    assert_eq!(second, first, "a re-send returns the ONE recorded verdict");
 }
 
 #[test]
-fn escape_class_sweep_signs_instantly_despite_a_hold() {
+fn an_escape_class_spend_fires_immediately_even_under_a_hold() {
     let fixture = held_fixture(HOLD);
-    // The canonical Rotate shape: every output pays the escape wallet, no change
-    // left behind. The implicit cancel of any pending spend, which must never be
-    // held. Kept alongside the change-bearing sweep below so both escape shapes
-    // stay covered.
+    // The canonical Rotate shape: every output pays the escape wallet. It
+    // completes immediately under EITHER pin — the destination is the user's own
+    // escape wallet either way, so there is nothing to defer and thus no timing
+    // oracle (ADR-0012).
     let mut psbt = vault_psbt(&fixture, vec![(fixture.escape_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let response =
-        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
-    assert!(
-        matches!(response, SignResponse::Signed(_)),
-        "an escape sweep is instant even under a Hold, got {response:?}"
+    let accepted = expect_accepted(
+        handle_sign(&fixture.node, &fixture.held_request(&psbt), NOW).expect("decodable request"),
+    );
+    assert_eq!(
+        accepted.remaining_secs, 0,
+        "an escape-class spend's fire event is now, even under a Hold"
     );
 }
 
 #[test]
-fn escape_class_with_vault_change_signs_instantly_despite_a_hold() {
+fn an_escape_class_spend_with_vault_change_fires_immediately_too() {
     let fixture = held_fixture(HOLD);
-    // Every non-change output pays the escape wallet. The vault output is change
-    // and excluded from destination classification (ADR-0013 §3), so this is
-    // still an escape sweep: the implicit cancel that must never be held.
+    // Vault change is permitted in every class and excluded from classification
+    // (ADR-0013 §3), so this is still escape-class.
     let mut psbt = vault_psbt(
         &fixture,
         vec![
@@ -865,77 +908,108 @@ fn escape_class_with_vault_change_signs_instantly_despite_a_hold() {
         ],
     );
     user_sign(&fixture, &mut psbt);
-    let response =
-        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
-    assert!(
-        matches!(response, SignResponse::Signed(_)),
-        "an escape sweep is instant even under a Hold, got {response:?}"
+    let accepted = expect_accepted(
+        handle_sign(&fixture.node, &fixture.held_request(&psbt), NOW).expect("decodable request"),
     );
+    assert_eq!(accepted.remaining_secs, 0);
 }
 
+/// ADR-0013 §3: a SpendRequest whose spend classifies refresh-class is REJECTED.
+/// A pure self-spend belongs in a pin-less RefreshRequest — admitting it here
+/// would pose the "honor the pin or ignore it?" question the tagged union deletes,
+/// and put refresh back on the duress surface.
 #[test]
-fn refresh_self_spend_signs_instantly_despite_a_hold() {
+fn a_refresh_shaped_spend_request_is_rejected() {
     let fixture = held_fixture(HOLD);
     let vault_spk = fixture.descriptor.script_pubkey();
-    // Every output pays the vault back: a refresh self-spend.
     let mut psbt = vault_psbt(&fixture, vec![(vault_spk, 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    // Preserve the pre-existing PIN-gated self-spend until V0-8b lands the
-    // first-class Refresh arm and its bounds as one unit.
-    let response =
-        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
-    assert!(
-        matches!(response, SignResponse::Signed(_)),
-        "a refresh self-spend is instant even under a Hold, got {response:?}"
+    let refusal = expect_refusal(
+        handle_sign(&fixture.node, &fixture.held_request(&psbt), NOW).expect("decodable request"),
     );
+    assert_eq!(refusal.code, RefusalCode::PsbtInconsistent);
+    assert_eq!(refusal.check, "transaction_class");
 }
 
 #[test]
-fn an_invalid_hot_spend_is_refused_not_held() {
+fn an_invalid_hot_spend_is_refused_never_signed_or_registered() {
     let fixture = held_fixture(HOLD);
-    // A hot-class spend with NO user signature. It fails validation, so the
-    // response is a Refusal — not Pending. A held spend answers Pending, so a
-    // Refusal here proves the invalid submission was never recorded as pending
-    // (the pending log holds only spends that would otherwise be signed).
+    // A hot-class spend with NO user signature. It fails validation, so it is
+    // refused — never signed, never registered, never propagated.
     let psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
-    let response =
-        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
-    let refusal = expect_refusal(response);
+    let refusal = expect_refusal(
+        handle_sign(&fixture.node, &fixture.held_request(&psbt), NOW).expect("decodable request"),
+    );
     assert_eq!(refusal.code, RefusalCode::UserSigInvalid);
 }
 
+/// EXPIRY_TOO_SHORT (ADR-0013 §6): a hot-class commitment must outlive its Hold
+/// AND the combine window that follows. Otherwise the node would sign at ingress,
+/// hold the partial, and watch the candidate expire before it could ever combine —
+/// an acceptance that could only ever fail silently.
 #[test]
-fn hot_spend_expiring_at_the_hold_boundary_is_refused_not_pending() {
+fn a_hot_spend_whose_expiry_cannot_outlive_the_hold_plus_combine_window_is_refused() {
     let fixture = held_fixture(HOLD);
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    // Expiry is exclusive. If expiry == first_seen + hold_secs, the spend will
-    // be expired exactly when the Hold elapses, so recording Pending would
-    // promise a signature that can never be returned.
+    // One second short of `now + hold_secs + combine_slack_secs`.
+    let refusal = expect_refusal(
+        handle_sign(
+            &fixture.node,
+            &fixture.request_at(&psbt, NORMAL_PIN, NOW + HOLD + COMBINE_SLACK - 1),
+            NOW,
+        )
+        .expect("decodable request"),
+    );
+    assert_eq!(refusal.code, RefusalCode::ExpiryTooShort);
+    assert_eq!(refusal.check, "commitment_expiry");
+}
+
+/// Equality passes: expiry EXACTLY at `now + hold_secs + combine_slack_secs` is
+/// accepted. The bound is the last instant the combine could still complete, not
+/// the first instant it could not.
+#[test]
+fn a_hot_spend_expiring_exactly_at_the_bound_is_accepted() {
+    let fixture = held_fixture(HOLD);
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
     let response = handle_sign(
         &fixture.node,
-        &request_at(&psbt, NORMAL_PIN, NOW + HOLD),
+        &fixture.request_at(&psbt, NORMAL_PIN, NOW + HOLD + COMBINE_SLACK),
         NOW,
     )
     .expect("decodable request");
-    let refusal = expect_refusal(response);
-    assert_eq!(refusal.code, RefusalCode::CommitmentExpired);
+    assert_eq!(expect_accepted(response).remaining_secs, HOLD);
+}
+
+/// The bound is hot-class only: an escape-class spend fires NOW, so it needs only
+/// the combine window, not a Hold it does not have.
+#[test]
+fn expiry_too_short_does_not_apply_to_an_escape_class_spend() {
+    let fixture = held_fixture(HOLD);
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.escape_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    let response = handle_sign(
+        &fixture.node,
+        // Far short of the hot-class bound, but it fires immediately.
+        &fixture.request_at(&psbt, NORMAL_PIN, NOW + HOLD),
+        NOW,
+    )
+    .expect("decodable request");
+    assert_eq!(expect_accepted(response).remaining_secs, 0);
 }
 
 #[test]
-fn a_hot_spend_signs_instantly_when_hold_is_zero() {
-    // hold_secs = 0 is the first-light configuration: the hot class exists but
-    // the Hold is a no-op, so the spend signs on first submission. No pending
-    // entry is created (the demo stays one-shot).
+fn a_hot_spend_fires_immediately_when_hold_is_zero() {
+    // hold_secs = 0 is the first-light configuration: the hot class exists but the
+    // Hold is a no-op, so the fire event is ingress itself.
     let fixture = held_fixture(0);
     let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
-    let response =
-        handle_sign(&fixture.node, &held_request(&psbt), NOW).expect("decodable request");
-    assert!(
-        matches!(response, SignResponse::Signed(_)),
-        "hold_secs = 0 signs the hot spend on first submission, got {response:?}"
+    let accepted = expect_accepted(
+        handle_sign(&fixture.node, &fixture.held_request(&psbt), NOW).expect("decodable request"),
     );
+    assert_eq!(accepted.remaining_secs, 0);
 }
 
 /// The coordinator-auth + freshness gate (ADR-0013 §2/§3): a node admits a
@@ -957,7 +1031,7 @@ mod coord_auth {
         let fixture = fixture();
         let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
         user_sign(&fixture, &mut psbt);
-        let req = request(&psbt, NORMAL_PIN);
+        let req = fixture.request(&psbt, NORMAL_PIN);
         (fixture, req)
     }
 
@@ -967,20 +1041,24 @@ mod coord_auth {
         assert!(
             matches!(
                 handle_sign(&fixture.node, &req, NOW).expect("decodable"),
-                SignResponse::Signed(_)
+                SignResponse::Accepted(_)
             ),
             "an authentic coord-signed request must reach the signer"
         );
     }
 
     /// A user-signed pure self-spend, coord-signed by the vault's pinned
-    /// coordinator. The first-class arm authenticates but deliberately refuses
-    /// to sign until its ADR-0013 §6 bounds exist.
+    /// coordinator — the first-class pin-less Refresh arm (ADR-0013 §2).
+    ///
+    /// The output value leaves a REALISTIC self-spend fee (1_000 sat over a ~94 vB
+    /// transaction, ~10 sat/vB). The spend fixture's flat 10_000 sat would read as
+    /// ~106 sat/vB here and trip the refresh fee cap — correctly, which is the
+    /// point of that cap and is covered by its own test.
     fn honest_refresh() -> (Fixture, RefreshRequest) {
         let fixture = fixture();
         let mut psbt = vault_psbt(
             &fixture,
-            vec![(fixture.descriptor.script_pubkey(), 99_990_000)],
+            vec![(fixture.descriptor.script_pubkey(), 99_999_000)],
         );
         user_sign(&fixture, &mut psbt);
         let req = refresh_request(&psbt);
@@ -988,12 +1066,14 @@ mod coord_auth {
     }
 
     #[test]
-    fn a_correctly_coord_signed_refresh_is_authenticated_but_not_signed() {
+    fn a_correctly_coord_signed_refresh_is_accepted() {
         let (fixture, req) = honest_refresh();
-        let refusal =
-            expect_refusal(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
-        assert_eq!(refusal.code, RefusalCode::RefreshUnsupported);
-        assert_eq!(refusal.check, "refresh_bounds");
+        let accepted =
+            expect_accepted(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
+        assert_eq!(
+            accepted.remaining_secs, 0,
+            "a refresh is instant: it has no Hold and no pin"
+        );
     }
 
     /// The Refresh arm authenticates against the same pinned root as a spend: a
@@ -1019,9 +1099,7 @@ mod coord_auth {
     #[test]
     fn a_replayed_refresh_nonce_is_rejected() {
         let (fixture, req) = honest_refresh();
-        let first =
-            expect_refusal(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
-        assert_eq!(first.code, RefusalCode::RefreshUnsupported);
+        expect_accepted(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
         let refusal =
             expect_refusal(handle_refresh(&fixture.node, &req, NOW).expect("decodable refresh"));
         assert_eq!(refusal.code, RefusalCode::NonceReplayed);
@@ -1116,7 +1194,7 @@ mod coord_auth {
         let (fixture, req) = honest_request();
         assert!(matches!(
             handle_sign(&fixture.node, &req, NOW).expect("decodable"),
-            SignResponse::Signed(_)
+            SignResponse::Accepted(_)
         ));
 
         // The identical request (same nonce, same signature) is a replay: the gate
@@ -1191,7 +1269,7 @@ mod coord_auth {
         coord_sign_as(&mut old, &coord_key().0, "old-nonce");
         assert!(matches!(
             handle_sign(&fixture.node, &old, NOW).expect("decodable"),
-            SignResponse::Signed(_)
+            SignResponse::Accepted(_)
         ));
 
         // Advance authenticated node time to the old request's expiry. This
@@ -1201,7 +1279,7 @@ mod coord_auth {
         coord_sign_as(&mut newer, &coord_key().0, "new-nonce");
         assert!(matches!(
             handle_sign(&fixture.node, &newer, NOW + 100).expect("decodable"),
-            SignResponse::Signed(_)
+            SignResponse::Accepted(_)
         ));
 
         // Even if wall time steps backwards into the old request's original
@@ -1216,7 +1294,7 @@ mod coord_auth {
     /// drops the field entirely. Everything else is the config the rest of this
     /// file loads, so the pinned coordinator is the ONLY variable.
     fn config_with_coord_line(line: &str) -> String {
-        let cfg = fixture_config(0, MAX_AGE, false, true);
+        let cfg = fixture_config(0, MAX_AGE, true);
         let (head, tail) = cfg
             .split_once("coordinator_auth_pubkey")
             .expect("the fixture config pins a coordinator");
@@ -1304,5 +1382,316 @@ mod coord_auth {
                 "node key {index} must be refused as a coordinator key: {err}"
             );
         }
+    }
+}
+
+/// The refresh contract (ADR-0013 §2/§6): pin-less, instant, and bounded by its
+/// own limits, because it has neither the Hold nor the PIN that ADR-0006 relies on
+/// for its burn defense.
+mod refresh_bounds {
+    use super::*;
+
+    /// The fixture refresh: a pure self-spend paying `value` back to the vault,
+    /// over the vault UTXO at `input_txid:0`.
+    fn refresh_of(fixture: &Fixture, input_txid: u8, value: u64) -> Psbt {
+        refresh_of_inputs(
+            fixture,
+            vec![OutPoint::new(Txid::from_byte_array([input_txid; 32]), 0)],
+            value,
+        )
+    }
+
+    fn refresh_of_inputs(fixture: &Fixture, inputs: Vec<OutPoint>, value: u64) -> Psbt {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .into_iter()
+                .map(|previous_output| TxIn {
+                    previous_output,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                script_pubkey: fixture.descriptor.script_pubkey(),
+                value: Amount::from_sat(value),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("unsigned tx");
+        for input in &mut psbt.inputs {
+            input.witness_utxo = Some(TxOut {
+                script_pubkey: fixture.descriptor.script_pubkey(),
+                value: Amount::from_sat(100_000_000),
+            });
+            input.witness_script = Some(
+                fixture
+                    .descriptor
+                    .explicit_script()
+                    .expect("wsh witness script"),
+            );
+        }
+        user_sign(fixture, &mut psbt);
+        psbt
+    }
+
+    /// A realistic self-spend fee: ~1_000 sat over a ~94 vB transaction.
+    fn healthy_refresh(fixture: &Fixture, input_txid: u8) -> Psbt {
+        refresh_of(fixture, input_txid, 99_999_000)
+    }
+
+    /// The node's default `refresh_min_interval_secs` (ADR-0013 §6, ~30 days).
+    const MIN_INTERVAL: u64 = 2_592_000;
+
+    #[test]
+    fn a_refresh_is_accepted_signed_and_instant() {
+        let fixture = fixture();
+        let psbt = healthy_refresh(&fixture, 7);
+        let accepted = expect_accepted(
+            handle_refresh(&fixture.node, &refresh_request(&psbt), NOW).expect("decodable"),
+        );
+        assert_eq!(accepted.first_seen, NOW);
+        assert_eq!(
+            accepted.remaining_secs, 0,
+            "a refresh has no Hold: it moves nothing to anyone"
+        );
+    }
+
+    /// ADR-0013 §6's minimum refresh interval, on the coin a refresh CREATES.
+    ///
+    /// This is the half that actually bounds the burn RATE: an attacker driving
+    /// repeated refreshes to burn the vault must CHAIN them — refresh A→B, then
+    /// B→C — and every link spends a coin the previous refresh just made. Keyed on
+    /// inputs alone, each link would spend a never-before-seen outpoint and the
+    /// interval would never fire.
+    #[test]
+    fn a_chained_refresh_of_a_freshly_refreshed_coin_is_refused_as_too_soon() {
+        let fixture = fixture();
+        let first = healthy_refresh(&fixture, 7);
+        expect_accepted(
+            handle_refresh(&fixture.node, &refresh_request(&first), NOW).expect("decodable"),
+        );
+
+        // The next link spends the coin the first refresh created.
+        let first_txid = first.unsigned_tx.compute_txid();
+        let mut second = healthy_refresh(&fixture, 8);
+        second.unsigned_tx.input[0].previous_output = OutPoint::new(first_txid, 0);
+        user_sign(&fixture, &mut second);
+
+        let refusal = expect_refusal(
+            handle_refresh(&fixture.node, &refresh_request(&second), NOW + 60).expect("decodable"),
+        );
+        assert_eq!(refusal.code, RefusalCode::RefreshTooSoon);
+        assert_eq!(refusal.check, "refresh_min_interval");
+    }
+
+    #[test]
+    fn refreshing_the_same_coin_again_inside_the_interval_is_refused() {
+        let fixture = fixture();
+        let first = healthy_refresh(&fixture, 7);
+        expect_accepted(
+            handle_refresh(&fixture.node, &refresh_request(&first), NOW).expect("decodable"),
+        );
+        // A different transaction (different output value ⇒ different commitment)
+        // over the SAME coin, one day later — well inside the ~30-day interval.
+        let again = refresh_of(&fixture, 7, 99_998_000);
+        let day_later = NOW + 86_400;
+        let refusal = expect_refusal(
+            handle_refresh(
+                &fixture.node,
+                &refresh_request_at(&again, day_later + 3_600),
+                day_later,
+            )
+            .expect("decodable"),
+        );
+        assert_eq!(refusal.code, RefusalCode::RefreshTooSoon);
+    }
+
+    #[test]
+    fn every_input_of_a_multi_input_refresh_is_checked_for_recent_history() {
+        let fixture = fixture();
+        let first = healthy_refresh(&fixture, 7);
+        expect_accepted(
+            handle_refresh(&fixture.node, &refresh_request(&first), NOW).expect("decodable"),
+        );
+
+        // Put an untracked coin first and the recently refreshed coin second. A
+        // missing history entry for input 0 must continue, not return from the
+        // whole check and silently skip input 1.
+        let multi = refresh_of_inputs(
+            &fixture,
+            vec![
+                OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+                first.unsigned_tx.input[0].previous_output,
+            ],
+            199_998_000,
+        );
+        let refusal = expect_refusal(
+            handle_refresh(
+                &fixture.node,
+                &refresh_request_at(&multi, NOW + 3_660),
+                NOW + 60,
+            )
+            .expect("decodable"),
+        );
+        assert_eq!(refusal.code, RefusalCode::RefreshTooSoon);
+        assert!(
+            refusal
+                .detail
+                .contains(&first.unsigned_tx.input[0].previous_output.to_string()),
+            "the second, tracked input must be the refused coin: {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn refreshing_the_same_coin_once_the_interval_has_elapsed_is_accepted() {
+        let fixture = fixture();
+        let first = healthy_refresh(&fixture, 7);
+        expect_accepted(
+            handle_refresh(&fixture.node, &refresh_request(&first), NOW).expect("decodable"),
+        );
+        // Past the interval. The legitimate ~90-day cadence never sees this bound.
+        let again = refresh_of(&fixture, 7, 99_998_000);
+        let later = NOW + MIN_INTERVAL;
+        expect_accepted(
+            handle_refresh(
+                &fixture.node,
+                &refresh_request_at(&again, later + 3_600),
+                later,
+            )
+            .expect("decodable"),
+        );
+    }
+
+    /// ADR-0013 §6's tight refresh fee cap — the other half of the burn bound. A
+    /// real self-spend pays a normal feerate, never the 10% `max_fee_pct` a
+    /// hot-class spend may use.
+    #[test]
+    fn a_refresh_above_the_refresh_fee_cap_is_refused() {
+        let fixture = fixture();
+        // 5_000_000 sat of fee: far under `max_fee_pct` (10% of 100_000_000), so
+        // the ORDINARY fee cap admits it — and this cap is what stops it.
+        let psbt = refresh_of(&fixture, 7, 95_000_000);
+        let refusal = expect_refusal(
+            handle_refresh(&fixture.node, &refresh_request(&psbt), NOW).expect("decodable"),
+        );
+        assert_eq!(refusal.code, RefusalCode::RefreshFeeExceedsCap);
+        assert_eq!(refusal.check, "refresh_fee_cap");
+    }
+
+    /// The refresh fee cap is an EXACT bound: `fee == cap * vsize` (exactly the cap)
+    /// passes, but a single satoshi more is refused. The truncated integer feerate
+    /// `fee / vsize` would round `cap * vsize + 1` back down to the cap and wrongly
+    /// admit it — this pins the burn bound to the satoshi.
+    #[test]
+    fn the_refresh_fee_cap_is_enforced_to_the_exact_satoshi() {
+        let fixture = fixture();
+        // The fixture leaves `refresh_max_feerate` at its 100 sat/vB default.
+        const CAP: u64 = 100;
+        let vsize = refresh_of(&fixture, 7, 99_990_000).unsigned_tx.vsize() as u64;
+
+        // Exactly at the cap: accepted (equality passes).
+        let at_cap = refresh_of(&fixture, 8, 100_000_000 - CAP * vsize);
+        expect_accepted(
+            handle_refresh(&fixture.node, &refresh_request(&at_cap), NOW).expect("decodable"),
+        );
+
+        // One satoshi over `cap * vsize`: the truncated feerate still reads as the
+        // cap, but the exact bound refuses it. (Distinct coin, so no min-interval
+        // collision with the accepted refresh above.)
+        let over_fee = CAP * vsize + 1;
+        assert_eq!(
+            over_fee / vsize,
+            CAP,
+            "the truncated feerate equals the cap — exactly the trap this closes"
+        );
+        let over = refresh_of(&fixture, 9, 100_000_000 - over_fee);
+        let refusal = expect_refusal(
+            handle_refresh(&fixture.node, &refresh_request(&over), NOW).expect("decodable"),
+        );
+        assert_eq!(refusal.code, RefusalCode::RefreshFeeExceedsCap);
+        assert_eq!(refusal.check, "refresh_fee_cap");
+    }
+
+    /// Refresh subordination (ADR-0012): while ANY spend is pending, every refresh
+    /// is turned away — deliberately coarse, not "refreshes whose inputs overlap".
+    /// A duress escape sweeps most of the vault while the triggering hot spend
+    /// touches a few coins, so an input-overlap rule would let a refresh over a
+    /// non-overlapping escape input finalize instantly and invalidate the armed
+    /// escape. Only the coarse rule closes that.
+    #[test]
+    fn a_refresh_is_subordinate_to_a_pending_spend_it_shares_no_inputs_with() {
+        let fixture = held_fixture(HOLD);
+        // A pending hot spend over coin 7.
+        let mut spend = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+        user_sign(&fixture, &mut spend);
+        expect_accepted(
+            handle_sign(&fixture.node, &fixture.held_request(&spend), NOW).expect("decodable"),
+        );
+
+        // A refresh over a DIFFERENT coin (8), sharing no input with the pending
+        // spend. It is still blocked.
+        let refresh = healthy_refresh(&fixture, 8);
+        assert_ne!(
+            refresh.unsigned_tx.input[0].previous_output,
+            spend.unsigned_tx.input[0].previous_output,
+            "the refresh and the pending spend share no input"
+        );
+        let refusal = expect_refusal(
+            handle_refresh(&fixture.node, &refresh_request(&refresh), NOW).expect("decodable"),
+        );
+        assert_eq!(refusal.code, RefusalCode::RefreshSubordinated);
+        assert_eq!(refusal.check, "refresh_subordination");
+    }
+
+    /// The block is bounded by the pending spend's commitment expiry, so an
+    /// attacker holding a spend pending forever to starve refreshes cannot: it is
+    /// denial, and it ends. (Retriable, not terminal.)
+    #[test]
+    fn a_refresh_is_served_once_the_pending_spend_has_expired() {
+        let fixture = held_fixture(HOLD);
+        let mut spend = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+        user_sign(&fixture, &mut spend);
+        let spend_expiry = NOW + MAX_AGE;
+        expect_accepted(
+            handle_sign(&fixture.node, &fixture.held_request(&spend), NOW).expect("decodable"),
+        );
+
+        let refresh = healthy_refresh(&fixture, 8);
+        // Blocked while the spend is pending...
+        assert_eq!(
+            expect_refusal(
+                handle_refresh(&fixture.node, &refresh_request(&refresh), NOW).expect("decodable")
+            )
+            .code,
+            RefusalCode::RefreshSubordinated
+        );
+        // ...and served after its final authorized fire second. The refresh's own
+        // expiry has to outlive the spend's, so it is re-issued at the later clock.
+        expect_accepted(
+            handle_refresh(
+                &fixture.node,
+                &refresh_request_at(&refresh, spend_expiry + 3_600),
+                spend_expiry + 1,
+            )
+            .expect("decodable"),
+        );
+    }
+
+    /// A RefreshRequest must BE a refresh: anything that can move value to a
+    /// destination is refused on this pin-less path. This is what keeps refresh off
+    /// the duress surface — a transaction that moves nothing to anyone needs no
+    /// duress decision, so there is no signal for an attacker to read here.
+    #[test]
+    fn a_refresh_request_carrying_a_hot_destination_is_rejected() {
+        let fixture = fixture();
+        let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_999_000)]);
+        user_sign(&fixture, &mut psbt);
+        let refusal = expect_refusal(
+            handle_refresh(&fixture.node, &refresh_request(&psbt), NOW).expect("decodable"),
+        );
+        assert_eq!(refusal.code, RefusalCode::PsbtInconsistent);
+        assert_eq!(refusal.check, "transaction_class");
     }
 }

@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use vault_node::{server, Node};
+use vault_node::{server, spawn_drivers, Node};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -29,11 +29,12 @@ async fn run() -> Result<(), vault_node::Error> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", node.listen_port))
         .await
         .map_err(|e| format!("cannot bind 127.0.0.1:{}: {e}", node.listen_port))?;
-    // If a chain backend is configured, drive the watchtower (ADR-0001, V0-6b):
-    // one background tokio task scanning this node's own chain view on an
-    // interval, queueing alerts that surface through GET /events. We are inside
-    // the runtime here, so the task spawns cleanly.
-    node.spawn_watchtower();
+    // With a chain backend configured, start the two background drivers: the
+    // watchtower (ADR-0001, V0-6b) scanning this node's own chain view, and the
+    // fire driver (V0-8b) that releases partials at each candidate's authorized
+    // fire event and then combines + broadcasts. We are inside the runtime here,
+    // so the tasks spawn cleanly.
+    spawn_drivers(&node);
     println!("vault-node listening on 127.0.0.1:{}", node.listen_port);
     server::serve(listener, Arc::clone(&node))
         .await
