@@ -13,7 +13,7 @@ The vault spend path requiring the User key plus a Quorum of node signatures; ev
 _Avoid_: primary path, spend branch
 
 **Recovery path**:
-The vault spend path requiring 2-of-3 Recovery keys after a relative timelock. Used for loss and inheritance only — never as a response to an attack.
+The vault spend path requiring 2-of-3 Recovery keys after a relative timelock. The **fallback exit**: taken for loss / inheritance / a stuck vault, and after a failed Escape sweep + terminal Lockdown (ADR-0008). It is not the first-line answer to an *active* attack — that is the Normal path + the Escape sweep — but it IS how funds re-emerge once a locked-down vault is the only state left (freeze + Lockdown → recovery).
 _Avoid_: emergency path, backup path
 
 **Federation**:
