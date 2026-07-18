@@ -44,8 +44,7 @@ use bitcoin::hex::FromHex;
 use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
 use bitcoin::{EcdsaSighashType, Psbt, PublicKey, ScriptBuf, Txid};
-use miniscript::descriptor::WshInner;
-use miniscript::{Descriptor, DescriptorPublicKey, Terminal};
+use miniscript::{Descriptor, DescriptorPublicKey};
 use replay::{NonceDecision, NonceLog, ReplayLog, SignState, MAX_COORD_NONCE_BYTES};
 use serde::Deserialize;
 use subtle::{ConditionallySelectable, ConstantTimeEq};
@@ -483,11 +482,28 @@ impl Node {
             .map_err(|e| format!("bad descriptor: {e}"))?;
         let vault = Descriptor::<DescriptorPublicKey>::from_str(&config.descriptor)
             .map_err(|e| format!("bad descriptor: {e}"))?;
-        let user_pubkey = first_light_user_key_of(&descriptor)?;
-        // The federation: `t` (the combine threshold) and the node keys (for the
-        // channel manifest's node_id ↔ descriptor-key bijection, §1). Both read
-        // from the descriptor while the concrete parse is in scope.
-        let (threshold, node_keys) = first_light_federation_of(&descriptor)?;
+        // Parse + VALIDATE the vault descriptor against the fixed two-branch
+        // template (ADR-0013 §1): the normal branch (user key + `t`-of-`n`
+        // federation) AND the timelocked recovery branch (`older(4224679)` +
+        // 2-of-3). policy-core owns the template shape, so setup and every node
+        // enforce the same rule; a descriptor off-template — including one with NO
+        // recovery branch (a vault with no exit) or an `older(30375)` BLOCK lock —
+        // is a fatal config error here, never a runtime refusal. `t` and the node
+        // keys come from the descriptor, never config: both are consensus facts
+        // about the script the coins are locked to. A config copy of `t` could
+        // disagree with it — too low and this node broadcasts transactions the
+        // network rejects, too high and every legitimate spend stalls forever. The
+        // node keys are the descriptor-canonical set the channel manifest's
+        // `node_id` bijection is defined over (§1); they come back in descriptor
+        // order, and the channel derives the canonical (lexicographic) order itself.
+        // The recovery keys are validated (2-of-3, off-branch) but not otherwise
+        // used by the node — recovery is a user-side exit (vault-cli), never
+        // node-signed.
+        let template = policy_core::parse_vault_template(&descriptor)
+            .map_err(|e| format!("bad descriptor: {e}"))?;
+        let user_pubkey = template.user_key;
+        let threshold = template.threshold;
+        let node_keys = template.node_keys;
         // The coordinator is a DISTINCT role from the two the descriptor names:
         // its key authorizes *requests*, the user key authorizes *spends*, and the
         // federation keys *sign* them. Reusing one key across two roles silently
@@ -747,8 +763,10 @@ impl Node {
     }
 
     /// The vault's own watched scriptPubKey(s) for the watchtower scan
-    /// (ADR-0001). The first-light vault is a single definite P2WSH, so this is
-    /// one script — the P2WSH of the node's witness script.
+    /// (ADR-0001). The vault is a single definite P2WSH, so this is one script —
+    /// the P2WSH of the node's witness script. Both descriptor branches (normal
+    /// AND recovery) share this one scriptPubKey (ADR-0013 §1), so it covers a
+    /// recovery spend too; the branch is told apart from the spend's witness.
     pub fn vault_scripts(&self) -> Vec<ScriptBuf> {
         vec![ScriptBuf::new_p2wsh(&self.witness_script.wscript_hash())]
     }
@@ -760,11 +778,11 @@ impl Node {
     ///
     /// This is the SAME pass the daemon's background driver runs — both go
     /// through [`watchtower::scan_pass`] over this node's shared authorized set
-    /// and alert queue — so tests and production exercise one code path. The
-    /// recovery-branch script set is empty in v0 (the first-light vault has no
-    /// recovery branch), so this pass emits only `UnrecognizedSpend`;
-    /// `RecoveryPathSpend` classification lives in [`watchtower::scan`] and is
-    /// tested there.
+    /// and alert queue — so tests and production exercise one code path. A spend
+    /// that took the recovery branch is classified `RecoveryPathSpend` from its
+    /// witness (the two branches share one scriptPubKey); every other vault spend
+    /// this node did not validate-and-accept is `UnrecognizedSpend`
+    /// ([`watchtower::scan`]).
     pub fn watchtower_tick(
         &self,
         backend: &dyn ChainBackend,
@@ -1327,72 +1345,6 @@ pub(crate) fn handle_channel_body(node: &Node, body: &[u8], now: u64) -> Channel
             }
         }
     }
-}
-
-/// Extract the user key from the fixed first-light descriptor template
-/// `wsh(and_v(v:pk(USER),multi(t,node...)))`.
-fn first_light_user_key_of(descriptor: &Descriptor<PublicKey>) -> Result<PublicKey, Error> {
-    let template_err = || -> Error {
-        "descriptor does not match the first-light template \
-         wsh(and_v(v:pk(USER),multi(t,...)))"
-            .into()
-    };
-    let Descriptor::Wsh(wsh) = descriptor else {
-        return Err(template_err());
-    };
-    let WshInner::Ms(ms) = wsh.as_inner() else {
-        return Err(template_err());
-    };
-    let Terminal::AndV(left, right) = &ms.node else {
-        return Err(template_err());
-    };
-    // `v:pk(USER)` parses as Verify(Check(PkK(USER))).
-    let Terminal::Verify(inner) = &left.node else {
-        return Err(template_err());
-    };
-    let Terminal::Check(inner) = &inner.node else {
-        return Err(template_err());
-    };
-    let Terminal::PkK(user) = &inner.node else {
-        return Err(template_err());
-    };
-    let Terminal::Multi(_) = &right.node else {
-        return Err(template_err());
-    };
-    Ok(*user)
-}
-
-/// Extract the federation from the first-light descriptor template's
-/// `multi(t, node...)`: the threshold `t` and the node keys.
-///
-/// Both come from the descriptor and never from config, because both are
-/// consensus facts about the script the coins are actually locked to. A config
-/// copy of `t` could disagree with it — too low and this node would broadcast
-/// transactions the network rejects, too high and every legitimate spend would
-/// stall forever. The keys are the descriptor-canonical set the channel manifest's
-/// `node_id` bijection is defined over (§1); they come back in descriptor order,
-/// and the channel derives the canonical (lexicographic) order itself.
-fn first_light_federation_of(
-    descriptor: &Descriptor<PublicKey>,
-) -> Result<(usize, Vec<PublicKey>), Error> {
-    let template_err = || -> Error {
-        "descriptor does not match the first-light template \
-         wsh(and_v(v:pk(USER),multi(t,...)))"
-            .into()
-    };
-    let Descriptor::Wsh(wsh) = descriptor else {
-        return Err(template_err());
-    };
-    let WshInner::Ms(ms) = wsh.as_inner() else {
-        return Err(template_err());
-    };
-    let Terminal::AndV(_left, right) = &ms.node else {
-        return Err(template_err());
-    };
-    let Terminal::Multi(thresh) = &right.node else {
-        return Err(template_err());
-    };
-    Ok((thresh.k(), thresh.data().to_vec()))
 }
 
 /// Handle one `/sign` submission. `now` is unix seconds by the node's own
@@ -2715,11 +2667,30 @@ mod watchtower_wiring {
     }
 
     fn vault_spend(node: &Node, spend_txid: Txid) -> SpendSeen {
+        vault_spend_witness(node, spend_txid, normal_branch_witness())
+    }
+
+    /// A spend of the vault script carrying `witness` — the watchtower reads it to
+    /// tell the recovery branch from the normal branch.
+    fn vault_spend_witness(node: &Node, spend_txid: Txid, witness: bitcoin::Witness) -> SpendSeen {
         SpendSeen {
             spend_txid,
             outpoint: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
             script: node.vault_scripts()[0].clone(),
+            witness,
         }
+    }
+
+    /// A normal-branch (`or_i` IF) witness: a non-empty `01` selector before the
+    /// witness script.
+    fn normal_branch_witness() -> bitcoin::Witness {
+        bitcoin::Witness::from_slice(&[vec![0x30u8; 71], vec![0x01u8], vec![0xABu8; 32]])
+    }
+
+    /// A recovery-branch (`or_i` ELSE) witness: an EMPTY selector before the
+    /// witness script — the on-chain signal the watchtower alerts on.
+    fn recovery_branch_witness() -> bitcoin::Witness {
+        bitcoin::Witness::from_slice(&[vec![0x30u8; 71], Vec::new(), vec![0xABu8; 32]])
     }
 
     #[test]
@@ -2746,6 +2717,34 @@ mod watchtower_wiring {
         assert_eq!(alerts[0].watchtower().kind, AlertKind::UnrecognizedSpend);
         assert_eq!(alerts[0].watchtower().spend_txid, foreign.to_string());
         assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn a_recovery_branch_spend_surfaces_a_recovery_path_alert_through_events() {
+        // The V0-10 exit, end to end through the node's own watchtower pass: a
+        // spend of the vault script that took the recovery (or_i ELSE) branch is a
+        // RecoveryPathSpend — even though the node never validated-and-accepted it
+        // (recovery uses recovery keys, not node keys), and even though it pays
+        // from the SAME scriptPubKey a normal spend does. The witness is the signal.
+        let (node, _accepted) = accepted_node();
+        let recovery_txid = Txid::from_byte_array([0xEC; 32]);
+        let backend = MockBackend {
+            spends: vec![vault_spend_witness(
+                &node,
+                recovery_txid,
+                recovery_branch_witness(),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(node.watchtower_tick(&backend, 0).expect("scan"), 1);
+        let (alerts, _) = node.events(0);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            alerts[0].watchtower().kind,
+            AlertKind::RecoveryPathSpend,
+            "a recovery-branch spend must alert RECOVERY_PATH_SPEND, never UNRECOGNIZED_SPEND"
+        );
+        assert_eq!(alerts[0].watchtower().spend_txid, recovery_txid.to_string());
     }
 
     /// **The B5 recognition fix.** A spend this node policy-REFUSED must NOT count
@@ -2890,6 +2889,17 @@ pub(crate) mod test_support {
         (sk, PublicKey::new(sk.public_key(&secp)))
     }
 
+    /// The two-branch vault descriptor (ADR-0013 §1) for a `t = node_keys.len()`
+    /// fixture: `user` + all `node_keys` on the normal branch, plus a fixed
+    /// throwaway 2-of-3 recovery keyset (seeds 0x30..=0x32). The recovery branch is
+    /// off the path these node-side tests drive; it exists so `from_toml_str`'s
+    /// template parse accepts the descriptor.
+    fn test_vault_descriptor(user: &PublicKey, node_keys: &[PublicKey]) -> String {
+        let nodes: Vec<String> = node_keys.iter().map(|k| k.to_string()).collect();
+        let recovery: Vec<String> = (0x30u8..=0x32).map(|i| key(i).1.to_string()).collect();
+        policy_core::vault_descriptor_string(&user.to_string(), nodes.len(), &nodes, &recovery)
+    }
+
     /// The coordinator this fixture's vault is sealed to (ADR-0013 §2).
     fn coord_key() -> (SecretKey, PublicKey) {
         key(0xC0)
@@ -2907,7 +2917,7 @@ pub(crate) mod test_support {
         let (nsk, node_pub) = key(2);
         let (_, hot_key) = key(10);
         let (_, escape_key) = key(11);
-        let descriptor = format!("wsh(and_v(v:pk({user}),multi(1,{node_pub})))");
+        let descriptor = test_vault_descriptor(&user, &[node_pub]);
         format!(
             "listen_port = 0\nnode_seckey = \"{}\"\ndescriptor = \"{descriptor}\"\n\
              allowlist = [\"wpkh({hot_key})\", \"wpkh({escape_key})\"]\n\
@@ -3012,7 +3022,7 @@ pub(crate) mod test_support {
         let (nsk, node_pub) = key(2);
         let (_, hot_key) = key(10);
         let (_, escape_key) = key(11);
-        let descriptor = format!("wsh(and_v(v:pk({user}),multi(1,{node_pub})))");
+        let descriptor = test_vault_descriptor(&user, &[node_pub]);
         let hot = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({hot_key})"))
             .expect("hot descriptor");
         let escape = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({escape_key})"))

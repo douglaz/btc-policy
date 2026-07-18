@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bitcoin::{ScriptBuf, Txid};
+use bitcoin::{ScriptBuf, Txid, Witness};
 use serde::Serialize;
 
 use crate::chain::{ChainBackend, SpendSeen};
@@ -127,26 +127,22 @@ impl Event {
 
 /// Classify each observed spend into the alerts to queue.
 ///
-/// Precedence (DESIGN.md, "Watchtower"): a spend of a recovery-branch script is a
+/// Precedence (DESIGN.md, "Watchtower"): a spend that took the recovery BRANCH is a
 /// `RecoveryPathSpend` even though the node never authorized it — the recovery path
 /// uses recovery keys, not node keys, so the acceptance test would otherwise
-/// mislabel it. Any other spend the backend surfaced is a spend of a vault UTXO
-/// (the backend was only asked for these two script sets); it is an
+/// mislabel it as unrecognized. Any other spend the backend surfaced is a spend of
+/// a vault UTXO (the backend was only asked for the vault script set); it is an
 /// `UnrecognizedSpend` unless its txid is in `authorized_txids` — the node's
 /// validated-AND-policy-ACCEPTED set (see the module docs).
 ///
-/// This keys recovery off a DISTINCT prevout script set — correct for v0, whose
-/// recovery set is empty. In v1 the real (Liana-style) recovery branch shares the
-/// vault's scriptPubKey, so the branch must be read from the spending witness, not
-/// the prevout script; see [`SpendSeen::script`].
-fn classify(
-    spends: &[SpendSeen],
-    recovery_scripts: &HashSet<ScriptBuf>,
-    authorized_txids: &HashSet<Txid>,
-) -> Vec<Alert> {
+/// The recovery branch shares the vault's scriptPubKey (ADR-0013 §1: recovery is an
+/// alternate branch inside the SAME `wsh(...)`), so it CANNOT be told from a normal
+/// spend by the prevout script. The branch is read from the spending WITNESS
+/// instead ([`is_recovery_branch`]) — the on-chain, branch-identifiable signal.
+fn classify(spends: &[SpendSeen], authorized_txids: &HashSet<Txid>) -> Vec<Alert> {
     let mut alerts = Vec::new();
     for spend in spends {
-        if recovery_scripts.contains(&spend.script) {
+        if is_recovery_branch(&spend.witness) {
             alerts.push(Alert::from_spend(AlertKind::RecoveryPathSpend, spend));
         } else if !authorized_txids.contains(&spend.spend_txid) {
             alerts.push(Alert::from_spend(AlertKind::UnrecognizedSpend, spend));
@@ -155,23 +151,38 @@ fn classify(
     alerts
 }
 
-/// One watchtower scan pass: ask `backend` for spends of the vault and recovery
-/// scripts at or after `from_height`, then classify them against the node's
-/// authorized set. The first-light vault has no recovery branch, so
-/// `recovery_scripts` is empty there; the classification is exercised directly in
-/// the tests.
+/// Whether a P2WSH vault-script spend took the RECOVERY branch, read from its
+/// witness. The vault template's top-level `or_i(NORMAL, RECOVERY)` compiles to
+/// `OP_IF <normal> OP_ELSE <recovery> OP_ENDIF`, so the witness carries an explicit
+/// branch selector as the element immediately BEFORE the witness script (the last
+/// element): a non-empty `01` selects the normal (IF) branch, an EMPTY push selects
+/// the recovery (ELSE) branch. So a recovery spend is exactly one whose
+/// second-from-last witness element is empty.
+///
+/// A witness too short to carry a P2WSH selector + script (< 2 elements) is not a
+/// vault-branch spend of this shape and reads as non-recovery — the safe default,
+/// since it still alerts as `UnrecognizedSpend` when it is not in the authorized
+/// set. `spends_of` only ever returns spends of the vault script, so every witness
+/// reaching here belongs to a spend of the two-branch `wsh(...)`.
+fn is_recovery_branch(witness: &Witness) -> bool {
+    witness
+        .second_to_last()
+        .is_some_and(|selector| selector.is_empty())
+}
+
+/// One watchtower scan pass: ask `backend` for spends of the vault scripts at or
+/// after `from_height`, then classify them against the node's authorized set. The
+/// two-branch `wsh(...)` shares one scriptPubKey across the normal and recovery
+/// branches (ADR-0013 §1), so `vault_scripts` alone covers a recovery spend too —
+/// the branch is read from each spend's witness ([`classify`] / [`is_recovery_branch`]).
 pub fn scan(
     backend: &dyn ChainBackend,
     vault_scripts: &[ScriptBuf],
-    recovery_scripts: &[ScriptBuf],
     authorized_txids: &HashSet<Txid>,
     from_height: u32,
 ) -> Result<Vec<Alert>, Error> {
-    let mut watched = vault_scripts.to_vec();
-    watched.extend_from_slice(recovery_scripts);
-    let spends = backend.spends_of(&watched, from_height)?;
-    let recovery: HashSet<ScriptBuf> = recovery_scripts.iter().cloned().collect();
-    Ok(classify(&spends, &recovery, authorized_txids))
+    let spends = backend.spends_of(vault_scripts, from_height)?;
+    Ok(classify(&spends, authorized_txids))
 }
 
 /// Interval between watchtower scan passes in the daemon driver. A `const`, not a
@@ -198,8 +209,8 @@ pub(crate) struct ScanOutcome {
 ///
 /// The authorized set is snapshotted (and its lock released) before the
 /// possibly-slow backend fetch, so a concurrent `/sign` is never blocked on chain
-/// I/O. The vault has no recovery branch in v0, so the recovery script set is
-/// empty here (see [`scan`]).
+/// I/O. `vault_scripts` covers both descriptor branches (they share one
+/// scriptPubKey); a recovery spend is told apart by its witness (see [`scan`]).
 pub(crate) fn scan_pass(
     backend: &dyn ChainBackend,
     vault_scripts: &[ScriptBuf],
@@ -209,7 +220,7 @@ pub(crate) fn scan_pass(
 ) -> Result<ScanOutcome, Error> {
     let tip = backend.tip_height()?;
     let authorized = authorized.lock().expect("authorized lock poisoned").clone();
-    let new_alerts = scan(backend, vault_scripts, &[], &authorized, from_height)?;
+    let new_alerts = scan(backend, vault_scripts, &authorized, from_height)?;
     let mut queue = alerts.lock().expect("alerts lock poisoned");
     let mut queued = 0;
     for alert in new_alerts {
@@ -404,26 +415,46 @@ mod tests {
         ScriptBuf::from(vec![byte; 4])
     }
 
-    fn spend(spend_byte: u8, script_byte: u8) -> SpendSeen {
+    /// A witness that took the NORMAL (or_i IF) branch: a non-empty `01` selector
+    /// sits immediately before the witness script.
+    fn normal_witness() -> Witness {
+        Witness::from_slice(&[vec![0x30u8; 71], vec![0x01u8], vec![0xABu8; 32]])
+    }
+
+    /// A witness that took the RECOVERY (or_i ELSE) branch: an EMPTY selector sits
+    /// immediately before the witness script — the branch-identifiable signal.
+    fn recovery_witness() -> Witness {
+        Witness::from_slice(&[vec![0x30u8; 71], Vec::new(), vec![0xABu8; 32]])
+    }
+
+    fn spend_with(spend_byte: u8, script_byte: u8, witness: Witness) -> SpendSeen {
         SpendSeen {
             spend_txid: txid(spend_byte),
             outpoint: bitcoin::OutPoint::new(txid(0xF0 | script_byte), 0),
             script: script(script_byte),
+            witness,
         }
+    }
+
+    /// A normal-branch spend (the default for the cursor/dedup/driver tests, which
+    /// are about queue mechanics, not branch classification).
+    fn spend(spend_byte: u8, script_byte: u8) -> SpendSeen {
+        spend_with(spend_byte, script_byte, normal_witness())
     }
 
     // -- classification (task test 1) ---------------------------------------
 
     #[test]
-    fn a_recovery_path_spend_alerts_recovery_path_spend() {
+    fn a_recovery_branch_spend_alerts_recovery_path_spend() {
         let vault = script(0x01);
-        let recovery = script(0x02);
-        // The backend reports a spend of the recovery-branch script.
+        // A spend of the vault script whose WITNESS took the recovery (or_i ELSE)
+        // branch — the empty selector before the witness script. Prevout script is
+        // the ordinary vault script (both branches share it).
         let backend = MockBackend {
-            spends: vec![spend(0xAA, 0x02)],
+            spends: vec![spend_with(0xAA, 0x01, recovery_witness())],
             ..Default::default()
         };
-        let alerts = scan(&backend, &[vault], &[recovery], &HashSet::new(), 0).expect("scan");
+        let alerts = scan(&backend, &[vault], &HashSet::new(), 0).expect("scan");
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].kind, AlertKind::RecoveryPathSpend);
     }
@@ -435,9 +466,9 @@ mod tests {
             spends: vec![spend(0xAA, 0x01)],
             ..Default::default()
         };
-        // Empty authorized set: the node accepted nothing, so this spend is
-        // unknown to it.
-        let alerts = scan(&backend, &[vault], &[], &HashSet::new(), 0).expect("scan");
+        // Empty authorized set: the node accepted nothing, so this normal-branch
+        // spend is unknown to it.
+        let alerts = scan(&backend, &[vault], &HashSet::new(), 0).expect("scan");
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].kind, AlertKind::UnrecognizedSpend);
         assert_eq!(alerts[0].spend_txid, txid(0xAA).to_string());
@@ -450,10 +481,10 @@ mod tests {
             spends: vec![spend(0xAA, 0x01)],
             ..Default::default()
         };
-        // The node's authorized set holds this spend's txid: it is expected, not
-        // an alert.
+        // The node's authorized set holds this normal-branch spend's txid: it is
+        // expected, not an alert.
         let accepted: HashSet<Txid> = [txid(0xAA)].into_iter().collect();
-        let alerts = scan(&backend, &[vault], &[], &accepted, 0).expect("scan");
+        let alerts = scan(&backend, &[vault], &accepted, 0).expect("scan");
         assert!(
             alerts.is_empty(),
             "a spend the node accepted must raise nothing, got {alerts:?}"
@@ -461,15 +492,19 @@ mod tests {
     }
 
     #[test]
-    fn a_recovery_spend_alerts_recovery_even_though_it_was_never_authorized() {
-        // Guard the precedence: the recovery branch is never node-authorized, so
-        // an empty authorized set must NOT downgrade it to UnrecognizedSpend.
-        let recovery = script(0x02);
+    fn recovery_is_classified_by_branch_not_by_the_authorized_set() {
+        // Guard the precedence: the recovery branch is read from the witness FIRST,
+        // so even a recovery-branch spend whose txid is (implausibly) in the
+        // authorized set is a RecoveryPathSpend — the recovery exit is never
+        // silently swallowed as an accepted normal spend, and an empty authorized
+        // set never downgrades it to UnrecognizedSpend.
+        let vault = script(0x01);
         let backend = MockBackend {
-            spends: vec![spend(0xAA, 0x02)],
+            spends: vec![spend_with(0xAA, 0x01, recovery_witness())],
             ..Default::default()
         };
-        let alerts = scan(&backend, &[], &[recovery], &HashSet::new(), 0).expect("scan");
+        let authorized: HashSet<Txid> = [txid(0xAA)].into_iter().collect();
+        let alerts = scan(&backend, &[vault], &authorized, 0).expect("scan");
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].kind, AlertKind::RecoveryPathSpend);
     }

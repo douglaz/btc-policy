@@ -85,9 +85,15 @@ fn coord_sign_refresh(req: &mut RefreshRequest) {
 
 fn descriptor_str() -> String {
     let secp = Secp256k1::new();
-    let user = pubkey(&secp, 1);
+    let user = pubkey(&secp, 1).to_string();
     let nodes: Vec<String> = (2..=6).map(|i| pubkey(&secp, i).to_string()).collect();
-    format!("wsh(and_v(v:pk({user}),multi(3,{})))", nodes.join(","))
+    // Throwaway recovery keyset (seeds 0x30..=0x32) — off the normal path these
+    // handler tests exercise. The node validates the two-branch template at
+    // startup but never signs recovery; the recovery exit is user-side (vault-cli).
+    let recovery: Vec<String> = (0x30u8..=0x32)
+        .map(|i| pubkey(&secp, i).to_string())
+        .collect();
+    policy_core::vault_descriptor_string(&user, 3, &nodes, &recovery)
 }
 
 struct Fixture {

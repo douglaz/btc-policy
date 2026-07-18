@@ -1088,6 +1088,7 @@ version = "0.0.1"
 dependencies = [
  "bitcoin",
  "miniscript",
+ "policy-core",
  "serde_json",
  "vault-node",
  "vault-proto",
