@@ -97,10 +97,11 @@ pub fn run_recovery_drill() -> Result<(), Error> {
     let vault_spk = descriptor.script_pubkey();
     let vault_address = descriptor.address(Network::Regtest)?;
     println!(
-        "      recovery branch present: older({}) + {}-of-{} (BIP68 time-lock, 30375 units of 512s)",
+        "      recovery branch present: older({}) + {}-of-{} (BIP68 time-lock, {} units of 512s)",
         template.recovery_timelock,
         policy_core::RECOVERY_THRESHOLD,
         policy_core::RECOVERY_KEYS,
+        policy_core::RECOVERY_TIMELOCK_UNITS,
     );
 
     println!("[2/6] starting private regtest bitcoind, funding the vault");
@@ -148,20 +149,33 @@ pub fn run_recovery_drill() -> Result<(), Error> {
     }
 
     println!("[4/6] 2-of-3 recovery signatures are required (1-of-3 cannot finalize)");
-    if build_recovery_spend(
+    match build_recovery_spend(
         &secp,
         outpoint,
         &txout,
         &witness_script,
         &dest_spk,
         sweep,
-        &recovery[..1],
-    )
-    .is_ok()
-    {
-        return Err("a 1-of-3 recovery spend must not finalize".into());
+        &recovery[..policy_core::RECOVERY_THRESHOLD - 1],
+    ) {
+        Ok(_) => return Err("a 1-of-3 recovery spend must not finalize".into()),
+        // Only the SATISFIER's threshold refusal proves the 2-of-3 property. An
+        // unrelated construction failure (PSBT/sighash) would otherwise let this
+        // negative test "pass" for the wrong reason, so match the specific
+        // finalize-does-not-satisfy error and treat anything else as a real failure.
+        Err(e)
+            if e.to_string()
+                .contains("does not satisfy the recovery branch") =>
+        {
+            println!("      1-of-3 refused to finalize — the recovery keyset threshold holds")
+        }
+        Err(e) => {
+            return Err(format!(
+                "1-of-3 spend failed to build, but NOT at the threshold check: {e}"
+            )
+            .into())
+        }
     }
-    println!("      1-of-3 refused to finalize — the recovery keyset threshold holds");
 
     println!(
         "[5/6] advancing MEDIAN-TIME-PAST past the 512-sec-unit relative lock, then broadcasting"
@@ -265,8 +279,13 @@ fn build_recovery_spend(
             },
         );
     }
-    psbt.finalize_mut(&Secp256k1::verification_only()).map_err(|e| {
-        format!("recovery spend does not satisfy the recovery branch (insufficient signatures?): {e:?}")
+    // Reuse the caller's `secp` (`All` implements `Verification`) rather than
+    // building a fresh verification-only context per call — context creation does
+    // non-trivial precomputation.
+    psbt.finalize_mut(secp).map_err(|e| {
+        format!(
+            "recovery spend does not satisfy the recovery branch (insufficient signatures?): {e:?}"
+        )
     })?;
     Ok(psbt.extract_tx()?)
 }
