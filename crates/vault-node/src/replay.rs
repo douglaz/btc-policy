@@ -43,6 +43,10 @@ pub(crate) struct SignState {
     /// Per-coin refresh times (ADR-0013 §6). Under the same one lock so the
     /// interval check-then-record cannot interleave with a concurrent refresh.
     pub(crate) refreshes: RefreshLog,
+    /// The pin-attempt budget (ADR-0013 §7). Under the same one lock so the
+    /// wrong-pin check-then-charge is atomic with the rest of `/sign` — two
+    /// concurrent wrong pins cannot both read `fails = k` and both write `k+1`.
+    pub(crate) pin_budget: crate::pin::AttemptBudget,
 }
 
 /// In-memory anti-replay log: `decision identity -> recorded verdict`.

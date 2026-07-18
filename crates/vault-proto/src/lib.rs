@@ -10,8 +10,94 @@
 //! Refusals are policy *outcomes*, not transport errors: nodes answer them
 //! with HTTP 200. Only input the node cannot decode earns a 400.
 
+use std::fmt;
+
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
+
+/// The submitted plaintext PIN — a load-bearing SECRET, not ordinary wire data.
+///
+/// ADR-0008 makes the pin ephemeral: RAM only, hash-compared and immediately
+/// discarded, **never persisted or logged anywhere**. This newtype enforces both
+/// halves in the type system, so the guarantee survives every clone the request
+/// makes (the propagation outbox, a coordinator retry) rather than resting on
+/// remembering to scrub each one:
+///
+///  - **Zeroized on drop.** Every owned copy wipes its buffer when dropped, so the
+///    plaintext does not linger in freed memory after the compare.
+///  - **Redacted Debug.** `{:?}` never prints the plaintext, so the pin cannot leak
+///    into a log line, trace, or panic message via a `Debug`-formatted request —
+///    the "never log pins" property that ADR-0008 calls load-bearing security.
+///
+/// The wire encoding is unchanged: `#[serde(transparent)]` (de)serializes it as a
+/// plain JSON string, so the tagged request body is byte-identical to before.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Pin(String);
+
+impl Pin {
+    /// The plaintext bytes to hash-compare. Callers must not persist or log these.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// The plaintext as `&str`, for the length bound and the coord-auth preimage.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Byte length, for the `MAX_PIN_BYTES` protocol bound.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the pin field is empty (an omitted/blank pin — never an enrolled one).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Wipe the plaintext and empty the field. Zeroizes the buffer (not a bare
+    /// `String::clear`, which would leave the plaintext in freed capacity), used to
+    /// build the length-hiding propagation padding shape without carrying the pin.
+    pub fn clear(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Redacts the plaintext: a `Debug`-formatted request must never carry the pin.
+impl fmt::Debug for Pin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Pin(<redacted>)")
+    }
+}
+
+// Plaintext equality (used only by the wire types' derived `PartialEq`/`Eq` in
+// round-trip tests) — never the security-critical compare, which is the Argon2
+// output's constant-time equality on the node.
+impl PartialEq for Pin {
+    fn eq(&self, other: &Pin) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for Pin {}
+
+impl From<&str> for Pin {
+    fn from(s: &str) -> Pin {
+        Pin(s.to_string())
+    }
+}
+impl From<String> for Pin {
+    fn from(s: String) -> Pin {
+        Pin(s)
+    }
+}
 
 /// Maximum plaintext PIN length accepted by the v0 request protocol.
 ///
@@ -167,7 +253,7 @@ pub fn push_var(out: &mut Vec<u8>, b: &[u8]) {
 ///
 /// Each variant's canonical encoding begins with a distinct tag byte, so a Spend
 /// and a Refresh with otherwise-identical fields can never share a digest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CoordRequest<'a> {
     /// `SpendRequest{spend, escape, pin, nonce, expiry, policy_version}` (§2).
     Spend {
@@ -187,6 +273,41 @@ pub enum CoordRequest<'a> {
         expiry: u64,
         policy_version: u32,
     },
+}
+
+impl fmt::Debug for CoordRequest<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CoordRequest::Spend {
+                spend_psbt,
+                escape_psbt,
+                nonce,
+                expiry,
+                policy_version,
+                ..
+            } => f
+                .debug_struct("CoordRequest::Spend")
+                .field("spend_psbt", spend_psbt)
+                .field("escape_psbt", escape_psbt)
+                .field("pin", &"<redacted>")
+                .field("nonce", nonce)
+                .field("expiry", expiry)
+                .field("policy_version", policy_version)
+                .finish(),
+            CoordRequest::Refresh {
+                refresh_psbt,
+                nonce,
+                expiry,
+                policy_version,
+            } => f
+                .debug_struct("CoordRequest::Refresh")
+                .field("refresh_psbt", refresh_psbt)
+                .field("nonce", nonce)
+                .field("expiry", expiry)
+                .field("policy_version", policy_version)
+                .finish(),
+        }
+    }
 }
 
 impl<'a> CoordRequest<'a> {
@@ -224,8 +345,36 @@ impl<'a> CoordRequest<'a> {
     /// PSBTs are bound as their exact base64 ASCII (un-decoded), exactly as the
     /// channel binds its opaque payload, so both sides commit to the identical
     /// string without a re-serialization round trip.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    ///
+    /// Spend preimages contain the plaintext PIN, so the returned allocation wipes
+    /// itself on every drop, including authentication failures and early returns.
+    pub fn canonical_bytes(&self) -> Zeroizing<Vec<u8>> {
+        // Reserve the complete variant before writing anything. In particular, a
+        // Spend preimage must never grow after the PIN is copied: wrapping only
+        // the final allocation in `Zeroizing` cannot wipe a buffer freed by Vec
+        // growth.
+        let capacity = match *self {
+            CoordRequest::Spend {
+                spend_psbt,
+                escape_psbt,
+                pin,
+                nonce,
+                ..
+            } => 29usize
+                .saturating_add(spend_psbt.len())
+                .saturating_add(escape_psbt.len())
+                .saturating_add(pin.len())
+                .saturating_add(nonce.len()),
+            CoordRequest::Refresh {
+                refresh_psbt,
+                nonce,
+                ..
+            } => 21usize
+                .saturating_add(refresh_psbt.len())
+                .saturating_add(nonce.len()),
+        };
+        let mut out = Vec::with_capacity(capacity);
+        let allocation = out.as_ptr();
         match *self {
             CoordRequest::Spend {
                 spend_psbt,
@@ -256,7 +405,12 @@ impl<'a> CoordRequest<'a> {
                 out.extend_from_slice(&policy_version.to_le_bytes());
             }
         }
-        out
+        debug_assert_eq!(
+            out.as_ptr(),
+            allocation,
+            "secret coordinator-auth preimage must not reallocate"
+        );
+        Zeroizing::new(out)
     }
 
     /// The 32-byte digest the coordinator signs (`tagged_hash(COORD_REQUEST_TAG,
@@ -288,9 +442,11 @@ pub struct SignRequest {
     /// Wire name `escape` (ADR-0013 §2; see [`SignRequest::psbt`]).
     #[serde(rename = "escape")]
     pub escape_psbt: String,
-    /// PIN in plaintext (hash-compared on the node; ADR-0008 accepts this for MVP).
+    /// PIN in plaintext (Argon2id-compared on the node; ADR-0008 accepts plaintext
+    /// transport for MVP). A [`Pin`], not a `String`: zeroized on drop and redacted
+    /// in `Debug`, so no owned copy of the pin outlives its compare or reaches a log.
     #[serde(default)]
-    pub pin: String,
+    pub pin: Pin,
     /// Fresh, single-use per-**transmission** nonce, bound into the
     /// coordinator-auth canonical bytes; a node rejects a nonce it has already
     /// seen (ADR-0013 §2/§3 freshness gate). A coordinator re-sending the same
@@ -325,7 +481,7 @@ impl SignRequest {
         CoordRequest::Spend {
             spend_psbt: &self.psbt,
             escape_psbt: &self.escape_psbt,
-            pin: &self.pin,
+            pin: self.pin.as_str(),
             nonce: &self.nonce,
             expiry: self.expiry,
             policy_version: self.policy_version,
@@ -636,11 +792,74 @@ mod tests {
         assert_ne!(original.commitment_id(), replacement.commitment_id());
     }
 
+    /// The pin is a SECRET newtype (ADR-0008): a `Debug`-formatted request must
+    /// never carry the plaintext (so it cannot leak into a log/trace/panic), and
+    /// clearing it wipes the buffer. Zeroize-on-drop is enforced by [`Pin`]'s `Drop`
+    /// (the same code path `clear` exercises); observing freed heap is UB, so this
+    /// checks the redaction and the wipe rather than reading after free.
+    #[test]
+    fn the_pin_is_redacted_in_debug_and_wiped_on_clear() {
+        let mut req = SignRequest {
+            psbt: "cHNidP8B".into(),
+            escape_psbt: "cHNidP8C".into(),
+            pin: "super-secret-pin".into(),
+            nonce: "ab12".into(),
+            expiry: 1,
+            policy_version: 1,
+            coord_sig: "deadbeef".into(),
+        };
+        let rendered = format!("{req:?}");
+        assert!(
+            !rendered.contains("super-secret-pin"),
+            "a Debug-formatted request must never carry the pin plaintext: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "the pin field is redacted, not omitted"
+        );
+
+        let coord_rendered = format!("{:?}", req.coord_request());
+        assert!(
+            !coord_rendered.contains("super-secret-pin"),
+            "the borrowing coordinator-auth view must redact the plaintext PIN: {coord_rendered}"
+        );
+        assert!(coord_rendered.contains("redacted"));
+
+        req.pin.clear();
+        assert!(req.pin.is_empty(), "clear wipes the pin to empty");
+
+        // A bare Pin redacts too.
+        let pin: Pin = "another-secret".into();
+        assert!(!format!("{pin:?}").contains("another-secret"));
+    }
+
+    #[test]
+    fn the_pin_bearing_auth_preimage_is_zeroizable() {
+        let request = SignRequest {
+            psbt: "spend".into(),
+            escape_psbt: "escape".into(),
+            pin: "canonical-secret".into(),
+            nonce: "nonce".into(),
+            expiry: 1,
+            policy_version: 1,
+            coord_sig: String::new(),
+        };
+        let mut preimage = request.coord_request().canonical_bytes();
+        assert!(preimage
+            .windows(b"canonical-secret".len())
+            .any(|window| window == b"canonical-secret"));
+        preimage.zeroize();
+        assert!(
+            preimage.iter().all(|byte| *byte == 0),
+            "the PIN-bearing canonical buffer must be overwritten on drop/error paths"
+        );
+    }
+
     #[test]
     fn missing_pin_decodes_as_empty_pin() {
         let json = r#"{"spend":"cHNidP8B","escape":"cHNidP8C"}"#;
         let back: SignRequest = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(back.pin, "");
+        assert!(back.pin.is_empty());
     }
 
     #[test]

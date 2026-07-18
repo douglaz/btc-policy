@@ -116,10 +116,11 @@ impl Bitcoind {
             "method": method,
             "params": params,
         });
+        let request_body = request.to_string();
         let response = http::post_json(
             self.rpc_addr,
             &self.endpoint,
-            &request.to_string(),
+            request_body.as_bytes(),
             Some(&self.auth),
             RPC_TIMEOUT,
         )?;

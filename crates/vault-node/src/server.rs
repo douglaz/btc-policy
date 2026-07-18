@@ -4,26 +4,118 @@
 //! Edge statuses use axum defaults: oversized body 413, wrong method 405, and
 //! unknown route 404.
 
+use std::future::poll_fn;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::{to_bytes, Body, Bytes};
-use axum::extract::{DefaultBodyLimit, State};
+use axum::body::{Body, HttpBody};
+use axum::extract::State;
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use bytes::BytesMut;
 use vault_proto::TaggedRequest;
+use zeroize::Zeroize;
 
 use crate::channel::{self, ChannelReply, RejectReason};
 use crate::{handle_channel_body, handle_refresh_now, handle_sign_now, propagate_outbox, Node};
 
-/// Unchanged 1 MiB cap applied before axum buffers a request body.
+/// Unchanged 1 MiB cap applied while the zeroizing accumulator reads `/sign`.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// Handler deadline only: it never cancels an accepted sign job. A socket-level
-/// header-read deadline is deferred v1 hardening.
+/// Base handler deadline: production adds the configured maximum PIN backoff so
+/// every policy refusal can retain the HTTP-200 contract. It never cancels an
+/// accepted sign job. A socket-level header-read deadline is deferred v1 hardening.
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The uniquely-owned application buffer for a raw body. It may contain a plaintext
+/// PIN even when JSON decoding fails, so success and every parse/read/limit return
+/// scrub it rather than relying only on [`vault_proto::Pin`]'s later drop.
+struct SecretRequestBytes(BytesMut);
+
+impl SecretRequestBytes {
+    fn new() -> SecretRequestBytes {
+        SecretRequestBytes(BytesMut::new())
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        let needed = self
+            .len()
+            .checked_add(bytes.len())
+            .expect("bounded request length cannot overflow usize");
+        if needed > self.0.capacity() {
+            // `BytesMut::reserve` may free its old allocation without wiping it.
+            // Grow explicitly under a second guard, copy the live prefix, wipe the
+            // old allocation, then swap. Thus every application-owned allocation is
+            // scrubbed even when a body arrives across many growing frames.
+            let capacity = self.0.capacity().saturating_mul(2).max(needed);
+            let mut replacement = SecretRequestBytes(BytesMut::with_capacity(capacity));
+            replacement.0.extend_from_slice(self.0.as_ref());
+            self.zeroize();
+            std::mem::swap(&mut self.0, &mut replacement.0);
+        }
+        self.0.extend_from_slice(bytes);
+    }
+}
+
+impl AsRef<[u8]> for SecretRequestBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl Zeroize for SecretRequestBytes {
+    fn zeroize(&mut self) {
+        self.0.as_mut().zeroize();
+    }
+}
+
+impl Drop for SecretRequestBytes {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecretBodyError {
+    TooLarge,
+    ReadFailed,
+}
+
+/// Read a body directly into uniquely-owned zeroizing storage. Reading frame by
+/// frame avoids `to_bytes`/the `Bytes` extractor returning a shared transport
+/// allocation, and creating the guard before the first poll ensures a partial body
+/// is wiped if the read errors, exceeds its cap, or its enclosing timeout cancels
+/// this future.
+async fn read_secret_body(
+    mut body: Body,
+    max_bytes: usize,
+) -> Result<SecretRequestBytes, SecretBodyError> {
+    let mut secret = SecretRequestBytes::new();
+    loop {
+        let frame = poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+        let Some(frame) = frame else {
+            return Ok(secret);
+        };
+        let frame = frame.map_err(|_| SecretBodyError::ReadFailed)?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let remaining = max_bytes.saturating_sub(secret.len());
+        if data.len() > remaining {
+            // Retain (and therefore wipe) the accepted prefix before rejecting. In
+            // particular, a PIN early in an oversized body cannot bypass the guard.
+            secret.extend_from_slice(&data[..remaining]);
+            return Err(SecretBodyError::TooLarge);
+        }
+        secret.extend_from_slice(&data);
+    }
+}
 
 /// Bound the pre-auth `/channel` body read so an incomplete or slow body cannot pin
 /// a concurrency permit indefinitely. The permit is acquired BEFORE the body is
@@ -56,7 +148,19 @@ pub async fn serve(listener: tokio::net::TcpListener, node: Arc<Node>) -> std::i
 
 /// Build the app with the production timeout.
 pub(crate) fn app(node: Arc<Node>) -> Router {
-    app_with_timeout(node, HANDLER_TIMEOUT)
+    let handler_timeout = production_handler_timeout(&node);
+    app_with_timeout(node, handler_timeout)
+}
+
+fn production_handler_timeout(node: &Node) -> Duration {
+    let max_backoff = node
+        .pin_budget_config
+        .backoff_schedule
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    HANDLER_TIMEOUT.saturating_add(Duration::from_secs(max_backoff))
 }
 
 /// Build the app with an explicit timeout for the no-cancel test.
@@ -91,17 +195,12 @@ fn router(state: AppState) -> Router {
         .route("/events", get(events));
     // `/channel` is mounted ONLY in channel mode (absent `[channel]` ⇒ the route
     // does not exist, so a request 404s and the node behaves exactly as today).
-    // Its body limit is disabled here so the handler can enforce its OWN
-    // `max_msg_bytes` cap and answer a TAGGED `REJECTED`/400 for an oversized body
-    // (the channel surface is uniformly tagged), instead of axum's untagged 413.
+    // The handler enforces its OWN `max_msg_bytes` cap and answers a TAGGED
+    // `REJECTED`/400 for an oversized body (the channel surface is uniformly tagged).
     if state.node.channel.is_some() {
-        router = router.route("/channel", post(channel).layer(DefaultBodyLimit::disable()));
+        router = router.route("/channel", post(channel));
     }
-    router
-        // The global 1 MiB body limit applies to `/sign` (413 preserved) and
-        // `/events`; `/channel` overrides it above.
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(state)
+    router.with_state(state)
 }
 
 #[cfg(test)]
@@ -117,8 +216,17 @@ fn app_with_sign_entry(node: Arc<Node>, sign_entered: std::sync::mpsc::Sender<()
 /// Tagged `/sign`: Spend and Refresh arms return 200 verdict JSON or 400 error
 /// JSON. Synchronous policy/secp work runs off-runtime. A timed-out client stops
 /// waiting, but its accepted job must finish and commit for idempotent resubmission.
-async fn sign(State(state): State<AppState>, body: Bytes) -> Response {
-    let request: TaggedRequest = match serde_json::from_slice(&body) {
+async fn sign(State(state): State<AppState>, body: Body) -> Response {
+    let body = match read_secret_body(body, MAX_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(SecretBodyError::TooLarge) => {
+            return error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large")
+        }
+        Err(SecretBodyError::ReadFailed) => {
+            return error_response(StatusCode::BAD_REQUEST, "cannot read request body")
+        }
+    };
+    let request: TaggedRequest = match serde_json::from_slice(body.as_ref()) {
         Ok(request) => request,
         Err(e) => {
             return error_response(
@@ -127,6 +235,21 @@ async fn sign(State(state): State<AppState>, body: Bytes) -> Response {
             );
         }
     };
+    // The parsed request's Pin newtype now owns the only application copy needed
+    // by the job; wipe the raw JSON before queueing any Argon2/signing work.
+    //
+    // ZEROIZATION SCOPE (codex V0-4a audit, 2026-07-18): every copy this code OWNS
+    // is wiped — `SecretRequestBytes` zeroizes on drop (incl. its realloc path),
+    // this `body` drops before any Argon2/signing, and `Pin` zeroizes on drop. Two
+    // residuals live in LIBRARY-internal buffers we cannot wipe without forking the
+    // deps: (a) hyper's ref-counted `Bytes` read frames in `read_secret_body`, and
+    // (b) serde_json's transient scratch when a pin is `\u`-escaped. Both are
+    // defense-in-depth only — reaching them needs a SEPARATE heap-disclosure
+    // primitive — and the pin already necessarily transits hyper's read buffer and
+    // the trusted coordinator's RAM regardless. Accepted residual; closing it would
+    // require a zeroizing JSON reader + unsafe wiping of shared Bytes, disproportion-
+    // ate to the risk. Tracked for a possible v1 hardening pass.
+    drop(body);
     #[cfg(test)]
     if let Some(sign_entered) = &state.sign_entered {
         let _ = sign_entered.send(());
@@ -210,7 +333,7 @@ async fn channel(State(state): State<AppState>, body: Body) -> Response {
     // the permit indefinitely (else the pre-auth concurrency guard is exhaustible).
     let bytes = match tokio::time::timeout(
         state.channel_body_timeout,
-        to_bytes(body, ch.max_msg_bytes()),
+        read_secret_body(body, ch.max_msg_bytes()),
     )
     .await
     {
@@ -246,7 +369,7 @@ async fn channel(State(state): State<AppState>, body: Body) -> Response {
             // `handle_channel_body`, not `channel.ingest`: a `request` envelope has to
             // pass THIS node's own coordinator-auth + policy gates, which live on the
             // node, not the channel (§3).
-            handle_channel_body(&node, &bytes, channel::unix_now())
+            handle_channel_body(&node, bytes.as_ref(), channel::unix_now())
         })
         .await;
         // A `request` this node accepted now goes to every peer (§3), so delivery to
@@ -320,6 +443,29 @@ mod tests {
     use std::time::Instant;
     use tokio::task::spawn_blocking;
     use vault_proto::{SignRequest, SignResponse, TaggedRequest};
+
+    #[test]
+    fn raw_request_buffers_are_wiped() {
+        let mut body = SecretRequestBytes::new();
+        body.extend_from_slice(br#"{"spend":{"pin":"buffer-secret"}}"#);
+        body.zeroize();
+        assert!(
+            body.as_ref().iter().all(|byte| *byte == 0),
+            "the owned HTTP request allocation must be overwritten, not merely dropped"
+        );
+    }
+
+    #[test]
+    fn production_timeout_includes_the_largest_pin_backoff() {
+        let (node, _) = crate::test_support::node_and_valid_request_with_budget(
+            "[pin_attempt_budget]\nbackoff_schedule = [0, 1, 30]\n",
+        );
+        assert_eq!(
+            production_handler_timeout(&node),
+            Duration::from_secs(40),
+            "a documented 30s terminal backoff must still reach its HTTP-200 refusal"
+        );
+    }
 
     /// Send a `Connection: close` request and read its full response. Oversized
     /// requests tolerate axum closing before the client finishes writing.

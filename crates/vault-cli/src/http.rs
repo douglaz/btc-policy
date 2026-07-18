@@ -5,6 +5,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -16,7 +17,7 @@ pub struct Response {
 pub fn post_json(
     addr: SocketAddr,
     path: &str,
-    body: &str,
+    body: &[u8],
     basic_auth: Option<&str>,
     timeout: Duration,
 ) -> Result<Response, Error> {
@@ -28,15 +29,21 @@ pub fn post_json(
         Some(credentials) => format!("Authorization: Basic {credentials}\r\n"),
         None => String::new(),
     };
-    let request = format!(
+    let head = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {addr}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
-         {auth_header}Connection: close\r\n\r\n{body}",
+         {auth_header}Connection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(request.as_bytes())?;
+    // This generic client also carries the demo's plaintext PIN. Keep the full
+    // serialized request in a zeroizing allocation and write it by reference, so
+    // success and every socket-error path wipe the application-owned copy.
+    let mut request = Zeroizing::new(Vec::with_capacity(head.len() + body.len()));
+    request.extend_from_slice(head.as_bytes());
+    request.extend_from_slice(body);
+    stream.write_all(&request)?;
     let mut raw = Vec::new();
     stream
         .read_to_end(&mut raw)

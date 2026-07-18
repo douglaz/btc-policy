@@ -82,6 +82,7 @@
 //! before payload parsing: the node verifies the envelope, THEN base64-decodes.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -95,9 +96,11 @@ use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
 use bitcoin::{ecdsa, EcdsaSighashType, Psbt, PublicKey, ScriptBuf, Transaction, Txid};
+use bytes::Bytes;
 use miniscript::psbt::PsbtExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
+use zeroize::{Zeroize, Zeroizing};
 // The channel's digest and length-prefix primitives live in vault-proto and are
 // shared with the coordinator-request preimage, so the two provably cannot drift.
 use vault_proto::{push_var, tagged_hash, TaggedRequest, MAX_PIN_BYTES};
@@ -244,6 +247,9 @@ struct Enc(Vec<u8>);
 impl Enc {
     fn new() -> Enc {
         Enc(Vec::new())
+    }
+    fn with_capacity(capacity: usize) -> Enc {
+        Enc(Vec::with_capacity(capacity))
     }
     fn fixed(&mut self, b: &[u8]) -> &mut Enc {
         self.0.extend_from_slice(b);
@@ -454,8 +460,18 @@ fn envelope_preimage(
     payload_b64: &[u8],
     nonce: &[u8],
     timestamp: u64,
-) -> Vec<u8> {
-    let mut e = Enc::new();
+) -> Zeroizing<Vec<u8>> {
+    // Three u32 length prefixes, the fixed-width fields, and every variable
+    // field. Reserve the complete allocation before copying `payload_b64`, which
+    // reversibly contains the PIN, so Vec growth cannot leave a freed plaintext
+    // copy behind that the final `Zeroizing` allocation would not wipe.
+    const FIXED_BYTES: usize = 3 * 4 + 4 + 2 * 32 + 2 * 2 + 8;
+    let capacity = FIXED_BYTES
+        .saturating_add(msg_type.len())
+        .saturating_add(payload_b64.len())
+        .saturating_add(nonce.len());
+    let mut e = Enc::with_capacity(capacity);
+    let allocation = e.0.as_ptr();
     e.var(msg_type.as_bytes());
     e.u32(protocol_version);
     e.fixed(wallet_id);
@@ -465,7 +481,12 @@ fn envelope_preimage(
     e.var(payload_b64);
     e.var(nonce);
     e.u64(timestamp);
-    e.0
+    debug_assert_eq!(
+        e.0.as_ptr(),
+        allocation,
+        "secret envelope preimage must not reallocate"
+    );
+    Zeroizing::new(e.0)
 }
 
 fn validate_endpoint(ep: &str) -> Result<SocketAddr, Error> {
@@ -481,7 +502,7 @@ fn validate_endpoint(ep: &str) -> Result<SocketAddr, Error> {
 /// One channel message. Every field is signed by `channel_sig` (over the
 /// [`envelope_preimage`]); hashes/pubkeys are lowercase hex in JSON, raw in the
 /// preimage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Envelope {
     pub(crate) msg_type: String,
     pub(crate) protocol_version: u32,
@@ -489,10 +510,30 @@ pub(crate) struct Envelope {
     pub(crate) manifest_hash: String,
     pub(crate) sender_node_id: u16,
     pub(crate) recipient_node_id: u16,
-    pub(crate) payload_b64: String,
+    /// Opaque payload bytes encoded for transport. A request payload contains the
+    /// plaintext PIN reversibly encoded, so every clone and deserialize-error
+    /// intermediate must wipe this allocation on drop.
+    pub(crate) payload_b64: Zeroizing<String>,
     pub(crate) nonce: String,
     pub(crate) timestamp: u64,
     pub(crate) channel_sig: String,
+}
+
+impl fmt::Debug for Envelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Envelope")
+            .field("msg_type", &self.msg_type)
+            .field("protocol_version", &self.protocol_version)
+            .field("wallet_id", &self.wallet_id)
+            .field("manifest_hash", &self.manifest_hash)
+            .field("sender_node_id", &self.sender_node_id)
+            .field("recipient_node_id", &self.recipient_node_id)
+            .field("payload_b64", &"<redacted>")
+            .field("nonce", &self.nonce)
+            .field("timestamp", &self.timestamp)
+            .field("channel_sig", &self.channel_sig)
+            .finish()
+    }
 }
 
 /// The `partial` payload (opaque base64 until the envelope authenticates).
@@ -1957,11 +1998,20 @@ impl ChannelState {
                 return Ingested::Reply(ChannelReply::RateLimited { retry_after_secs });
             }
         };
-        // 8. only now decode the opaque payload.
-        let payload = match STANDARD.decode(env.payload_b64.as_bytes()) {
-            Ok(p) => p,
-            Err(_) => return reject(RejectReason::MalformedPayload),
-        };
+        // 8. only now decode the opaque payload. Request payloads contain the PIN,
+        // so the decoded allocation wipes on every dispatch/error exit. Decode
+        // straight into a zeroizing buffer via `decode_vec`: `Engine::decode`
+        // allocates its own plain `Vec`, decodes the valid base64 prefix into
+        // it, and on a malformed tail drops it UNWIPED before we could wrap it —
+        // leaking partially-decoded plaintext on the error path. Writing into our
+        // own buffer makes both the Ok dispatch and the Err reject wipe on drop.
+        let mut payload = Zeroizing::new(Vec::new());
+        if STANDARD
+            .decode_vec(env.payload_b64.as_bytes(), &mut payload)
+            .is_err()
+        {
+            return reject(RejectReason::MalformedPayload);
+        }
         // 9. dispatch. Two msg_types: `partial` (verified + stored here) and
         //    `request` (handed back to the node, which owns every policy gate).
         match env.msg_type.as_str() {
@@ -2064,7 +2114,7 @@ impl ChannelState {
             manifest_hash: to_hex(&self.manifest_hash),
             sender_node_id: self.node_id,
             recipient_node_id,
-            payload_b64,
+            payload_b64: payload_b64.into(),
             nonce: to_hex(&nonce),
             timestamp,
             channel_sig: to_hex(&sig.serialize_der()),
@@ -2099,7 +2149,7 @@ impl ChannelState {
 /// produce identical payload sizes. Nothing about the PIN class or the node's
 /// internal fire decision reaches the wire — the property V0-4b's silence rests
 /// on (ADR-0012, "pin-independent ingress").
-pub(crate) fn request_payload(request: &TaggedRequest) -> Vec<u8> {
+pub(crate) fn request_payload(request: &TaggedRequest) -> Zeroizing<Vec<u8>> {
     // JSON can expand one input byte to six bytes (`\u00xx`). Both PIN and nonce
     // have protocol bounds; an accepted coordinator signature is canonical secp
     // DER rendered as ASCII hex. Serialize the invariant request shape with those
@@ -2127,14 +2177,27 @@ pub(crate) fn request_payload(request: &TaggedRequest) -> Vec<u8> {
         .expect("TaggedRequest is always serializable")
         .len()
         .saturating_add(variable_budget);
-    let mut payload = serde_json::to_vec(request).expect("TaggedRequest is always serializable");
+    // Allocate the final secret-bearing buffer at its worst-case size BEFORE the
+    // PIN is written. `serde_json::to_vec` grows from a small allocation and can
+    // free an earlier buffer containing the plaintext PIN without wiping it; this
+    // shape-derived reservation guarantees `to_writer` never reallocates for any
+    // protocol-valid request. Serialization errors still drop and wipe `payload`.
+    let mut payload = Zeroizing::new(Vec::with_capacity(target_len));
+    let allocation = payload.as_ptr();
+    serde_json::to_writer(&mut *payload, request).expect("TaggedRequest is always serializable");
+    debug_assert_eq!(
+        payload.as_ptr(),
+        allocation,
+        "secret request serialization must not reallocate"
+    );
     debug_assert!(
         payload.len() <= target_len,
         "an accepted request's bounded fields must fit the propagation padding budget"
     );
     // Never truncate if a direct unit caller constructs an invalid over-bound DTO;
     // production calls this only after the node's PIN, nonce, and signature gates.
-    payload.resize(payload.len().max(target_len), b' ');
+    let padded_len = payload.len().max(target_len);
+    payload.resize(padded_len, b' ');
     payload
 }
 
@@ -2159,7 +2222,7 @@ pub(crate) fn request_fits_channel_body(request: &TaggedRequest, max_msg_bytes: 
         manifest_hash: "0".repeat(HEX_32_BYTES),
         sender_node_id: u16::MAX,
         recipient_node_id: u16::MAX,
-        payload_b64: STANDARD.encode(request_payload(request)),
+        payload_b64: STANDARD.encode(request_payload(request)).into(),
         nonce: "0".repeat(HEX_16_BYTES),
         timestamp: u64::MAX,
         channel_sig: "0".repeat(MAX_CHANNEL_SIG_HEX_BYTES),
@@ -2175,7 +2238,8 @@ pub(crate) fn request_fits_channel_body(request: &TaggedRequest, max_msg_bytes: 
 /// draws a fresh nonce + timestamp + signature around these same bytes.
 pub(crate) struct Outbound {
     pub(crate) msg_type: &'static str,
-    pub(crate) payload: Vec<u8>,
+    /// Request payloads carry a plaintext PIN; every fan-out clone wipes on drop.
+    pub(crate) payload: Zeroizing<Vec<u8>>,
     /// Last instant a send may be *initiated*; the retry loop stops here.
     pub(crate) deadline: u64,
 }
@@ -2187,7 +2251,7 @@ impl Release {
             .iter()
             .map(|payload| Outbound {
                 msg_type: MSG_TYPE_PARTIAL,
-                payload: payload.to_bytes(),
+                payload: Zeroizing::new(payload.to_bytes()),
                 deadline: self.deadline,
             })
             .collect()
@@ -2227,6 +2291,9 @@ pub(crate) async fn send_envelope(
         .build()
         .map_err(|e| format!("build reqwest client: {e}"))?;
     let body = envelope_body(envelope)?;
+    // Keep the zeroizing allocation as the HTTP body's owner. Once the last
+    // transport clone drops, the serialized envelope (including any PIN) wipes.
+    let body = reqwest::Body::from(Bytes::from_owner(body));
     let mut resp = client
         .post(&url)
         .header("content-type", "application/json")
@@ -2257,13 +2324,52 @@ pub(crate) async fn send_envelope(
 /// not make the HTTP body size-independent of the PIN: changing the signed payload
 /// changes the ECDSA signature, whose DER form ranges up to 72 bytes. The nonce and
 /// every other envelope identity field already have fixed-width encodings.
-fn envelope_body(envelope: &Envelope) -> Result<Vec<u8>, Error> {
+fn envelope_body(envelope: &Envelope) -> Result<Zeroizing<Vec<u8>>, Error> {
+    const JSON_BYTE_EXPANSION: usize = 6;
     const MAX_CHANNEL_SIG_HEX_BYTES: usize = MAX_ECDSA_DER_BYTES * 2;
-    let mut body = serde_json::to_vec(envelope).map_err(|e| format!("encode envelope: {e}"))?;
-    body.resize(
-        body.len()
-            .saturating_add(MAX_CHANNEL_SIG_HEX_BYTES.saturating_sub(envelope.channel_sig.len())),
-        b' ',
+
+    // The base64 payload reversibly contains the PIN. Measure a wiped clone, then
+    // reserve for JSON's worst-case string expansion before serializing the real
+    // envelope, so no secret-bearing allocation can be freed during Vec growth.
+    // Base64/signature text normally needs no escaping; the 6x budget also keeps
+    // this safe for direct test callers that construct arbitrary strings.
+    let mut shape = envelope.clone();
+    shape.payload_b64.zeroize();
+    shape.channel_sig.clear();
+    let variable_capacity = envelope
+        .payload_b64
+        .len()
+        .saturating_add(envelope.channel_sig.len())
+        .saturating_mul(JSON_BYTE_EXPANSION);
+    let serialize_capacity = serde_json::to_vec(&shape)
+        .map_err(|e| format!("encode envelope shape: {e}"))?
+        .len()
+        .saturating_add(variable_capacity);
+    // Reserve the serialize estimate PLUS the maximum trailing pad up front, so
+    // neither `to_writer` nor the later `resize` can reallocate. `to_writer`
+    // stays within `serialize_capacity` (asserted below), and the pad adds at
+    // most `MAX_CHANNEL_SIG_HEX_BYTES` (channel_sig empty), so this single
+    // reservation is a provable upper bound. Without it, a pathologically small
+    // payload could make `padded_len > serialize_capacity` and the resize would
+    // realloc — leaving an unwiped freed copy of this secret-bearing buffer, the
+    // exact hazard the sibling `request_payload`/`canonical_bytes` assert away.
+    let capacity = serialize_capacity.saturating_add(MAX_CHANNEL_SIG_HEX_BYTES);
+    let mut body = Zeroizing::new(Vec::with_capacity(capacity));
+    let allocation = body.as_ptr();
+    serde_json::to_writer(&mut *body, envelope).map_err(|e| format!("encode envelope: {e}"))?;
+    debug_assert_eq!(
+        body.as_ptr(),
+        allocation,
+        "secret envelope serialization must not reallocate"
+    );
+    let padded_len = body
+        .len()
+        .saturating_add(MAX_CHANNEL_SIG_HEX_BYTES.saturating_sub(envelope.channel_sig.len()));
+    body.resize(padded_len, b' ');
+    debug_assert_eq!(
+        body.as_ptr(),
+        allocation,
+        "secret envelope padding must not reallocate"
     );
     Ok(body)
 }
@@ -2720,8 +2826,8 @@ mod fixture {
                 self.hot_desc,
                 self.escape_desc,
                 self.escape_desc,
-                sha256::Hash::hash(b"1234"),
-                sha256::Hash::hash(b"9999"),
+                crate::argon2id_normal_phc("1234"),
+                crate::argon2id_duress_phc("9999"),
                 self.coord_pk,
             )
         }
@@ -2758,7 +2864,7 @@ mod fixture {
             let mut request = SignRequest {
                 psbt: spend.to_string(),
                 escape_psbt: escape.to_string(),
-                pin: "1234".to_string(),
+                pin: "1234".into(),
                 nonce: String::new(),
                 expiry,
                 policy_version: 1,
@@ -3611,9 +3717,9 @@ mod ingress {
         let (send, recv) = (fx.channel_state(0), fx.channel_state(1));
         // Flip one byte of the SIGNED payload_b64 field — the sig no longer matches.
         let bytes = envelope_bytes(&fx, &send, 1, "c", NOW, |e| {
-            let mut b = e.payload_b64.clone().into_bytes();
+            let mut b = e.payload_b64.as_bytes().to_vec();
             b[0] ^= 0x01;
-            e.payload_b64 = String::from_utf8_lossy(&b).into_owned();
+            e.payload_b64 = String::from_utf8_lossy(&b).into_owned().into();
         });
         assert_eq!(
             recv.ingest_reply(&bytes, NOW),
@@ -4128,7 +4234,7 @@ mod partial {
         let manifest_hash = from_hex_32(&env.manifest_hash).expect("mh");
         let nonce = from_hex_16(&env.nonce).expect("nonce");
         // (label, mutated preimage) for each field.
-        let variants: Vec<(&str, Vec<u8>)> = vec![
+        let variants: Vec<(&str, Zeroizing<Vec<u8>>)> = vec![
             (
                 "msg_type",
                 envelope_preimage(
@@ -6768,10 +6874,10 @@ mod fire {
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
 
         let mut normal = fx.spend_request(&psbt, EXPIRY, "pin-normal");
-        normal.pin = "1234".to_string();
+        normal.pin = "1234".into();
         fx.coord_sign(&mut normal, "pin-normal-signed");
         let mut duress = fx.spend_request(&psbt, EXPIRY, "pin-duress");
-        duress.pin = "999999999999".to_string();
+        duress.pin = "999999999999".into();
         fx.coord_sign(&mut duress, "pin-duress-signed");
         assert_ne!(
             normal.pin, duress.pin,
@@ -6819,6 +6925,20 @@ mod fire {
             envelope_body(&normal_envelope).expect("normal body").len(),
             envelope_body(&duress_envelope).expect("duress body").len(),
             "variable DER channel signatures must not reintroduce a wire-size PIN oracle"
+        );
+    }
+
+    #[test]
+    fn pin_bearing_channel_payloads_are_zeroizable() {
+        let fx = Fixture::new(3, 5);
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = TaggedRequest::Spend(fx.spend_request(&psbt, EXPIRY, "wipe-pin"));
+        let mut payload = request_payload(&request);
+        assert!(payload.windows(3).any(|window| window == b"123"));
+        zeroize::Zeroize::zeroize(&mut payload);
+        assert!(
+            payload.iter().all(|byte| *byte == 0),
+            "the serialized propagation allocation must be overwritten"
         );
     }
 

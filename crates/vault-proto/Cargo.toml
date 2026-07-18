@@ -11,6 +11,11 @@ serde = { workspace = true }
 # only for `hashes::sha256` to compute the commitment id — no new crate lands
 # in the dependency graph.
 bitcoin = { workspace = true }
+# The submitted PIN is a wire field but load-bearing SECRET (ADR-0008: RAM only,
+# never persisted or logged). `zeroize` lets [`Pin`] scrub its buffer on drop so
+# every owned copy of the plaintext — the request, its clones, the propagation
+# outbox — is wiped, not just the log lines.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

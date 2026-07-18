@@ -13,6 +13,7 @@ path = "src/main.rs"
 bitcoin = { workspace = true }
 miniscript = { workspace = true }
 serde_json = { workspace = true }
+zeroize = { workspace = true }
 vault-proto = { path = "../vault-proto" }
 # The demo plays the SETUP CEREMONY, which must compute `manifest_hash` and each
 # node's channel endorsement byte-identically to the nodes it provisions — a
