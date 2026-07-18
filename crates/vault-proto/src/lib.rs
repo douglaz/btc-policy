@@ -1,13 +1,24 @@
 //! Wire types shared by coordinator and nodes; drift is a compile error.
 //!
-//! Two-phase /sign per ADR-0004/0008: `{psbt, escape_psbt, pin}` ->
-//! pending | signed | refusal. See docs/DESIGN.md ("/sign wire contract").
+//! `/sign` carries the coordinator-authenticated tagged request of ADR-0013 §2
+//! (`{spend, escape, pin, …}` or the pin-less `{refresh, …}`) and answers
+//! **accepted | refusal** — never a signature. Under Model B (ADR-0012) the node
+//! signs at ingress, withholds the partial until the candidate's authorized fire
+//! event, and the NODES combine and broadcast; the coordinator is a pure relay
+//! that never holds a finalizable transaction. See [`SignResponse`].
 //!
 //! Refusals are policy *outcomes*, not transport errors: nodes answer them
 //! with HTTP 200. Only input the node cannot decode earns a 400.
 
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use serde::{Deserialize, Serialize};
+
+/// Maximum plaintext PIN length accepted by the v0 request protocol.
+///
+/// Besides bounding ingress memory, this gives the node channel a fixed budget
+/// with which to pad the coordinator-authenticated request payload. The payload
+/// size must not disclose whether the submitted PIN was the normal or duress PIN.
+pub const MAX_PIN_BYTES: usize = 64;
 
 /// The exact-transaction binding a node evaluates and signs against
 /// (DESIGN.md, "Transaction commitment"; CONTEXT.md "Commitment"). Built
@@ -378,29 +389,53 @@ pub enum TaggedRequest {
     Refresh(RefreshRequest),
 }
 
-/// The three `/sign` outcomes. Serializes to exactly the DESIGN.md wire shapes:
-/// `{"pending":{...}}`, `{"signed_psbt":"..."}`, `{"refusal":{...}}`.
+/// The two `/sign` outcomes: `{"accepted":{...}}` or `{"refusal":{...}}`.
+///
+/// **There is no signature-bearing variant, and that absence is the security
+/// property** (ADR-0012, "the coordinator is a pure relay, always"). Under
+/// Model B the node signs its partial(s) at ingress but releases them ONLY to
+/// its peers, ONLY at the candidate's authorized fire event; the nodes combine
+/// and broadcast. A `/sign` response that could carry a partial would hand a
+/// post-wrench coordinator a way to collect `t` of them and finalize a coerced
+/// spend itself — breaking both the Hold and duress silence without compromising
+/// a single node. Deleting the coordinator's finalize code would not close that:
+/// the response type itself must make the partial unrepresentable, so no
+/// handler, no future caller, and no hostile relay can obtain one here.
+///
+/// The former `Signed(String)` variant is therefore GONE, not deprecated. Do not
+/// re-add a signature-carrying variant: partials leave a node exclusively through
+/// the fire-gated `/channel` `partial` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignResponse {
-    /// Hot-class spend inside its Hold (ADR-0004). Declared for the wire
-    /// contract; not exercised at first light (hold_secs = 0).
-    #[serde(rename = "pending")]
-    Pending(Pending),
-    /// The node ran every check and contributed its signature.
-    #[serde(rename = "signed_psbt")]
-    Signed(String),
+    /// The node authenticated, validated, and ACCEPTED the request: it registered
+    /// the candidate(s), signed its partial(s) at ingress, and is withholding them
+    /// until fire. Carries no signature — see the type docs.
+    #[serde(rename = "accepted")]
+    Accepted(Accepted),
     /// The node refuses to sign, with a machine-readable reason.
     #[serde(rename = "refusal")]
     Refusal(Refusal),
 }
 
-/// A hot-class commitment waiting out its Hold.
+/// The fixed acknowledgement an accepted request earns — **the same fields with
+/// the same shape under every transaction class and under either PIN** (ADR-0012,
+/// "constant-observable ingress" / "response cover"). It reports only what the
+/// coordinator already knows (which commitment, when this node first saw it, and
+/// the remaining Hold), never which transaction will fire or when a duress escape
+/// is scheduled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Pending {
+pub struct Accepted {
+    /// The spend's commitment id (the exact-tx binding, ADR-0012).
     pub commitment_id: String,
     /// Unix seconds when this node first saw the commitment.
     pub first_seen: u64,
-    /// Seconds left before re-submission returns a signature.
+    /// Seconds measured **from `first_seen`** until this node's Hold expires and
+    /// the spend becomes fire-eligible; the absolute fire time is
+    /// `first_seen + remaining_secs`. Fixed at first acceptance and replayed
+    /// verbatim on an idempotent resubmission (the Hold schedule the first
+    /// acceptance fixed is never reset), so it is NOT a live countdown from the
+    /// response instant — mid-Hold, seconds-left is `first_seen + remaining_secs −
+    /// now`. `0` for a class that fires immediately (escape-class, refresh).
     pub remaining_secs: u64,
 }
 
@@ -440,10 +475,33 @@ pub enum RefusalCode {
     /// The bounded authenticated-nonce cache is full. No new request is admitted
     /// until an older nonce expires; existing entries are never evicted early.
     CoordNonceCapacity,
-    /// The request is an authenticated, well-formed [`RefreshRequest`], but this
-    /// node does not serve the pin-less arm until its refresh-specific interval,
-    /// fee, and pending-spend bounds land (ADR-0013 §6).
-    RefreshUnsupported,
+    /// The node's bounded candidate registry cannot atomically admit every new
+    /// member of this request's candidate set. In channel mode an acknowledgement
+    /// is valid only after the node can retain its ingress signature(s) for the
+    /// fire-time quorum, so capacity is a refusal rather than a dropped candidate.
+    CandidateCapacity,
+    /// A hot-class spend whose commitment expiry does not outlive this node's
+    /// Hold plus its combine window (`now + hold_secs + combine_slack_secs`,
+    /// ADR-0013 §6). Distinct from [`RefusalCode::CommitmentExpired`], which is
+    /// the ingress acceptance window: this one says the commitment would die
+    /// mid-flight — the node would sign at ingress, hold the partial, and find the
+    /// candidate pruned before it could ever combine. Refusing up front beats
+    /// accepting a spend that can only silently fail. Equality passes.
+    ExpiryTooShort,
+    /// A refresh of a coin refreshed less than `refresh_min_interval_secs` ago
+    /// (ADR-0013 §6). The refresh path is pin-less and instant, so it has neither
+    /// the Hold nor the PIN that ADR-0006 leans on for its burn defense; this
+    /// interval is half of what replaces them.
+    RefreshTooSoon,
+    /// A refresh paying more than `refresh_max_feerate` (ADR-0013 §6) — the other
+    /// half of the refresh burn bound. A real self-spend pays a normal feerate,
+    /// never the 10% `max_fee_pct` a hot-class spend may use.
+    RefreshFeeExceedsCap,
+    /// A refresh submitted while a spend is pending on this node (ADR-0012,
+    /// "refreshes are subordinate to pending spends"). Retriable: resubmit once
+    /// the pending spend settles. The rule is deliberately COARSE — any pending
+    /// spend blocks every refresh.
+    RefreshSubordinated,
 }
 
 #[cfg(test)]
@@ -586,17 +644,8 @@ mod tests {
     }
 
     #[test]
-    fn signed_response_uses_design_doc_shape() {
-        let resp = SignResponse::Signed("cHNidP8B".into());
-        let json = serde_json::to_string(&resp).expect("serialize");
-        assert_eq!(json, r#"{"signed_psbt":"cHNidP8B"}"#);
-        let back: SignResponse = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, resp);
-    }
-
-    #[test]
-    fn pending_response_round_trips() {
-        let resp = SignResponse::Pending(Pending {
+    fn accepted_response_round_trips() {
+        let resp = SignResponse::Accepted(Accepted {
             commitment_id: "c0ffee".into(),
             first_seen: 1_752_500_000,
             remaining_secs: 86_400,
@@ -604,10 +653,45 @@ mod tests {
         let json = serde_json::to_string(&resp).expect("serialize");
         assert_eq!(
             json,
-            r#"{"pending":{"commitment_id":"c0ffee","first_seen":1752500000,"remaining_secs":86400}}"#
+            r#"{"accepted":{"commitment_id":"c0ffee","first_seen":1752500000,"remaining_secs":86400}}"#
         );
         let back: SignResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, resp);
+    }
+
+    /// The structural half of "the coordinator is a pure relay" (§2): no `/sign`
+    /// response can carry a node signature, because no variant can hold one. A
+    /// hostile coordinator that collects every node's response therefore holds
+    /// nothing it can finalize.
+    ///
+    /// This asserts over the SERIALIZED forms of both variants rather than
+    /// pattern-matching the enum: a future variant carrying a PSBT would compile
+    /// and pass a match-based test, but it cannot pass this one without putting
+    /// base64 PSBT data on the wire. The old `{"signed_psbt":"..."}` shape must
+    /// also no longer decode — a node speaking it would be a downgrade.
+    #[test]
+    fn no_sign_response_can_carry_a_node_signature() {
+        let accepted = SignResponse::Accepted(Accepted {
+            commitment_id: "c0ffee".into(),
+            first_seen: 1_752_500_000,
+            remaining_secs: 0,
+        });
+        let refusal = SignResponse::Refusal(Refusal {
+            code: RefusalCode::BadPin,
+            check: "pin".into(),
+            detail: "nope".into(),
+        });
+        for response in [&accepted, &refusal] {
+            let json = serde_json::to_string(response).expect("serialize");
+            assert!(
+                !json.contains("psbt") && !json.contains("cHNidP"),
+                "a /sign response must never carry PSBT/signature data: {json}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<SignResponse>(r#"{"signed_psbt":"cHNidP8B"}"#).is_err(),
+            "the retired signature-bearing response must no longer decode"
+        );
     }
 
     #[test]

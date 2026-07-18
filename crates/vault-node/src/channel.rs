@@ -1,13 +1,20 @@
-//! The node-to-node channel (V0-8a): authenticated peer messaging + a verified
-//! partial-signature exchange. ADR-0012 ("The node-to-node channel") is the
-//! authoritative security spec; ADR-0013 §4 is the manifest root.
+//! The node-to-node channel (V0-8a; V0-8b adds fire + `request`): authenticated
+//! peer messaging, a verified partial-signature exchange, and the fire-gated
+//! release + combine. ADR-0012 ("The node-to-node channel") is the authoritative
+//! security spec; ADR-0013 §4 is the manifest root.
 //!
 //! This is the CHANNEL LAYER ONLY. It carries signatures and assembly, **never
-//! policy**. It does NOT combine/broadcast (V0-8b) or run the duress state
-//! machine (V0-4). It provides the primitives those tasks drive: a
-//! self-authenticating **signed envelope** (possession proven per message — the
-//! fresh nonce+timestamp IS the challenge; there is no session handshake) and a
-//! **partial** message verified against this node's own registered candidate.
+//! policy** — a `request` envelope is authenticated here and handed straight back
+//! to the node, which owns every policy gate. It does not run the duress state
+//! machine (V0-4). It provides:
+//!
+//! - a self-authenticating **signed envelope** (possession proven per message —
+//!   the fresh nonce+timestamp IS the challenge; there is no session handshake);
+//! - a **partial** message verified against this node's own registered candidate;
+//! - a **request** message carrying the coordinator-signed tagged request verbatim
+//!   ([`MSG_TYPE_REQUEST`]), so delivery to one node reaches all;
+//! - the **partial-release gate** ([`ChannelState::release_partials`]) — ADR-0012
+//!   invariant 7, the one door a partial may leave through, and only at fire.
 //!
 //! # Ingress pipeline (every rejection exit is a tagged `ChannelReply`)
 //!
@@ -39,15 +46,18 @@
 //!         │
 //!   base64-decode payload_b64 ───────── err ─▶ REJECTED(MALFORMED_PAYLOAD)
 //!         │
-//!   dispatch on msg_type ───── not "partial" ▶ REJECTED(UNKNOWN_MSG_TYPE)
-//!         │  (partial)
-//!   payload.wallet_id == envelope ───── ne ──▶ REJECTED(PAYLOAD_WALLET_MISMATCH)
-//!   signer_node_id == sender_node_id ── ne ──▶ REJECTED(SIGNER_MISMATCH)
-//!   candidate(commitment_id) present ── no ──▶ UNKNOWN_CANDIDATE   (retriable)
-//!   txid / user_sig_hash / input / sighash ─▶ REJECTED(WRONG_*)
-//!   verify partial vs expected pubkey ─ no ──▶ REJECTED(BAD_PARTIAL_SIG)
+//!   dispatch on msg_type ──────────── unknown ▶ REJECTED(UNKNOWN_MSG_TYPE)
+//!         ├── "partial" ─────────────────────────────────────────────────┐
+//!         │  payload.wallet_id == envelope ─ ne ─▶ REJECTED(PAYLOAD_WALLET_MISMATCH)
+//!         │  signer_node_id == sender_node_id  ne ─▶ REJECTED(SIGNER_MISMATCH)
+//!         │  candidate(commitment_id) present  no ─▶ UNKNOWN_CANDIDATE  (retriable)
+//!         │  txid / user_sig_hash / input / sighash ▶ REJECTED(WRONG_*)
+//!         │  verify partial vs expected pubkey  no ─▶ REJECTED(BAD_PARTIAL_SIG)
+//!         │  store (≤1 per (input,signer), no evict) ▶ ACCEPTED
 //!         │
-//!   store (≤1 per (input,signer), no evict) ▶ ACCEPTED
+//!         └── "request" ─▶ Ingested::Request — handed to the NODE, which re-runs
+//!               its own coord-auth + freshness + user-sig + policy gates. The
+//!               channel decides nothing about it (signing-oracle prohibition).
 //! ```
 //!
 //! # Canonical byte layout (this implementer OWNS it; v0 greenfield until v1)
@@ -84,13 +94,15 @@ use bitcoin::hashes::Hash;
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
-use bitcoin::{ecdsa, EcdsaSighashType, Psbt, PublicKey, ScriptBuf, Txid};
+use bitcoin::{ecdsa, EcdsaSighashType, Psbt, PublicKey, ScriptBuf, Transaction, Txid};
+use miniscript::psbt::PsbtExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 // The channel's digest and length-prefix primitives live in vault-proto and are
 // shared with the coordinator-request preimage, so the two provably cannot drift.
-use vault_proto::{push_var, tagged_hash};
+use vault_proto::{push_var, tagged_hash, TaggedRequest, MAX_PIN_BYTES};
 
+use crate::replay::MAX_COORD_NONCE_BYTES;
 use crate::watchtower::{AlertQueue, FreshnessEvent, FreshnessKind};
 use crate::Error;
 
@@ -114,6 +126,22 @@ const USER_SIG_HASH_TAG: &str = "btc-policy/user-sig-hash/v0";
 /// knob). Nodes never exchange or negotiate time.
 const FRESHNESS_PAST_SECS: u64 = 300;
 const FRESHNESS_FUTURE_SECS: u64 = 60;
+
+/// How long past its own combine window a node keeps polling a hot spend's
+/// settlement (§1 post-window recognition). Bounds what would otherwise be a
+/// 1 Hz settlement poll running until commitment expiry (up to
+/// `max_commitment_age_secs`, hours) for a candidate that missed its window.
+///
+/// A peer can only broadcast inside ITS combine window `[peer_fire, peer_fire +
+/// combine_slack]`. Every node fixes `fire = first_seen + hold`, and freshness
+/// pins each node's `first_seen` to `[coord_ts - FRESHNESS_FUTURE, coord_ts +
+/// FRESHNESS_PAST]`, so the widest any peer's window can trail this node's is
+/// `FRESHNESS_PAST + FRESHNESS_FUTURE`. Past `deadline + this`, no peer's window
+/// is still open, so no peer can newly settle the spend; if it has not settled by
+/// then it never will over the channel, and the pending Hold's guaranteed
+/// backstop is its commitment-expiry prune. Polling further only loads the
+/// backend and can starve a fresh quorum-ready candidate on the same pass.
+const SETTLEMENT_OBSERVE_GRACE_SECS: u64 = FRESHNESS_PAST_SECS + FRESHNESS_FUTURE_SECS;
 
 /// Per-peer quota window; `per_peer_quota_per_min` envelopes are allowed per this
 /// many seconds, keyed by authenticated `sender_node_id`.
@@ -483,9 +511,148 @@ pub(crate) struct PartialPayload {
 }
 
 impl PartialPayload {
-    #[allow(dead_code)] // canonical payload bytes for the outbound envelope (V0-8b caller)
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("PartialPayload is always serializable")
+    }
+}
+
+/// What the partial-release gate hands back when a candidate fires (§1): this
+/// node's own partials, and how long the fan-out may keep retrying.
+pub(crate) struct Release {
+    /// One payload per input this node signed.
+    pub(crate) payloads: Vec<PartialPayload>,
+    /// Last instant the combine window is open; the retry loop stops there rather
+    /// than at the commitment expiry, so a fan-out cannot outlive its window.
+    pub(crate) deadline: u64,
+}
+
+/// The `request` message type (§3): the coordinator-signed tagged request,
+/// relayed VERBATIM between nodes.
+///
+/// This does not make a peer an authority — the signing-oracle prohibition still
+/// holds absolutely. The peer is pure transport: authority comes from the
+/// COORDINATOR's signature over the canonical request bytes, and the receiving
+/// node independently re-runs its own coord-auth + freshness + user-signature +
+/// policy gates before anything is registered or signed (ADR-0012). A peer that
+/// tampers with a byte simply produces a request whose `coord_sig` no longer
+/// verifies, and a rogue node cannot manufacture one at all.
+///
+/// Why it exists: it makes delivery to ONE node enough. A post-wrench coordinator
+/// that selectively delivers cannot leave part of the federation unaware — which
+/// is what V0-4b needs so a duress request that reaches one node arms the rest.
+pub(crate) const MSG_TYPE_REQUEST: &str = "request";
+
+/// The `partial` message type: one verified partial signature for a registered
+/// candidate.
+pub(crate) const MSG_TYPE_PARTIAL: &str = "partial";
+
+/// What [`ChannelState::ingest`] resolved a body to.
+pub(crate) enum Ingested {
+    /// The channel handled it end to end (a `partial`, or any rejection).
+    Reply(ChannelReply),
+    /// An authenticated `request` envelope. The channel layer deliberately does
+    /// NOT process it: it carries policy, and the channel carries signatures and
+    /// assembly only. The node applies its own gates (see
+    /// [`crate::handle_channel_body`]).
+    Request(Box<TaggedRequest>),
+}
+
+/// One rejection exit, as an [`Ingested`].
+fn reject(reason: RejectReason) -> Ingested {
+    Ingested::Reply(ChannelReply::Rejected(reason))
+}
+
+/// The setup ceremony's half of the channel manifest (ADR-0013 §4).
+///
+/// Setup is a distinct role from the node — it collects every node's keys,
+/// assembles the manifest, computes `manifest_hash`, and provisions each node with
+/// it — but it must compute those bytes **identically** to every node, or the
+/// federation it provisions cannot boot. Re-deriving the preimages in the setup
+/// tool would make "identical" a coincidence that no test on either side could
+/// catch. So the ceremony calls the node's own definitions, here.
+///
+/// v0 only: the regtest demo is the ceremony. The real ceremony (sealed hosts, no
+/// machine holding two node keys) is later work, and it will call these same
+/// functions for the same reason.
+pub mod ceremony {
+    use super::{
+        channel_pubkey_of, compute_manifest_hash, derive_channel_seckey, endorsement_digest,
+        ManifestNode, PROTOCOL_VERSION_V0,
+    };
+    use bitcoin::hex::DisplayHex;
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+    use bitcoin::PublicKey;
+
+    /// One node as the ceremony knows it, before the manifest exists.
+    pub struct CeremonyNode {
+        /// Its 0-based position in the descriptor's canonical node-key order (§1).
+        pub node_id: u16,
+        pub signing_pubkey: PublicKey,
+        pub endpoints: Vec<String>,
+    }
+
+    /// The channel pubkey a node will derive at startup from its signing key. The
+    /// ceremony must publish this in the manifest, and the node re-derives it and
+    /// refuses to boot on a mismatch.
+    pub fn channel_pubkey(node_seckey: &SecretKey) -> PublicKey {
+        channel_pubkey_of(&derive_channel_seckey(node_seckey))
+    }
+
+    /// `manifest_hash` over the assembled membership (§4). `nodes` must be sorted
+    /// by `node_id`; every entry's `channel_pubkey` comes from [`channel_pubkey`].
+    pub fn manifest_hash(
+        wallet_id: &[u8; 32],
+        coordinator_auth_pubkey: &PublicKey,
+        nodes: &[CeremonyNode],
+        channel_pubkeys: &[PublicKey],
+    ) -> [u8; 32] {
+        let manifest = manifest_nodes(nodes, channel_pubkeys);
+        compute_manifest_hash(
+            wallet_id,
+            PROTOCOL_VERSION_V0,
+            coordinator_auth_pubkey,
+            &manifest,
+        )
+    }
+
+    /// One node's channel-key endorsement, as lowercase-hex DER: that node's
+    /// **Bitcoin signing key** vouching for its channel key over the
+    /// domain-separated `(wallet_id, manifest_hash, node_id, channel_pubkey,
+    /// protocol_version, endpoints)`. Peers accept a channel identity only because
+    /// a key already in the federation signed for it, which is what stops the
+    /// coordinator minting a node.
+    pub fn endorse(
+        node_seckey: &SecretKey,
+        wallet_id: &[u8; 32],
+        manifest_hash: &[u8; 32],
+        node_id: u16,
+        endpoints: &[String],
+    ) -> String {
+        let digest = endorsement_digest(
+            wallet_id,
+            manifest_hash,
+            node_id,
+            &channel_pubkey(node_seckey),
+            PROTOCOL_VERSION_V0,
+            endpoints,
+        );
+        Secp256k1::new()
+            .sign_ecdsa(&Message::from_digest(digest), node_seckey)
+            .serialize_der()
+            .to_lower_hex_string()
+    }
+
+    fn manifest_nodes(nodes: &[CeremonyNode], channel_pubkeys: &[PublicKey]) -> Vec<ManifestNode> {
+        nodes
+            .iter()
+            .zip(channel_pubkeys)
+            .map(|(node, channel_pubkey)| ManifestNode {
+                node_id: node.node_id,
+                signing_pubkey: node.signing_pubkey,
+                channel_pubkey: *channel_pubkey,
+                endpoints: node.endpoints.clone(),
+            })
+            .collect()
     }
 }
 
@@ -583,9 +750,57 @@ pub(crate) enum RegisterOutcome {
     Inserted,
     /// The commitment was already a live candidate (idempotent).
     AlreadyPresent,
+    /// The same commitment id is already bound to incompatible request state
+    /// (for example, a different user-signature instance or paired escape).
+    /// The resident candidate is left untouched.
+    Conflict,
     /// The count or byte cap was hit — the candidate is NOT inserted, no live
-    /// candidate is ever evicted, and the `/sign` verdict is unchanged (V0-8a).
+    /// candidate is ever evicted, and the request must be refused before it is
+    /// acknowledged (Model B has no coordinator-side fallback).
     AtCapacity,
+}
+
+/// Which transaction of a request's mandatory PAIR a candidate is (§4). Every
+/// `SpendRequest` carries `{spend, escape}` and both are registered — distinct
+/// exact-byte commitments, both signed at ingress — so the escape is already
+/// assembled-and-waiting if V0-4b ever arms it. The role is unambiguous and
+/// node-derived, never a coordinator label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateRole {
+    /// The requested spend. Fires at its Hold expiry (hot-class) or immediately
+    /// (escape-class).
+    Spend,
+    /// The request's mandatory user-signed escape. In V0-8b nothing schedules it:
+    /// it is signed, registered, and inert. V0-4b's duress arm is what gives it a
+    /// [`FireWindow`] (at `T`), and it then rides this exact same fire path.
+    Escape,
+}
+
+/// When a candidate's partials may be released, and how long the combine may run
+/// (§1). `[fire_at, deadline]` where `deadline = min(commitment_expiry, fire_at +
+/// combine_slack_secs)`: outside this window nothing is released and nothing is
+/// combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FireWindow {
+    /// The candidate's authorized fire event (unix seconds). Before this instant
+    /// NO partial may leave this node — ADR-0012 invariant 7.
+    pub(crate) fire_at: u64,
+    /// Last instant the combine window is open.
+    pub(crate) deadline: u64,
+}
+
+impl FireWindow {
+    fn is_open(&self, now: u64) -> bool {
+        now >= self.fire_at && now <= self.deadline
+    }
+}
+
+/// A quorum-complete candidate plus the last instant at which this node may
+/// broadcast it. Carrying the deadline with the finalized transaction lets the
+/// blocking package path re-authorize immediately before `sendrawtransaction`.
+pub(crate) struct FinalizedCandidate {
+    pub(crate) tx: Transaction,
+    pub(crate) deadline: u64,
 }
 
 /// One registered candidate — this node's OWN canonical view of a spend, so a
@@ -594,8 +809,14 @@ pub(crate) enum RegisterOutcome {
 pub(crate) struct Candidate {
     commitment_id: String,
     unsigned_txid: Txid,
+    /// This candidate's role in its request's mandatory pair (§4).
+    role: CandidateRole,
+    /// The sibling candidate's `commitment_id` — the pairing is by request, so a
+    /// spend always names its escape and vice versa.
+    paired_commitment_id: String,
     /// This node's canonical PSBT; verified peer partials are imported here (never
-    /// blind-merged from a peer PSBT).
+    /// blind-merged from a peer PSBT). This node's OWN partial is present from
+    /// registration: Model B signs at ingress (ADR-0012).
     psbt: Psbt,
     /// Per-input sighash recomputed by THIS node.
     sighashes: Vec<[u8; 32]>,
@@ -604,6 +825,18 @@ pub(crate) struct Candidate {
     user_sig_hash: [u8; 32],
     /// The commitment's own fixed eviction horizon (no extension in V0-8a).
     expiry: u64,
+    /// This candidate's authorized fire event + combine window, or `None` when
+    /// nothing has scheduled it (every [`CandidateRole::Escape`] in V0-8b). The
+    /// partial-release gate reads THIS and nothing else.
+    fire: Option<FireWindow>,
+    /// Whether this node has already released its own partials to peers. Set once,
+    /// at fire, by [`ChannelState::release_partials`] — so a re-tick re-sends
+    /// nothing and the release remains a single authorized event.
+    released: bool,
+    /// Whether this node has already broadcast this candidate, so a re-tick does
+    /// not re-broadcast. (A redundant broadcast of identical bytes is harmless —
+    /// peers dedup it — but re-doing the package test every tick is waste.)
+    broadcast: bool,
     /// At most one partial per `(input, signer_node_id)` (DER bytes).
     partials: HashMap<(u32, u16), Vec<u8>>,
     /// Byte accounting: stored PSBT + sighashes + user_sig_hash + partials.
@@ -615,38 +848,69 @@ pub(crate) struct Candidate {
     capacity_bytes: usize,
 }
 
+/// Everything that describes ONE candidate of a request's pair, so registering
+/// the spend and registering the escape are the same call with different data.
+pub(crate) struct CandidateSpec<'a> {
+    /// This node's own decoded PSBT for this transaction.
+    pub(crate) psbt: &'a Psbt,
+    /// Its exact-byte commitment id (ADR-0012 / V0-2b).
+    pub(crate) commitment_id: &'a str,
+    /// The sibling's commitment id (the pairing, §4).
+    pub(crate) paired_commitment_id: &'a str,
+    pub(crate) role: CandidateRole,
+    /// The authorized fire window, or `None` for a candidate nothing schedules.
+    pub(crate) fire: Option<FireWindow>,
+    pub(crate) expiry: u64,
+}
+
+/// The node keys a candidate is verified and signed against.
+pub(crate) struct CandidateKeys<'a> {
+    pub(crate) witness_script: &'a ScriptBuf,
+    pub(crate) user_pubkey: &'a PublicKey,
+    /// This node's federation signing key — the one partial that is present from
+    /// registration.
+    pub(crate) self_signing_pubkey: &'a PublicKey,
+}
+
 impl Candidate {
-    /// Build a candidate from the node's own post-verdict PSBT: recompute per-input
-    /// sighashes and the `user_sig_hash` from the user's verified partial sigs, and
-    /// **strip every partial signature the node has not verified or produced**.
+    /// Build a candidate from the node's own post-verdict, ingress-SIGNED PSBT:
+    /// recompute per-input sighashes and the `user_sig_hash` from the user's
+    /// verified partial sigs, and **strip every partial signature the node has not
+    /// verified or produced**.
     ///
     /// `verify_user_signatures` validated only the `user_pubkey` entry, so any
     /// federation `partial_sig` the coordinator planted in the request PSBT — under
     /// this node's own signing key or a peer's — is unverified. The canonical PSBT
-    /// therefore keeps ONLY the verified user signature plus, once this node has
-    /// actually signed (`node_signed`), its own real signature under
-    /// `self_signing_pubkey`; peer partials enter later exclusively through the
-    /// verified `accept_partial`. Without
-    /// this strip a coordinator-planted signature would (a) blind-import an
-    /// unverified sig into the canonical view (§5 forbids this) and (b) survive the
-    /// Pending→Signed `or_insert` merge, pinning a forgery under this node's key that
-    /// suppresses its real signature and relays as garbage every peer rejects —
-    /// silently dropping the node from the combine set (a coordinator gaining power
-    /// over assembly, which Model B forbids).
-    pub(crate) fn build(
-        psbt: &Psbt,
-        commitment_id: &str,
-        expiry: u64,
-        witness_script: &ScriptBuf,
-        user_pubkey: &PublicKey,
-        self_signing_pubkey: &PublicKey,
-        node_signed: bool,
-    ) -> Result<Candidate, Error> {
-        let mut psbt = psbt.clone();
+    /// therefore keeps ONLY the verified user signature plus this node's own real
+    /// signature under `self_signing_pubkey`, which Model B added at ingress before
+    /// this call; peer partials enter later exclusively through the verified
+    /// `accept_partial`. Without this strip a coordinator-planted signature would
+    /// blind-import an unverified sig into the canonical view (§5 forbids this),
+    /// pinning a forgery under this node's key that suppresses its real signature
+    /// and relays as garbage every peer rejects — silently dropping the node from
+    /// the combine set (a coordinator gaining power over assembly, which Model B
+    /// forbids).
+    ///
+    /// The candidate is born fully signed and fully WITHHELD: nothing here releases
+    /// a partial, and `spec.fire` alone decides when one may (ADR-0012 invariant 7).
+    pub(crate) fn build(spec: CandidateSpec, keys: &CandidateKeys) -> Result<Candidate, Error> {
+        let mut psbt = spec.psbt.clone();
         for input in &mut psbt.inputs {
+            // Finalization metadata is coordinator input, not part of the exact
+            // unsigned transaction the user signature commits to. Canonicalize the
+            // P2WSH fields from this node's configured descriptor and discard any
+            // pre-finalized witness/script so quorum finalization cannot preserve a
+            // coordinator-supplied witness or fail because `witness_script` was
+            // omitted/replaced. The verified user and node partials below are the
+            // only satisfaction material retained at ingress.
+            input.witness_script = Some(keys.witness_script.clone());
+            input.redeem_script = None;
+            input.sighash_type = Some(EcdsaSighashType::All.into());
+            input.final_script_sig = None;
+            input.final_script_witness = None;
             input
                 .partial_sigs
-                .retain(|pk, _| pk == user_pubkey || (node_signed && pk == self_signing_pubkey));
+                .retain(|pk, _| pk == keys.user_pubkey || pk == keys.self_signing_pubkey);
         }
         let unsigned_txid = psbt.unsigned_tx.compute_txid();
         let mut cache = SighashCache::new(&psbt.unsigned_tx);
@@ -658,12 +922,12 @@ impl Candidate {
                 .as_ref()
                 .ok_or_else(|| format!("input {i} has no witness_utxo"))?;
             let sh = cache
-                .p2wsh_signature_hash(i, witness_script, utxo.value, EcdsaSighashType::All)
+                .p2wsh_signature_hash(i, keys.witness_script, utxo.value, EcdsaSighashType::All)
                 .map_err(|e| format!("sighash for input {i}: {e}"))?;
             sighashes.push(sh.to_byte_array());
             let sig = input
                 .partial_sigs
-                .get(user_pubkey)
+                .get(keys.user_pubkey)
                 .ok_or_else(|| format!("input {i} missing the user partial signature"))?;
             usig.var(&sig.signature.serialize_der());
             usig.u8(sig.sighash_type.to_u32() as u8);
@@ -671,16 +935,57 @@ impl Candidate {
         let user_sig_hash = tagged_hash(USER_SIG_HASH_TAG, &usig.0);
         let bytes = psbt.serialize().len() + sighashes.len() * 32 + 32;
         Ok(Candidate {
-            commitment_id: commitment_id.to_string(),
+            commitment_id: spec.commitment_id.to_string(),
             unsigned_txid,
+            role: spec.role,
+            paired_commitment_id: spec.paired_commitment_id.to_string(),
             psbt,
             sighashes,
             user_sig_hash,
-            expiry,
+            expiry: spec.expiry,
+            fire: spec.fire,
+            released: false,
+            broadcast: false,
             partials: HashMap::new(),
             bytes,
             capacity_bytes: bytes,
         })
+    }
+
+    /// Distinct valid federation signatures on `input`, counted over this node's
+    /// canonical PSBT. Every entry got there either from this node's own ingress
+    /// signing or through `accept_partial`'s verification against the recomputed
+    /// sighash and the expected descriptor key, so presence IS validity.
+    fn signature_count(&self, input: usize, nodes: &[ManifestNode]) -> usize {
+        let Some(psbt_input) = self.psbt.inputs.get(input) else {
+            return 0;
+        };
+        nodes
+            .iter()
+            .filter(|node| psbt_input.partial_sigs.contains_key(&node.signing_pubkey))
+            .count()
+    }
+
+    /// Whether EVERY input carries at least `t` distinct valid federation
+    /// signatures — the combine precondition (§1). Per-input, never a total: a tx
+    /// with `t` signatures on input 0 and none on input 1 cannot be finalized, and
+    /// a global count would call it ready.
+    fn has_quorum(&self, threshold: usize, nodes: &[ManifestNode]) -> bool {
+        !self.psbt.inputs.is_empty()
+            && (0..self.psbt.inputs.len()).all(|i| self.signature_count(i, nodes) >= threshold)
+    }
+
+    /// Whether another registration under this commitment id describes the same
+    /// combinable candidate. `fire`/release/broadcast state is deliberately absent:
+    /// a later idempotent delivery must retain the resident candidate's original
+    /// authorization window and monotonic release state.
+    fn matches_registration(&self, other: &Candidate) -> bool {
+        self.unsigned_txid == other.unsigned_txid
+            && self.role == other.role
+            && self.paired_commitment_id == other.paired_commitment_id
+            && self.sighashes == other.sighashes
+            && self.user_sig_hash == other.user_sig_hash
+            && self.expiry == other.expiry
     }
 
     /// Reserve all future descriptor-signature growth. Peer signatures need one
@@ -708,35 +1013,6 @@ impl Candidate {
         }
         self.capacity_bytes = capacity;
     }
-
-    /// Merge signatures created by this node after a Pending candidate transitions
-    /// to Signed. Preserve peer partials already received during the Hold and never
-    /// extend the candidate's original expiry/capacity reservation. A valid ECDSA
-    /// user signature is not unique and is not commitment-bound witness data. When
-    /// a resubmission carries a different valid encoding, retain the original user
-    /// signature/hash (which existing peer partials name) while importing this
-    /// node's new signature over the identical registered sighash.
-    fn merge_post_verdict(&mut self, newer: &Candidate) {
-        if self.unsigned_txid != newer.unsigned_txid
-            || self.sighashes != newer.sighashes
-            || self.expiry != newer.expiry
-            || self.psbt.inputs.len() != newer.psbt.inputs.len()
-        {
-            return;
-        }
-        let old_psbt_bytes = self.psbt.serialize().len();
-        for (existing, update) in self.psbt.inputs.iter_mut().zip(&newer.psbt.inputs) {
-            for (pubkey, signature) in &update.partial_sigs {
-                existing.partial_sigs.entry(*pubkey).or_insert(*signature);
-            }
-        }
-        let new_psbt_bytes = self.psbt.serialize().len();
-        self.bytes = self
-            .bytes
-            .saturating_sub(old_psbt_bytes)
-            .saturating_add(new_psbt_bytes);
-        debug_assert!(self.bytes <= self.capacity_bytes);
-    }
 }
 
 /// Verified fields of a parsed `partial` payload, ready for the store.
@@ -762,12 +1038,24 @@ pub(crate) struct PartialStore {
 }
 
 impl PartialStore {
-    /// Register `c` unless the store is at capacity (§5: at capacity the candidate
-    /// is simply NOT inserted — no eviction; the `/sign` verdict is unchanged).
+    /// Register `c` unless the store is at capacity. No live candidate is evicted;
+    /// the request-level caller preflights the complete candidate set so this
+    /// single-candidate path is used only by focused registry tests.
+    ///
+    /// A compatible commitment that is already live is left EXACTLY as it is. It
+    /// is already fully signed (Model B signs at ingress) and may already hold peer
+    /// partials and a fire decision, so overwriting or merging would create ways to
+    /// reset `released`/`fire` — i.e. to re-open the partial-release gate after fire.
+    /// A same-id registration with a different user-signature instance, sighash, or
+    /// paired candidate is a conflict, not idempotency: commitment ids deliberately
+    /// bind unsigned transaction bytes, while those request fields live alongside.
     fn register(&mut self, c: Candidate) -> RegisterOutcome {
-        if let Some(existing) = self.candidates.get_mut(&c.commitment_id) {
-            existing.merge_post_verdict(&c);
-            return RegisterOutcome::AlreadyPresent;
+        if let Some(resident) = self.candidates.get(&c.commitment_id) {
+            return if resident.matches_registration(&c) {
+                RegisterOutcome::AlreadyPresent
+            } else {
+                RegisterOutcome::Conflict
+            };
         }
         if self.candidates.len() >= self.max_active_candidates
             || self.reserved_bytes.saturating_add(c.capacity_bytes) > self.max_bytes
@@ -779,11 +1067,13 @@ impl PartialStore {
         RegisterOutcome::Inserted
     }
 
-    /// Evict every candidate whose commitment has expired (its own clock).
+    /// Evict every candidate whose commitment expiry is strictly in the past.
+    /// Fire windows are inclusive at their deadline, so a candidate remains live
+    /// at `now == expiry` for that final authorized second.
     fn prune(&mut self, now: u64) {
         let mut removed = 0usize;
         self.candidates.retain(|_, c| {
-            if c.expiry > now {
+            if c.expiry >= now {
                 true
             } else {
                 removed = removed.saturating_add(c.capacity_bytes);
@@ -795,7 +1085,13 @@ impl PartialStore {
 
     /// Verify and store a partial against the registered candidate. Enforced at
     /// lookup: an expired candidate is evicted and answered `UnknownCandidate`
-    /// (retriable) even with no intervening `/sign` sweep.
+    /// (retriable) even with no intervening `/sign` sweep. The expiry boundary is
+    /// the SAME one `prune` uses (`expiry < now` is expired, `now == expiry` is the
+    /// final authorized second): `FireWindow` is inclusive at its deadline and the
+    /// deadline can equal `expiry`, so `broadcast_package` may still push a spend at
+    /// `now == expiry`. Evicting on `<= now` here would drop the candidate — and its
+    /// quorum-completing partial — in exactly that second, defeating a broadcast the
+    /// fire path still intends. Both consumers therefore expire on `< now`.
     fn accept_partial(
         &mut self,
         p: &ParsedPartial,
@@ -803,7 +1099,7 @@ impl PartialStore {
         now: u64,
     ) -> ChannelReply {
         let expired = match self.candidates.get(p.commitment_id) {
-            Some(c) => c.expiry <= now,
+            Some(c) => c.expiry < now,
             None => return ChannelReply::UnknownCandidate,
         };
         if expired {
@@ -969,19 +1265,20 @@ impl IngressGuards {
             return IngressGuardResult::Replayed;
         }
 
-        // Consume the nonce for ANY authenticated + fresh envelope, BEFORE the
-        // quota check — so a rate-limited (but authenticated) envelope cannot be
-        // replayed after the quota window resets (codex adversarial 2026-07-17:
-        // charging quota first let a captured RATE_LIMITED envelope replay once
-        // the window reset). Replay-safety must NOT rest on message idempotency:
-        // a future non-idempotent msg_type (V0-8b/V0-4) would inherit the hole,
-        // so the nonce is consumed unconditionally here. Cache growth stays
-        // bounded: entries prune at the freshness horizon (above) and the
-        // per-peer quota caps the rate at which a peer can add fresh nonces.
-        self.seen_nonces.insert(key, timestamp);
+        // Charge before retaining a new nonce. Inserting first would let an
+        // authenticated peer exceed its quota with fresh nonces while still
+        // growing this map without the quota's bound; every later request also
+        // pays the O(n) prune above, so that becomes a combine-window liveness
+        // attack. A RATE_LIMITED envelope is not dispatched and therefore has not
+        // performed an action to replay. If retried after the quota window, the
+        // current message types are either idempotent partial delivery or carry
+        // the coordinator's independent single-use request nonce. Any future
+        // message type MUST likewise be idempotent or carry independent replay
+        // protection; a channel nonce rejected for quota is deliberately reusable.
         if let Some(limited) = self.charge_quota(sender, now, quota_per_min) {
             return limited;
         }
+        self.seen_nonces.insert(key, timestamp);
         IngressGuardResult::Accepted { now }
     }
 }
@@ -1035,6 +1332,23 @@ impl ChannelState {
                 Semaphore::MAX_PERMITS
             )
             .into());
+        }
+        // A zero per-send deadline is a silent broadcast trap, the same class of
+        // invisible failure the `combine_slack_secs == 0` and missing-`[chain_backend]`
+        // checks reject at load. `try_endpoints` never *initiates* a send once
+        // `now > deadline`, and it caps every send timeout at `per_send_deadline`
+        // (see [`ChannelState::per_send_deadline`]); at zero that timeout is
+        // `Duration::ZERO`, so every request/partial fan-out fails immediately and
+        // no message ever reaches a peer. In a `t > 1` federation `/sign` still
+        // returns Accepted, yet no candidate ever reaches quorum or broadcasts —
+        // the money silently never moves. Reject it at provisioning.
+        if cfg.per_send_deadline_secs == 0 {
+            return Err(
+                "[channel] per_send_deadline_secs must be greater than 0: a zero send deadline \
+                 gives every outbound envelope a zero-duration timeout, so no request or partial \
+                 ever reaches a peer and no spend can combine or broadcast"
+                    .into(),
+            );
         }
         // Channel endpoint consistency is validated before the listener exists.
         // Port zero would be replaced by an OS-selected ephemeral port at bind
@@ -1245,12 +1559,62 @@ impl ChannelState {
 
     // -- the /sign-path registry funnel ------------------------------------
 
-    /// Register a candidate on a non-refused `/sign` verdict (§4). At capacity the
-    /// candidate is simply not inserted (logged by the caller).
+    /// Register one candidate for focused store tests. Production `/sign` uses
+    /// [`Self::register_candidates`] so an entire request is admitted atomically.
+    #[cfg(test)]
     pub(crate) fn register_candidate(&self, c: Candidate) -> RegisterOutcome {
         let mut c = c;
         c.reserve_partial_capacity(&self.nodes, self.node_id);
         self.store.lock().expect("store lock poisoned").register(c)
+    }
+
+    /// Register one request's complete candidate set atomically under one store
+    /// lock. A conflict or insufficient count/byte capacity inserts NONE of the
+    /// incoming candidates. Model B structurally withholds partials from the
+    /// coordinator, so acknowledging a half-registered pair would strand the
+    /// request and (for the mandatory escape) break its future duress seam.
+    pub(crate) fn register_candidates(
+        &self,
+        mut candidates: Vec<Candidate>,
+    ) -> Vec<RegisterOutcome> {
+        for candidate in &mut candidates {
+            candidate.reserve_partial_capacity(&self.nodes, self.node_id);
+        }
+        let mut store = self.store.lock().expect("store lock poisoned");
+        if candidates.iter().any(|candidate| {
+            store
+                .candidates
+                .get(&candidate.commitment_id)
+                .is_some_and(|resident| !resident.matches_registration(candidate))
+        }) {
+            return vec![RegisterOutcome::Conflict; candidates.len()];
+        }
+
+        let new_candidates: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|candidate| !store.candidates.contains_key(&candidate.commitment_id))
+            .collect();
+        let added_bytes = new_candidates.iter().fold(0usize, |total, candidate| {
+            total.saturating_add(candidate.capacity_bytes)
+        });
+        if store.candidates.len().saturating_add(new_candidates.len()) > store.max_active_candidates
+            || store.reserved_bytes.saturating_add(added_bytes) > store.max_bytes
+        {
+            return candidates
+                .iter()
+                .map(|candidate| {
+                    if store.candidates.contains_key(&candidate.commitment_id) {
+                        RegisterOutcome::AlreadyPresent
+                    } else {
+                        RegisterOutcome::AtCapacity
+                    }
+                })
+                .collect();
+        }
+        candidates
+            .into_iter()
+            .map(|candidate| store.register(candidate))
+            .collect()
     }
 
     /// Prune expired candidates — driven from the same `/sign` sweep the replay
@@ -1258,6 +1622,197 @@ impl ChannelState {
     /// idle node still rejects them.
     pub(crate) fn prune_store(&self, now: u64) {
         self.store.lock().expect("store lock poisoned").prune(now);
+    }
+
+    // -- the fire path (§1): release, combine ------------------------------
+
+    /// Every live candidate whose combine window is open at `now`, in stable
+    /// (sorted) order. Candidates with no [`FireWindow`] — nothing has scheduled
+    /// them — are never returned, so the escape of a normal request stays inert.
+    pub(crate) fn due_for_fire(&self, now: u64) -> Vec<String> {
+        let store = self.store.lock().expect("store lock poisoned");
+        let mut due: Vec<String> = store
+            .candidates
+            .values()
+            .filter(|c| !c.broadcast && c.fire.is_some_and(|window| window.is_open(now)))
+            .map(|c| c.commitment_id.clone())
+            .collect();
+        due.sort();
+        due
+    }
+
+    /// Whether a scheduled candidate is still worth polling for a peer's
+    /// settlement: its fire event has arrived AND `now` is within the bounded
+    /// observation window `[fire_at, deadline + SETTLEMENT_OBSERVE_GRACE_SECS]`.
+    /// Used ONLY for post-window settlement recognition — it never releases,
+    /// finalizes, or broadcasts ([`release_partials`](Self::release_partials) and
+    /// [`try_finalize`](Self::try_finalize) still enforce the complete combine
+    /// window independently). Past the grace no peer's window is still open, so the
+    /// spend can no longer newly settle over the channel; the pending Hold then
+    /// lifts on its commitment-expiry backstop rather than a 1 Hz backend poll.
+    pub(crate) fn fire_settlement_pollable(&self, commitment_id: &str, now: u64) -> bool {
+        self.store
+            .lock()
+            .expect("store lock poisoned")
+            .candidates
+            .get(commitment_id)
+            .and_then(|candidate| candidate.fire)
+            .is_some_and(|window| {
+                now >= window.fire_at
+                    && now
+                        <= window
+                            .deadline
+                            .saturating_add(SETTLEMENT_OBSERVE_GRACE_SECS)
+            })
+    }
+
+    /// **The partial-release gate — ADR-0012 invariant 7, the load-bearing one.**
+    /// The ONLY way a partial signature leaves this node.
+    ///
+    /// Returns this node's own partials for `commitment_id` iff the candidate's
+    /// authorized fire event has arrived and its combine window is still open;
+    /// `None` in every other case, including a candidate that is registered,
+    /// signed, and merely waiting. It marks the candidate released, so the release
+    /// happens once.
+    ///
+    /// Why this is not "release at ingress and let the Hold gate the broadcast":
+    /// partials in a peer's hands are a finalizable transaction. If a node handed
+    /// them out at ingress, ONE compromised node (or a coordinator that could
+    /// solicit them) could collect `t` peers' partials during the Hold and
+    /// broadcast the spend early — breaking the Hold AND duress silence without
+    /// compromising `t` nodes. Withholding until fire is what makes "the escape
+    /// fires at T and the frozen spend never settles" enforceable, and it is the
+    /// hook V0-4b's arm uses to suppress release entirely.
+    pub(crate) fn release_partials(&self, commitment_id: &str, now: u64) -> Option<Release> {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        let candidate = store.candidates.get_mut(commitment_id)?;
+        // The gate. An unscheduled candidate (`fire == None`) never passes; a
+        // scheduled one passes only inside its open combine window, and only once.
+        let window = candidate.fire?;
+        if !window.is_open(now) || candidate.released {
+            return None;
+        }
+        candidate.released = true;
+        let signer = self.nodes[self.node_id as usize].signing_pubkey;
+        let payloads = (0..candidate.psbt.inputs.len())
+            .filter_map(|input| {
+                let sig = candidate.psbt.inputs[input].partial_sigs.get(&signer)?;
+                Some(PartialPayload {
+                    commitment_id: commitment_id.to_string(),
+                    wallet_id: to_hex(&self.wallet_id),
+                    txid: candidate.unsigned_txid.to_string(),
+                    input: input as u32,
+                    signer_node_id: self.node_id,
+                    sighash_type: EcdsaSighashType::All.to_u32(),
+                    // A non-authoritative hint (ADR-0012): every peer derives the
+                    // class from the outputs itself and ignores this.
+                    spend_purpose: match candidate.role {
+                        CandidateRole::Spend => "spend",
+                        CandidateRole::Escape => "escape",
+                    }
+                    .to_string(),
+                    user_sig_hash: to_hex(&candidate.user_sig_hash),
+                    partial_sig: to_hex(&sig.signature.serialize_der()),
+                })
+            })
+            .collect();
+        Some(Release {
+            payloads,
+            deadline: window.deadline,
+        })
+    }
+
+    /// The fully-signed transaction for `commitment_id` when its combine window is
+    /// open and EVERY input carries ≥ `threshold` distinct valid federation
+    /// signatures (§1); `None` otherwise — including when the quorum is not yet
+    /// present, which is the ordinary "still collecting" case.
+    ///
+    /// Finalization runs on a CLONE: the canonical candidate keeps its partials, so
+    /// a later tick can retry if the broadcast fails.
+    pub(crate) fn try_finalize(
+        &self,
+        commitment_id: &str,
+        threshold: usize,
+        now: u64,
+    ) -> Option<FinalizedCandidate> {
+        let store = self.store.lock().expect("store lock poisoned");
+        let candidate = store.candidates.get(commitment_id)?;
+        let window = candidate.fire?;
+        if !window.is_open(now) || candidate.broadcast {
+            return None;
+        }
+        if !candidate.has_quorum(threshold, &self.nodes) {
+            return None;
+        }
+        let mut psbt = candidate.psbt.clone();
+        // miniscript builds the witness from the descriptor + the collected
+        // signatures. A failure here is a real inconsistency (a candidate whose
+        // signatures do not satisfy its own script), so it is logged and skipped —
+        // never a panic on the fire path.
+        if let Err(e) = psbt.finalize_mut(&Secp256k1::verification_only()) {
+            eprintln!("channel: cannot finalize candidate {commitment_id}: {e:?}");
+            return None;
+        }
+        match psbt.extract_tx() {
+            Ok(tx) => Some(FinalizedCandidate {
+                tx,
+                deadline: window.deadline,
+            }),
+            Err(e) => {
+                eprintln!("channel: cannot extract candidate {commitment_id}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Exact txid of a resident candidate, independent of local partial count.
+    /// Used to recognize that a peer already settled the transaction even when
+    /// this node never received enough partials to finalize its own copy.
+    pub(crate) fn candidate_txid(&self, commitment_id: &str) -> Option<Txid> {
+        self.store
+            .lock()
+            .expect("store lock poisoned")
+            .candidates
+            .get(commitment_id)
+            .map(|candidate| candidate.unsigned_txid)
+    }
+
+    /// Mark `commitment_id` broadcast so later ticks skip it.
+    pub(crate) fn mark_broadcast(&self, commitment_id: &str) {
+        if let Some(candidate) = self
+            .store
+            .lock()
+            .expect("store lock poisoned")
+            .candidates
+            .get_mut(commitment_id)
+        {
+            candidate.broadcast = true;
+        }
+    }
+
+    /// A registered candidate's role and the commitment id of its sibling — §4's
+    /// "paired by request" link, read back.
+    ///
+    /// Public because the pairing is protocol state, not an implementation detail:
+    /// it is how anything holding one half of a request finds the other. V0-4b's
+    /// duress arm is the production reader — it takes the frozen spend it just
+    /// suppressed and needs that request's escape to schedule at `T` — and it can
+    /// do so through this one link rather than re-deriving a pairing from
+    /// transaction shapes, which would be guesswork.
+    pub fn pairing(&self, commitment_id: &str) -> Option<(CandidateRole, String)> {
+        let store = self.store.lock().expect("store lock poisoned");
+        let candidate = store.candidates.get(commitment_id)?;
+        Some((candidate.role, candidate.paired_commitment_id.clone()))
+    }
+
+    /// Every peer's node id (everyone but self), in manifest order — the fan-out
+    /// set for both a partial release and a request propagation.
+    pub(crate) fn peer_ids(&self) -> Vec<u16> {
+        self.nodes
+            .iter()
+            .map(|node| node.node_id)
+            .filter(|id| *id != self.node_id)
+            .collect()
     }
 
     // -- ingress -----------------------------------------------------------
@@ -1287,49 +1842,52 @@ impl ChannelState {
 
     /// Process one raw channel body. `now_input` is unix seconds (the server
     /// passes the local clock; tests pass a fixed value); the monotonic high-water
-    /// is applied internally. Purely verify-and-store — structurally NO path to the
-    /// signer (signing-oracle prohibition, §7).
-    pub(crate) fn ingest(&self, body: &[u8], now_input: u64) -> ChannelReply {
+    /// is applied internally.
+    ///
+    /// Structurally NO path to the signer (signing-oracle prohibition, §7): a
+    /// `partial` is verified and stored, and a `request` is handed BACK to the node
+    /// unprocessed — this layer never decides to sign anything.
+    pub(crate) fn ingest(&self, body: &[u8], now_input: u64) -> Ingested {
         let env: Envelope = match serde_json::from_slice(body) {
             Ok(e) => e,
-            Err(_) => return ChannelReply::Rejected(RejectReason::MalformedJson),
+            Err(_) => return reject(RejectReason::MalformedJson),
         };
         let wallet_id = match from_hex_32(&env.wallet_id) {
             Ok(x) => x,
-            Err(_) => return ChannelReply::Rejected(RejectReason::MalformedJson),
+            Err(_) => return reject(RejectReason::MalformedJson),
         };
         let manifest_hash = match from_hex_32(&env.manifest_hash) {
             Ok(x) => x,
-            Err(_) => return ChannelReply::Rejected(RejectReason::MalformedJson),
+            Err(_) => return reject(RejectReason::MalformedJson),
         };
         let nonce = match from_hex_16(&env.nonce) {
             Ok(x) => x,
-            Err(_) => return ChannelReply::Rejected(RejectReason::MalformedJson),
+            Err(_) => return reject(RejectReason::MalformedJson),
         };
         let sig_der = match from_hex_vec(&env.channel_sig) {
             Ok(x) => x,
-            Err(_) => return ChannelReply::Rejected(RejectReason::MalformedJson),
+            Err(_) => return reject(RejectReason::MalformedJson),
         };
 
         // 1. protocol_version pinned to the manifest.
         if env.protocol_version != PROTOCOL_VERSION_V0 {
-            return ChannelReply::Rejected(RejectReason::BadProtocolVersion);
+            return reject(RejectReason::BadProtocolVersion);
         }
         // 2. explicit local-vault equality (independent of endorsement validity).
         if wallet_id != self.wallet_id {
-            return ChannelReply::Rejected(RejectReason::WrongWallet);
+            return reject(RejectReason::WrongWallet);
         }
         if manifest_hash != self.manifest_hash {
-            return ChannelReply::Rejected(RejectReason::WrongManifest);
+            return reject(RejectReason::WrongManifest);
         }
         // 3. recipient bind (closes cross-recipient replay for every msg_type).
         if env.recipient_node_id != self.node_id {
-            return ChannelReply::Rejected(RejectReason::WrongRecipient);
+            return reject(RejectReason::WrongRecipient);
         }
         // 4. sender must be an in-manifest peer (never self).
         let sender = env.sender_node_id;
         if sender == self.node_id || (sender as usize) >= self.nodes.len() {
-            return ChannelReply::Rejected(RejectReason::UnknownSender);
+            return reject(RejectReason::UnknownSender);
         }
         let peer_channel_pubkey = self.nodes[sender as usize].channel_pubkey;
         // 5. channel_sig over the recomputed preimage (proves possession of the
@@ -1348,7 +1906,7 @@ impl ChannelState {
         let digest = tagged_hash(ENVELOPE_TAG, &preimage);
         let sig = match Signature::from_der(&sig_der) {
             Ok(s) => s,
-            Err(_) => return ChannelReply::Rejected(RejectReason::BadChannelSig),
+            Err(_) => return reject(RejectReason::BadChannelSig),
         };
         if Secp256k1::verification_only()
             .verify_ecdsa(
@@ -1358,7 +1916,7 @@ impl ChannelState {
             )
             .is_err()
         {
-            return ChannelReply::Rejected(RejectReason::BadChannelSig);
+            return reject(RejectReason::BadChannelSig);
         }
 
         // Sender authenticated. Apply freshness, monotonic-clock advancement,
@@ -1390,24 +1948,31 @@ impl ChannelState {
             IngressGuardResult::Accepted { now } => now,
             IngressGuardResult::Stale { now } => {
                 self.record_freshness_reject(sender, env.timestamp, now);
-                return ChannelReply::Rejected(RejectReason::StaleTimestamp);
+                return reject(RejectReason::StaleTimestamp);
             }
             IngressGuardResult::Replayed => {
-                return ChannelReply::Rejected(RejectReason::ReplayedNonce);
+                return reject(RejectReason::ReplayedNonce);
             }
             IngressGuardResult::RateLimited { retry_after_secs } => {
-                return ChannelReply::RateLimited { retry_after_secs };
+                return Ingested::Reply(ChannelReply::RateLimited { retry_after_secs });
             }
         };
         // 8. only now decode the opaque payload.
         let payload = match STANDARD.decode(env.payload_b64.as_bytes()) {
             Ok(p) => p,
-            Err(_) => return ChannelReply::Rejected(RejectReason::MalformedPayload),
+            Err(_) => return reject(RejectReason::MalformedPayload),
         };
-        // 9. dispatch. V0-8a registers exactly one msg_type: `partial`.
+        // 9. dispatch. Two msg_types: `partial` (verified + stored here) and
+        //    `request` (handed back to the node, which owns every policy gate).
         match env.msg_type.as_str() {
-            "partial" => self.handle_partial(sender, &payload, &wallet_id, now),
-            _ => ChannelReply::Rejected(RejectReason::UnknownMsgType),
+            MSG_TYPE_PARTIAL => {
+                Ingested::Reply(self.handle_partial(sender, &payload, &wallet_id, now))
+            }
+            MSG_TYPE_REQUEST => match serde_json::from_slice::<TaggedRequest>(&payload) {
+                Ok(request) => Ingested::Request(Box::new(request)),
+                Err(_) => reject(RejectReason::MalformedPayload),
+            },
+            _ => reject(RejectReason::UnknownMsgType),
         }
     }
 
@@ -1464,12 +2029,11 @@ impl ChannelState {
             .accept_partial(&parsed, &self.nodes, now)
     }
 
-    // -- outbound (§6) — no production caller in V0-8a; tests + V0-8b drive it --
+    // -- outbound (§6) -----------------------------------------------------
 
     /// Build a freshly-signed envelope carrying `payload` for `recipient_node_id`.
     /// Each call draws a FRESH nonce + timestamp + `channel_sig`, so a channel
     /// nonce is single-use (consumed on the receiver at first sight).
-    #[allow(dead_code)]
     pub(crate) fn build_envelope(
         &self,
         msg_type: &str,
@@ -1507,39 +2071,8 @@ impl ChannelState {
         })
     }
 
-    /// Build a `partial` payload for `(commitment_id, input)` from this node's own
-    /// registered candidate + its own signature — no test-only injection.
-    #[allow(dead_code)]
-    pub(crate) fn partial_payload_for(
-        &self,
-        commitment_id: &str,
-        input: u32,
-    ) -> Option<PartialPayload> {
-        let store = self.store.lock().expect("store lock poisoned");
-        let c = store.candidates.get(commitment_id)?;
-        let expected = self.nodes[self.node_id as usize].signing_pubkey;
-        let sig = c
-            .psbt
-            .inputs
-            .get(input as usize)?
-            .partial_sigs
-            .get(&expected)?;
-        Some(PartialPayload {
-            commitment_id: commitment_id.to_string(),
-            wallet_id: to_hex(&self.wallet_id),
-            txid: c.unsigned_txid.to_string(),
-            input,
-            signer_node_id: self.node_id,
-            sighash_type: EcdsaSighashType::All.to_u32(),
-            spend_purpose: "hot".to_string(),
-            user_sig_hash: to_hex(&c.user_sig_hash),
-            partial_sig: to_hex(&sig.signature.serialize_der()),
-        })
-    }
-
     /// Every endorsed canonical base address for `node_id`, in manifest order.
     /// A transport failure on one endpoint must not discard the alternatives.
-    #[allow(dead_code)]
     pub(crate) fn peer_bases(&self, node_id: u16) -> Option<Vec<String>> {
         self.nodes
             .get(node_id as usize)
@@ -1547,13 +2080,117 @@ impl ChannelState {
             .filter(|endpoints| !endpoints.is_empty())
     }
 
-    #[allow(dead_code)]
     fn per_send_deadline(&self) -> Duration {
         Duration::from_secs(self.limits.per_send_deadline_secs)
     }
-    #[allow(dead_code)]
     fn max_response_bytes(&self) -> usize {
         self.limits.max_response_bytes
+    }
+}
+
+/// The canonical propagation payload for one request (§3): the coordinator-signed
+/// tagged request followed by JSON whitespace padding. `serde_json` accepts the
+/// trailing whitespace, so peers recover and authenticate the request verbatim.
+///
+/// **The constant-observable step.** This is a pure function of the request, so
+/// every accepted request produces one message per peer over this one path. For a
+/// given candidate pair, the fixed budget hides the encoded lengths of the PIN,
+/// nonce, and DER coordinator signature, so unequal-length enrolled PINs still
+/// produce identical payload sizes. Nothing about the PIN class or the node's
+/// internal fire decision reaches the wire — the property V0-4b's silence rests
+/// on (ADR-0012, "pin-independent ingress").
+pub(crate) fn request_payload(request: &TaggedRequest) -> Vec<u8> {
+    // JSON can expand one input byte to six bytes (`\u00xx`). Both PIN and nonce
+    // have protocol bounds; an accepted coordinator signature is canonical secp
+    // DER rendered as ASCII hex. Serialize the invariant request shape with those
+    // fields empty, then reserve their worst-case encoded contents. This produces
+    // one exact target length for all valid values without mutating the signed
+    // request itself.
+    const JSON_BYTE_EXPANSION: usize = 6;
+    const MAX_COORD_SIG_HEX_BYTES: usize = MAX_ECDSA_DER_BYTES * 2;
+
+    let mut shape = request.clone();
+    let variable_budget = match &mut shape {
+        TaggedRequest::Spend(spend) => {
+            spend.pin.clear();
+            spend.nonce.clear();
+            spend.coord_sig.clear();
+            JSON_BYTE_EXPANSION * (MAX_PIN_BYTES + MAX_COORD_NONCE_BYTES) + MAX_COORD_SIG_HEX_BYTES
+        }
+        TaggedRequest::Refresh(refresh) => {
+            refresh.nonce.clear();
+            refresh.coord_sig.clear();
+            JSON_BYTE_EXPANSION * MAX_COORD_NONCE_BYTES + MAX_COORD_SIG_HEX_BYTES
+        }
+    };
+    let target_len = serde_json::to_vec(&shape)
+        .expect("TaggedRequest is always serializable")
+        .len()
+        .saturating_add(variable_budget);
+    let mut payload = serde_json::to_vec(request).expect("TaggedRequest is always serializable");
+    debug_assert!(
+        payload.len() <= target_len,
+        "an accepted request's bounded fields must fit the propagation padding budget"
+    );
+    // Never truncate if a direct unit caller constructs an invalid over-bound DTO;
+    // production calls this only after the node's PIN, nonce, and signature gates.
+    payload.resize(payload.len().max(target_len), b' ');
+    payload
+}
+
+/// Whether a coordinator request can be propagated without its base64 envelope
+/// exceeding this node's configured `/channel` body cap.
+///
+/// `/sign` is allowed to buffer up to 1 MiB, but the signed channel envelope is
+/// larger than the request it carries. Use worst-case numeric widths and a maximum
+/// DER signature so the admission decision is independent of which peer sends it
+/// and of the wall-clock timestamp. A request that fails this preflight must never
+/// be acknowledged: after acknowledgement the coordinator has no partials and peer
+/// propagation is the only path to a quorum.
+pub(crate) fn request_fits_channel_body(request: &TaggedRequest, max_msg_bytes: usize) -> bool {
+    const HEX_32_BYTES: usize = 64;
+    const HEX_16_BYTES: usize = 32;
+    const MAX_CHANNEL_SIG_HEX_BYTES: usize = MAX_ECDSA_DER_BYTES * 2;
+
+    let envelope = Envelope {
+        msg_type: MSG_TYPE_REQUEST.to_string(),
+        protocol_version: PROTOCOL_VERSION_V0,
+        wallet_id: "0".repeat(HEX_32_BYTES),
+        manifest_hash: "0".repeat(HEX_32_BYTES),
+        sender_node_id: u16::MAX,
+        recipient_node_id: u16::MAX,
+        payload_b64: STANDARD.encode(request_payload(request)),
+        nonce: "0".repeat(HEX_16_BYTES),
+        timestamp: u64::MAX,
+        channel_sig: "0".repeat(MAX_CHANNEL_SIG_HEX_BYTES),
+    };
+    envelope_body(&envelope)
+        .expect("a channel envelope containing only serializable fields")
+        .len()
+        <= max_msg_bytes
+}
+
+/// One outbound message to one peer: the `(msg_type, payload)` pair the fan-out
+/// re-envelopes per attempt. The payload is immutable — each transport attempt
+/// draws a fresh nonce + timestamp + signature around these same bytes.
+pub(crate) struct Outbound {
+    pub(crate) msg_type: &'static str,
+    pub(crate) payload: Vec<u8>,
+    /// Last instant a send may be *initiated*; the retry loop stops here.
+    pub(crate) deadline: u64,
+}
+
+impl Release {
+    /// This release as one outbound `partial` message per signed input.
+    pub(crate) fn outbound(&self) -> Vec<Outbound> {
+        self.payloads
+            .iter()
+            .map(|payload| Outbound {
+                msg_type: MSG_TYPE_PARTIAL,
+                payload: payload.to_bytes(),
+                deadline: self.deadline,
+            })
+            .collect()
     }
 }
 
@@ -1563,11 +2200,10 @@ impl ChannelState {
 /// canonical `host:port`; this appends `http://…/channel` exactly once.
 ///
 /// **Partial-release authorization (ADR-0012):** no partial may leave the node
-/// before its candidate's authorized fire event. V0-8a has NO production caller —
-/// V0-8b must add the fire-authorization gate before wiring one. Tests are the
-/// only callers here; hence `pub(crate)` + `#[allow(dead_code)]`.
-#[allow(dead_code)]
-pub(crate) async fn send_partial(
+/// before its candidate's authorized fire event. This function is transport only
+/// and enforces nothing — the gate is [`ChannelState::release_partials`], which is
+/// the single source of every `partial` payload that reaches here.
+pub(crate) async fn send_envelope(
     base: &str,
     envelope: &Envelope,
     deadline: Duration,
@@ -1590,7 +2226,7 @@ pub(crate) async fn send_partial(
         .timeout(deadline)
         .build()
         .map_err(|e| format!("build reqwest client: {e}"))?;
-    let body = serde_json::to_vec(envelope).map_err(|e| format!("encode envelope: {e}"))?;
+    let body = envelope_body(envelope)?;
     let mut resp = client
         .post(&url)
         .header("content-type", "application/json")
@@ -1616,11 +2252,26 @@ pub(crate) async fn send_partial(
     parse_reply(status, &buf)
 }
 
+/// Serialize one channel envelope with enough trailing JSON whitespace to hide
+/// the variable DER length of `channel_sig`. Request payload padding alone would
+/// not make the HTTP body size-independent of the PIN: changing the signed payload
+/// changes the ECDSA signature, whose DER form ranges up to 72 bytes. The nonce and
+/// every other envelope identity field already have fixed-width encodings.
+fn envelope_body(envelope: &Envelope) -> Result<Vec<u8>, Error> {
+    const MAX_CHANNEL_SIG_HEX_BYTES: usize = MAX_ECDSA_DER_BYTES * 2;
+    let mut body = serde_json::to_vec(envelope).map_err(|e| format!("encode envelope: {e}"))?;
+    body.resize(
+        body.len()
+            .saturating_add(MAX_CHANNEL_SIG_HEX_BYTES.saturating_sub(envelope.channel_sig.len())),
+        b' ',
+    );
+    Ok(body)
+}
+
 /// Client-side view of a channel reply. A permanent rejection's reason remains
 /// the peer's opaque wire string: the retry policy never branches on individual
 /// reason codes, so decoding and immediately re-encoding all frozen server enums
 /// would add no correctness.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OutboundReply {
     Accepted,
@@ -1629,7 +2280,6 @@ pub(crate) enum OutboundReply {
     RateLimited { retry_after_secs: u64 },
 }
 
-#[allow(dead_code)] // outbound reply parser (no production caller in V0-8a)
 fn parse_reply(status: u16, body: &[u8]) -> Result<OutboundReply, Error> {
     #[derive(Deserialize)]
     struct Tagged {
@@ -1664,7 +2314,6 @@ fn parse_reply(status: u16, body: &[u8]) -> Result<OutboundReply, Error> {
 }
 
 /// Bounded retry backoff schedule (§6). Static — not a ceremony knob.
-#[allow(dead_code)]
 fn default_backoff() -> [Duration; 5] {
     [
         Duration::from_secs(1),
@@ -1676,7 +2325,6 @@ fn default_backoff() -> [Duration; 5] {
 }
 
 /// The terminal outcome of a bounded-retry loop.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RetryOutcome {
     Accepted,
@@ -1693,7 +2341,6 @@ pub(crate) enum RetryOutcome {
 /// node's wall clock is re-read before every attempt and after every response so
 /// NTP steps stay aligned with candidate expiry; sleeps remain monotonic tokio
 /// time so clock changes cannot distort an individual backoff.
-#[allow(dead_code)]
 async fn retry_loop<A, Fut, N>(
     mut attempt: A,
     commitment_expiry: u64,
@@ -1707,7 +2354,7 @@ where
 {
     let mut i = 0usize;
     loop {
-        if now() >= commitment_expiry {
+        if now() > commitment_expiry {
             return RetryOutcome::GaveUp;
         }
         let wait = match attempt().await {
@@ -1722,10 +2369,18 @@ where
                 wait
             }
         };
-        let remaining = Duration::from_secs(commitment_expiry.saturating_sub(now()));
-        if remaining.is_zero() {
+        let after_attempt = now();
+        if after_attempt > commitment_expiry {
             return RetryOutcome::GaveUp;
         }
+        // Unix timestamps name whole seconds and the fire window is inclusive.
+        // At `now == deadline`, one final attempt may still start during that
+        // second, so its remaining transport budget is one second rather than zero.
+        let remaining = Duration::from_secs(
+            commitment_expiry
+                .saturating_sub(after_attempt)
+                .saturating_add(1),
+        );
         tokio::time::sleep(wait.max(Duration::from_secs(1)).min(remaining)).await;
     }
 }
@@ -1735,31 +2390,31 @@ where
 /// even when its response was lost, so reusing that envelope at an alternative
 /// endpoint could self-reject as a replay.
 ///
-/// Bounded-until-expiry (§6) is enforced at ENDPOINT granularity, not just at the
-/// retry-loop boundary: the clock is re-read before every endpoint so a send is
-/// never *initiated* past `commitment_expiry`, and each send's deadline is capped
-/// to the remaining lifetime so one stalled endpoint cannot burn the full
-/// per-send deadline and push a later endpoint past expiry.
-#[allow(dead_code)]
-async fn try_partial_endpoints(
+/// Bounded-until-deadline (§6) is enforced at ENDPOINT granularity, not just at
+/// the retry-loop boundary: the clock is re-read before every endpoint so a send
+/// is never *initiated* past `deadline`, and each send's timeout is capped to the
+/// remaining lifetime so one stalled endpoint cannot burn the full per-send
+/// deadline and push a later endpoint past it.
+async fn try_endpoints(
     channel: &ChannelState,
+    msg_type: &str,
     recipient_node_id: u16,
     payload: &[u8],
     endpoints: &[String],
-    commitment_expiry: u64,
+    deadline: u64,
 ) -> Result<OutboundReply, Error> {
     let mut last_error = None;
     for base in endpoints {
         let now = unix_now();
-        let remaining = commitment_expiry.saturating_sub(now);
-        if remaining == 0 {
+        if now > deadline {
             break;
         }
-        let deadline = channel
+        let remaining = deadline.saturating_sub(now).saturating_add(1);
+        let send_deadline = channel
             .per_send_deadline()
             .min(Duration::from_secs(remaining));
-        let envelope = channel.build_envelope("partial", recipient_node_id, payload, now)?;
-        match send_partial(base, &envelope, deadline, channel.max_response_bytes()).await {
+        let envelope = channel.build_envelope(msg_type, recipient_node_id, payload, now)?;
+        match send_envelope(base, &envelope, send_deadline, channel.max_response_bytes()).await {
             Ok(reply) => return Ok(reply),
             Err(error) => last_error = Some(error),
         }
@@ -1767,33 +2422,37 @@ async fn try_partial_endpoints(
     Err(last_error.unwrap_or_else(|| Error::from("peer has no endpoints")))
 }
 
-/// Bounded retry to `recipient_node_id` until `commitment_expiry` (§6). Each
-/// attempt re-envelopes the immutable `payload` afresh (single-use nonce) — the
-/// helper holds the payload, never the envelope. Returns `Ok(())` on accept,
-/// `Err` on permanent rejection or on giving up at expiry.
-#[allow(dead_code)]
-pub(crate) async fn retry_partial_until(
+/// Bounded retry of one `(msg_type, payload)` to `recipient_node_id` until
+/// `deadline` (§6). Each attempt re-envelopes the immutable `payload` afresh
+/// (single-use nonce) — the helper holds the payload, never the envelope.
+///
+/// `deadline` is the message's own horizon, not always the commitment expiry: a
+/// released partial stops at the end of its COMBINE window (there is no point
+/// delivering a partial a peer can no longer combine), while a propagated request
+/// runs to the request's expiry.
+pub(crate) async fn retry_message_until(
     channel: &ChannelState,
+    msg_type: &'static str,
     recipient_node_id: u16,
-    payload: &PartialPayload,
-    commitment_expiry: u64,
+    payload: &[u8],
+    deadline: u64,
 ) -> Result<(), Error> {
     let endpoints = channel
         .peer_bases(recipient_node_id)
         .ok_or_else(|| Error::from(format!("no endpoint for peer {recipient_node_id}")))?;
     let backoff = default_backoff();
-    let payload_bytes = payload.to_bytes();
     let outcome = retry_loop(
         || {
-            try_partial_endpoints(
+            try_endpoints(
                 channel,
+                msg_type,
                 recipient_node_id,
-                &payload_bytes,
+                payload,
                 &endpoints,
-                commitment_expiry,
+                deadline,
             )
         },
-        commitment_expiry,
+        deadline,
         unix_now,
         &backoff,
     )
@@ -1801,9 +2460,9 @@ pub(crate) async fn retry_partial_until(
     match outcome {
         RetryOutcome::Accepted => Ok(()),
         RetryOutcome::Rejected(reason) => {
-            Err(format!("partial permanently rejected: {reason}").into())
+            Err(format!("{msg_type} permanently rejected: {reason}").into())
         }
-        RetryOutcome::GaveUp => Err("partial retry gave up at commitment expiry".into()),
+        RetryOutcome::GaveUp => Err(format!("{msg_type} retry gave up at its deadline").into()),
     }
 }
 
@@ -1862,6 +2521,7 @@ mod fixture {
         pub(crate) hot_desc: String,
         pub(crate) hot_spk: ScriptBuf,
         pub(crate) escape_desc: String,
+        pub(crate) escape_spk: ScriptBuf,
         pub(crate) vault_spk: ScriptBuf,
         pub(crate) entries: Vec<Entry>,
         pub(crate) ports: Vec<u16>,
@@ -1910,6 +2570,9 @@ mod fixture {
                     .to_string();
             let hot_spk = Descriptor::<PublicKey>::from_str(&format!("wpkh({hot_pk})"))
                 .expect("hot p")
+                .script_pubkey();
+            let escape_spk = Descriptor::<PublicKey>::from_str(&format!("wpkh({escape_pk})"))
+                .expect("escape p")
                 .script_pubkey();
 
             // Canonical node order: lexicographic over the key-expression string.
@@ -1968,6 +2631,7 @@ mod fixture {
                 hot_desc,
                 hot_spk,
                 escape_desc,
+                escape_spk,
                 vault_spk,
                 entries,
                 ports: ports.to_vec(),
@@ -2042,8 +2706,14 @@ mod fixture {
             channel: &str,
         ) -> String {
             let e = &self.entries[self_id as usize];
+            // `[chain_backend]` is present on every fixture config because channel
+            // mode REQUIRES one: the nodes combine and broadcast, so a channel node
+            // with no chain view of its own is a fatal misconfiguration. Nothing
+            // here ever dials it — only `spawn_drivers` does, which these tests do
+            // not call — so the address only has to parse. Table headers end the
+            // top-level section, so it and `{channel}` come last.
             format!(
-                "listen_port = {}\nnode_seckey = \"{}\"\ndescriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nmax_commitment_age_secs = 172800\npolicy_version = 1\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n{channel}",
+                "listen_port = {}\nnode_seckey = \"{}\"\ndescriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nmax_commitment_age_secs = 172800\npolicy_version = 1\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
                 self.ports[self_id as usize],
                 e.fed_sk.display_secret(),
                 self.descriptor,
@@ -2069,6 +2739,85 @@ mod fixture {
             let sig =
                 Secp256k1::signing_only().sign_ecdsa(&Message::from_digest(digest), &self.coord_sk);
             request.coord_sig = sig.serialize_der().to_lower_hex_string();
+        }
+
+        /// A coordinator-authenticated `SpendRequest` for `spend`, carrying the
+        /// mandatory escape over the same input. Every `SpendRequest` needs a real
+        /// escape-class escape (§4), so this is how channel tests reach `/sign`.
+        pub(crate) fn spend_request(
+            &self,
+            spend: &Psbt,
+            expiry: u64,
+            nonce_seed: &str,
+        ) -> SignRequest {
+            let input_txid = spend.unsigned_tx.input[0]
+                .previous_output
+                .txid
+                .to_byte_array()[0];
+            let escape = self.spend_psbt(&self.escape_spk, input_txid);
+            let mut request = SignRequest {
+                psbt: spend.to_string(),
+                escape_psbt: escape.to_string(),
+                pin: "1234".to_string(),
+                nonce: String::new(),
+                expiry,
+                policy_version: 1,
+                coord_sig: String::new(),
+            };
+            self.coord_sign(&mut request, nonce_seed);
+            request
+        }
+
+        /// A user-signed spend PSBT paying `dest_spk`, spending the single vault
+        /// UTXO at `outpoint` — for the chained-parent tests, where the input has
+        /// to be a specific transaction's output.
+        pub(crate) fn spend_psbt_over(&self, dest_spk: &ScriptBuf, outpoint: OutPoint) -> Psbt {
+            let mut psbt = self.spend_psbt(dest_spk, 0);
+            psbt.unsigned_tx.input[0].previous_output = outpoint;
+            self.user_sign_all(&mut psbt);
+            psbt
+        }
+
+        /// A user-signed TWO-input vault spend paying `dest_spk` — the shape the
+        /// per-input quorum rule is about.
+        pub(crate) fn two_input_spend_psbt(&self, dest_spk: &ScriptBuf) -> Psbt {
+            let mut psbt = self.spend_psbt(dest_spk, 7);
+            psbt.unsigned_tx.input.push(TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            });
+            let second = psbt.inputs[0].clone();
+            psbt.inputs.push(second);
+            psbt.unsigned_tx.output[0].value = Amount::from_sat(199_990_000);
+            self.user_sign_all(&mut psbt);
+            psbt
+        }
+
+        /// Re-sign every input with the user key over the CURRENT unsigned tx —
+        /// any structural edit above invalidates the signature `spend_psbt` made.
+        fn user_sign_all(&self, psbt: &mut Psbt) {
+            let unsigned = psbt.unsigned_tx.clone();
+            let mut cache = SighashCache::new(&unsigned);
+            for (index, input) in psbt.inputs.iter_mut().enumerate() {
+                let value = input.witness_utxo.as_ref().expect("witness_utxo").value;
+                let sighash = cache
+                    .p2wsh_signature_hash(index, &self.witness_script, value, EcdsaSighashType::All)
+                    .expect("sighash");
+                let sig = Secp256k1::signing_only().sign_ecdsa(
+                    &Message::from_digest(sighash.to_byte_array()),
+                    &self.user_sk,
+                );
+                input.partial_sigs.clear();
+                input.partial_sigs.insert(
+                    self.user_pk,
+                    ecdsa::Signature {
+                        signature: sig,
+                        sighash_type: EcdsaSighashType::All,
+                    },
+                );
+            }
         }
 
         /// A user-signed spend PSBT paying `dest_spk`, spending one vault UTXO at
@@ -2112,18 +2861,30 @@ mod fixture {
             psbt
         }
 
-        /// Build a `Candidate` from a spend PSBT (this node's own view). Models a
-        /// freshly-registered candidate awaiting peer partials (`node_signed = false`);
-        /// the spend PSBT carries only the user signature, so no self entry exists.
+        /// Build a spend-role `Candidate` from a PSBT (this node's own view),
+        /// UNSCHEDULED — no fire window, so its partials can never be released.
+        /// Models a freshly-registered candidate awaiting peer partials. The
+        /// registry tests are about storage and verification, not the fire path —
+        /// the `fire` module drives that through the real `/sign` ingress, which is
+        /// the only thing that schedules a candidate in production.
         pub(crate) fn candidate(&self, psbt: &Psbt, commitment_id: &str, expiry: u64) -> Candidate {
             Candidate::build(
-                psbt,
-                commitment_id,
-                expiry,
-                &self.witness_script,
-                &self.user_pk,
-                &self.entries[0].fed_pk,
-                false,
+                CandidateSpec {
+                    psbt,
+                    commitment_id,
+                    // These fixtures register one candidate at a time, so it is its
+                    // own pair; `register_pair` is what builds real pairs.
+                    paired_commitment_id: commitment_id,
+                    role: CandidateRole::Spend,
+                    // UNSCHEDULED: nothing here can release a partial.
+                    fire: None,
+                    expiry,
+                },
+                &CandidateKeys {
+                    witness_script: &self.witness_script,
+                    user_pubkey: &self.user_pk,
+                    self_signing_pubkey: &self.entries[0].fed_pk,
+                },
             )
             .expect("candidate")
         }
@@ -2193,7 +2954,7 @@ mod fixture {
         let env = sender
             .build_envelope(msg_type, receiver.node_id, payload, ts)
             .expect("envelope");
-        receiver.ingest(&serde_json::to_vec(&env).expect("json"), now)
+        receiver.ingest_reply(&serde_json::to_vec(&env).expect("json"), now)
     }
 }
 
@@ -2362,6 +3123,38 @@ mod identity {
         assert!(node.channel.is_some());
     }
 
+    /// Channel mode is what makes a node responsible for BROADCASTING (§5), so a
+    /// channel node with no chain view of its own must not boot: it would
+    /// authenticate, sign at ingress, reach quorum, and then silently never
+    /// broadcast while every `/sign` answer claimed the spend was accepted — a
+    /// failure invisible until the user noticed the money never moved.
+    ///
+    /// The input is the config `a_valid_channel_config_builds` accepts, with only
+    /// the `[chain_backend]` block removed, so the missing backend is the sole
+    /// variable — this cannot pass because some *other* part of the config went
+    /// bad, which is exactly the risk in asserting a fatal.
+    #[test]
+    fn channel_mode_without_a_chain_backend_is_fatal() {
+        let fx = Fixture::new(2, 3);
+        let valid = fx.config(0, 0, "");
+        let stripped = valid.replace(
+            "[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n",
+            "",
+        );
+        assert_ne!(
+            stripped, valid,
+            "the fixture no longer carries the [chain_backend] block this test strips"
+        );
+        let err = crate::Node::from_toml_str(&stripped)
+            .err()
+            .expect("a channel node with no chain backend must fail startup")
+            .to_string();
+        assert!(
+            err.contains("[channel] mode requires a [chain_backend]"),
+            "the fatal must name the missing backend, not some other defect: {err}"
+        );
+    }
+
     #[test]
     fn an_oversized_concurrency_limit_is_a_config_error_not_a_panic() {
         let fx = Fixture::new(2, 3);
@@ -2379,6 +3172,24 @@ mod identity {
         assert!(
             err.to_string()
                 .contains("max_concurrent_channel_requests exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_per_send_deadline_is_a_config_error_not_a_silent_broadcast_trap() {
+        // A zero send deadline gives every outbound envelope a zero-duration
+        // timeout, so no request or partial ever reaches a peer and no spend can
+        // ever combine or broadcast — an invisible failure. It must be fatal at
+        // load, exactly like `combine_slack_secs = 0` and a missing chain backend.
+        let fx = Fixture::new(2, 3);
+        let cfg = fx.config(0, 0, "per_send_deadline_secs = 0\n");
+        let err = crate::Node::from_toml_str(&cfg)
+            .err()
+            .expect("a zero per_send_deadline_secs must fail startup");
+        assert!(
+            err.to_string()
+                .contains("per_send_deadline_secs must be greater than 0"),
             "unexpected error: {err}"
         );
     }
@@ -2641,8 +3452,39 @@ mod identity {
 
 #[cfg(test)]
 impl ChannelState {
+    /// [`ChannelState::ingest`] for the envelope tests, which send `partial` and
+    /// malformed bodies only: the terminal reply. A `request` envelope has no
+    /// terminal reply at this layer BY DESIGN — the node decides it — so one
+    /// reaching here is a test wiring mistake, not a case to paper over.
+    pub(crate) fn ingest_reply(&self, body: &[u8], now: u64) -> ChannelReply {
+        match self.ingest(body, now) {
+            Ingested::Reply(reply) => reply,
+            Ingested::Request(_) => {
+                panic!("a `request` envelope is decided by the node (handle_channel_body)")
+            }
+        }
+    }
     pub(crate) fn store_len(&self) -> usize {
         self.store.lock().expect("store lock").candidates.len()
+    }
+    /// A candidate's fire window, or `None` when nothing has scheduled it.
+    pub(crate) fn fire_window(&self, cid: &str) -> Option<FireWindow> {
+        self.store
+            .lock()
+            .expect("store lock")
+            .candidates
+            .get(cid)
+            .and_then(|c| c.fire)
+    }
+    /// Whether this node has already released `cid`'s partials.
+    pub(crate) fn was_released(&self, cid: &str) -> bool {
+        self.store
+            .lock()
+            .expect("store lock")
+            .candidates
+            .get(cid)
+            .map(|c| c.released)
+            .unwrap_or(false)
     }
     pub(crate) fn nonce_len(&self) -> usize {
         self.ingress_guards
@@ -2724,7 +3566,7 @@ mod ingress {
         let fx = Fixture::new(2, 3);
         let recv = fx.channel_state(1);
         assert_eq!(
-            recv.ingest(b"definitely not json", NOW),
+            recv.ingest_reply(b"definitely not json", NOW),
             ChannelReply::Rejected(RejectReason::MalformedJson)
         );
     }
@@ -2735,7 +3577,7 @@ mod ingress {
         let (send, recv) = (fx.channel_state(0), fx.channel_state(1));
         let bytes = envelope_bytes(&fx, &send, 1, "c", NOW, |e| e.protocol_version = 1);
         assert_eq!(
-            recv.ingest(&bytes, NOW),
+            recv.ingest_reply(&bytes, NOW),
             ChannelReply::Rejected(RejectReason::BadProtocolVersion)
         );
     }
@@ -2747,7 +3589,7 @@ mod ingress {
         // A valid envelope DIRECTED at node 2, replayed to node 1, fails the bind.
         let bytes = envelope_bytes(&fx, &send, 2, "c", NOW, |_| {});
         assert_eq!(
-            recv.ingest(&bytes, NOW),
+            recv.ingest_reply(&bytes, NOW),
             ChannelReply::Rejected(RejectReason::WrongRecipient)
         );
     }
@@ -2758,7 +3600,7 @@ mod ingress {
         let (send, recv) = (fx.channel_state(0), fx.channel_state(1));
         let bytes = envelope_bytes(&fx, &send, 1, "c", NOW, |e| e.sender_node_id = 99);
         assert_eq!(
-            recv.ingest(&bytes, NOW),
+            recv.ingest_reply(&bytes, NOW),
             ChannelReply::Rejected(RejectReason::UnknownSender)
         );
     }
@@ -2774,7 +3616,7 @@ mod ingress {
             e.payload_b64 = String::from_utf8_lossy(&b).into_owned();
         });
         assert_eq!(
-            recv.ingest(&bytes, NOW),
+            recv.ingest_reply(&bytes, NOW),
             ChannelReply::Rejected(RejectReason::BadChannelSig)
         );
     }
@@ -2796,7 +3638,7 @@ mod ingress {
         // fx2.wallet_id != fx1.wallet_id ⇒ WRONG_WALLET, before any sender lookup
         // or endorsement/sig work (the direct local-equality check).
         assert_eq!(
-            recv.ingest(&serde_json::to_vec(&env).expect("json"), NOW),
+            recv.ingest_reply(&serde_json::to_vec(&env).expect("json"), NOW),
             ChannelReply::Rejected(RejectReason::WrongWallet)
         );
     }
@@ -2810,7 +3652,7 @@ mod ingress {
             e.manifest_hash = to_hex(&[0x5au8; 32]);
         });
         assert_eq!(
-            recv.ingest(&bytes, NOW),
+            recv.ingest_reply(&bytes, NOW),
             ChannelReply::Rejected(RejectReason::WrongManifest)
         );
     }
@@ -2845,7 +3687,7 @@ mod ingress {
             e.channel_sig = to_hex(&sig.serialize_der());
         });
         assert_eq!(
-            recv.ingest(&bytes, NOW),
+            recv.ingest_reply(&bytes, NOW),
             ChannelReply::Rejected(RejectReason::BadChannelSig)
         );
     }
@@ -2857,7 +3699,7 @@ mod ingress {
         // 400s in the past, outside the 300s past window.
         let bytes = envelope_bytes(&fx, &send, 1, "c", NOW - 400, |_| {});
         assert_eq!(
-            recv.ingest(&bytes, NOW),
+            recv.ingest_reply(&bytes, NOW),
             ChannelReply::Rejected(RejectReason::StaleTimestamp)
         );
     }
@@ -2877,10 +3719,13 @@ mod ingress {
         let bytes = serde_json::to_vec(&env).expect("json");
         // First sight at now: passes freshness (ts=now+60), unknown candidate, nonce
         // consumed.
-        assert_eq!(recv.ingest(&bytes, NOW), ChannelReply::UnknownCandidate);
+        assert_eq!(
+            recv.ingest_reply(&bytes, NOW),
+            ChannelReply::UnknownCandidate
+        );
         // Replay 60s later, still within the future-stamp's validity → replay.
         assert_eq!(
-            recv.ingest(&bytes, NOW + 60),
+            recv.ingest_reply(&bytes, NOW + 60),
             ChannelReply::Rejected(RejectReason::ReplayedNonce)
         );
     }
@@ -2895,10 +3740,13 @@ mod ingress {
             .build_envelope("partial", 1, &payload, NOW)
             .expect("env");
         let bytes = serde_json::to_vec(&env).expect("json");
-        assert_eq!(recv.ingest(&bytes, NOW), ChannelReply::UnknownCandidate);
+        assert_eq!(
+            recv.ingest_reply(&bytes, NOW),
+            ChannelReply::UnknownCandidate
+        );
         assert_eq!(recv.nonce_len(), 1);
         assert_eq!(
-            recv.ingest(&bytes, NOW),
+            recv.ingest_reply(&bytes, NOW),
             ChannelReply::Rejected(RejectReason::ReplayedNonce)
         );
         // A later fresh envelope prunes the now-old nonce: the set stays bounded.
@@ -2906,7 +3754,7 @@ mod ingress {
             .build_envelope("partial", 1, &payload, NOW + 400)
             .expect("env2");
         assert_eq!(
-            recv.ingest(&serde_json::to_vec(&env2).expect("json"), NOW + 400),
+            recv.ingest_reply(&serde_json::to_vec(&env2).expect("json"), NOW + 400),
             ChannelReply::UnknownCandidate
         );
         assert_eq!(recv.nonce_len(), 1, "the old nonce pruned by its timestamp");
@@ -2931,7 +3779,7 @@ mod ingress {
                 .expect("replay envelope");
             let replay_body = serde_json::to_vec(&replay).expect("json");
             assert_eq!(
-                recv.ingest(&replay_body, base),
+                recv.ingest_reply(&replay_body, base),
                 ChannelReply::UnknownCandidate,
                 "first sight consumes the nonce"
             );
@@ -2946,12 +3794,12 @@ mod ingress {
                 let old_barrier = Arc::clone(&barrier);
                 let old = scope.spawn(move || {
                     old_barrier.wait();
-                    old_recv.ingest(&replay_body, base)
+                    old_recv.ingest_reply(&replay_body, base)
                 });
                 let new_recv = Arc::clone(&recv);
                 let new = scope.spawn(move || {
                     barrier.wait();
-                    new_recv.ingest(&advancing_body, base + 400)
+                    new_recv.ingest_reply(&advancing_body, base + 400)
                 });
                 (
                     old.join().expect("replay thread"),
@@ -2985,7 +3833,7 @@ mod ingress {
                 .build_envelope("partial", 1, &payload, NOW)
                 .expect("env");
             assert_eq!(
-                recv.ingest(&serde_json::to_vec(&env).expect("json"), NOW),
+                recv.ingest_reply(&serde_json::to_vec(&env).expect("json"), NOW),
                 ChannelReply::UnknownCandidate
             );
         }
@@ -2993,9 +3841,37 @@ mod ingress {
             .build_envelope("partial", 1, &payload, NOW)
             .expect("env");
         assert!(matches!(
-            recv.ingest(&serde_json::to_vec(&env).expect("json"), NOW),
+            recv.ingest_reply(&serde_json::to_vec(&env).expect("json"), NOW),
             ChannelReply::RateLimited { .. }
         ));
+    }
+
+    #[test]
+    fn fresh_nonces_over_quota_do_not_grow_the_replay_cache() {
+        let fx = Fixture::new(2, 3);
+        let send = fx.channel_state(0);
+        let node = crate::Node::from_toml_str(&fx.config(1, 0, "per_peer_quota_per_min = 2\n"))
+            .expect("config");
+        let recv = node.channel.as_ref().expect("channel");
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let payload = fx.partial_payload(&psbt, "c", 0, 0).to_bytes();
+
+        for attempt in 0..32 {
+            let env = send
+                .build_envelope("partial", 1, &payload, NOW)
+                .expect("fresh envelope");
+            let reply = recv.ingest_reply(&serde_json::to_vec(&env).expect("json"), NOW);
+            if attempt < 2 {
+                assert_eq!(reply, ChannelReply::UnknownCandidate);
+            } else {
+                assert!(matches!(reply, ChannelReply::RateLimited { .. }));
+            }
+        }
+        assert_eq!(
+            recv.nonce_len(),
+            2,
+            "only quota-admitted nonces are retained; an authenticated flood stays bounded"
+        );
     }
 
     #[test]
@@ -3046,11 +3922,11 @@ mod ingress {
             .expect("stale envelope");
         let stale_body = serde_json::to_vec(&stale).expect("json");
         assert_eq!(
-            stale_recv.ingest(&stale_body, NOW),
+            stale_recv.ingest_reply(&stale_body, NOW),
             ChannelReply::Rejected(RejectReason::StaleTimestamp)
         );
         assert!(matches!(
-            stale_recv.ingest(&stale_body, NOW),
+            stale_recv.ingest_reply(&stale_body, NOW),
             ChannelReply::RateLimited { .. }
         ));
         assert_eq!(
@@ -3070,28 +3946,26 @@ mod ingress {
             .expect("replay envelope");
         let replay_body = serde_json::to_vec(&replay).expect("json");
         assert_eq!(
-            replay_recv.ingest(&replay_body, NOW),
+            replay_recv.ingest_reply(&replay_body, NOW),
             ChannelReply::UnknownCandidate
         );
         assert_eq!(
-            replay_recv.ingest(&replay_body, NOW),
+            replay_recv.ingest_reply(&replay_body, NOW),
             ChannelReply::Rejected(RejectReason::ReplayedNonce)
         );
         assert!(matches!(
-            replay_recv.ingest(&replay_body, NOW),
+            replay_recv.ingest_reply(&replay_body, NOW),
             ChannelReply::RateLimited { .. }
         ));
     }
 
     #[test]
-    fn rate_limited_envelopes_still_consume_their_nonce_so_replay_stays_closed() {
-        // codex adversarial 2026-07-17: a rate-limited authenticated envelope must
-        // STILL consume its nonce, so it cannot be captured and replayed after the
-        // quota window resets. Replay-safety must not rest on message idempotency
-        // (a future non-idempotent msg_type would inherit the hole), so the nonce
-        // is consumed for any authenticated + fresh envelope BEFORE the quota
-        // check. Cache growth stays bounded by the freshness-horizon prune
-        // (FRESHNESS_PAST_SECS) plus the per-peer rate, not by dropping nonces.
+    fn a_rate_limited_envelope_can_be_retried_after_the_quota_window() {
+        // RATE_LIMITED means the envelope was not dispatched. Retaining every
+        // fresh over-quota nonce would let an authenticated peer grow the cache at
+        // line rate despite the quota. Retrying later is safe for today's message
+        // types: partial delivery is idempotent and request delivery has a second,
+        // coordinator-authenticated single-use nonce at the node handler.
         let fx = Fixture::new(2, 3);
         let send = fx.channel_state(0);
         let node = crate::Node::from_toml_str(&fx.config(1, 0, "per_peer_quota_per_min = 1\n"))
@@ -3105,31 +3979,29 @@ mod ingress {
             .build_envelope("partial", 1, &payload, NOW)
             .expect("e1");
         assert_eq!(
-            recv.ingest(&serde_json::to_vec(&e1).expect("json"), NOW),
+            recv.ingest_reply(&serde_json::to_vec(&e1).expect("json"), NOW),
             ChannelReply::UnknownCandidate
         );
         assert_eq!(recv.nonce_len(), 1);
 
-        // A flood of distinct rate-limited envelopes is REJECTED for rate, but each
-        // still records its nonce (replay-closed) — the cache grows with the flood
-        // and is bounded by the freshness prune, not by dropping unrecorded nonces.
-        let mut last = Vec::new();
-        for i in 0..64 {
-            let e = send.build_envelope("partial", 1, &payload, NOW).expect("e");
-            last = serde_json::to_vec(&e).expect("json");
-            assert!(matches!(
-                recv.ingest(&last, NOW),
-                ChannelReply::RateLimited { .. }
-            ));
-            assert_eq!(recv.nonce_len(), 2 + i as usize);
-        }
+        // The next distinct envelope is rate-limited without being retained.
+        let retry = send
+            .build_envelope("partial", 1, &payload, NOW)
+            .expect("retry envelope");
+        let retry_body = serde_json::to_vec(&retry).expect("json");
+        assert!(matches!(
+            recv.ingest_reply(&retry_body, NOW),
+            ChannelReply::RateLimited { .. }
+        ));
+        assert_eq!(recv.nonce_len(), 1);
 
-        // Replaying the last rate-limited envelope after the quota window resets is
-        // caught as a REPLAY (its nonce was recorded), not admitted — the fix.
+        // Once the rolling quota resets, the same never-dispatched envelope is
+        // admitted and retained exactly once.
         assert_eq!(
-            recv.ingest(&last, NOW + QUOTA_WINDOW_SECS),
-            ChannelReply::Rejected(RejectReason::ReplayedNonce)
+            recv.ingest_reply(&retry_body, NOW + QUOTA_WINDOW_SECS),
+            ChannelReply::UnknownCandidate
         );
+        assert_eq!(recv.nonce_len(), 2);
     }
 
     #[test]
@@ -3188,7 +4060,10 @@ mod ingress {
         // An UNKNOWN_CANDIDATE outcome proves the envelope authenticated (sig +
         // freshness + nonce all passed) before the payload was even looked up.
         let bytes = envelope_bytes(&fx, &send, 1, "no-such-candidate", NOW, |_| {});
-        assert_eq!(recv.ingest(&bytes, NOW), ChannelReply::UnknownCandidate);
+        assert_eq!(
+            recv.ingest_reply(&bytes, NOW),
+            ChannelReply::UnknownCandidate
+        );
     }
 }
 
@@ -3199,10 +4074,38 @@ mod partial {
     use super::fixture::{deliver, Fixture};
     use super::*;
     use bitcoin::secp256k1::{Message, Secp256k1};
-    use bitcoin::Txid;
+    use bitcoin::{Txid, Witness};
+    use vault_proto::SignResponse;
 
     const NOW: u64 = 1_752_000_000;
     const EXPIRY: u64 = NOW + 3_600;
+
+    #[test]
+    fn candidate_build_canonicalizes_coordinator_controlled_finalization_fields() {
+        let fx = Fixture::new(2, 3);
+        let mut psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        psbt.inputs[0].witness_script = None;
+        psbt.inputs[0].redeem_script = Some(ScriptBuf::from_bytes(vec![0x51]));
+        psbt.inputs[0].sighash_type = Some(EcdsaSighashType::Single.into());
+        psbt.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x51]));
+        psbt.inputs[0].final_script_witness = Some(Witness::from_slice(&[b"coordinator"]));
+
+        let candidate = fx.candidate(&psbt, "canonical-finalization", EXPIRY);
+        let input = &candidate.psbt.inputs[0];
+        assert_eq!(
+            input.witness_script.as_ref(),
+            Some(&fx.witness_script),
+            "the node's configured P2WSH script is authoritative"
+        );
+        assert!(input.redeem_script.is_none());
+        assert_eq!(
+            input.sighash_type,
+            Some(EcdsaSighashType::All.into()),
+            "candidate finalization must use the verified SIGHASH_ALL contract"
+        );
+        assert!(input.final_script_sig.is_none());
+        assert!(input.final_script_witness.is_none());
+    }
 
     #[test]
     fn every_signed_envelope_field_is_covered_by_the_channel_signature() {
@@ -3492,7 +4395,7 @@ mod partial {
     #[test]
     fn no_channel_message_ever_triggers_signing() {
         // Signing-oracle prohibition (§7): a partial imports the PEER's signature,
-        // never the node's own — and the sign log is untouched.
+        // never the node's own — and the authorized set is untouched.
         let fx = Fixture::new(2, 3);
         let send = fx.channel_state(0);
         let node = crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("config");
@@ -3505,9 +4408,10 @@ mod partial {
             ChannelReply::Accepted
         );
         // The node NEVER produced a signature: its own federation key is absent
-        // from the candidate PSBT, and its sign log is empty.
+        // from the candidate PSBT (the fixture registered it unsigned), and it
+        // authorized nothing — a peer message cannot make a node accept a spend.
         assert!(!recv.psbt_has_pubkey("cid", 0, &fx.entries[1].fed_pk));
-        assert!(node.sign_log.lock().expect("sign_log").is_empty());
+        assert!(node.authorized.lock().expect("authorized").is_empty());
     }
 
     #[test]
@@ -3559,6 +4463,28 @@ mod partial {
         assert!(
             !recv.has_candidate("cid"),
             "the expired candidate was evicted on lookup"
+        );
+    }
+
+    #[test]
+    fn a_partial_arriving_in_the_final_authorized_second_is_accepted_not_evicted() {
+        let fx = Fixture::new(2, 3);
+        let (send, recv) = (fx.channel_state(0), fx.channel_state(1));
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        // Candidate expiry EXACTLY at the delivery instant. `prune` keeps a candidate
+        // live at `now == expiry` (its final authorized second) and `FireWindow` is
+        // inclusive at its deadline, so a quorum partial arriving in that second must
+        // be verified and stored — not answered UnknownCandidate with the candidate
+        // evicted, which would sabotage a broadcast the fire path still authorizes.
+        recv.register_candidate(fx.candidate(&psbt, "cid", NOW));
+        let payload = fx.partial_payload(&psbt, "cid", 0, 0);
+        assert_eq!(
+            deliver(&send, &recv, "partial", &payload.to_bytes(), NOW, NOW),
+            ChannelReply::Accepted
+        );
+        assert!(
+            recv.has_candidate("cid"),
+            "the candidate survives its final authorized second and stores the partial"
         );
     }
 
@@ -3652,67 +4578,21 @@ mod partial {
         assert!(store.reserved_bytes <= store.max_bytes);
     }
 
+    /// Model B registers a candidate that is ALREADY fully signed — there is no
+    /// Pending→Signed transition to lose anything across. What must still hold is
+    /// that a re-send disturbs nothing: the registered candidate keeps its own
+    /// signature, keeps any peer partials that arrived, and keeps the user
+    /// signature instance those payloads are bound to.
+    ///
+    /// The re-send here carries a DIFFERENT but equally valid user signature (ECDSA
+    /// encodings are not unique, and a user signature is not part of the unsigned
+    /// commitment). It must not borrow the first request's cached Accepted verdict:
+    /// peers bind partials to `user_sig_hash`, so admitting both instances could
+    /// split the combine set. The resident stays untouched and the conflict is
+    /// refused.
     #[test]
-    fn a_pending_candidate_gains_the_local_signature_without_losing_peer_partials() {
-        use vault_proto::{SignRequest, SignResponse};
-
-        let fx = Fixture::new(2, 3);
-        let sender = fx.channel_state(0);
-        let node = crate::Node::from_toml_str(&fx.config(1, 10, "")).expect("config");
-        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
-        let mut request = SignRequest {
-            psbt: psbt.to_string(),
-            escape_psbt: psbt.to_string(),
-            pin: "1234".to_string(),
-            nonce: String::new(),
-            expiry: NOW + 3_600,
-            policy_version: 1,
-            coord_sig: String::new(),
-        };
-        fx.coord_sign(&mut request, "pending-candidate");
-        assert!(matches!(
-            crate::handle_sign(&node, &request, NOW).expect("pending verdict"),
-            SignResponse::Pending(_)
-        ));
-        let channel = node.channel.as_ref().expect("channel");
-        let commitment_id = channel
-            .candidate_ids()
-            .into_iter()
-            .next()
-            .expect("pending candidate");
-        let peer_payload = fx.partial_payload(&psbt, &commitment_id, 0, 0);
-        assert_eq!(
-            deliver(
-                &sender,
-                channel,
-                "partial",
-                &peer_payload.to_bytes(),
-                NOW,
-                NOW
-            ),
-            ChannelReply::Accepted
-        );
-
-        // Resubmitting past the Hold: same commitment, fresh nonce per send.
-        fx.coord_sign(&mut request, "pending-candidate-past-hold");
-        assert!(matches!(
-            crate::handle_sign(&node, &request, NOW + 10).expect("signed verdict"),
-            SignResponse::Signed(_)
-        ));
-        assert!(
-            channel.partial_stored(&commitment_id, 0, 0),
-            "the peer partial received during Hold must survive the signed verdict"
-        );
-        assert!(
-            channel.partial_payload_for(&commitment_id, 0).is_some(),
-            "the signed verdict must add this node's own partial to the candidate"
-        );
-    }
-
-    #[test]
-    fn a_changed_valid_user_signature_does_not_drop_the_local_or_peer_partial() {
-        use vault_proto::{SignRequest, SignResponse};
-
+    fn a_resend_with_a_different_valid_user_signature_is_refused_and_leaves_the_candidate_untouched(
+    ) {
         let fx = Fixture::new(2, 3);
         let sender = fx.channel_state(0);
         let node = crate::Node::from_toml_str(&fx.config(1, 10, "")).expect("config");
@@ -3723,26 +4603,13 @@ mod partial {
             .expect("original user signature")
             .signature
             .serialize_der();
-        let mut request = SignRequest {
-            psbt: psbt.to_string(),
-            escape_psbt: psbt.to_string(),
-            pin: "1234".to_string(),
-            nonce: String::new(),
-            expiry: NOW + 3_600,
-            policy_version: 1,
-            coord_sig: String::new(),
-        };
-        fx.coord_sign(&mut request, "changed-user-sig");
+        let request = fx.spend_request(&psbt, NOW + 3_600, "changed-user-sig");
         assert!(matches!(
-            crate::handle_sign(&node, &request, NOW).expect("pending verdict"),
-            SignResponse::Pending(_)
+            crate::handle_sign(&node, &request, NOW).expect("accepted verdict"),
+            SignResponse::Accepted(_)
         ));
         let channel = node.channel.as_ref().expect("channel");
-        let commitment_id = channel
-            .candidate_ids()
-            .into_iter()
-            .next()
-            .expect("pending candidate");
+        let commitment_id = crate::commitment_id_for(&node, &psbt, NOW + 3_600);
         let original_user_sig_hash = channel
             .store
             .lock()
@@ -3751,6 +4618,12 @@ mod partial {
             .get(&commitment_id)
             .expect("candidate")
             .user_sig_hash;
+        // Sign-at-ingress: this node's own partial is in the candidate already,
+        // before any Hold elapses and before any peer says anything.
+        assert!(
+            channel.psbt_has_pubkey(&commitment_id, 0, &fx.entries[1].fed_pk),
+            "Model B signs at ingress: the candidate carries this node's partial from birth"
+        );
 
         let peer_payload = fx.partial_payload(&psbt, &commitment_id, 0, 0);
         assert_eq!(
@@ -3765,8 +4638,8 @@ mod partial {
             ChannelReply::Accepted
         );
 
-        // Re-sign the same SIGHASH_ALL message with extra nonce data. This is a
-        // distinct, valid ECDSA encoding over the same commitment.
+        // Re-sign the same SIGHASH_ALL message with extra nonce data: a distinct,
+        // valid ECDSA encoding over the same commitment.
         let mut resigned = psbt.clone();
         let value = resigned.inputs[0]
             .witness_utxo
@@ -3789,20 +4662,15 @@ mod partial {
                 sighash_type: EcdsaSighashType::All,
             },
         );
-        let mut resigned_request = SignRequest {
-            psbt: resigned.to_string(),
-            escape_psbt: resigned.to_string(),
-            ..request
+        // The unsigned commitment is unchanged, but accepted replay identity binds
+        // the complete request pair, so this reaches the registry conflict check.
+        let resent = fx.spend_request(&resigned, NOW + 3_600, "changed-user-sig-resend");
+        let refusal = match crate::handle_sign(&node, &resent, NOW + 10).expect("verdict") {
+            SignResponse::Refusal(refusal) => refusal,
+            other => panic!("the conflicting user-signature instance must be refused: {other:?}"),
         };
-        // A new transmission carrying different bytes: the coordinator signs what
-        // it relays, so the re-signed PSBT gets a fresh nonce + coord_sig. (The
-        // commitment is unchanged — a user signature is not part of it — which is
-        // exactly what keeps the candidate's peer partials alive below.)
-        fx.coord_sign(&mut resigned_request, "changed-user-sig-resend");
-        assert!(matches!(
-            crate::handle_sign(&node, &resigned_request, NOW + 10).expect("signed verdict"),
-            SignResponse::Signed(_)
-        ));
+        assert_eq!(refusal.code, vault_proto::RefusalCode::PsbtInconsistent);
+        assert_eq!(refusal.check, "candidate_identity");
 
         let store = channel.store.lock().expect("store");
         let candidate = store
@@ -3811,7 +4679,7 @@ mod partial {
             .expect("candidate remains registered");
         assert_eq!(
             candidate.user_sig_hash, original_user_sig_hash,
-            "the candidate retains the user-signature instance named by peer payloads"
+            "the candidate retains the user-signature instance peer payloads name"
         );
         assert_eq!(
             candidate.psbt.inputs[0]
@@ -3824,27 +4692,62 @@ mod partial {
         );
         assert!(
             candidate.partials.contains_key(&(0, 0)),
-            "the peer partial received during Hold must survive"
+            "the peer partial must survive a re-send"
         );
         assert!(
             candidate.psbt.inputs[0]
                 .partial_sigs
                 .contains_key(&fx.entries[1].fed_pk),
-            "the signed verdict must import this node's new local partial"
+            "this node's own partial must survive a re-send"
         );
     }
 
     #[test]
-    fn a_coordinator_forged_federation_partial_never_survives_into_the_candidate() {
-        use vault_proto::{SignRequest, SignResponse};
+    fn a_resend_with_a_different_mandatory_escape_is_refused_without_repairing_the_pair() {
+        let fx = Fixture::new(2, 3);
+        let node = crate::Node::from_toml_str(&fx.config(1, 10, "")).expect("config");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let original = fx.spend_request(&spend, NOW + 3_600, "original-pair");
+        assert!(matches!(
+            crate::handle_sign(&node, &original, NOW).expect("accepted"),
+            SignResponse::Accepted(_)
+        ));
+        let channel = node.channel.as_ref().expect("channel");
+        let spend_cid = crate::commitment_id_for(&node, &spend, NOW + 3_600);
+        let original_escape = Psbt::from_str(&original.escape_psbt).expect("original escape");
+        let original_escape_cid = crate::commitment_id_for(&node, &original_escape, NOW + 3_600);
 
+        // Same exact spend, a different but independently valid escape transaction.
+        let replacement_escape = fx.spend_psbt(&fx.escape_spk, 8);
+        let replacement_escape_cid =
+            crate::commitment_id_for(&node, &replacement_escape, NOW + 3_600);
+        assert_ne!(original_escape_cid, replacement_escape_cid);
+        let mut conflicting = fx.spend_request(&spend, NOW + 3_600, "replacement-pair");
+        conflicting.escape_psbt = replacement_escape.to_string();
+        fx.coord_sign(&mut conflicting, "replacement-pair-signed");
+        let refusal = match crate::handle_sign(&node, &conflicting, NOW + 1).expect("verdict") {
+            SignResponse::Refusal(refusal) => refusal,
+            other => panic!("the conflicting mandatory escape must be refused: {other:?}"),
+        };
+        assert_eq!(refusal.code, vault_proto::RefusalCode::PsbtInconsistent);
+        assert_eq!(refusal.check, "candidate_identity");
+        assert_eq!(channel.store_len(), 2, "no orphan replacement was inserted");
+        assert_eq!(
+            channel.pairing(&spend_cid),
+            Some((CandidateRole::Spend, original_escape_cid)),
+            "the first accepted pair remains authoritative on this node"
+        );
+        assert!(channel.pairing(&replacement_escape_cid).is_none());
+    }
+
+    #[test]
+    fn a_coordinator_forged_federation_partial_never_survives_into_the_candidate() {
         // A pure-relay coordinator plants a bogus partial_sig under THIS node's
         // federation signing key in the request PSBT. `verify_user_signatures`
-        // checks only the user entry, so the forgery clears ingress. If the candidate
-        // kept it, the Pending→Signed `or_insert` merge would pin the forgery over
-        // this node's real signature — relaying garbage every peer rejects and
-        // silently dropping the node from the combine set (a coordinator gaining
-        // power over assembly, which Model B forbids).
+        // checks only the user entry, so the forgery clears ingress. If the
+        // candidate kept it, this node would release garbage every peer rejects and
+        // drop itself from the combine set — a coordinator gaining power over
+        // assembly, which Model B forbids.
         let fx = Fixture::new(2, 3);
         let node = crate::Node::from_toml_str(&fx.config(1, 10, "")).expect("config");
         let mut psbt = fx.spend_psbt(&fx.hot_spk, 7);
@@ -3857,41 +4760,22 @@ mod partial {
                 sighash_type: EcdsaSighashType::All,
             },
         );
-        let mut request = SignRequest {
-            psbt: psbt.to_string(),
-            escape_psbt: psbt.to_string(),
-            pin: "1234".to_string(),
-            nonce: String::new(),
-            expiry: NOW + 3_600,
-            policy_version: 1,
-            coord_sig: String::new(),
-        };
-        fx.coord_sign(&mut request, "forged-partial-first");
-        // Pending registers the candidate; the forged self entry must be stripped.
+        let request = fx.spend_request(&psbt, NOW + 3_600, "forged-partial");
         assert!(matches!(
-            crate::handle_sign(&node, &request, NOW).expect("pending verdict"),
-            SignResponse::Pending(_)
-        ));
-        // The Hold elapses and the node signs; its OWN real partial must reach the
-        // candidate, not the coordinator's forgery. Resubmitting past the Hold is a
-        // second transmission of the same commitment, so it carries a fresh nonce.
-        fx.coord_sign(&mut request, "forged-partial-past-hold");
-        assert!(matches!(
-            crate::handle_sign(&node, &request, NOW + 10).expect("signed verdict"),
-            SignResponse::Signed(_)
+            crate::handle_sign(&node, &request, NOW).expect("accepted verdict"),
+            SignResponse::Accepted(_)
         ));
         let channel = node.channel.as_ref().expect("channel");
-        let cid = channel
-            .candidate_ids()
-            .into_iter()
-            .next()
-            .expect("candidate");
-        let payload = channel
-            .partial_payload_for(&cid, 0)
-            .expect("this node's own partial");
-        // The relayed partial must be this node's REAL signature: it verifies against
-        // node 1's federation key over the node's own recomputed sighash. The forged
-        // sig (over a different digest) would fail this check.
+        let cid = crate::commitment_id_for(&node, &psbt, NOW + 3_600);
+
+        // Fire the candidate so the release gate hands back what this node WOULD
+        // relay: its own real signature, never the coordinator's forgery. (The Hold
+        // is 10s, so the fire event is NOW + 10.)
+        let release = channel
+            .release_partials(&cid, NOW + 10)
+            .expect("the fire event has arrived");
+        let payload: PartialPayload =
+            serde_json::from_slice(&release.payloads[0].to_bytes()).expect("payload");
         let der = from_hex_vec(&payload.partial_sig).expect("der hex");
         let sig = Signature::from_der(&der).expect("der");
         let value = psbt.inputs[0]
@@ -3908,35 +4792,38 @@ mod partial {
                 &sig,
                 &fx.entries[1].fed_pk.inner,
             )
-            .expect("the relayed partial must be this node's real signature");
+            .expect("the released partial must be this node's real signature, not the forgery");
     }
 
     #[test]
-    fn the_sign_verdict_is_unchanged_when_the_store_is_at_capacity() {
-        use vault_proto::{SignRequest, SignResponse};
+    fn an_unregistrable_pair_is_refused_atomically_at_capacity() {
         let fx = Fixture::new(2, 3);
+        // One slot: the first accepted request's PAIR (spend + escape) already
+        // needs two. Neither half may be inserted and the request cannot be
+        // acknowledged: the coordinator has no signature fallback in Model B.
         let node = crate::Node::from_toml_str(&fx.config(1, 0, "max_active_candidates = 1\n"))
             .expect("config");
-        let sign = |txid: u8| {
-            let psbt = fx.spend_psbt(&fx.hot_spk, txid);
-            let mut req = SignRequest {
-                psbt: psbt.to_string(),
-                escape_psbt: psbt.to_string(),
-                pin: "1234".to_string(),
-                nonce: String::new(),
-                expiry: NOW + 3_600,
-                policy_version: 1,
-                coord_sig: String::new(),
-            };
-            // Distinct spends ⇒ distinct nonces: each is its own transmission.
-            fx.coord_sign(&mut req, &format!("capacity-{txid}"));
-            crate::handle_sign(&node, &req, NOW).expect("decodable")
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let req = fx.spend_request(&psbt, NOW + 3_600, "capacity-pair");
+        let refusal = match crate::handle_sign(&node, &req, NOW).expect("decodable") {
+            SignResponse::Refusal(refusal) => refusal,
+            other => panic!("an unregistrable pair must not be acknowledged: {other:?}"),
         };
-        // Both spends sign; the second is not registered (store full) but its
-        // verdict is unchanged — capacity gates the registry slot, not the sign.
-        assert!(matches!(sign(7), SignResponse::Signed(_)));
-        assert!(matches!(sign(8), SignResponse::Signed(_)));
-        assert_eq!(node.channel.as_ref().expect("channel").store_len(), 1);
+        assert_eq!(refusal.code, vault_proto::RefusalCode::CandidateCapacity);
+        assert_eq!(refusal.check, "candidate_registry_capacity");
+        assert_eq!(
+            node.channel.as_ref().expect("channel").store_len(),
+            0,
+            "capacity preflight inserts neither half of the pair"
+        );
+        assert!(
+            node.authorized.lock().expect("authorized").is_empty(),
+            "a capacity-refused transaction is not watchtower-recognized or parent-authorized"
+        );
+        assert!(
+            node.outbox.lock().expect("outbox").is_empty(),
+            "a refused request is not propagated as accepted work"
+        );
     }
 }
 
@@ -4062,7 +4949,7 @@ mod startup_and_schema {
                 .build_envelope("partial", 1, &payload, NOW - 400)
                 .expect("env");
             assert_eq!(
-                recv.ingest(&serde_json::to_vec(&env).expect("json"), NOW),
+                recv.ingest_reply(&serde_json::to_vec(&env).expect("json"), NOW),
                 ChannelReply::Rejected(RejectReason::StaleTimestamp)
             );
             assert_eq!(
@@ -4085,7 +4972,7 @@ mod startup_and_schema {
             .build_envelope("partial", 1, &payload, u64::MAX)
             .expect("env");
         assert_eq!(
-            recv.ingest(&serde_json::to_vec(&env).expect("json"), NOW),
+            recv.ingest_reply(&serde_json::to_vec(&env).expect("json"), NOW),
             ChannelReply::Rejected(RejectReason::StaleTimestamp)
         );
         let skew = node.events(0).0.into_iter().find_map(|event| match event {
@@ -4126,19 +5013,6 @@ mod startup_and_schema {
 }
 
 #[cfg(test)]
-impl ChannelState {
-    pub(crate) fn candidate_ids(&self) -> Vec<String> {
-        self.store
-            .lock()
-            .expect("store lock")
-            .candidates
-            .keys()
-            .cloned()
-            .collect()
-    }
-}
-
-#[cfg(test)]
 mod net {
     //! Real-path (loopback axum + reqwest) and retry-control tests.
     use super::fixture::Fixture;
@@ -4149,7 +5023,7 @@ mod net {
     use std::sync::Mutex as StdMutex;
 
     use crate::server;
-    use vault_proto::{SignRequest, SignResponse, TaggedRequest};
+    use vault_proto::{SignResponse, TaggedRequest};
 
     async fn ephemeral() -> (tokio::net::TcpListener, u16) {
         let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -4159,8 +5033,15 @@ mod net {
         (l, port)
     }
 
+    /// §3 end to end over the real network: a request delivered to **ONE** node
+    /// reaches the other, which registers the same paired candidates and signs at
+    /// ingress — then the two exchange a verified partial over the real `/channel`.
+    ///
+    /// This is what makes selective delivery useless to a post-wrench coordinator,
+    /// and it is what V0-4b will rely on so a duress request that reaches one node
+    /// arms the rest.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn two_nodes_exchange_a_verified_partial_through_the_real_sign_and_channel_paths() {
+    async fn a_request_delivered_to_one_node_propagates_to_the_other_over_the_real_paths() {
         let (l0, p0) = ephemeral().await;
         let (l1, p1) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[p0, p1]);
@@ -4170,54 +5051,74 @@ mod net {
         tokio::spawn(server::serve(l1, Arc::clone(&node1)));
 
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
-        let mut req = SignRequest {
-            psbt: psbt.to_string(),
-            escape_psbt: psbt.to_string(),
-            pin: "1234".to_string(),
-            nonce: String::new(),
-            expiry: unix_now() + 3_600,
-            policy_version: 1,
-            coord_sig: String::new(),
-        };
-        // ONE coordinator signature fans to all n nodes (ADR-0013 §2 node-fan-out):
-        // the nonce log is per-node, so each node sees this nonce exactly once. A
-        // per-node signature is neither needed nor what the coordinator does.
-        fx.coord_sign(&mut req, "net-fanout");
-        // Each node receives the spend via the REAL POST /sign, registering the
-        // candidate (no test-only injection).
+        let expiry = unix_now() + 3_600;
+        let req = fx.spend_request(&psbt, expiry, "net-propagation");
+
+        // ONE node is told. node1 is never contacted by the "coordinator" here.
         let client = reqwest::Client::new();
-        for port in [p0, p1] {
-            let resp = client
-                .post(format!("http://127.0.0.1:{port}/sign"))
-                .json(&TaggedRequest::Spend(req.clone()))
-                .send()
-                .await
-                .expect("sign send");
-            assert!(resp.status().is_success());
-            let body: SignResponse = resp.json().await.expect("sign body");
-            assert!(matches!(body, SignResponse::Signed(_)), "got {body:?}");
-        }
+        let resp = client
+            .post(format!("http://127.0.0.1:{p0}/sign"))
+            .json(&TaggedRequest::Spend(req.clone()))
+            .send()
+            .await
+            .expect("sign send");
+        assert!(resp.status().is_success());
+        let body: SignResponse = resp.json().await.expect("sign body");
+        assert!(matches!(body, SignResponse::Accepted(_)), "got {body:?}");
 
         let ch0 = node0.channel.as_ref().expect("ch0");
         let ch1 = node1.channel.as_ref().expect("ch1");
-        let cid = ch0
-            .candidate_ids()
-            .first()
-            .cloned()
-            .expect("node0 candidate");
+        let cid = crate::commitment_id_for(&node0, &psbt, expiry);
+        assert!(ch0.has_candidate(&cid), "the delivered node registered it");
+
+        // node1 learns the request from node0's propagation alone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ch1.has_candidate(&cid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node1 never learned the request: propagation did not reach it"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // It did not merely record it — it ran its OWN gates and signed at ingress,
+        // which is what makes it useful to the combine.
         assert!(
-            ch1.has_candidate(&cid),
-            "both nodes registered the same commitment"
+            ch1.psbt_has_pubkey(&cid, 0, &fx.entries[1].fed_pk),
+            "a propagated request must be validated and signed by the receiving node itself"
+        );
+        // Both halves of the mandatory pair are registered on the propagated-to
+        // node too (§4).
+        let escape_cid = crate::commitment_id_for(
+            &node1,
+            &Psbt::from_str(&req.escape_psbt).expect("escape psbt"),
+            expiry,
+        );
+        assert!(
+            ch1.has_candidate(&escape_cid),
+            "the escape is registered too"
+        );
+        assert_eq!(
+            ch1.pairing(&cid).expect("pairing").1,
+            escape_cid,
+            "the spend names its escape"
         );
 
-        // node0 sends its partial to node1 over the real /channel.
-        let payload = ch0.partial_payload_for(&cid, 0).expect("payload");
+        // node0 releases at its fire event (hold_secs = 0 ⇒ now) and sends its
+        // partial to node1 over the real /channel.
+        let release = ch0
+            .release_partials(&cid, unix_now())
+            .expect("the fire gate opens at ingress under hold_secs = 0");
         let env = ch0
-            .build_envelope("partial", 1, &payload.to_bytes(), unix_now())
+            .build_envelope(
+                MSG_TYPE_PARTIAL,
+                1,
+                &release.payloads[0].to_bytes(),
+                unix_now(),
+            )
             .expect("envelope");
         let bases = ch0.peer_bases(1).expect("peer bases");
         let base = bases.first().expect("peer base");
-        let reply = send_partial(base, &env, std::time::Duration::from_secs(5), 65_536)
+        let reply = send_envelope(base, &env, std::time::Duration::from_secs(5), 65_536)
             .await
             .expect("send");
         assert_eq!(reply, OutboundReply::Accepted);
@@ -4225,6 +5126,99 @@ mod net {
             ch1.partial_stored(&cid, 0, 0),
             "node1 stored node0's partial"
         );
+    }
+
+    #[test]
+    fn a_relayed_request_rechecks_expiry_after_waiting_for_the_sign_lock() {
+        let fx = Fixture::new(2, 3);
+        let sender = fx.channel_state(0);
+        let node = Arc::new(crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("node"));
+        // Escape-class has no hot Hold+slack floor, so only the coordinator expiry
+        // decides whether this short-lived request remains admissible.
+        let spend = fx.spend_psbt(&fx.escape_spk, 7);
+        let received_at = unix_now();
+        let expiry = received_at + 1;
+        let request = fx.spend_request(&spend, expiry, "relay-lock-expiry");
+        let tagged = TaggedRequest::Spend(request);
+        let envelope = sender
+            .build_envelope(MSG_TYPE_REQUEST, 1, &request_payload(&tagged), received_at)
+            .expect("request envelope");
+        let body = serde_json::to_vec(&envelope).expect("envelope json");
+
+        let sign_guard = node.sign_state.lock().expect("sign state");
+        let worker_node = Arc::clone(&node);
+        let worker = std::thread::spawn(move || {
+            crate::handle_channel_body(&worker_node, &body, received_at)
+        });
+        std::thread::sleep(Duration::from_secs(2));
+        drop(sign_guard);
+
+        assert_eq!(
+            worker.join().expect("relay worker"),
+            ChannelReply::Accepted,
+            "the peer reply remains policy-opaque"
+        );
+        let cid = crate::commitment_id_for(&node, &spend, expiry);
+        assert!(
+            !node.channel.as_ref().expect("channel").has_candidate(&cid),
+            "a request that expired while queued must not register or backdate a candidate"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_request_that_finishes_after_http_timeout_still_propagates() {
+        let (l0, p0) = ephemeral().await;
+        let (l1, p1) = ephemeral().await;
+        let fx = Fixture::with_ports(2, &[p0, p1]);
+        let node0 = Arc::new(crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("node0"));
+        let node1 = Arc::new(crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("node1"));
+        let served0 = Arc::clone(&node0);
+        tokio::spawn(async move {
+            axum::serve(
+                l0,
+                server::app_with_timeout(served0, std::time::Duration::from_millis(1)),
+            )
+            .await
+            .expect("node0 serve");
+        });
+        tokio::spawn(server::serve(l1, Arc::clone(&node1)));
+
+        // Hold sign-state past the HTTP deadline. The blocking sign job remains
+        // detached; when it eventually commits, that same detached job must drain
+        // the newly staged outbox entry.
+        let gate = Arc::clone(&node0);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = gate.sign_state.lock().expect("sign_state");
+            held_tx.send(()).expect("held signal");
+            release_rx.recv().expect("release signal");
+        });
+        held_rx.recv().expect("sign lock held");
+
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let expiry = unix_now() + 3_600;
+        let request = fx.spend_request(&psbt, expiry, "timeout-propagation");
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{p0}/sign"))
+            .json(&TaggedRequest::Spend(request))
+            .send()
+            .await
+            .expect("sign send");
+        assert_eq!(response.status().as_u16(), 408);
+
+        release_tx.send(()).expect("release sign job");
+        holder.join().expect("holder thread");
+
+        let cid = crate::commitment_id_for(&node1, &psbt, expiry);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !node1.channel.as_ref().expect("channel").has_candidate(&cid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the post-timeout sign committed but its request never propagated"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4342,7 +5336,13 @@ mod net {
             crate::Node::from_toml_str(&fx.config_with_channel(0, 0, "")).expect("absent node"),
         );
         assert!(node.channel.is_none());
-        tokio::spawn(server::serve(l, Arc::clone(&node)));
+        // Exercise the parser/router seam directly. The runnable daemon refuses
+        // this shape below because Model B has no channel-less completion path.
+        tokio::spawn(async move {
+            axum::serve(l, server::app(node))
+                .await
+                .expect("test router");
+        });
         let resp = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{p}/channel"))
             .body("{}")
@@ -4350,6 +5350,20 @@ mod net {
             .await
             .expect("send");
         assert_eq!(resp.status().as_u16(), 404, "/channel is not mounted");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_runnable_daemon_rejects_absent_channel_mode_before_serving() {
+        let (listener, port) = ephemeral().await;
+        let fx = Fixture::with_ports(2, &[port, port + 1]);
+        let node = Arc::new(
+            crate::Node::from_toml_str(&fx.config_with_channel(0, 0, "")).expect("parsed node"),
+        );
+        let error = server::serve(listener, node)
+            .await
+            .expect_err("a channel-less Model-B daemon must not accept /sign traffic");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("[channel] is required"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4372,8 +5386,8 @@ mod net {
         let live_base = format!("127.0.0.1:{p1}");
         // Concurrent fan-out: the dead peer errors, the live peer still replies.
         let (live, dead) = tokio::join!(
-            send_partial(&live_base, &live_env, dl, 65_536),
-            send_partial("127.0.0.1:1", &dead_env, dl, 65_536),
+            send_envelope(&live_base, &live_env, dl, 65_536),
+            send_envelope("127.0.0.1:1", &dead_env, dl, 65_536),
         );
         assert!(live.is_ok(), "the live peer must reply: {live:?}");
         assert!(dead.is_err(), "the dead peer must error, not panic");
@@ -4429,7 +5443,7 @@ mod net {
             .build_envelope("partial", 1, &payload, unix_now())
             .expect("env");
         let base = format!("127.0.0.1:{p_redir}");
-        let result = send_partial(&base, &env, std::time::Duration::from_secs(2), 65_536).await;
+        let result = send_envelope(&base, &env, std::time::Duration::from_secs(2), 65_536).await;
 
         assert!(
             result.is_err(),
@@ -4556,6 +5570,28 @@ mod net {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn retry_may_attempt_in_the_inclusive_deadline_second() {
+        let calls = AtomicUsize::new(0);
+        let outcome = retry_loop(
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(OutboundReply::Accepted)
+            },
+            10_000,
+            || 10_000,
+            &[Duration::from_secs(1)],
+        )
+        .await;
+
+        assert_eq!(outcome, RetryOutcome::Accepted);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the final legal second must initiate one delivery attempt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn rate_limited_retry_honors_the_peer_retry_after() {
         let calls = AtomicUsize::new(0);
         let start = tokio::time::Instant::now();
@@ -4663,9 +5699,15 @@ mod net {
         tokio::spawn(server::serve(live_listener, Arc::clone(&receiver)));
         let payload = fx.partial_payload(&psbt, "cid", 0, 0);
 
-        retry_partial_until(&sender, 1, &payload, unix_now() + 5)
-            .await
-            .expect("the second endorsed endpoint is live");
+        retry_message_until(
+            &sender,
+            MSG_TYPE_PARTIAL,
+            1,
+            &payload.to_bytes(),
+            unix_now() + 5,
+        )
+        .await
+        .expect("the second endorsed endpoint is live");
         assert!(receiver
             .channel
             .as_ref()
@@ -4695,9 +5737,16 @@ mod net {
         let payload = fx.partial_payload(&psbt, "cid", 0, 0).to_bytes();
         let endpoints = sender.peer_bases(1).expect("peer endpoints");
 
-        // Already-expired commitment ⇒ remaining == 0 on the first endpoint ⇒ the
-        // loop breaks before any send is initiated.
-        let expired = try_partial_endpoints(&sender, 1, &payload, &endpoints, unix_now()).await;
+        // A deadline strictly in the past breaks before any send is initiated.
+        let expired = try_endpoints(
+            &sender,
+            MSG_TYPE_PARTIAL,
+            1,
+            &payload,
+            &endpoints,
+            unix_now().saturating_sub(1),
+        )
+        .await;
         assert!(
             expired.is_err(),
             "no send may start once the commitment has expired"
@@ -4712,9 +5761,16 @@ mod net {
         );
 
         // A live expiry over the identical endpoint reaches the peer and stores.
-        let live = try_partial_endpoints(&sender, 1, &payload, &endpoints, unix_now() + 30)
-            .await
-            .expect("a live commitment reaches the endorsed endpoint");
+        let live = try_endpoints(
+            &sender,
+            MSG_TYPE_PARTIAL,
+            1,
+            &payload,
+            &endpoints,
+            unix_now() + 30,
+        )
+        .await
+        .expect("a live commitment reaches the endorsed endpoint");
         assert_eq!(live, OutboundReply::Accepted);
         assert!(
             receiver
@@ -4797,5 +5853,1029 @@ mod net {
         for j in burst {
             let _ = j.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod fire {
+    //! The V0-8b spine: **release only at fire** (ADR-0012 invariant 7), then
+    //! combine + broadcast behind package acceptance.
+    use super::fixture::{deliver, Fixture};
+    use super::*;
+    use crate::chain::{mock::MockBackend, Prevout};
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::{Amount, OutPoint, TxOut};
+    use vault_proto::SignResponse;
+
+    const NOW: u64 = 1_752_000_000;
+    const HOLD: u64 = 3_600;
+    const EXPIRY: u64 = NOW + 172_800;
+
+    /// A 3-of-5 vault whose node 0 has ACCEPTED one honest hot spend under a Hold,
+    /// plus the spend's commitment id and its PSBT.
+    fn accepted_hot_spend(hold_secs: u64) -> (Fixture, crate::Node, String, Psbt) {
+        let fx = Fixture::new(3, 5);
+        let node = crate::Node::from_toml_str(&fx.config(0, hold_secs, "")).expect("config");
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = fx.spend_request(&psbt, EXPIRY, "fire-fixture");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &psbt, EXPIRY);
+        (fx, node, cid, psbt)
+    }
+
+    /// A backend whose chain view has `psbt`'s single prevout confirmed — so
+    /// package assembly needs no ancestor.
+    fn backend_for(psbt: &Psbt) -> MockBackend {
+        let mut backend = MockBackend::default();
+        backend.prevouts.insert(
+            psbt.unsigned_tx.input[0].previous_output,
+            Prevout {
+                txout: psbt.inputs[0]
+                    .witness_utxo
+                    .clone()
+                    .expect("fixture witness_utxo"),
+                confirmed: true,
+            },
+        );
+        backend
+    }
+
+    /// Give `cid` `count` peer partials on input 0 (node 0 signed at ingress, so
+    /// `count = threshold - 1` reaches quorum).
+    fn deliver_peer_partials(
+        fx: &Fixture,
+        channel: &ChannelState,
+        psbt: &Psbt,
+        cid: &str,
+        count: u16,
+    ) {
+        for signer in 1..=count {
+            let payload = fx.partial_payload(psbt, cid, 0, signer);
+            assert_eq!(
+                deliver(
+                    &fx.channel_state(signer),
+                    channel,
+                    MSG_TYPE_PARTIAL,
+                    &payload.to_bytes(),
+                    NOW,
+                    NOW
+                ),
+                ChannelReply::Accepted,
+                "peer {signer}'s partial must verify and store"
+            );
+        }
+    }
+
+    // -- the partial-release gate (§1, ADR-0012 invariant 7) -----------------
+
+    /// **The load-bearing test.** A node signs at ingress but releases NOTHING
+    /// until its candidate's authorized fire event.
+    ///
+    /// Releasing at ingress would let one compromised node (or anything that could
+    /// solicit a partial) collect `t` peers' partials during the Hold and broadcast
+    /// early — breaking the Hold AND duress silence without compromising `t` nodes.
+    #[test]
+    fn no_partial_is_released_before_the_candidate_fires() {
+        let (_fx, node, cid, _psbt) = accepted_hot_spend(HOLD);
+        let channel = node.channel.as_ref().expect("channel");
+
+        // Signed at ingress — the partial exists...
+        assert!(
+            channel.psbt_has_pubkey(&cid, 0, &node.pubkey),
+            "Model B signs at ingress"
+        );
+        // ...and is withheld for the whole Hold. Every instant before fire.
+        for now in [NOW, NOW + 1, NOW + HOLD / 2, NOW + HOLD - 1] {
+            assert!(
+                channel.release_partials(&cid, now).is_none(),
+                "a partial escaped at {now}, {}s before the fire event",
+                (NOW + HOLD) - now
+            );
+        }
+        assert!(!channel.was_released(&cid));
+    }
+
+    /// The same gate from the attacker's side: a compromised peer that has the
+    /// candidate registered and asks for partials during the Hold gets none. The
+    /// only door is `release_partials`, and it is shut until fire.
+    #[test]
+    fn a_compromised_peer_cannot_obtain_a_partial_before_fire() {
+        let (fx, node, cid, psbt) = accepted_hot_spend(HOLD);
+        let channel = node.channel.as_ref().expect("channel");
+
+        // The compromised peer floods the node with its own partials — a
+        // `partial` message is the only thing it can send about this candidate.
+        // Storing them tells it nothing: nothing goes back.
+        deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
+        assert!(
+            channel.release_partials(&cid, NOW + HOLD - 1).is_none(),
+            "no peer action can open the release gate early"
+        );
+        assert!(!channel.was_released(&cid), "nothing left the node");
+    }
+
+    #[test]
+    fn at_its_fire_event_the_node_releases_its_partial_exactly_once() {
+        let (_fx, node, cid, psbt) = accepted_hot_spend(HOLD);
+        let channel = node.channel.as_ref().expect("channel");
+
+        let release = channel
+            .release_partials(&cid, NOW + HOLD)
+            .expect("the fire event has arrived");
+        assert_eq!(release.payloads.len(), psbt.inputs.len());
+        assert_eq!(release.payloads[0].signer_node_id, 0);
+        assert!(channel.was_released(&cid));
+        // Once. A re-tick must not re-send.
+        assert!(
+            channel.release_partials(&cid, NOW + HOLD + 1).is_none(),
+            "release is a single authorized event, not a repeatable one"
+        );
+    }
+
+    /// The combine deadline is inclusive. In the equality case required by
+    /// `EXPIRY_TOO_SHORT`, pruning must not delete a quorum-complete candidate
+    /// before its final authorized fire pass.
+    #[tokio::test]
+    async fn a_quorum_at_commitment_expiry_still_broadcasts_in_the_final_legal_second() {
+        let fx = Fixture::new(3, 5);
+        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let expiry = NOW + 60;
+        let request = fx.spend_request(&psbt, expiry, "inclusive-expiry");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &psbt, expiry);
+        deliver_peer_partials(&fx, node.channel.as_ref().expect("channel"), &psbt, &cid, 2);
+
+        assert_eq!(
+            crate::fire_tick(Arc::new(node), Arc::new(backend_for(&psbt)), expiry).await,
+            1,
+            "expiry == deadline remains an authorized combine+broadcast instant"
+        );
+    }
+
+    /// The combine window closes at `min(expiry, fire_at + combine_slack_secs)`:
+    /// past it there is no point releasing a partial nobody can still combine.
+    #[test]
+    fn nothing_is_released_after_the_combine_window_closes() {
+        let (_fx, node, cid, _psbt) = accepted_hot_spend(HOLD);
+        let channel = node.channel.as_ref().expect("channel");
+        let window = channel.fire_window(&cid).expect("the spend is scheduled");
+        assert_eq!(window.fire_at, NOW + HOLD);
+        assert_eq!(
+            window.deadline,
+            NOW + HOLD + 60,
+            "the default combine slack"
+        );
+        assert!(channel
+            .release_partials(&cid, window.deadline + 1)
+            .is_none());
+    }
+
+    // -- the mandatory pair (§4) --------------------------------------------
+
+    /// Every SpendRequest registers TWO distinct exact-byte candidates, both
+    /// signed at ingress, each naming the other. The spend carries a fire window;
+    /// the escape carries NONE — nothing in V0-8b schedules it, so its partials can
+    /// never be released. V0-4b's arm is what gives it one, and it then rides this
+    /// same path.
+    #[test]
+    fn a_spend_request_registers_a_paired_spend_and_escape_both_signed_and_only_the_spend_fires() {
+        let (fx, node, spend_cid, _psbt) = accepted_hot_spend(HOLD);
+        let channel = node.channel.as_ref().expect("channel");
+        let escape_psbt = fx.spend_psbt(&fx.escape_spk, 7);
+        let escape_cid = crate::commitment_id_for(&node, &escape_psbt, EXPIRY);
+
+        assert_ne!(spend_cid, escape_cid, "two distinct exact-byte commitments");
+        assert_eq!(
+            channel.store_len(),
+            2,
+            "the pair is registered, not just the spend"
+        );
+
+        // Roles, and the pairing in both directions.
+        assert_eq!(
+            channel.pairing(&spend_cid).expect("spend registered"),
+            (CandidateRole::Spend, escape_cid.clone())
+        );
+        assert_eq!(
+            channel.pairing(&escape_cid).expect("escape registered"),
+            (CandidateRole::Escape, spend_cid.clone())
+        );
+
+        // BOTH signed at ingress.
+        assert!(channel.psbt_has_pubkey(&spend_cid, 0, &node.pubkey));
+        assert!(
+            channel.psbt_has_pubkey(&escape_cid, 0, &node.pubkey),
+            "the escape is signed at ingress too, so it is ready if V0-4b ever arms it"
+        );
+
+        // Only the spend is scheduled. The escape is inert — signed, registered,
+        // and unreleasable at every instant.
+        assert!(channel.fire_window(&spend_cid).is_some());
+        assert!(
+            channel.fire_window(&escape_cid).is_none(),
+            "V0-8b schedules no escape; V0-4b's duress arm does"
+        );
+        for now in [NOW, NOW + HOLD, EXPIRY - 1] {
+            assert!(
+                channel.release_partials(&escape_cid, now).is_none(),
+                "an unscheduled escape must never release, not even at {now}"
+            );
+        }
+    }
+
+    // -- combine + broadcast (§1, §5) ---------------------------------------
+
+    #[test]
+    fn with_quorum_on_every_input_the_node_package_validates_then_broadcasts() {
+        let (fx, node, cid, psbt) = accepted_hot_spend(0);
+        let channel = node.channel.as_ref().expect("channel");
+        let backend = backend_for(&psbt);
+        assert!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .pending
+                .has_any(NOW),
+            "an accepted hot spend starts pending"
+        );
+
+        // Node 0 signed at ingress; two peers make 3-of-5.
+        deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
+        let broadcast =
+            crate::combine_and_broadcast(&node, &backend, std::slice::from_ref(&cid), NOW);
+        assert_eq!(broadcast, 1);
+        assert!(
+            !node
+                .sign_state
+                .lock()
+                .expect("sign_state")
+                .pending
+                .has_any(NOW),
+            "successful node broadcast settles the pending spend so refreshes can resume"
+        );
+
+        // The package was tested BEFORE the broadcast, and it is the spend alone
+        // (its prevout is confirmed, so it carries no ancestor).
+        let packages = backend.packages_tested.lock().expect("packages");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].len(), 1);
+        let broadcasts = backend.broadcasts.lock().expect("broadcasts");
+        assert_eq!(broadcasts.len(), 1);
+        let tx: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&broadcasts[0]).expect("a real transaction");
+        assert_eq!(
+            tx.compute_txid(),
+            psbt.unsigned_tx.compute_txid(),
+            "the broadcast tx is the exact transaction the user signed"
+        );
+        assert!(
+            !tx.input[0].witness.is_empty(),
+            "the broadcast tx is finalized, not a bare unsigned tx"
+        );
+    }
+
+    #[test]
+    fn below_quorum_nothing_is_broadcast_and_the_candidate_stays_collectable() {
+        let (fx, node, cid, psbt) = accepted_hot_spend(0);
+        let channel = node.channel.as_ref().expect("channel");
+        let backend = backend_for(&psbt);
+
+        // Node 0 + one peer = 2 of the 3 needed.
+        deliver_peer_partials(&fx, channel, &psbt, &cid, 1);
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, std::slice::from_ref(&cid), NOW),
+            0,
+            "t-1 signatures must not combine"
+        );
+        assert!(backend.packages_tested.lock().expect("p").is_empty());
+        assert!(backend.broadcasts.lock().expect("b").is_empty());
+
+        // Still collectable: the late third partial completes it.
+        deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, &[cid], NOW),
+            1,
+            "a late partial must still complete the combine"
+        );
+    }
+
+    /// Quorum is per INPUT, never a total. A transaction with `t` signatures on
+    /// input 0 and none on input 1 cannot be finalized, and a global count would
+    /// wrongly call it ready.
+    #[test]
+    fn quorum_is_required_on_every_input_of_a_multi_input_spend() {
+        let fx = Fixture::new(3, 5);
+        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let psbt = fx.two_input_spend_psbt(&fx.hot_spk);
+        let escape = fx.two_input_spend_psbt(&fx.escape_spk);
+        let mut request = fx.spend_request(&psbt, EXPIRY, "multi-input");
+        request.escape_psbt = escape.to_string();
+        fx.coord_sign(&mut request, "multi-input-resign");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &psbt, EXPIRY);
+        let channel = node.channel.as_ref().expect("channel");
+        let mut backend = MockBackend::default();
+        for input in &psbt.inputs {
+            // Both prevouts confirmed.
+            backend.prevouts.insert(
+                psbt.unsigned_tx.input[psbt
+                    .inputs
+                    .iter()
+                    .position(|i| std::ptr::eq(i, input))
+                    .unwrap_or(0)]
+                .previous_output,
+                Prevout {
+                    txout: input.witness_utxo.clone().expect("witness_utxo"),
+                    confirmed: true,
+                },
+            );
+        }
+        for (index, txin) in psbt.unsigned_tx.input.iter().enumerate() {
+            backend.prevouts.insert(
+                txin.previous_output,
+                Prevout {
+                    txout: psbt.inputs[index]
+                        .witness_utxo
+                        .clone()
+                        .expect("witness_utxo"),
+                    confirmed: true,
+                },
+            );
+        }
+
+        // Quorum on input 0 ONLY: node 0 signed both at ingress, two peers sign
+        // just input 0.
+        for signer in 1..=2u16 {
+            let payload = fx.partial_payload(&psbt, &cid, 0, signer);
+            assert_eq!(
+                deliver(
+                    &fx.channel_state(signer),
+                    channel,
+                    MSG_TYPE_PARTIAL,
+                    &payload.to_bytes(),
+                    NOW,
+                    NOW
+                ),
+                ChannelReply::Accepted
+            );
+        }
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, std::slice::from_ref(&cid), NOW),
+            0,
+            "input 1 has only this node's signature: t-of-n is per input"
+        );
+
+        // Complete input 1 and it combines.
+        for signer in 1..=2u16 {
+            let payload = fx.partial_payload(&psbt, &cid, 1, signer);
+            assert_eq!(
+                deliver(
+                    &fx.channel_state(signer),
+                    channel,
+                    MSG_TYPE_PARTIAL,
+                    &payload.to_bytes(),
+                    NOW,
+                    NOW
+                ),
+                ChannelReply::Accepted
+            );
+        }
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, &[cid], NOW),
+            1,
+            "with quorum on EVERY input the multi-input spend finalizes"
+        );
+    }
+
+    /// A backend that refuses the package: nothing is broadcast, nothing panics,
+    /// and the candidate stays eligible for the next tick.
+    #[test]
+    fn a_backend_that_rejects_the_package_broadcasts_nothing_and_does_not_panic() {
+        let (fx, node, cid, psbt) = accepted_hot_spend(0);
+        let channel = node.channel.as_ref().expect("channel");
+        let mut backend = backend_for(&psbt);
+        backend.package_rejection = Some("insufficient fee".to_string());
+
+        deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, std::slice::from_ref(&cid), NOW),
+            0
+        );
+        assert_eq!(
+            backend.packages_tested.lock().expect("p").len(),
+            1,
+            "the package WAS tested"
+        );
+        assert!(
+            backend.broadcasts.lock().expect("b").is_empty(),
+            "a rejected package must not be broadcast"
+        );
+
+        // Not marked broadcast: a later tick against a healed backend still fires.
+        let healthy = backend_for(&psbt);
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &healthy, &[cid], NOW),
+            1,
+            "a package rejection is transient, not terminal"
+        );
+    }
+
+    /// Blocking prevout/package RPCs may start inside the combine window and finish
+    /// after it. The node must re-read its clock immediately before broadcast; a
+    /// pass-start timestamp is not continuing authorization to send late.
+    #[test]
+    fn a_candidate_that_crosses_its_deadline_during_package_checks_is_not_broadcast() {
+        use std::cell::Cell;
+
+        let (fx, node, cid, psbt) = accepted_hot_spend(0);
+        let channel = node.channel.as_ref().expect("channel");
+        let backend = backend_for(&psbt);
+        deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
+
+        let reads = Cell::new(0usize);
+        let clock = || {
+            let read = reads.get();
+            reads.set(read + 1);
+            match read {
+                // Quorum/finalization begins inside the inclusive window.
+                0 => NOW,
+                // The package RPC completed after the default 60s deadline.
+                _ => NOW + 61,
+            }
+        };
+        assert_eq!(
+            crate::combine_and_broadcast_with_clock(
+                &node,
+                &backend,
+                std::slice::from_ref(&cid),
+                clock,
+            ),
+            0
+        );
+        assert_eq!(
+            backend.packages_tested.lock().expect("p").len(),
+            1,
+            "the deadline crossed during the blocking package path"
+        );
+        assert!(
+            backend.broadcasts.lock().expect("b").is_empty(),
+            "sendrawtransaction must not run after the combine deadline"
+        );
+    }
+
+    /// ADR-0012 build-over-mempool, through the real broadcast path: a spend that
+    /// chains off this vault's own unconfirmed spend-change carries that parent in
+    /// its package and broadcasts.
+    #[test]
+    fn a_spend_over_a_vault_authorized_unconfirmed_parent_broadcasts_against_the_mempool_chain() {
+        let fx = Fixture::new(3, 5);
+        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+
+        // The parent: an accepted vault spend, so its txid is authorized.
+        let parent = fx.spend_psbt(&fx.hot_spk, 7);
+        let parent_request = fx.spend_request(&parent, EXPIRY, "chain-parent");
+        assert!(matches!(
+            crate::handle_sign(&node, &parent_request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let parent_txid = parent.unsigned_tx.compute_txid();
+        assert!(
+            node.authorized
+                .lock()
+                .expect("authorized")
+                .contains(&parent_txid),
+            "an accepted spend is vault-authorized"
+        );
+
+        // The child spends the parent's (unconfirmed) output.
+        let child = fx.spend_psbt_over(&fx.hot_spk, OutPoint::new(parent_txid, 0));
+        let child_escape = fx.spend_psbt_over(&fx.escape_spk, OutPoint::new(parent_txid, 0));
+        let mut child_request = fx.spend_request(&child, EXPIRY, "chain-child");
+        child_request.escape_psbt = child_escape.to_string();
+        fx.coord_sign(&mut child_request, "chain-child-resign");
+        assert!(matches!(
+            crate::handle_sign(&node, &child_request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let child_cid = crate::commitment_id_for(&node, &child, EXPIRY);
+        let channel = node.channel.as_ref().expect("channel");
+        deliver_peer_partials(&fx, channel, &child, &child_cid, 2);
+
+        let mut backend = MockBackend::default();
+        backend.prevouts.insert(
+            OutPoint::new(parent_txid, 0),
+            Prevout {
+                txout: TxOut {
+                    script_pubkey: fx.vault_spk.clone(),
+                    value: Amount::from_sat(100_000_000),
+                },
+                // UNCONFIRMED — the common case for vault spend-change.
+                confirmed: false,
+            },
+        );
+        backend
+            .raw_txs
+            .insert(parent_txid, serialize(&parent.unsigned_tx));
+        // Deliberately do NOT expose the parent's own input through `prevout`.
+        // Real bitcoind's gettxout returns null because the mempool parent already
+        // spent it; the ancestor walk must stop via mempool membership instead.
+
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, &[child_cid], NOW),
+            1
+        );
+        let packages = backend.packages_tested.lock().expect("p");
+        assert_eq!(
+            packages[0].len(),
+            1,
+            "the authorized parent is already in the mempool, so Core tests only the new child"
+        );
+        let tested: Transaction =
+            bitcoin::consensus::deserialize(&packages[0][0]).expect("tested transaction");
+        assert_eq!(
+            tested.compute_txid(),
+            child.unsigned_tx.compute_txid(),
+            "the finalized candidate is tested against Core's existing ancestor view"
+        );
+    }
+
+    /// The toxic-deposit rule through the real broadcast path: a spend chaining off
+    /// an unconfirmed deposit this node never authorized is not broadcast at all.
+    #[test]
+    fn a_spend_over_an_external_unconfirmed_deposit_is_never_broadcast() {
+        let fx = Fixture::new(3, 5);
+        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let deposit_txid = bitcoin::Txid::from_byte_array([0xEE; 32]);
+        let spend = fx.spend_psbt_over(&fx.hot_spk, OutPoint::new(deposit_txid, 0));
+        let escape = fx.spend_psbt_over(&fx.escape_spk, OutPoint::new(deposit_txid, 0));
+        let mut request = fx.spend_request(&spend, EXPIRY, "toxic-deposit");
+        request.escape_psbt = escape.to_string();
+        fx.coord_sign(&mut request, "toxic-deposit-resign");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        let channel = node.channel.as_ref().expect("channel");
+        deliver_peer_partials(&fx, channel, &spend, &cid, 2);
+
+        let mut backend = MockBackend::default();
+        backend.prevouts.insert(
+            OutPoint::new(deposit_txid, 0),
+            Prevout {
+                txout: TxOut {
+                    script_pubkey: fx.vault_spk.clone(),
+                    value: Amount::from_sat(100_000_000),
+                },
+                confirmed: false,
+            },
+        );
+        // The deposit is NOT in the node's authorized set: nobody validated it.
+        assert!(!node
+            .authorized
+            .lock()
+            .expect("authorized")
+            .contains(&deposit_txid));
+
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, &[cid], NOW),
+            0,
+            "an external unconfirmed deposit's parent can be replaced out from under \
+             this spend, so it is excluded"
+        );
+        assert!(backend.broadcasts.lock().expect("b").is_empty());
+    }
+
+    /// A candidate registered LATE (its peer's partials arrived first) still
+    /// combines: an early partial is answered UNKNOWN_CANDIDATE and retried, and
+    /// once the candidate exists the retry lands.
+    #[test]
+    fn a_partial_arriving_before_its_candidate_is_retriable_not_lost() {
+        let fx = Fixture::new(3, 5);
+        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let cid = crate::commitment_id_for(&node, &psbt, EXPIRY);
+        let channel = node.channel.as_ref().expect("channel");
+
+        // The peer is ahead of us: no candidate yet.
+        let payload = fx.partial_payload(&psbt, &cid, 0, 1);
+        assert_eq!(
+            deliver(
+                &fx.channel_state(1),
+                channel,
+                MSG_TYPE_PARTIAL,
+                &payload.to_bytes(),
+                NOW,
+                NOW
+            ),
+            ChannelReply::UnknownCandidate,
+            "a partial for an unregistered candidate is retriable, never a permanent reject"
+        );
+
+        // Our own ingress catches up, and the peer's retry lands.
+        let request = fx.spend_request(&psbt, EXPIRY, "late-registration");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
+        let backend = backend_for(&psbt);
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, &[cid], NOW),
+            1
+        );
+    }
+
+    /// A dead peer costs redundancy, never the spend. With 3-of-5, this node plus
+    /// two live peers is a quorum — the other two can be silent, unreachable, or
+    /// rebooted, and the combine proceeds without them. (The fan-out's own
+    /// dead-peer behaviour — an `Err`, never a panic, and never blocking a live
+    /// send — is covered in `net`.)
+    #[test]
+    fn a_dead_peer_costs_redundancy_but_not_the_combine() {
+        let (fx, node, cid, psbt) = accepted_hot_spend(0);
+        let channel = node.channel.as_ref().expect("channel");
+        let backend = backend_for(&psbt);
+
+        // Peers 3 and 4 never answer. Peers 1 and 2 do.
+        deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, std::slice::from_ref(&cid), NOW),
+            1,
+            "2 of 4 peers is enough for 3-of-5: the silent two are not needed"
+        );
+    }
+
+    /// The redundant-broadcast steady state (ADR-0012): every node fires on its own
+    /// clock, so all but the race winner find the exact spend already in their
+    /// mempool. A node that treated that as a failure would never clear its pending
+    /// Hold and would wrongly subordinate refreshes until commitment expiry. The
+    /// losing node instead recognizes settlement independently of local quorum — it
+    /// marks the candidate broadcast and clears the pending spend while pushing
+    /// nothing of its own.
+    #[test]
+    fn a_peer_winning_the_broadcast_race_settles_even_without_local_quorum() {
+        let (_fx, node, cid, psbt) = accepted_hot_spend(0);
+        let mut backend = backend_for(&psbt);
+        // A peer already broadcast this exact tx: it sits in THIS node's mempool.
+        backend.raw_txs.insert(
+            psbt.unsigned_tx.compute_txid(),
+            serialize(&psbt.unsigned_tx),
+        );
+        // No peer partial reached this node: it has only its own ingress signature,
+        // strictly below the 3-of-5 threshold.
+        assert!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .pending
+                .has_any(NOW),
+            "the accepted hot spend starts pending"
+        );
+
+        // This node pushes NOTHING (the peer already did), but still settles.
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, std::slice::from_ref(&cid), NOW),
+            0,
+            "the returned count is this node's own broadcasts, and it made none"
+        );
+        assert!(
+            backend.broadcasts.lock().expect("b").is_empty(),
+            "a lost race must not re-push the already-settled tx"
+        );
+        assert!(
+            !node
+                .sign_state
+                .lock()
+                .expect("sign_state")
+                .pending
+                .has_any(NOW),
+            "recognizing settlement clears the pending Hold so refreshes resume"
+        );
+        // Marked broadcast: a later tick does not re-attempt.
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, &[cid], NOW),
+            0
+        );
+        assert!(backend.broadcasts.lock().expect("b").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_peer_settlement_seen_after_the_combine_window_still_clears_pending() {
+        let (_fx, node, cid, psbt) = accepted_hot_spend(0);
+        let node = std::sync::Arc::new(node);
+        let mut backend = backend_for(&psbt);
+        backend.raw_txs.insert(
+            psbt.unsigned_tx.compute_txid(),
+            serialize(&psbt.unsigned_tx),
+        );
+        let backend: std::sync::Arc<dyn crate::chain::ChainBackend + Send + Sync> =
+            std::sync::Arc::new(backend);
+
+        // The default combine deadline was NOW + 60. This pass starts after it,
+        // with no peer partials, so it may only recognize the peer's settlement —
+        // never release, finalize, or broadcast locally.
+        assert_eq!(
+            crate::fire_tick(std::sync::Arc::clone(&node), backend, NOW + 61).await,
+            0
+        );
+        assert!(
+            !node
+                .sign_state
+                .lock()
+                .expect("sign_state")
+                .pending
+                .has_any(NOW + 61),
+            "settlement releases refresh subordination even after the combine window"
+        );
+        assert!(
+            !node.channel.as_ref().expect("channel").was_released(&cid),
+            "post-window settlement recognition must not reopen partial release"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_window_settlement_polling_stops_after_the_observation_grace() {
+        // The candidate fires at NOW (hold 0) and its combine window closes at
+        // NOW + 60; the settlement-observation window extends that by
+        // SETTLEMENT_OBSERVE_GRACE_SECS (360) to NOW + 420. Its commitment expiry
+        // (EXPIRY = NOW + 172_800) is far beyond, so it is still resident — the ONLY
+        // reason a pass past the grace skips it is the bound. Even with the exact tx
+        // confirmed on-chain, one second past the grace this node no longer polls
+        // it, so it does not recognize the (impossible-in-practice) settlement and
+        // falls back to the commitment-expiry prune. This is what stops a candidate
+        // that missed its window from polling the backend at 1 Hz for hours.
+        let (_fx, node, _cid, psbt) = accepted_hot_spend(0);
+        let node = std::sync::Arc::new(node);
+        let mut backend = backend_for(&psbt);
+        backend
+            .confirmed_txs
+            .insert(psbt.unsigned_tx.compute_txid());
+        let backend: std::sync::Arc<dyn crate::chain::ChainBackend + Send + Sync> =
+            std::sync::Arc::new(backend);
+
+        let past_grace = NOW + 60 + super::SETTLEMENT_OBSERVE_GRACE_SECS + 1;
+        assert_eq!(
+            crate::fire_tick(std::sync::Arc::clone(&node), backend, past_grace).await,
+            0
+        );
+        assert!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .pending
+                .has_any(past_grace),
+            "past the observation grace a stuck candidate is no longer polled, so its \
+             pending Hold survives to its commitment-expiry backstop instead of being \
+             cleared by an unbounded 1 Hz settlement poll"
+        );
+    }
+
+    /// The peer winner may be mined before this node's next fire pass. In that
+    /// case the exact transaction has left the mempool and every candidate input
+    /// is now spent, so package assembly cannot identify settlement from prevouts.
+    /// Confirmation lookup must settle the local Hold before assembly is attempted.
+    #[test]
+    fn a_peer_copy_confirmed_before_our_fire_pass_settles_the_candidate_here_too() {
+        let (_fx, node, cid, psbt) = accepted_hot_spend(0);
+        let mut backend = backend_for(&psbt);
+        let txid = psbt.unsigned_tx.compute_txid();
+        backend.confirmed_txs.insert(txid);
+        // Once mined, the candidate's input is spent and no longer appears in the
+        // UTXO view. This proves the confirmed-transaction shortcut runs before
+        // package assembly's unknown/spent-prevout error.
+        backend.prevouts.clear();
+        // Confirmation itself settles the candidate; this node need not have
+        // received the peer quorum that assembled the mined transaction.
+
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, std::slice::from_ref(&cid), NOW),
+            0,
+            "the peer confirmed it, so this node pushes nothing"
+        );
+        assert!(
+            backend.packages_tested.lock().expect("p").is_empty(),
+            "an already-confirmed candidate needs no package test"
+        );
+        assert!(
+            backend.broadcasts.lock().expect("b").is_empty(),
+            "an already-confirmed candidate must not be re-broadcast"
+        );
+        assert!(
+            !node
+                .sign_state
+                .lock()
+                .expect("sign_state")
+                .pending
+                .has_any(NOW),
+            "confirmation settles the pending Hold so refreshes resume"
+        );
+        assert_eq!(
+            crate::combine_and_broadcast(&node, &backend, &[cid], NOW),
+            0,
+            "the candidate was marked settled and is not retried"
+        );
+    }
+
+    /// An escape-class spend whose mandatory escape is byte-identical to it (the
+    /// spend already sweeps to the escape wallet) is ACCEPTED — the pair collapses
+    /// to one candidate, which is correct: an escape-class spend fires immediately
+    /// under either pin and has no duress path that needs a distinct escape. This
+    /// pins that equal commitment ids are benign, not a rejected request.
+    #[test]
+    fn an_escape_class_spend_that_equals_its_own_escape_registers_one_candidate() {
+        let fx = Fixture::new(3, 5);
+        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let tx = fx.spend_psbt(&fx.escape_spk, 7);
+        let mut request = fx.spend_request(&tx, EXPIRY, "self-paired");
+        request.escape_psbt = tx.to_string();
+        fx.coord_sign(&mut request, "self-paired-resign");
+        assert!(
+            matches!(
+                crate::handle_sign(&node, &request, NOW).expect("decodable"),
+                SignResponse::Accepted(_)
+            ),
+            "an escape-class spend that is its own escape is accepted"
+        );
+        assert_eq!(
+            node.channel.as_ref().expect("channel").store_len(),
+            1,
+            "the pair collapses to one candidate when spend and escape are identical"
+        );
+    }
+
+    /// The whole pass end to end: `fire_tick` opens the gate at the fire event,
+    /// then combines and broadcasts once quorum is present. The driver runs exactly
+    /// this on its interval.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fire_tick_releases_then_combines_and_broadcasts() {
+        let (fx, node, cid, psbt) = accepted_hot_spend(HOLD);
+        let node = std::sync::Arc::new(node);
+        let channel = node.channel.as_ref().expect("channel");
+        let backend: std::sync::Arc<dyn crate::chain::ChainBackend + Send + Sync> =
+            std::sync::Arc::new(backend_for(&psbt));
+        deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
+
+        // Before the fire event: nothing is released, nothing is broadcast — even
+        // though the quorum is already sitting there.
+        assert_eq!(
+            crate::fire_tick(
+                std::sync::Arc::clone(&node),
+                std::sync::Arc::clone(&backend),
+                NOW + HOLD - 1
+            )
+            .await,
+            0
+        );
+        assert!(
+            !channel.was_released(&cid),
+            "quorum present is not authorization: the Hold has not expired"
+        );
+
+        // At the fire event: released and broadcast.
+        assert_eq!(
+            crate::fire_tick(std::sync::Arc::clone(&node), backend, NOW + HOLD).await,
+            1,
+            "at its fire event the candidate combines and broadcasts"
+        );
+        assert!(node.channel.as_ref().expect("channel").was_released(&cid));
+    }
+
+    // -- request propagation (§3) -------------------------------------------
+
+    /// The constant-observable step: a normal-PIN and a duress-PIN request
+    /// propagate over the identical path, to the identical peers, in the identical
+    /// message count, at the identical size.
+    ///
+    /// V0-4b's silence rests on this. If a duress request propagated differently —
+    /// more messages, a different size, a different peer set — a coordinator-
+    /// controlling attacker could read the duress bit straight off the wire without
+    /// compromising a single node.
+    #[test]
+    fn both_pins_propagate_over_an_identical_path_count_and_size() {
+        let fx = Fixture::new(3, 5);
+        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+
+        let mut normal = fx.spend_request(&psbt, EXPIRY, "pin-normal");
+        normal.pin = "1234".to_string();
+        fx.coord_sign(&mut normal, "pin-normal-signed");
+        let mut duress = fx.spend_request(&psbt, EXPIRY, "pin-duress");
+        duress.pin = "999999999999".to_string();
+        fx.coord_sign(&mut duress, "pin-duress-signed");
+        assert_ne!(
+            normal.pin, duress.pin,
+            "the two requests differ ONLY in the pin"
+        );
+
+        assert_ne!(
+            normal.pin.len(),
+            duress.pin.len(),
+            "the regression must cover unequal-length enrolled PINs"
+        );
+        let normal_request = TaggedRequest::Spend(normal);
+        let duress_request = TaggedRequest::Spend(duress);
+        let normal_payload = request_payload(&normal_request);
+        let duress_payload = request_payload(&duress_request);
+        assert_eq!(
+            normal_payload.len(),
+            duress_payload.len(),
+            "a duress request must be the same size on the wire as a normal one"
+        );
+        assert_eq!(
+            serde_json::from_slice::<TaggedRequest>(&normal_payload)
+                .expect("padded normal request"),
+            normal_request,
+            "padding must preserve the coordinator-signed request verbatim"
+        );
+        assert_eq!(
+            serde_json::from_slice::<TaggedRequest>(&duress_payload)
+                .expect("padded duress request"),
+            duress_request,
+            "padding must preserve the coordinator-signed request verbatim"
+        );
+
+        // Identical peer set (the path + the count), every time, from one pure
+        // function of the manifest — nothing about the pin can reach it.
+        let channel = node.channel.as_ref().expect("channel");
+        assert_eq!(channel.peer_ids(), vec![1, 2, 3, 4]);
+        let normal_envelope = channel
+            .build_envelope(MSG_TYPE_REQUEST, 1, &normal_payload, NOW)
+            .expect("normal envelope");
+        let duress_envelope = channel
+            .build_envelope(MSG_TYPE_REQUEST, 1, &duress_payload, NOW)
+            .expect("duress envelope");
+        assert_eq!(
+            envelope_body(&normal_envelope).expect("normal body").len(),
+            envelope_body(&duress_envelope).expect("duress body").len(),
+            "variable DER channel signatures must not reintroduce a wire-size PIN oracle"
+        );
+    }
+
+    /// A request can fit `/sign`'s 1 MiB JSON cap yet exceed `max_msg_bytes` after
+    /// request padding, base64, and envelope metadata. Such a request must fail
+    /// before acknowledgement because peer propagation is the only quorum path.
+    #[test]
+    fn a_request_that_cannot_fit_its_channel_envelope_is_not_accepted() {
+        let fx = Fixture::new(3, 5);
+        let node =
+            crate::Node::from_toml_str(&fx.config(0, 0, "max_msg_bytes = 100\n")).expect("config");
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = fx.spend_request(&psbt, EXPIRY, "oversized-propagation");
+
+        let error = crate::handle_sign(&node, &request, NOW)
+            .expect_err("an unpropagatable request must not receive Accepted");
+        assert!(
+            error.0.contains("max_msg_bytes"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(node.channel.as_ref().expect("channel").store_len(), 0);
+        assert!(node.outbox.lock().expect("outbox").is_empty());
+        assert!(node.authorized.lock().expect("authorized").is_empty());
+    }
+
+    /// Loop suppression: a node propagates only what it just ACCEPTED, and
+    /// acceptance consumes the request's coordinator nonce. The copy that comes
+    /// back from a peer is refused as a replay and is never propagated again, so
+    /// the fan-out dies after one round instead of ringing forever.
+    #[test]
+    fn a_request_that_comes_back_from_a_peer_is_not_propagated_again() {
+        let fx = Fixture::new(3, 5);
+        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = fx.spend_request(&psbt, EXPIRY, "loop-suppression");
+
+        // First sight: accepted, and staged for every peer.
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(
+            node.outbox.lock().expect("outbox").len(),
+            1,
+            "an accepted request is staged for propagation"
+        );
+        node.outbox.lock().expect("outbox").clear();
+
+        // The same request arriving again (a peer echoing it back) is refused on
+        // its consumed nonce and stages nothing.
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Refusal(r) if r.code == vault_proto::RefusalCode::NonceReplayed
+        ));
+        assert!(
+            node.outbox.lock().expect("outbox").is_empty(),
+            "an echo must not re-propagate, or the fan-out never terminates"
+        );
     }
 }

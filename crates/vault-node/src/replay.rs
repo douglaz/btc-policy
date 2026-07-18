@@ -1,10 +1,12 @@
 //! The anti-replay log (DESIGN.md, "What the anti-replay log is — and is not").
 //!
-//! An in-memory map from `commitment_id` to the verdict the node recorded for
-//! that exact transaction. Its jobs are idempotency and audit — it does **not**
-//! defend the signature (V0-1's sighash binding does). It is keyed by
-//! commitment hash, **never** by outpoint set, so an RBF replacement or a
-//! rebroadcast is a fresh commitment and is never blocked as a replay.
+//! An in-memory map from a decision identity to the verdict the node recorded.
+//! Transaction-determined refusals use the `commitment_id`; accepted decisions
+//! use a hash of the complete candidate set (commitment ids + ingress PSBTs), so
+//! a different user-signature instance or mandatory escape cannot replay an
+//! unrelated acceptance. Its jobs are idempotency and audit — it does **not**
+//! defend the signature (V0-1's sighash binding does). No key is an outpoint set,
+//! so an RBF replacement is a fresh commitment and is never blocked as a replay.
 //!
 //! Entries are pruned once their expiry has passed, so retention is bounded by
 //! each commitment's node-capped expiry. `now` is always a parameter, never a
@@ -38,29 +40,31 @@ pub(crate) struct SignState {
     /// Seen coordinator-request nonces (ADR-0013 §2/§3). Under the same one lock
     /// so the check-then-record at ingress is atomic with the rest of `/sign`.
     pub(crate) coord_nonces: NonceLog,
+    /// Per-coin refresh times (ADR-0013 §6). Under the same one lock so the
+    /// interval check-then-record cannot interleave with a concurrent refresh.
+    pub(crate) refreshes: RefreshLog,
 }
 
-/// In-memory anti-replay log: `commitment_id -> recorded verdict`.
+/// In-memory anti-replay log: `decision identity -> recorded verdict`.
 #[derive(Default)]
 pub(crate) struct ReplayLog {
     entries: HashMap<String, Entry>,
 }
 
 impl ReplayLog {
-    /// The recorded verdict for `commitment_id` if one exists and has not yet
+    /// The recorded verdict for `key` if one exists and has not yet
     /// expired at `now`. An expired entry is treated as absent (it is removed
     /// by [`ReplayLog::prune`]).
-    pub(crate) fn get(&self, commitment_id: &str, now: u64) -> Option<SignResponse> {
+    pub(crate) fn get(&self, key: &str, now: u64) -> Option<SignResponse> {
         self.entries
-            .get(commitment_id)
+            .get(key)
             .filter(|entry| entry.expiry > now)
             .map(|entry| entry.verdict.clone())
     }
 
-    /// Record `verdict` under `commitment_id`, retained until `expiry`.
-    pub(crate) fn record(&mut self, commitment_id: String, expiry: u64, verdict: SignResponse) {
-        self.entries
-            .insert(commitment_id, Entry { expiry, verdict });
+    /// Record `verdict` under `key`, retained until `expiry`.
+    pub(crate) fn record(&mut self, key: String, expiry: u64, verdict: SignResponse) {
+        self.entries.insert(key, Entry { expiry, verdict });
     }
 
     /// Drop every entry whose expiry has passed, bounding retention time.
@@ -77,62 +81,115 @@ impl ReplayLog {
     }
 }
 
-/// One hot-class commitment's Hold timer (ADR-0004), retained until expiry.
+/// The set of PENDING SPENDS: `commitment_id -> that commitment's expiry`.
 ///
-/// **Timer-only by design** — this stores when the commitment was first seen,
-/// **never the PSBT**. This resolves the V0-2 commitment/tx-identity question:
-/// on re-submission the node re-verifies the resubmitted PSBT in full (PIN,
-/// user-sig/sighash, policy) and signs the PSBT *in hand*, never a stored one.
-/// The commitment binds every field of the exact unsigned transaction,
-/// including version, nLockTime, and each input's nSequence, so distinct
-/// transactions cannot share a timer. On re-submission the node still verifies
-/// and signs the PSBT in hand; nothing recorded here can be replayed into a
-/// signature — the timer only decides *when* signing is allowed, not *what*
-/// gets signed.
-struct PendingEntry {
-    /// Unix seconds when this node first saw the commitment; the Hold's start.
-    first_seen: u64,
-    /// The commitment's expiry (unix seconds); the prune horizon, exactly as
-    /// [`ReplayLog`] uses it.
-    expiry: u64,
-}
-
-/// In-memory Hold timers: `commitment_id -> first_seen`. A sibling of
-/// [`ReplayLog`] with the same expiry-pruned, `now`-as-a-parameter discipline,
-/// so every Hold path is deterministically testable.
+/// Under Model B (ADR-0012) this is no longer a Hold *timer*. The Hold used to
+/// live here because signing waited for a re-submission, and the log had to
+/// remember when the clock started. Model B signs at ingress and there is no
+/// re-submission — a spend's fire time lives on its candidate, which is what the
+/// fire driver reads — so nothing needs `first_seen` any more and the log is now
+/// pure membership: **is any spend pending on this vault?**
+///
+/// That one question is what refresh subordination asks (ADR-0012: "while any
+/// normal-path spend is pending, a refresh is queued behind it"), and the expiry
+/// is what bounds it: a spend kept perpetually pending to block refreshes dies
+/// with its commitment. Denial, never theft.
+///
+/// It stores no PSBT and never has: nothing recorded here can be replayed into a
+/// signature, because it decides only *whether a spend is outstanding*, never
+/// *what* gets signed.
 #[derive(Default)]
 pub(crate) struct PendingLog {
-    entries: HashMap<String, PendingEntry>,
+    /// `commitment_id -> expiry` (unix seconds); the prune horizon, exactly as
+    /// [`ReplayLog`] uses it.
+    entries: HashMap<String, u64>,
 }
 
 impl PendingLog {
-    /// The `first_seen` recorded for `commitment_id` if a live (unexpired at
-    /// `now`) pending entry exists. An expired entry reads as absent.
-    pub(crate) fn first_seen(&self, commitment_id: &str, now: u64) -> Option<u64> {
-        self.entries
-            .get(commitment_id)
-            .filter(|entry| entry.expiry > now)
-            .map(|entry| entry.first_seen)
+    /// Record `commitment_id` as a pending spend until `expiry`.
+    pub(crate) fn record(&mut self, commitment_id: String, expiry: u64) {
+        self.entries.insert(commitment_id, expiry);
     }
 
-    /// Start `commitment_id`'s Hold timer at `first_seen`, retained until
-    /// `expiry`. The handler calls this only on genuine first sight (it reads
-    /// [`PendingLog::first_seen`] first), so the timer never resets on
-    /// re-submission.
-    pub(crate) fn record(&mut self, commitment_id: String, first_seen: u64, expiry: u64) {
-        self.entries
-            .insert(commitment_id, PendingEntry { first_seen, expiry });
+    /// A spend stops being pending once a node successfully submits the finalized
+    /// transaction. Removing an unknown id is intentionally a no-op: escape and
+    /// refresh candidates were never pending, but share the broadcast path.
+    pub(crate) fn remove(&mut self, commitment_id: &str) {
+        self.entries.remove(commitment_id);
     }
 
-    /// Drop every timer whose commitment has expired, bounding retention.
+    /// Drop every entry strictly after its commitment's final authorized second.
+    /// Candidate fire windows include `now == expiry`, so refresh subordination
+    /// must retain the spend through that same boundary.
     pub(crate) fn prune(&mut self, now: u64) {
-        self.entries.retain(|_, entry| entry.expiry > now);
+        self.entries.retain(|_, expiry| *expiry >= now);
+    }
+
+    /// Whether ANY spend is pending at `now` — the refresh-subordination predicate
+    /// (ADR-0012). Deliberately a bare existence question, not "which coins does it
+    /// touch?": the rule is coarse on purpose, because an input-overlap-granular
+    /// version reopens the disjoint-refresh escape invalidation.
+    pub(crate) fn has_any(&self, now: u64) -> bool {
+        self.entries.values().any(|expiry| *expiry >= now)
+    }
+
+    /// Live pending commitment ids. The fire driver uses these after a combine
+    /// window closes solely to notice that a peer settled the exact spend and to
+    /// release refresh subordination; it never reopens release or broadcast.
+    pub(crate) fn ids(&self, now: u64) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(_, expiry)| **expiry >= now)
+            .map(|(commitment_id, _)| commitment_id.clone())
+            .collect()
     }
 
     /// Number of live Hold timers. Test-only (see [`ReplayLog::len`]).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// Per-coin refresh times (ADR-0013 §6): `outpoint -> the unix second a refresh
+/// touched it`. RAMDISK/node-lifetime like every other log here — a reboot wipes
+/// the signing key too, so a rebooted machine is bare, not a fresh-interval signer.
+///
+/// It records BOTH a refresh's inputs and its outputs, and the outputs are the
+/// load-bearing half. The burn an attacker would drive is a CHAIN — refresh A→B,
+/// then B→C, then C→D — and every link spends a coin the previous refresh just
+/// created. Keyed on inputs alone, each link would spend a never-before-seen
+/// outpoint and no interval would ever fire. Starting the clock on the coins a
+/// refresh CREATES is what makes the interval bound the rate.
+#[derive(Default)]
+pub(crate) struct RefreshLog {
+    entries: HashMap<bitcoin::OutPoint, u64>,
+}
+
+impl RefreshLog {
+    /// When a refresh last touched `outpoint`, if this node has seen one.
+    pub(crate) fn last_refresh(&self, outpoint: &bitcoin::OutPoint) -> Option<u64> {
+        self.entries.get(outpoint).copied()
+    }
+
+    /// Start the interval clock at `now` for every coin this refresh consumes and
+    /// every coin it creates.
+    pub(crate) fn record(&mut self, refresh: &bitcoin::Psbt, now: u64) {
+        for input in &refresh.unsigned_tx.input {
+            self.entries.insert(input.previous_output, now);
+        }
+        let txid = refresh.unsigned_tx.compute_txid();
+        for vout in 0..refresh.unsigned_tx.output.len() as u32 {
+            self.entries.insert(bitcoin::OutPoint::new(txid, vout), now);
+        }
+    }
+
+    /// Drop entries older than the interval: past it they can no longer refuse
+    /// anything, so retention is bounded by `refresh_min_interval_secs` rather
+    /// than growing for the node's lifetime.
+    pub(crate) fn prune(&mut self, now: u64, min_interval_secs: u64) {
+        self.entries
+            .retain(|_, at| now.saturating_sub(*at) < min_interval_secs);
     }
 }
 
@@ -263,7 +320,11 @@ mod tests {
     use vault_proto::{Refusal, RefusalCode};
 
     fn signed() -> SignResponse {
-        SignResponse::Signed("cHNidP8B".into())
+        SignResponse::Accepted(vault_proto::Accepted {
+            commitment_id: "abc".into(),
+            first_seen: 1_752_000_000,
+            remaining_secs: 0,
+        })
     }
 
     fn refused() -> SignResponse {
@@ -493,15 +554,20 @@ mod tests {
     }
 
     #[test]
-    fn pending_records_first_seen_and_expires_like_the_replay_log() {
+    fn a_pending_spend_blocks_refreshes_until_its_commitment_expires() {
         let mut log = PendingLog::default();
-        log.record("abc".into(), 500, 1_000);
-        // Readable while unexpired, absent once expiry has passed.
-        assert_eq!(log.first_seen("abc", 600), Some(500));
-        assert_eq!(log.first_seen("abc", 1_000), None);
-        assert_eq!(log.first_seen("def", 600), None);
-        // Pruning at expiry drops it, keeping the map bounded.
-        log.prune(1_000);
+        assert!(!log.has_any(600), "nothing pending on a fresh node");
+        log.record("abc".into(), 1_000);
+        assert!(log.has_any(600), "a live pending spend blocks refreshes");
+        // The block is bounded by the commitment's own expiry: a spend held
+        // perpetually pending to starve refreshes dies with it (denial, not theft).
+        assert!(
+            log.has_any(1_000),
+            "the spend remains pending in its final fire second"
+        );
+        // The following second closes the fire window and drops the entry.
+        log.prune(1_001);
+        assert!(!log.has_any(1_001));
         assert_eq!(log.entries.len(), 0);
     }
 }

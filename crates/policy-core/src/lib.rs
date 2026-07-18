@@ -40,9 +40,40 @@ pub struct CheckParams {
     /// output is an allowed destination when its script re-derives from one of
     /// these within `max_derivation_index`.
     pub allowed: Vec<Descriptor<DescriptorPublicKey>>,
+    /// The escape wallet's descriptor, when configured. It is ALSO an `allowed`
+    /// entry (that is what lets a sweep pass the destination check); naming it
+    /// separately is what lets [`classify`] tell an escape destination from a hot
+    /// one. `None` ⇒ no output is escape-class (see [`classify`]).
+    pub escape: Option<Descriptor<DescriptorPublicKey>>,
     /// Bound on the derivation-index scan: an address beyond this index is not
     /// recognized (DESIGN.md config schema, `max_derivation_index`).
     pub max_derivation_index: u32,
+}
+
+/// The transaction class a node DERIVES from a spend's outputs — never trusts
+/// from a coordinator label (ADR-0013 §3; ADR-0012, "Transaction class is DERIVED
+/// by the node from the spend's outputs"). The channel envelope's `spend_purpose`
+/// is a hint with no authority.
+///
+/// Class drives behavior, so a misclassification is a duress bypass, not a
+/// cosmetic error: escape-class completes immediately under *either* PIN, so if
+/// "has an escape output" were enough to earn escape-class, an attacker would
+/// send 99%-to-hot + dust-to-escape and have it complete instantly under the
+/// duress PIN — extraction, with stolen hot keys. Requiring *every* destination
+/// output to pay the escape descriptor, and rejecting mixed, is what removes that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxClass {
+    /// Every output pays the vault: a pure self-spend that moves nothing to
+    /// anyone. Instant, pin-less, and bounded by its own interval + fee cap
+    /// (ADR-0013 §6) — it belongs in a `RefreshRequest`, not a `SpendRequest`.
+    Refresh,
+    /// Every destination output pays the escape descriptor (vault change allowed
+    /// alongside). Completes immediately under either PIN.
+    Escape,
+    /// Every destination output pays a hot-allowlist descriptor (vault change
+    /// allowed alongside). Signed at ingress, partial held, combined + broadcast
+    /// at Hold expiry.
+    Hot,
 }
 
 /// Machine-readable result code for a failed policy check.
@@ -270,6 +301,82 @@ fn check_destinations(psbt: &Psbt, params: &CheckParams) -> Result<(), Violation
     Ok(())
 }
 
+/// The node-derived transaction class (ADR-0013 §3, normative). Reads ONLY the
+/// spend's outputs, re-deriving each against the vault / escape / hot descriptors
+/// through the same bounded primitive every other check uses.
+///
+/// **Vault-change outputs are permitted in every class and excluded from the
+/// decision**; the class turns on the remaining *destination* outputs:
+///
+/// - no destination outputs at all ⇒ [`TxClass::Refresh`] (a pure self-spend);
+/// - every destination pays the escape descriptor ⇒ [`TxClass::Escape`];
+/// - every destination pays a hot-allowlist descriptor ⇒ [`TxClass::Hot`];
+/// - destinations spanning BOTH hot and escape ⇒ `PSBT_INCONSISTENT`. This is the
+///   mixed-class rejection, and it is load-bearing: without it the
+///   99%-to-hot + dust-to-escape spend above is a duress bypass.
+///
+/// A destination matching NO allowlisted descriptor is left to
+/// [`check_destinations`] — that is the ordinary allowlist refusal
+/// (`DEST_NOT_ALLOWED`), not a class question. So callers run [`evaluate`] first;
+/// this then sees only outputs already known to be vault change or allowlisted,
+/// and any leftover is reported as mixed rather than silently classified.
+pub fn classify(psbt: &Psbt, params: &CheckParams) -> Result<TxClass, Violation> {
+    let max = params.max_derivation_index;
+    let mut escape_outputs = Vec::new();
+    let mut hot_outputs = Vec::new();
+    let mut unrecognized = Vec::new();
+    for (index, txout) in psbt.unsigned_tx.output.iter().enumerate() {
+        let spk = txout.script_pubkey.as_script();
+        // Vault change: permitted in every class, excluded from the decision.
+        if derives_within(&params.vault, spk, max) {
+            continue;
+        }
+        let escape = params
+            .escape
+            .as_ref()
+            .is_some_and(|escape| derives_within(escape, spk, max));
+        if escape {
+            escape_outputs.push(index);
+            continue;
+        }
+        // Hot = allowlisted but not the escape wallet. The escape descriptor is
+        // itself an allowlist entry, so it must be tested (above) FIRST or every
+        // escape output would read as hot.
+        if params
+            .allowed
+            .iter()
+            .any(|descriptor| derives_within(descriptor, spk, max))
+        {
+            hot_outputs.push(index);
+            continue;
+        }
+        unrecognized.push(index);
+    }
+    if !unrecognized.is_empty() {
+        return Err(Violation::new(
+            ViolationCode::PsbtInconsistent,
+            "transaction_class",
+            format!(
+                "output(s) {unrecognized:?} pay neither the vault, the escape descriptor, \
+                 nor a hot-allowlist descriptor, so the spend has no single class"
+            ),
+        ));
+    }
+    match (hot_outputs.is_empty(), escape_outputs.is_empty()) {
+        (true, true) => Ok(TxClass::Refresh),
+        (true, false) => Ok(TxClass::Escape),
+        (false, true) => Ok(TxClass::Hot),
+        (false, false) => Err(Violation::new(
+            ViolationCode::PsbtInconsistent,
+            "transaction_class",
+            format!(
+                "mixed-class spend: output(s) {hot_outputs:?} pay the hot allowlist and \
+                 output(s) {escape_outputs:?} pay the escape wallet; a spend has exactly one class"
+            ),
+        )),
+    }
+}
+
 /// Fee cap: fee (Σ inputs − Σ outputs) must not exceed
 /// `MAX_FEE_PERCENT` % of Σ inputs. Exactly at the cap passes.
 /// [`check_psbt_consistency`] has already guaranteed every input carries a
@@ -375,8 +482,29 @@ mod tests {
         CheckParams {
             vault: vault(),
             allowed: vec![ranged(0xA0), ranged(0xB0)],
+            escape: None,
             max_derivation_index: MAX,
         }
+    }
+
+    /// The hot wallet (0xA0) and the escape wallet (0xB0) as a node configures
+    /// them: BOTH allowlisted, escape named separately so [`classify`] can tell
+    /// them apart.
+    fn class_params() -> CheckParams {
+        CheckParams {
+            vault: vault(),
+            allowed: vec![ranged(0xA0), ranged(0xB0)],
+            escape: Some(ranged(0xB0)),
+            max_derivation_index: MAX,
+        }
+    }
+
+    fn hot_spk(index: u32) -> ScriptBuf {
+        derived_spk(&ranged(0xA0), index)
+    }
+
+    fn escape_spk(index: u32) -> ScriptBuf {
+        derived_spk(&ranged(0xB0), index)
     }
 
     /// A one-input PSBT (prevout = the vault script) with the given outputs. The
@@ -626,6 +754,93 @@ mod tests {
             vec![(derived_spk(&ranged(0xA0), 0), 200_000, false)],
         );
         let violation = evaluate(&psbt, &params()).expect_err("must refuse");
+        assert_eq!(violation.code, ViolationCode::PsbtInconsistent);
+    }
+
+    // -- the transaction-class predicate (ADR-0013 §3) -----------------------
+
+    #[test]
+    fn every_output_to_the_vault_is_refresh_class() {
+        let psbt = psbt_with(100_000, vec![(vault_spk(), 90_000, false)]);
+        assert_eq!(classify(&psbt, &class_params()), Ok(TxClass::Refresh));
+    }
+
+    #[test]
+    fn a_hot_destination_with_vault_change_is_hot_class() {
+        let psbt = psbt_with(
+            100_000,
+            vec![(hot_spk(5), 60_000, false), (vault_spk(), 30_000, false)],
+        );
+        assert_eq!(classify(&psbt, &class_params()), Ok(TxClass::Hot));
+    }
+
+    #[test]
+    fn every_destination_to_the_escape_wallet_is_escape_class_even_with_vault_change() {
+        // Vault change is permitted in EVERY class and excluded from the
+        // decision, so it must not downgrade a sweep out of escape-class.
+        let psbt = psbt_with(
+            100_000,
+            vec![
+                (escape_spk(0), 60_000, false),
+                (escape_spk(1), 20_000, false),
+                (vault_spk(), 10_000, false),
+            ],
+        );
+        assert_eq!(classify(&psbt, &class_params()), Ok(TxClass::Escape));
+    }
+
+    /// The duress bypass this predicate exists to close: 99% to the hot wallet
+    /// plus dust to the escape wallet. Every output is individually allowlisted,
+    /// so `evaluate` passes it — a "has an escape output ⇒ escape-class" rule
+    /// would complete it IMMEDIATELY under the duress PIN, which with stolen hot
+    /// keys is extraction. It must be rejected outright.
+    #[test]
+    fn a_mixed_hot_and_escape_spend_is_rejected_even_though_every_output_is_allowlisted() {
+        let psbt = psbt_with(
+            100_000,
+            vec![(hot_spk(5), 89_000, false), (escape_spk(0), 1_000, false)],
+        );
+        assert_eq!(
+            evaluate(&psbt, &class_params()),
+            Ok(()),
+            "each output is individually allowlisted, so the allowlist alone admits this spend"
+        );
+        let violation = classify(&psbt, &class_params()).expect_err("mixed class must be rejected");
+        assert_eq!(violation.code, ViolationCode::PsbtInconsistent);
+        assert_eq!(violation.check, "transaction_class");
+    }
+
+    /// The escape descriptor is itself an allowlist entry, so testing "hot" by
+    /// allowlist membership alone would read every escape output as hot and
+    /// silently turn a sweep into a held hot-class spend.
+    #[test]
+    fn an_escape_output_is_not_read_as_hot_merely_because_it_is_allowlisted() {
+        let psbt = psbt_with(100_000, vec![(escape_spk(0), 90_000, false)]);
+        assert!(
+            class_params()
+                .allowed
+                .iter()
+                .any(|d| derives_within(d, escape_spk(0).as_script(), MAX)),
+            "the escape wallet must be allowlisted, or its sweep could not pass the destination check"
+        );
+        assert_eq!(classify(&psbt, &class_params()), Ok(TxClass::Escape));
+    }
+
+    #[test]
+    fn with_no_escape_descriptor_configured_nothing_is_escape_class() {
+        // `escape: None` — the escape wallet's script is still allowlisted, so it
+        // reads as an ordinary hot destination rather than a sweep.
+        let psbt = psbt_with(100_000, vec![(escape_spk(0), 90_000, false)]);
+        assert_eq!(classify(&psbt, &params()), Ok(TxClass::Hot));
+    }
+
+    #[test]
+    fn an_unallowlisted_output_has_no_class() {
+        // `classify` runs after `evaluate`, which refuses this with
+        // DEST_NOT_ALLOWED; reached directly it must refuse rather than guess.
+        let stranger = derived_spk(&ranged(0xEE), 0);
+        let psbt = psbt_with(100_000, vec![(stranger, 90_000, false)]);
+        let violation = classify(&psbt, &class_params()).expect_err("no class");
         assert_eq!(violation.code, ViolationCode::PsbtInconsistent);
     }
 }

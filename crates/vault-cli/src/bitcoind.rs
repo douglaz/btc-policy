@@ -1,6 +1,7 @@
 //! Private regtest bitcoind for the demo: spawn, cookie-auth JSON-RPC,
 //! kill + cleanup on drop.
 
+use std::cell::Cell;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -22,6 +23,16 @@ pub struct Bitcoind {
     auth: String,
     /// JSON-RPC endpoint path; "/wallet/<name>" after create_wallet.
     endpoint: String,
+    /// Every `sendrawtransaction` this process has issued.
+    ///
+    /// The coordinator is a **pure relay**: under Model B the NODES combine and
+    /// broadcast, and vault-cli must never push a vault transaction — if it could,
+    /// a post-wrench coordinator could too. [`Bitcoind::broadcasts`] is what the
+    /// demo asserts on, so "the coordinator does not broadcast" is checked against
+    /// what this process actually did at runtime, not against a reading of the
+    /// source. It counts every call, including the demo's own chain setup, so the
+    /// assertion can only pass at zero.
+    sendrawtransaction_calls: Cell<usize>,
 }
 
 impl Bitcoind {
@@ -46,6 +57,7 @@ impl Bitcoind {
             rpc_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, rpc_port)),
             auth: String::new(),
             endpoint: "/".into(),
+            sendrawtransaction_calls: Cell::new(0),
         };
         bitcoind.wait_ready()?;
         Ok(bitcoind)
@@ -87,7 +99,17 @@ impl Bitcoind {
         &self.auth
     }
 
+    /// How many times this process has called `sendrawtransaction`. The demo
+    /// asserts this is ZERO: the nodes broadcast, never the coordinator.
+    pub fn broadcasts(&self) -> usize {
+        self.sendrawtransaction_calls.get()
+    }
+
     pub fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
+        if method == "sendrawtransaction" {
+            self.sendrawtransaction_calls
+                .set(self.sendrawtransaction_calls.get() + 1);
+        }
         let request = json!({
             "jsonrpc": "1.0",
             "id": "first-light",

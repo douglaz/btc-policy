@@ -1,13 +1,26 @@
-//! Watchtower duty (ADR-0001): every node watches its OWN chain view and queues
-//! a structured [`Alert`] for two events —
+//! Watchtower duty (ADR-0001, as revised by ADR-0012): every node watches its OWN
+//! chain view and queues a structured [`Alert`] for two events —
 //!
 //!  - **RecoveryPathSpend**: a spend that took the timelocked recovery branch.
-//!  - **UnrecognizedSpend**: a spend of a vault UTXO whose txid this node never
-//!    co-signed (a node knows every spend it participated in from its sign log,
-//!    so an unrecognized one is by definition out-of-band).
+//!  - **UnrecognizedSpend**: a spend of a vault UTXO this node never **validated
+//!    AND policy-ACCEPTED**.
 //!
-//! A co-signed spend of the vault raises nothing — it is exactly what the node
-//! authorized. Alerts are pulled by the coordinator (ADR-0002); nodes never push.
+//! **Recognition is by ACCEPTANCE, not by signing** (ADR-0012's required fix). The
+//! two neighbouring criteria are both wrong:
+//!
+//!  - "*I co-signed it*" is too narrow. In a `t`-of-`n` only `t` nodes sign any
+//!    given spend, so the other `n−t` would false-alarm on entirely honest
+//!    traffic. This is what V0-6 did.
+//!  - "*I evaluated it*" is too broad, and dangerously so. A spend a node
+//!    policy-REFUSED was evaluated — so under that rule an attacker who fans a
+//!    theft out to the honest nodes would have it marked recognized everywhere and
+//!    **suppress its own alert**.
+//!
+//! Acceptance is the line that works: every node validates every request, so a
+//! legitimate spend is accepted by all `n` and alerts nowhere, while a theft the
+//! honest nodes refuse is in nobody's accepted set and alerts everywhere — whether
+//! or not the attacker fanned it out. Alerts are pulled by the coordinator
+//! (ADR-0002); nodes never push.
 //!
 //! The classification [`scan`] is a callable pass, deterministic and driven by a
 //! caller (the tests). In the running daemon a thin loop drives it: each node is
@@ -37,7 +50,8 @@ pub enum AlertKind {
     /// A spend took the recovery branch — stolen recovery keys, or a legitimate
     /// recovery; either way the user must be told (DESIGN.md, Wallet Topology).
     RecoveryPathSpend,
-    /// A vault UTXO was spent by a transaction this node never co-signed.
+    /// A vault UTXO was spent by a transaction this node never validated and
+    /// policy-accepted (see the module docs — NOT "never co-signed").
     UnrecognizedSpend,
 }
 
@@ -114,11 +128,12 @@ impl Event {
 /// Classify each observed spend into the alerts to queue.
 ///
 /// Precedence (DESIGN.md, "Watchtower"): a spend of a recovery-branch script is a
-/// `RecoveryPathSpend` even though the node never co-signed it — the recovery path
-/// uses recovery keys, not node keys, so the sign-log test would otherwise
+/// `RecoveryPathSpend` even though the node never authorized it — the recovery path
+/// uses recovery keys, not node keys, so the acceptance test would otherwise
 /// mislabel it. Any other spend the backend surfaced is a spend of a vault UTXO
 /// (the backend was only asked for these two script sets); it is an
-/// `UnrecognizedSpend` unless its txid is in `signed_txids`, the node's sign log.
+/// `UnrecognizedSpend` unless its txid is in `authorized_txids` — the node's
+/// validated-AND-policy-ACCEPTED set (see the module docs).
 ///
 /// This keys recovery off a DISTINCT prevout script set — correct for v0, whose
 /// recovery set is empty. In v1 the real (Liana-style) recovery branch shares the
@@ -127,13 +142,13 @@ impl Event {
 fn classify(
     spends: &[SpendSeen],
     recovery_scripts: &HashSet<ScriptBuf>,
-    signed_txids: &HashSet<Txid>,
+    authorized_txids: &HashSet<Txid>,
 ) -> Vec<Alert> {
     let mut alerts = Vec::new();
     for spend in spends {
         if recovery_scripts.contains(&spend.script) {
             alerts.push(Alert::from_spend(AlertKind::RecoveryPathSpend, spend));
-        } else if !signed_txids.contains(&spend.spend_txid) {
+        } else if !authorized_txids.contains(&spend.spend_txid) {
             alerts.push(Alert::from_spend(AlertKind::UnrecognizedSpend, spend));
         }
     }
@@ -141,21 +156,22 @@ fn classify(
 }
 
 /// One watchtower scan pass: ask `backend` for spends of the vault and recovery
-/// scripts at or after `from_height`, then classify them against the sign log.
-/// The first-light vault has no recovery branch, so `recovery_scripts` is empty
-/// there; the classification is exercised directly in the tests.
+/// scripts at or after `from_height`, then classify them against the node's
+/// authorized set. The first-light vault has no recovery branch, so
+/// `recovery_scripts` is empty there; the classification is exercised directly in
+/// the tests.
 pub fn scan(
     backend: &dyn ChainBackend,
     vault_scripts: &[ScriptBuf],
     recovery_scripts: &[ScriptBuf],
-    signed_txids: &HashSet<Txid>,
+    authorized_txids: &HashSet<Txid>,
     from_height: u32,
 ) -> Result<Vec<Alert>, Error> {
     let mut watched = vault_scripts.to_vec();
     watched.extend_from_slice(recovery_scripts);
     let spends = backend.spends_of(&watched, from_height)?;
     let recovery: HashSet<ScriptBuf> = recovery_scripts.iter().cloned().collect();
-    Ok(classify(&spends, &recovery, signed_txids))
+    Ok(classify(&spends, &recovery, authorized_txids))
 }
 
 /// Interval between watchtower scan passes in the daemon driver. A `const`, not a
@@ -172,7 +188,7 @@ pub(crate) struct ScanOutcome {
 
 /// One scan pass, shared by the daemon driver and the callable
 /// [`Node::watchtower_tick`](crate::Node::watchtower_tick) so tests and
-/// production run ONE code path: read the tip, snapshot the sign log, run the
+/// production run ONE code path: read the tip, snapshot the authorized set, run the
 /// [`scan`] classification over `vault_scripts` at or after `from_height`, and
 /// queue the new alerts. Returns the new-alert count and the next cursor —
 /// `tip + 1`, so the following pass skips the blocks this one covered (the height
@@ -180,20 +196,20 @@ pub(crate) struct ScanOutcome {
 /// racing block can leave). When the cursor is already caught up, the scan range
 /// is empty and the cursor remains caught up — never a re-scan from 0.
 ///
-/// The sign log is snapshotted (and its lock released) before the possibly-slow
-/// backend fetch, so a concurrent `/sign` is never blocked on chain I/O. The
-/// vault has no recovery branch in v0, so the recovery script set is empty here
-/// (see [`scan`]).
+/// The authorized set is snapshotted (and its lock released) before the
+/// possibly-slow backend fetch, so a concurrent `/sign` is never blocked on chain
+/// I/O. The vault has no recovery branch in v0, so the recovery script set is
+/// empty here (see [`scan`]).
 pub(crate) fn scan_pass(
     backend: &dyn ChainBackend,
     vault_scripts: &[ScriptBuf],
-    sign_log: &Mutex<HashSet<Txid>>,
+    authorized: &Mutex<HashSet<Txid>>,
     alerts: &Mutex<AlertQueue>,
     from_height: u32,
 ) -> Result<ScanOutcome, Error> {
     let tip = backend.tip_height()?;
-    let signed = sign_log.lock().expect("sign_log lock poisoned").clone();
-    let new_alerts = scan(backend, vault_scripts, &[], &signed, from_height)?;
+    let authorized = authorized.lock().expect("authorized lock poisoned").clone();
+    let new_alerts = scan(backend, vault_scripts, &[], &authorized, from_height)?;
     let mut queue = alerts.lock().expect("alerts lock poisoned");
     let mut queued = 0;
     for alert in new_alerts {
@@ -210,8 +226,8 @@ pub(crate) fn scan_pass(
 /// Spawn the daemon watchtower driver (ADR-0001, V0-6b): ONE background tokio
 /// task that runs a [`scan_pass`] every [`SCAN_INTERVAL`], carrying a height
 /// cursor between passes so it advances instead of re-scanning from 0.
-/// `sign_log` and `alerts` are the node's shared watchtower state — the same
-/// handles the `/sign` server writes/reads, so a spend the node co-signs is
+/// `authorized` and `alerts` are the node's shared watchtower state — the same
+/// handles the `/sign` server writes/reads, so a spend the node ACCEPTS is
 /// recognized and alerts surface through `GET /events`.
 ///
 /// Each pass's [`scan_pass`] calls blocking bitcoind JSON-RPC (`chain.rs`), so
@@ -223,7 +239,7 @@ pub(crate) fn scan_pass(
 pub fn spawn_driver(
     backend: Arc<dyn ChainBackend + Send + Sync>,
     vault_scripts: Vec<ScriptBuf>,
-    sign_log: Arc<Mutex<HashSet<Txid>>>,
+    authorized: Arc<Mutex<HashSet<Txid>>>,
     alerts: Arc<Mutex<AlertQueue>>,
 ) {
     let vault_scripts = Arc::new(vault_scripts);
@@ -234,13 +250,13 @@ pub fn spawn_driver(
             ticker.tick().await; // the first tick completes immediately
             let backend = Arc::clone(&backend);
             let vault_scripts = Arc::clone(&vault_scripts);
-            let sign_log = Arc::clone(&sign_log);
+            let authorized = Arc::clone(&authorized);
             let alerts = Arc::clone(&alerts);
             let pass = tokio::task::spawn_blocking(move || {
                 scan_pass(
                     backend.as_ref(),
                     &vault_scripts,
-                    &sign_log,
+                    &authorized,
                     &alerts,
                     from_height,
                 )
@@ -413,13 +429,14 @@ mod tests {
     }
 
     #[test]
-    fn a_vault_spend_never_co_signed_alerts_unrecognized_spend() {
+    fn a_vault_spend_the_node_never_accepted_alerts_unrecognized_spend() {
         let vault = script(0x01);
         let backend = MockBackend {
             spends: vec![spend(0xAA, 0x01)],
             ..Default::default()
         };
-        // Empty sign log: the node co-signed nothing, so this spend is unknown.
+        // Empty authorized set: the node accepted nothing, so this spend is
+        // unknown to it.
         let alerts = scan(&backend, &[vault], &[], &HashSet::new(), 0).expect("scan");
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].kind, AlertKind::UnrecognizedSpend);
@@ -427,26 +444,26 @@ mod tests {
     }
 
     #[test]
-    fn a_co_signed_vault_spend_raises_no_alert() {
+    fn an_accepted_vault_spend_raises_no_alert() {
         let vault = script(0x01);
         let backend = MockBackend {
             spends: vec![spend(0xAA, 0x01)],
             ..Default::default()
         };
-        // The node's sign log holds this spend's txid: it is expected, not an
-        // alert.
-        let signed: HashSet<Txid> = [txid(0xAA)].into_iter().collect();
-        let alerts = scan(&backend, &[vault], &[], &signed, 0).expect("scan");
+        // The node's authorized set holds this spend's txid: it is expected, not
+        // an alert.
+        let accepted: HashSet<Txid> = [txid(0xAA)].into_iter().collect();
+        let alerts = scan(&backend, &[vault], &[], &accepted, 0).expect("scan");
         assert!(
             alerts.is_empty(),
-            "a spend the node co-signed must raise nothing, got {alerts:?}"
+            "a spend the node accepted must raise nothing, got {alerts:?}"
         );
     }
 
     #[test]
-    fn a_recovery_spend_alerts_recovery_even_though_it_was_never_co_signed() {
-        // Guard the precedence: the recovery branch is never co-signed, so an
-        // empty sign log must NOT downgrade it to UnrecognizedSpend.
+    fn a_recovery_spend_alerts_recovery_even_though_it_was_never_authorized() {
+        // Guard the precedence: the recovery branch is never node-authorized, so
+        // an empty authorized set must NOT downgrade it to UnrecognizedSpend.
         let recovery = script(0x02);
         let backend = MockBackend {
             spends: vec![spend(0xAA, 0x02)],
@@ -612,7 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_driver_task_scans_and_surfaces_an_alert_without_an_explicit_tick() {
-        // A backend reporting an un-co-signed vault spend; the driver — nothing
+        // A backend reporting an unauthorized vault spend; the driver — nothing
         // else — must surface it through the shared queue.
         let vault = script(0x01);
         let backend = MockBackend {
@@ -620,13 +637,13 @@ mod tests {
             tip: 1,
             ..Default::default()
         };
-        let sign_log = Arc::new(Mutex::new(HashSet::new()));
+        let authorized = Arc::new(Mutex::new(HashSet::new()));
         let alerts = Arc::new(Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP)));
 
         spawn_driver(
             Arc::new(backend),
             vec![vault],
-            Arc::clone(&sign_log),
+            Arc::clone(&authorized),
             Arc::clone(&alerts),
         );
 
@@ -658,19 +675,19 @@ mod tests {
             spend_block: 5,
             ..Default::default()
         };
-        let sign_log = Mutex::new(HashSet::new());
+        let authorized = Mutex::new(HashSet::new());
         let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
         let scripts = std::slice::from_ref(&vault);
 
         // First pass scans 0..=5, alerts the spend, advances the cursor to 6.
-        let outcome = scan_pass(&backend, scripts, &sign_log, &alerts, 0).expect("first pass");
+        let outcome = scan_pass(&backend, scripts, &authorized, &alerts, 0).expect("first pass");
         assert_eq!(outcome.next_from, 6);
         assert_eq!(outcome.new_alerts, 1);
         assert_eq!(alerts.lock().expect("alerts lock").since(0).0.len(), 1);
 
         // A new empty block arrives; the second pass scans only the new range.
         backend.tip = 6;
-        let outcome = scan_pass(&backend, scripts, &sign_log, &alerts, outcome.next_from)
+        let outcome = scan_pass(&backend, scripts, &authorized, &alerts, outcome.next_from)
             .expect("second pass");
         assert_eq!(outcome.next_from, 7);
         assert_eq!(outcome.new_alerts, 0);
@@ -688,19 +705,19 @@ mod tests {
     #[test]
     fn the_shared_state_is_safe_under_a_concurrent_signer_and_scanner() {
         // Two threads on the SAME shared handles. The scanner is the driver's
-        // work — read the sign log, write the alert queue. The main thread drives
+        // work — read the authorized set, write the alert queue. The main thread drives
         // the exact shared-state touchpoints of the other two routes: `/sign`
-        // writes the sign log (`sign_log.lock().insert`, lib.rs handler step 8)
+        // writes the authorized set (`authorized.lock().insert`, lib.rs step 11)
         // and `/events` reads the queue (`alerts.lock().since`, `Node::events`).
         // Every access goes through a `Mutex`, so the two threads serialize with
         // no data race — a `RefCell` here would not even compile across threads,
         // and that this does (and stays consistent under contention) is the proof.
         let vault = script(0x01);
-        let sign_log = Arc::new(Mutex::new(HashSet::new()));
+        let authorized = Arc::new(Mutex::new(HashSet::new()));
         let alerts = Arc::new(Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP)));
 
         let scanner = {
-            let sign_log = Arc::clone(&sign_log);
+            let authorized = Arc::clone(&authorized);
             let alerts = Arc::clone(&alerts);
             let vault = vault.clone();
             // The spend's txid (0xFF) is one the signer below never records
@@ -714,16 +731,16 @@ mod tests {
                 };
                 let scripts = std::slice::from_ref(&vault);
                 for _ in 0..8 {
-                    scan_pass(&backend, scripts, &sign_log, &alerts, 0).expect("scan pass");
+                    scan_pass(&backend, scripts, &authorized, &alerts, 0).expect("scan pass");
                 }
             })
         };
 
         // Concurrently exercise the `/sign` write path and the `/events` read path.
         for n in 0..8u32 {
-            sign_log
+            authorized
                 .lock()
-                .expect("sign_log lock")
+                .expect("authorized lock")
                 .insert(txid((n % 251) as u8));
             let _ = alerts.lock().expect("alerts lock").since(0);
         }

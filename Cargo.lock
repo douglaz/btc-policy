@@ -983,6 +983,7 @@ dependencies = [
  "bitcoin",
  "miniscript",
  "serde_json",
+ "vault-node",
  "vault-proto",
 ]
 

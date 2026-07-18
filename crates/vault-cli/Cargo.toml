@@ -14,6 +14,12 @@ bitcoin = { workspace = true }
 miniscript = { workspace = true }
 serde_json = { workspace = true }
 vault-proto = { path = "../vault-proto" }
+# The demo plays the SETUP CEREMONY, which must compute `manifest_hash` and each
+# node's channel endorsement byte-identically to the nodes it provisions — a
+# mismatch means the federation cannot boot. It therefore calls the node's own
+# definitions (`channel::ceremony`) rather than keeping a second copy that no test
+# on either side could prove equal.
+vault-node = { path = "../vault-node" }
 
 [lints]
 workspace = true
