@@ -25,13 +25,17 @@
 
 pub mod chain;
 pub mod channel;
+mod pin;
 mod replay;
 pub mod server;
 pub mod watchtower;
 
+pub use pin::{argon2id_duress_phc, argon2id_normal_phc};
+
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +48,7 @@ use miniscript::descriptor::WshInner;
 use miniscript::{Descriptor, DescriptorPublicKey, Terminal};
 use replay::{NonceDecision, NonceLog, ReplayLog, SignState, MAX_COORD_NONCE_BYTES};
 use serde::Deserialize;
+use subtle::{ConditionallySelectable, ConstantTimeEq};
 use vault_proto::{
     Commitment, CommitmentInput, CommitmentOutput, CoordRequest, RefreshRequest, Refusal,
     RefusalCode, SignRequest, SignResponse, MAX_PIN_BYTES,
@@ -61,6 +66,7 @@ pub struct BadRequest(pub String);
 
 /// The node's policy config file (TOML, written once at deploy time).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub listen_port: u16,
     /// Hex-encoded 32-byte secret key. A key at rest is a deliberate
@@ -114,10 +120,20 @@ pub struct ConfigFile {
     /// The baked-at-setup policy identifier, bound into every commitment
     /// (policy is immutable, so this never changes).
     pub policy_version: u32,
-    /// Lowercase hex SHA-256 of each enrolled PIN (argon2 comes with the
-    /// real setup ceremony later).
+    /// The two enrolled PINs as **Argon2id PHC strings**, each with its OWN salt
+    /// (ADR-0012). Both are validated at startup as argon2id with valid params and
+    /// DISTINCT salts (fatal config error otherwise), and the node compares a
+    /// submitted pin against BOTH unconditionally in constant time
+    /// ([`pin::verify_pin`]). Not SHA-256: a plain hash makes online guessing cheap,
+    /// and distinct-salt argon2id is what the constant-cost duress compare rests on.
     pub pin_normal_hash: String,
     pub pin_duress_hash: String,
+    /// The per-node pin-attempt budget (ADR-0013 §7): online-guessing rate limit.
+    /// RAMDISK/node-lifetime, defaulted so a config that omits it still loads; the
+    /// defaults are validated exactly as an explicit block is (`max_attempts`,
+    /// `window_secs`, and `lockout_secs` >= 1; non-empty `backoff_schedule`).
+    #[serde(default)]
+    pub pin_attempt_budget: PinAttemptBudgetConfig,
     /// The coordinator's 33-byte compressed authentication pubkey: the mandatory
     /// per-vault trust root every request authenticates against (ADR-0013 §2/§4).
     /// Channel mode includes this same value in its base-manifest hash; when an
@@ -173,6 +189,57 @@ fn default_refresh_max_feerate() -> u64 {
     100
 }
 
+/// The per-node pin-attempt budget config (ADR-0013 §7). Every field defaults so a
+/// config may omit the whole block, but the defaults are validated like any other
+/// value at load ([`pin::PinBudgetConfig::validate`]).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinAttemptBudgetConfig {
+    /// Wrong pins within `window_secs` that trip a lockout (default 5).
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u64,
+    /// Sliding window over which wrong pins accumulate (default 1h).
+    #[serde(default = "default_window_secs")]
+    pub window_secs: u64,
+    /// Per-failure backoff sleep in seconds, indexed by the pre-failure count and
+    /// clamped to the last entry (default `[0]` — no per-attempt delay; the lockout
+    /// after `max_attempts` is the primary online-guessing defense). A deployment
+    /// that wants a rising delay sets an explicit ramp, e.g. `[0, 1, 5, 30]` (keep a
+    /// leading `0` so an honest single mistype is not penalized).
+    #[serde(default = "default_backoff_schedule")]
+    pub backoff_schedule: Vec<u64>,
+    /// How long a lockout lasts once tripped, in seconds (default 15m).
+    #[serde(default = "default_lockout_secs")]
+    pub lockout_secs: u64,
+}
+
+impl Default for PinAttemptBudgetConfig {
+    fn default() -> PinAttemptBudgetConfig {
+        PinAttemptBudgetConfig {
+            max_attempts: default_max_attempts(),
+            window_secs: default_window_secs(),
+            backoff_schedule: default_backoff_schedule(),
+            lockout_secs: default_lockout_secs(),
+        }
+    }
+}
+
+fn default_max_attempts() -> u64 {
+    5
+}
+
+fn default_window_secs() -> u64 {
+    3_600
+}
+
+fn default_backoff_schedule() -> Vec<u64> {
+    vec![0]
+}
+
+fn default_lockout_secs() -> u64 {
+    900
+}
+
 /// The bitcoind JSON-RPC endpoint the watchtower driver scans, exactly what
 /// [`BitcoindBackend`] needs (DESIGN.md, "Per-node chain backend").
 #[derive(Debug, Deserialize)]
@@ -193,8 +260,47 @@ pub struct Node {
     user_pubkey: PublicKey,
     witness_script: ScriptBuf,
     check_params: policy_core::CheckParams,
-    pin_normal_hash: String,
-    pin_duress_hash: String,
+    /// The dual-Argon2id pin verifier (ADR-0012 constant-cost compare). Behind an
+    /// `Arc<dyn ...>` so a test can inject a counting evaluator and assert exactly
+    /// two evaluations run per SpendRequest; production always holds the real
+    /// [`pin::Argon2Evaluator`].
+    pin_evaluator: Arc<dyn pin::PinEvaluator>,
+    /// The per-node attempt-budget config (ADR-0013 §7). Immutable; the mutable
+    /// wrong-pin accounting lives in [`replay::SignState`] under the one `/sign`
+    /// lock, so the budget check-then-update is atomic with the rest of the handler.
+    pin_budget_config: pin::PinBudgetConfig,
+    /// Terminal **Lockdown** (ADR-0008): once set, every spend AND refresh answers
+    /// `FRAUD_SUSPECTED` for the node's lifetime. A monotonic latch (false→true,
+    /// never back) with **durability EQUAL to the signing key's** (see
+    /// `lockdown_flag_path`): the key lives in the tmpfs config, so it survives a
+    /// process restart but dies on a machine reboot — Lockdown must match, or a
+    /// bare process restart (crash-loop, supervisor respawn, OOM-kill — none need
+    /// SSH) would reload the key from the surviving config yet resurrect an
+    /// UNLOCKED signer. No reset on sealed nodes; a reboot is node death (tmpfs
+    /// wiped → key AND flag gone), strictly stronger. V0-4a builds the state, the
+    /// refusal, and the [`Node::enter_lockdown`] entry point; V0-4b drives WHEN it
+    /// is entered (at T under duress).
+    lockdown: AtomicBool,
+    /// A PRE-OPENED handle to the RAMDISK Lockdown latch file, so the latch has the
+    /// SAME durability as `node_seckey` (both on tmpfs; both die on reboot, both
+    /// survive a process restart). Opened once by [`Node::load`] at startup — BEFORE
+    /// the server accepts any connection — and held for the node's lifetime, so
+    /// [`Node::enter_lockdown`] persists at `T` via `write_at` on this existing
+    /// descriptor and needs NO fresh fd: an attacker cannot exhaust the fd table
+    /// (EMFILE) to make the lockdown write fail and then restart into an unlocked
+    /// signer. **Content, not existence, means locked** (a fresh boot's file is
+    /// empty; enter_lockdown writes a marker) — so an empty file created at open time
+    /// is not mistaken for a latch. `None` for a path-less [`Node::from_toml_str`]
+    /// (pure in-RAM, unit tests only). This is NOT a durable at-rest "duress was
+    /// detected" artifact (ADR-0008 bars those): a tmpfs file is wiped by the same
+    /// reboot that wipes the key, so it never survives to a bare machine.
+    lockdown_flag_file: Option<std::fs::File>,
+    /// The duress arm-hook seam (ADR-0012 "internal fire bit"): incremented whenever
+    /// a valid DURESS pin is seen — even when the node is locked out (fail-closed).
+    /// V0-4a exposes only this counter (invisible on the wire, so it does not break
+    /// pin-independent ingress); V0-4b builds the arm/freeze/sweep state machine on
+    /// this same seam.
+    duress_arm: AtomicU64,
     /// The coordinator authentication pubkey this node is sealed to (ADR-0013
     /// §2): every `/sign` request must be validly coord-signed, carry a fresh
     /// nonce, and fall inside the expiry window before the PIN is even consulted.
@@ -288,9 +394,65 @@ impl Node {
     pub fn load(path: &str) -> Result<Node, Error> {
         let raw =
             std::fs::read_to_string(path).map_err(|e| format!("cannot read config {path}: {e}"))?;
-        let node = Node::from_toml_str(&raw)?;
+        let mut node = Node::from_toml_str(&raw)?;
         node.require_channel_mode()?;
+        node.apply_persisted_lockdown(path)?;
         Ok(node)
+    }
+
+    /// Bind this node to its RAMDISK Lockdown flag and adopt any latch that survived
+    /// into this process. Lockdown durability = signing-key durability: the key was
+    /// just reloaded from the tmpfs config, so if the sibling flag ALSO survived
+    /// (a process restart, not a machine reboot — a reboot wipes both) the node comes
+    /// back TERMINALLY LOCKED. Without this, a bare process restart against the
+    /// surviving config would resurrect an unlocked signer.
+    fn apply_persisted_lockdown(&mut self, config_path: &str) -> Result<(), Error> {
+        use std::io::Read;
+        let flag_path = Node::lockdown_flag_path_for(config_path);
+        // Pre-open (create if absent) the latch file ONCE, here at startup — before
+        // the server serves any connection — and hold the descriptor for life. This
+        // both (a) proves at startup that a future Lockdown CAN be persisted (open
+        // fails → refuse to start, fail-closed: a node that cannot lock itself down
+        // does not run) and (b) reserves the fd so `enter_lockdown` writes at `T`
+        // WITHOUT allocating a new one — closing the EMFILE bypass (exhaust the fd
+        // table before T so the lockdown write fails, then restart to release the
+        // fds and come up unlocked). Not O_TRUNC: an existing latch keeps its marker.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&flag_path)
+            .map_err(|e| {
+                format!(
+                    "cannot open the RAMDISK Lockdown latch {} ({e}); refusing to start \
+                     rather than run unable to lock down / unable to read a prior latch",
+                    flag_path.display()
+                )
+            })?;
+        // Content — not existence — means locked: a fresh boot's file is empty, and
+        // a machine reboot wipes the file with the tmpfs anyway. Any non-empty
+        // content is a persisted latch (robust even to a torn/partial marker write:
+        // non-empty ⇒ locked, fail-closed).
+        let mut marker = Vec::new();
+        file.read_to_end(&mut marker).map_err(|e| {
+            format!(
+                "cannot read the Lockdown latch {}: {e}",
+                flag_path.display()
+            )
+        })?;
+        if !marker.is_empty() {
+            self.lockdown.store(true, Ordering::Release);
+        }
+        self.lockdown_flag_file = Some(file);
+        Ok(())
+    }
+
+    /// The RAMDISK Lockdown flag path for a config at `config_path`: a sibling file
+    /// named after the config, so it is unique per node even when several nodes'
+    /// configs share one tmpfs directory (e.g. the demo's five nodes).
+    fn lockdown_flag_path_for(config_path: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{config_path}.lockdown"))
     }
 
     pub fn from_toml_str(raw: &str) -> Result<Node, Error> {
@@ -465,6 +627,28 @@ impl Node {
         if !allowed.iter().any(|d| d.to_string() == escape_canonical) {
             return Err("escape_descriptor must also be present in allowlist".into());
         }
+        // Both enrolled PINs must be Argon2id PHC strings with valid params and
+        // DISTINCT salts (ADR-0012). Validated here so a placeholder SHA-256, a
+        // non-argon2id KDF, or a copy-pasted shared salt is a fatal provisioning
+        // error, never a silently-weakened compare at the wrench.
+        pin::validate_digests(&config.pin_normal_hash, &config.pin_duress_hash)?;
+        // The pin-attempt budget config (ADR-0013 §7): reject undefined table
+        // indices and zero durations that silently disable accumulation/lockout.
+        let pin_budget_config = pin::PinBudgetConfig {
+            max_attempts: config.pin_attempt_budget.max_attempts,
+            window_secs: config.pin_attempt_budget.window_secs,
+            backoff_schedule: config.pin_attempt_budget.backoff_schedule.clone(),
+            lockout_secs: config.pin_attempt_budget.lockout_secs,
+        };
+        pin_budget_config.validate()?;
+        let pin_budget = pin::AttemptBudget::new(pin_budget_config.max_attempts)?;
+        // The pin digests are stored (owned) inside the evaluator, re-parsed per
+        // request. NOT lowercased: a PHC string's base64 salt/hash is case-sensitive,
+        // so the old `.to_lowercase()` would corrupt it.
+        let pin_evaluator: Arc<dyn pin::PinEvaluator> = Arc::new(pin::Argon2Evaluator::new(
+            config.pin_normal_hash.clone(),
+            config.pin_duress_hash.clone(),
+        ));
         // Parse the optional watchtower endpoint now so a bad address fails at
         // load, not silently at the first scan.
         let chain_backend = config
@@ -517,6 +701,10 @@ impl Node {
                 )
             })
             .transpose()?;
+        let sign_state = SignState {
+            pin_budget,
+            ..SignState::default()
+        };
         Ok(Node {
             listen_port: config.listen_port,
             seckey,
@@ -532,8 +720,14 @@ impl Node {
                 escape: Some(escape_descriptor),
                 max_derivation_index: config.max_derivation_index,
             },
-            pin_normal_hash: config.pin_normal_hash.to_lowercase(),
-            pin_duress_hash: config.pin_duress_hash.to_lowercase(),
+            pin_evaluator,
+            pin_budget_config,
+            lockdown: AtomicBool::new(false),
+            // Path-less construction (unit tests): no persistence. `Node::load`
+            // pre-opens the flag file and reads the latch so a real deployment's
+            // Lockdown survives a process restart (durability = key durability).
+            lockdown_flag_file: None,
+            duress_arm: AtomicU64::new(0),
             coordinator_auth,
             wallet_id,
             policy_version: config.policy_version,
@@ -543,7 +737,7 @@ impl Node {
             threshold,
             refresh_min_interval_secs: config.refresh_min_interval_secs,
             refresh_max_feerate: config.refresh_max_feerate,
-            sign_state: Mutex::new(SignState::default()),
+            sign_state: Mutex::new(sign_state),
             authorized: Arc::new(Mutex::new(HashSet::new())),
             alerts,
             chain_backend,
@@ -616,6 +810,91 @@ impl Node {
             );
         }
         Ok(())
+    }
+
+    /// Enter the terminal **Lockdown** state (ADR-0008). The entry point V0-4b calls
+    /// at `T` under duress; V0-4a exposes it so the state + `FRAUD_SUSPECTED` refusal
+    /// can be built and tested in isolation. Monotonic: once entered there is no
+    /// programmatic exit (RAMDISK, no reset on sealed nodes — the only exit is the
+    /// recovery path, and a reboot is node death, strictly stronger).
+    ///
+    /// The flag is set while holding `sign_state` so the transition LINEARIZES with
+    /// in-flight `/sign` and `/refresh` handlers, which re-check `is_locked_down`
+    /// under that same lock: a request either commits fully BEFORE this store (it
+    /// began pre-Lockdown) or observes the flag and refuses — none registers a new
+    /// candidate AFTER Lockdown. Because it acquires `sign_state`, it MUST NOT be
+    /// called while that lock is already held.
+    pub fn enter_lockdown(&self) {
+        let _guard = self.sign_state.lock().expect("sign_state lock poisoned");
+        // Persist the latch to tmpfs BEFORE flipping the in-RAM flag, so a crash or
+        // OOM-kill after this point restarts LOCKED (fail-closed): once the marker is
+        // on disk the next process reads it, and the only remaining window — a crash
+        // between the write and the store below — still leaves the marker on disk,
+        // i.e. still locked. The write goes through the descriptor pre-opened at
+        // startup (see `lockdown_flag_file`), so it allocates NO new fd and cannot be
+        // blocked by fd-table exhaustion (EMFILE). Durability = key durability.
+        if let Some(file) = &self.lockdown_flag_file {
+            use std::os::unix::fs::FileExt;
+            if let Err(e) = file
+                .write_all_at(b"locked\n", 0)
+                .and_then(|()| file.sync_all())
+            {
+                // Only ENOSPC-class failure remains (the RAM is full); irreducible
+                // (you cannot write to full storage) and self-limiting — such a node
+                // is failing and a reboot is node death = safe. This process still
+                // locks via the store below; logged loudly, never panicked (a panic
+                // would exit into an unlocked respawn, strictly worse).
+                eprintln!(
+                    "enter_lockdown: WARNING could not persist RAMDISK lockdown latch: {e} \
+                     (this process stays locked; a restart before reboot may not)"
+                );
+            }
+        }
+        self.lockdown.store(true, Ordering::Release);
+    }
+
+    /// Whether this node is in Lockdown. Read at the top of every spend/refresh (a
+    /// lock-free fast path) AND re-checked under `sign_state` inside the handler, so
+    /// a locked-down node answers `FRAUD_SUSPECTED` and does nothing else.
+    pub fn is_locked_down(&self) -> bool {
+        self.lockdown.load(Ordering::Acquire)
+    }
+
+    /// Fire the duress arm-hook (the ADR-0012 "internal fire bit"). V0-4a only
+    /// counts firings — the observable seam V0-4b's arm/freeze/sweep machine hangs
+    /// off. Invisible on the wire, so it does not break pin-independent ingress.
+    ///
+    /// Runs on EVERY SpendRequest with a constant-time-selected delta (1 for a
+    /// duress verdict, 0 for normal/wrong) rather than behind an `if verdict ==
+    /// Duress` branch: that keeps the arm-hook the SAME observable work for normal
+    /// and duress — the last verdict-dependent step on the ingress hot path — so the
+    /// constant-shape story (both Argon2 always run, budget touch is uniform) has no
+    /// remaining seam. The COUNT is still +1 only for duress, so the fail-closed test
+    /// reads exactly the duress arms.
+    fn fire_arm_hook(&self, verdict: pin::PinVerdict) {
+        let armed = (verdict as u8).ct_eq(&(pin::PinVerdict::Duress as u8));
+        let delta = u64::conditional_select(&0, &1, armed);
+        self.duress_arm.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// How many times the duress arm-hook has fired (test-only observable for the
+    /// fail-closed test: a valid duress pin arms even while the node is locked out).
+    #[cfg(test)]
+    pub(crate) fn duress_arm_count(&self) -> u64 {
+        self.duress_arm.load(Ordering::Relaxed)
+    }
+
+    /// Swap in a test evaluator (e.g. a counting one) to assert the constant-cost
+    /// invariant structurally.
+    #[cfg(test)]
+    pub(crate) fn set_pin_evaluator(&mut self, evaluator: Arc<dyn pin::PinEvaluator>) {
+        self.pin_evaluator = evaluator;
+    }
+
+    /// The current pin evaluator, so a test can wrap it in a counting evaluator.
+    #[cfg(test)]
+    pub(crate) fn pin_evaluator(&self) -> Arc<dyn pin::PinEvaluator> {
+        Arc::clone(&self.pin_evaluator)
     }
 }
 
@@ -1125,13 +1404,21 @@ fn first_light_federation_of(
 /// authorized fire event, and the NODES combine + broadcast, so a hostile
 /// coordinator collecting `/sign` responses can never finalize (§2).
 ///
-/// Ordering (ADR-0012 Model-B Hold lifecycle; ADR-0013 §§2-3, §6):
+/// Ordering (ADR-0012 Model-B Hold lifecycle; ADR-0013 §§2-3, §6-7; ADR-0008):
+///  -. Lockdown (ADR-0008) — a terminal-Lockdown node answers `FRAUD_SUSPECTED`
+///     and does nothing else. Checked before the lock, so it short-circuits auth,
+///     PIN, and the budget entirely.
 ///  0. coordinator-auth + freshness + fresh nonce + node-capped expiry — before
 ///     the PIN; an authentic request consumes its nonce even when a later check
 ///     refuses it ([`verify_coord_auth`]).
-///  1. PIN — before anything is signed. A bad PIN verdict is never logged: the
-///     PIN is not part of the commitment, so recording it would wrongly replay a
-///     `BAD_PIN` refusal for the same transaction resubmitted with a good PIN.
+///  1. PIN + per-node attempt budget (ADR-0012 constant-cost compare; ADR-0013 §7)
+///     — before anything is signed. BOTH Argon2id digests are computed and the
+///     verdict is constant-time-selected ([`pin::verify_pin`]); the budget charges
+///     ONLY wrong pins, a valid duress pin fires the arm-hook even when locked out
+///     (fail-closed), and a locked-out node refuses to sign. A bad/locked PIN
+///     verdict is never logged: the PIN is not part of the commitment, so recording
+///     it would wrongly replay a `BAD_PIN` refusal for the same transaction
+///     resubmitted with a good PIN.
 ///  2. decode BOTH PSBTs — the spend and its MANDATORY escape (§4); undecodable
 ///     input is a 400, not a refusal.
 ///  3. compute BOTH `commitment_id`s — the exact-byte pair of §4 (V0-2b).
@@ -1228,6 +1515,13 @@ fn handle_sign_after_lock(
     request: &SignRequest,
     clock: impl FnOnce() -> u64,
 ) -> Result<SignResponse, BadRequest> {
+    // Terminal Lockdown (ADR-0008) short-circuits everything: a locked-down node
+    // answers FRAUD_SUSPECTED to every spend for its lifetime and does no further
+    // work — no auth, no pin, no signing. Checked before the lock so a locked-down
+    // node does not even contend it.
+    if node.is_locked_down() {
+        return Ok(fraud_suspected());
+    }
     // The whole call runs under ONE lock over the replay + pending logs
     // (`Mutex<SignState>`), reproducing the atomicity the old sequential serve
     // loop gave for free: two concurrent `/sign` requests execute one-at-a-time
@@ -1235,7 +1529,28 @@ fn handle_sign_after_lock(
     // `/sign` against `/sign` BY DESIGN — the async migration isolates `/sign`
     // from `/events` (and, in V0-8a, `/channel`), which keep their own locks,
     // not sign-vs-sign throughput.
+    //
+    // Deliberate throughput tradeoff (V0-4a): the PIN compare's TWO Argon2id
+    // evaluations run under this lock (unconditionally, for the constant-cost
+    // invariant), so an authenticated request holds it for ~2×Argon2 instead of
+    // the old SHA-256 microseconds, serializing `/sign` against `/sign` for that
+    // span. Hoisting the hash out is not a free win — pre-lock it would either
+    // run Argon2 BEFORE coord-auth (an unauthenticated-Argon2 DoS vector) or
+    // duplicate the atomic nonce consumption the lock exists to give. The hash is
+    // gated by coord-auth, so only the vault's one pinned coordinator can trigger
+    // it, and for a low-volume personal vault the serialized cost is acceptable.
+    // The wrong-pin rate-limit backoff sleep is taken OUTSIDE this lock (below),
+    // so a wrong-pin flood never pins `/sign` against honest spends.
     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
+    // Authoritative Lockdown check, UNDER the lock. The pre-lock check above is only
+    // a fast path; `enter_lockdown` sets the flag while holding this same lock, so a
+    // terminal transition that races an in-flight request linearizes here — this
+    // request either saw `false` and now holds the lock (and commits before Lockdown
+    // could store) or sees `true` and refuses. Either way nothing is signed or
+    // registered after Lockdown is entered.
+    if node.is_locked_down() {
+        return Ok(fraud_suspected());
+    }
     let now = clock();
 
     // 0. Coordinator-auth + freshness gate (ADR-0013 §2/§3): every request must be
@@ -1258,24 +1573,49 @@ fn handle_sign_after_lock(
     ) {
         return Ok(rejected);
     }
-    // 1. PIN, before anything else: no valid PIN, nothing is ever signed
-    //    (ADR-0008). At first light a duress PIN is verified and accepted
-    //    exactly like the normal one — the duress *response* is v0 work,
-    //    and the wire answer is identical by design anyway.
-    if request.pin.len() > MAX_PIN_BYTES {
-        return Ok(refusal(
-            RefusalCode::BadPin,
-            "pin",
-            format!("submitted PIN exceeds the {MAX_PIN_BYTES}-byte protocol bound"),
-        ));
-    }
-    let pin_hash = sha256::Hash::hash(request.pin.as_bytes()).to_string();
-    if pin_hash != node.pin_normal_hash && pin_hash != node.pin_duress_hash {
-        return Ok(refusal(
-            RefusalCode::BadPin,
-            "pin",
-            "submitted PIN does not match an enrolled PIN".into(),
-        ));
+    // 1. PIN + per-node attempt budget, before anything is signed (ADR-0012 /
+    //    ADR-0013 §7). BOTH Argon2id digests are computed unconditionally and the
+    //    verdict is constant-time-selected ([`pin::verify_pin`]) — a short-circuit
+    //    would make a duress pin one Argon2 slower and leak the duress bit to the
+    //    coordinator-attacker. Normal and duress are then observably identical: same
+    //    two Argon2, same (no-op) budget touch, same lack of backoff. Only a WRONG
+    //    pin diverges (it charges the budget and sleeps its backoff), and a wrong
+    //    pin is neither PIN, so its divergence leaks nothing about duress.
+    //
+    //    A bad-pin verdict is never recorded in the replay log: the pin is not part
+    //    of the commitment, so recording it would wrongly replay a BAD_PIN refusal
+    //    for the same transaction later resubmitted with a good pin.
+    // Even an empty or over-length value runs both Argon2 evaluations: the structural
+    // invariant is exactly two evaluations for every authenticated SpendRequest,
+    // not two only after an input-shape fast path. It is forced Wrong afterward:
+    // empty is also how an omitted wire field decodes, and values beyond
+    // MAX_PIN_BYTES are outside the enrolment protocol.
+    let compared = pin::verify_pin(node.pin_evaluator.as_ref(), request.pin.as_bytes());
+    let verdict = if request.pin.is_empty() || request.pin.len() > MAX_PIN_BYTES {
+        pin::PinVerdict::Wrong
+    } else {
+        compared
+    };
+    let charge = state
+        .pin_budget
+        .charge(verdict, now, &node.pin_budget_config);
+    // Fail-closed (ADR-0012): a valid DURESS pin ALWAYS fires the arm-hook — even
+    // when the node is locked out on a wrong-pin flood, and even though V0-4a still
+    // signs a not-locked duress request identically to a normal one. The budget
+    // never charges a valid pin, so this arming can never be rate-limited away. The
+    // hook runs UNCONDITIONALLY here and selects its +1/+0 delta in constant time, so
+    // normal and duress do identical observable work on this line too.
+    node.fire_arm_hook(verdict);
+    if charge.refuse {
+        // Locked out (any pin) or a wrong pin: refuse to sign. Nothing below runs and
+        // no verdict is recorded, so it is safe to drop the sign lock now and sleep
+        // the backoff OUTSIDE it — a wrong-pin flood must not pin the one `/sign`
+        // lock for the whole backoff and stall honest spends.
+        drop(state);
+        if !charge.backoff.is_zero() {
+            std::thread::sleep(charge.backoff);
+        }
+        return Ok(pin_refusal(charge.locked));
     }
     ensure_request_propagatable(node, &vault_proto::TaggedRequest::Spend(request.clone()))?;
 
@@ -1500,9 +1840,22 @@ fn handle_refresh_after_lock(
     request: &RefreshRequest,
     clock: impl FnOnce() -> u64,
 ) -> Result<SignResponse, BadRequest> {
+    // Lockdown (ADR-0008) refuses refreshes too: every spend AND refresh answers
+    // FRAUD_SUSPECTED for the node's lifetime. (The refresh path is pin-less, so it
+    // has no budget to touch — only Lockdown gates it here.) This pre-lock check is
+    // a fast path.
+    if node.is_locked_down() {
+        return Ok(fraud_suspected());
+    }
     // Refreshes share the same serialized SignState as spends, so consuming the
     // nonce remains atomic with every other request at ingress.
     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
+    // Authoritative Lockdown re-check under the lock: `enter_lockdown` sets the flag
+    // while holding `sign_state`, so a transition racing this refresh linearizes here
+    // and no refresh registers after Lockdown is entered (mirrors `/sign`).
+    if node.is_locked_down() {
+        return Ok(fraud_suspected());
+    }
     let now = clock();
 
     if let Err(rejected) = verify_coord_auth(
@@ -2178,6 +2531,39 @@ fn refusal(code: RefusalCode, check: &str, detail: String) -> SignResponse {
     })
 }
 
+/// The terminal-Lockdown refusal (ADR-0008): every post-lockdown spend/refresh
+/// presents as automated fraud prevention, never as "duress PIN used" — the story
+/// is "the system locked itself; nobody can override it."
+fn fraud_suspected() -> SignResponse {
+    refusal(
+        RefusalCode::FraudSuspected,
+        "lockdown",
+        "funds quarantined by policy".into(),
+    )
+}
+
+/// The pin/lockout refusal. Uniform within each state so it leaks nothing about
+/// which pin was submitted: while locked out, a correct pin (normal OR duress) gets
+/// the IDENTICAL refusal a wrong pin would, so an attacker who floods a node into
+/// lockout cannot then read the victim's pin off the response. Lockout is a
+/// transient rate-limit, NOT Lockdown, so it stays a `BAD_PIN` denial that clears
+/// after `lockout_secs`.
+fn pin_refusal(locked: bool) -> SignResponse {
+    if locked {
+        refusal(
+            RefusalCode::BadPin,
+            "pin_attempt_budget",
+            "pin attempts are rate-limited; this node is temporarily locked out".into(),
+        )
+    } else {
+        refusal(
+            RefusalCode::BadPin,
+            "pin",
+            "submitted PIN does not match an enrolled PIN".into(),
+        )
+    }
+}
+
 fn map_policy_code(code: policy_core::ViolationCode) -> RefusalCode {
     match code {
         policy_core::ViolationCode::UnknownInput => RefusalCode::UnknownInput,
@@ -2531,8 +2917,8 @@ pub(crate) mod test_support {
              pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
              coordinator_auth_pubkey = \"{}\"\n{extra}",
             nsk.display_secret(),
-            sha256::Hash::hash(b"1234"),
-            sha256::Hash::hash(b"9999"),
+            argon2id_normal_phc("1234"),
+            argon2id_duress_phc("9999"),
             coord_key().1,
         )
     }
@@ -2612,8 +2998,16 @@ pub(crate) mod test_support {
     /// A 1-of-1 vault (user key + one node key, `hold_secs = 0`) bound to
     /// `listen_port = 0`, plus a valid, coordinator-signed hot-spend `SignRequest`
     /// that `handle_sign` signs on first submission. The request's `expiry` is set
-    /// against the REAL clock and sits well inside `max_commitment_age_secs`.
+    /// against the REAL clock and sits well inside `max_commitment_age_secs`. The
+    /// enrolled normal pin is `1234`, the duress pin `9999`.
     pub(crate) fn node_and_valid_request() -> (Node, SignRequest) {
+        node_and_valid_request_with_budget("")
+    }
+
+    /// [`node_and_valid_request`] with an explicit `[pin_attempt_budget]` TOML block
+    /// appended (empty ⇒ the defaulted budget), so the attempt-budget tests can
+    /// enrol a small `max_attempts` with a zero backoff (no real sleeping).
+    pub(crate) fn node_and_valid_request_with_budget(budget_toml: &str) -> (Node, SignRequest) {
         let (_, user) = key(1);
         let (nsk, node_pub) = key(2);
         let (_, hot_key) = key(10);
@@ -2633,10 +3027,10 @@ pub(crate) mod test_support {
              max_derivation_index = 5\nhold_secs = 0\n\
              max_commitment_age_secs = 172800\npolicy_version = 1\n\
              pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
-             coordinator_auth_pubkey = \"{}\"\n",
+             coordinator_auth_pubkey = \"{}\"\n{budget_toml}",
             nsk.display_secret(),
-            sha256::Hash::hash(b"1234"),
-            sha256::Hash::hash(b"9999"),
+            argon2id_normal_phc("1234"),
+            argon2id_duress_phc("9999"),
             coord_key().1,
         );
         let node = Node::from_toml_str(&config).expect("valid config");
@@ -2851,6 +3245,39 @@ mod config_bounds_tests {
         Node::from_toml_str(&config_with_bounds(0, 172_800, ""))
             .expect("a config on the default combine slack is valid");
     }
+
+    /// Security-sensitive top-level options must fail closed when misspelled,
+    /// rather than being silently ignored by serde.
+    #[test]
+    fn an_unknown_top_level_config_field_is_fatal() {
+        let err = Node::from_toml_str(&config_with_bounds(
+            0,
+            172_800,
+            "max_commitment_age_sec = 86400\n",
+        ))
+        .err()
+        .expect("an unknown top-level field must be rejected at load");
+        assert!(
+            err.to_string().contains("max_commitment_age_sec"),
+            "unexpected config error: {err}"
+        );
+    }
+
+    /// A misspelled budget key must not fall back to the default attempt limit.
+    #[test]
+    fn an_unknown_pin_attempt_budget_field_is_fatal() {
+        let err = Node::from_toml_str(&config_with_bounds(
+            0,
+            172_800,
+            "[pin_attempt_budget]\nmax_attemps = 2\n",
+        ))
+        .err()
+        .expect("an unknown pin-attempt-budget field must be rejected at load");
+        assert!(
+            err.to_string().contains("max_attemps"),
+            "unexpected config error: {err}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2886,5 +3313,466 @@ mod sign_clock_tests {
             .join()
             .expect("worker thread")
             .expect("valid request");
+    }
+}
+
+/// V0-4a substrate: the constant-cost pin compare, the per-node attempt budget, and
+/// terminal Lockdown, exercised through the real `handle_sign`/`handle_refresh`
+/// handlers. The transition-table arithmetic and the digest validation live in
+/// [`pin`]'s own unit tests; this module proves the node GLUE — that the handler
+/// runs two Argon2 evaluations per SpendRequest, charges the budget only on wrong
+/// pins, refuses a locked-out node while still arming under a valid duress pin, and
+/// answers FRAUD_SUSPECTED once locked down.
+#[cfg(test)]
+mod pin_substrate_tests {
+    use super::pin::{PinEvaluator, PinSlot};
+    use super::test_support::{
+        coord_sign, node_and_valid_request, node_and_valid_request_with_budget,
+        valid_refresh_request,
+    };
+    use super::{handle_refresh, handle_sign, Node};
+    use std::sync::Arc;
+    use subtle::Choice;
+    use vault_proto::{RefusalCode, SignRequest, SignResponse, MAX_PIN_BYTES};
+
+    /// The normal pin every fixture node enrols (`node_and_valid_request`).
+    const NORMAL: &str = "1234";
+    /// The enrolled duress pin.
+    const DURESS: &str = "9999";
+    /// A pin that matches neither.
+    const WRONG: &str = "0000";
+
+    /// A small attempt budget with a ZERO backoff, so the handler tests exercise
+    /// lockout without any real sleeping.
+    const SMALL_BUDGET: &str = "[pin_attempt_budget]\nmax_attempts = 3\nwindow_secs = 3600\n\
+         backoff_schedule = [0, 0, 0]\nlockout_secs = 100\n";
+
+    /// Clone `base`, set `pin`, and re-coord-sign under a fresh `nonce` (changing the
+    /// pin invalidates the coordinator signature, since the pin is in its preimage).
+    fn with_pin(base: &SignRequest, pin: &str, nonce: &str) -> SignRequest {
+        let mut request = base.clone();
+        request.pin = pin.into();
+        coord_sign(&mut request, nonce);
+        request
+    }
+
+    fn expect_refusal(response: SignResponse) -> vault_proto::Refusal {
+        match response {
+            SignResponse::Refusal(refusal) => refusal,
+            other => panic!("expected refusal, got {other:?}"),
+        }
+    }
+
+    /// PRIMARY structural constant-cost test: every SpendRequest — normal, duress, or
+    /// wrong — runs EXACTLY two Argon2 evaluations, in the fixed order [Normal,
+    /// Duress]. A short-circuit compare would make duress run only one (or one
+    /// more), which the counting evaluator would catch here without a flaky clock.
+    #[test]
+    fn every_spendrequest_runs_two_argon2_evaluations_in_a_fixed_order() {
+        use super::pin::test_util::CountingEvaluator;
+        let (mut node, base) = node_and_valid_request();
+        let now = base.expiry - 3_600;
+        let counting = Arc::new(CountingEvaluator::new(node.pin_evaluator()));
+        let calls = Arc::clone(&counting.calls);
+        node.set_pin_evaluator(counting);
+
+        for (i, pin) in [NORMAL, DURESS, WRONG].into_iter().enumerate() {
+            calls.lock().expect("calls").clear();
+            let request = with_pin(&base, pin, &format!("count-{i}"));
+            let _ = handle_sign(&node, &request, now).expect("decodable");
+            assert_eq!(
+                *calls.lock().expect("calls"),
+                vec![PinSlot::Normal, PinSlot::Duress],
+                "pin {pin} must run exactly two Argon2 evaluations, Normal then Duress"
+            );
+        }
+
+        calls.lock().expect("calls").clear();
+        let over_length = "x".repeat(MAX_PIN_BYTES + 1);
+        let request = with_pin(&base, &over_length, "count-over-length");
+        let _ = handle_sign(&node, &request, now).expect("decodable");
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            vec![PinSlot::Normal, PinSlot::Duress],
+            "an over-length authenticated SpendRequest must not bypass either evaluation"
+        );
+    }
+
+    /// An omitted PIN decodes as empty. Even if provisioning enrolled the empty
+    /// plaintext, the protocol boundary must classify it as Wrong only AFTER both
+    /// evaluations, so omission can never authenticate or bypass the budget.
+    #[test]
+    fn an_empty_pin_is_wrong_even_if_the_enrolled_normal_digest_matches_it() {
+        struct EmptyMatchesNormal;
+
+        impl PinEvaluator for EmptyMatchesNormal {
+            fn evaluate(&self, slot: PinSlot, pin: &[u8]) -> Choice {
+                Choice::from((slot == PinSlot::Normal && pin.is_empty()) as u8)
+            }
+        }
+
+        use super::pin::test_util::CountingEvaluator;
+        let (mut node, base) = node_and_valid_request();
+        let counting = Arc::new(CountingEvaluator::new(Arc::new(EmptyMatchesNormal)));
+        let calls = Arc::clone(&counting.calls);
+        node.set_pin_evaluator(counting);
+
+        let response = handle_sign(
+            &node,
+            &with_pin(&base, "", "empty-enrolled-normal"),
+            base.expiry - 3_600,
+        )
+        .expect("decodable");
+        assert_eq!(expect_refusal(response).code, RefusalCode::BadPin);
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            vec![PinSlot::Normal, PinSlot::Duress],
+            "empty input still performs both fixed-order evaluations"
+        );
+        assert_eq!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .pin_budget
+                .fails(),
+            1,
+            "empty input consumes the wrong-pin budget"
+        );
+        assert_eq!(node.duress_arm_count(), 0, "empty input never arms duress");
+    }
+
+    /// Budget instrumentation: the budget is touched exactly once per SpendRequest,
+    /// and normal and duress leave IDENTICAL budget state (both no-ops) — only a
+    /// wrong pin changes the logical wrong-count. This is the same-shaped-work
+    /// property (codex C3): the two SILENT classes are indistinguishable in the
+    /// budget, and only a wrong pin (which is neither PIN) diverges.
+    #[test]
+    fn the_budget_is_charged_once_and_normal_equals_duress() {
+        let read = |node: &Node| {
+            let state = node.sign_state.lock().expect("sign_state");
+            (
+                state.pin_budget.charges(),
+                state.pin_budget.fails(),
+                state.pin_budget.locked_until(),
+            )
+        };
+
+        let (node_n, base_n) = node_and_valid_request();
+        let now = base_n.expiry - 3_600;
+        handle_sign(&node_n, &with_pin(&base_n, NORMAL, "n"), now).expect("decodable");
+
+        let (node_d, base_d) = node_and_valid_request();
+        handle_sign(&node_d, &with_pin(&base_d, DURESS, "d"), now).expect("decodable");
+
+        let (node_w, base_w) = node_and_valid_request();
+        handle_sign(&node_w, &with_pin(&base_w, WRONG, "w"), now).expect("decodable");
+
+        assert_eq!(
+            read(&node_n),
+            (1, 0, 0),
+            "a normal pin charges once and consumes nothing"
+        );
+        assert_eq!(
+            read(&node_n),
+            read(&node_d),
+            "normal and duress leave identical budget state — no observable difference"
+        );
+        assert_eq!(
+            read(&node_w),
+            (1, 1, 0),
+            "only a wrong pin advances the wrong-count"
+        );
+    }
+
+    /// The attempt-budget lifecycle through the handler (the normative table): a
+    /// wrong-pin flood reaches lockout; a locked-out node refuses a valid NORMAL pin
+    /// while a valid DURESS pin STILL invokes the arm-hook (fail-closed); and the
+    /// node recovers after `lockout_secs`.
+    #[test]
+    fn wrong_pin_flood_locks_out_then_recovers_and_duress_still_arms_while_locked() {
+        let (node, base) = node_and_valid_request_with_budget(SMALL_BUDGET);
+        let now = base.expiry - 3_600;
+
+        // Three wrong pins (max_attempts = 3) trip the lockout.
+        for i in 0..3 {
+            let refusal = expect_refusal(
+                handle_sign(&node, &with_pin(&base, WRONG, &format!("wrong-{i}")), now)
+                    .expect("decodable"),
+            );
+            assert_eq!(refusal.code, RefusalCode::BadPin, "a wrong pin is BAD_PIN");
+        }
+
+        // A valid NORMAL pin is now refused (locked out) — and its refusal is the
+        // same BAD_PIN a wrong pin gets, so lockout leaks nothing about the pin.
+        let locked_normal = expect_refusal(
+            handle_sign(&node, &with_pin(&base, NORMAL, "normal-locked"), now).expect("decodable"),
+        );
+        assert_eq!(locked_normal.code, RefusalCode::BadPin);
+        assert_eq!(
+            locked_normal.check, "pin_attempt_budget",
+            "a locked-out refusal is a rate-limit denial, not an ordinary bad pin"
+        );
+
+        // A valid DURESS pin is ALSO refused while locked, but STILL arms (fail-closed).
+        let arm_before = node.duress_arm_count();
+        let locked_duress = expect_refusal(
+            handle_sign(&node, &with_pin(&base, DURESS, "duress-locked"), now).expect("decodable"),
+        );
+        assert_eq!(locked_duress.code, RefusalCode::BadPin);
+        assert_eq!(
+            node.duress_arm_count(),
+            arm_before + 1,
+            "a valid duress pin must arm even when the node is locked out (fail-closed)"
+        );
+
+        // After lockout_secs the node recovers and a valid normal pin signs again.
+        let recovered = handle_sign(
+            &node,
+            &with_pin(&base, NORMAL, "normal-recovered"),
+            now + 100,
+        )
+        .expect("decodable");
+        assert!(
+            matches!(recovered, SignResponse::Accepted(_)),
+            "the node must recover after lockout_secs: got {recovered:?}"
+        );
+    }
+
+    /// Fail-closed / subordination: a pin-less refresh never touches the pin budget
+    /// (it performs no pin compare at all — codex C2), so a refresh flood can neither
+    /// consume the budget nor lock the node out of signing.
+    #[test]
+    fn a_refresh_never_touches_the_pin_budget() {
+        let (node, spend) = node_and_valid_request();
+        let refresh = valid_refresh_request(&node, &spend, "refresh-budget");
+        let now = spend.expiry - 3_600;
+        let response = handle_refresh(&node, &refresh, now).expect("decodable");
+        assert!(
+            matches!(response, SignResponse::Accepted(_)),
+            "the refresh is valid"
+        );
+        assert_eq!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .pin_budget
+                .charges(),
+            0,
+            "the pin-less refresh path performs NO pin compare and cannot touch the budget"
+        );
+    }
+
+    /// Lockdown is terminal (ADR-0008): once entered, every spend AND refresh answers
+    /// FRAUD_SUSPECTED for the node's lifetime, with no reset.
+    #[test]
+    fn lockdown_refuses_every_spend_and_refresh_with_fraud_suspected() {
+        let (node, spend) = node_and_valid_request();
+        let refresh = valid_refresh_request(&node, &spend, "lockdown-refresh");
+        let now = spend.expiry - 3_600;
+
+        node.enter_lockdown();
+
+        let spend_refusal = expect_refusal(
+            handle_sign(&node, &with_pin(&spend, NORMAL, "ld-spend"), now).expect("decodable"),
+        );
+        assert_eq!(spend_refusal.code, RefusalCode::FraudSuspected);
+        let refresh_refusal =
+            expect_refusal(handle_refresh(&node, &refresh, now).expect("decodable"));
+        assert_eq!(refresh_refusal.code, RefusalCode::FraudSuspected);
+
+        // No reset: a second attempt is still FRAUD_SUSPECTED.
+        assert!(node.is_locked_down());
+        let again = expect_refusal(
+            handle_sign(&node, &with_pin(&spend, NORMAL, "ld-again"), now).expect("decodable"),
+        );
+        assert_eq!(again.code, RefusalCode::FraudSuspected);
+    }
+
+    /// A locked-down node does not even reach the budget: FRAUD_SUSPECTED short-
+    /// circuits before the pin compare, so Lockdown is not gated by (nor does it
+    /// interact with) the attempt budget.
+    #[test]
+    fn lockdown_short_circuits_before_the_pin_budget() {
+        let (node, spend) = node_and_valid_request();
+        let now = spend.expiry - 3_600;
+        node.enter_lockdown();
+        handle_sign(&node, &with_pin(&spend, WRONG, "ld-wrong"), now).expect("decodable");
+        assert_eq!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .pin_budget
+                .charges(),
+            0,
+            "Lockdown answers FRAUD_SUSPECTED before any pin/budget work runs"
+        );
+    }
+
+    /// The config-validation wiring: a non-argon2id pin digest (the old SHA-256
+    /// placeholder) is a fatal config error, not a silently-weakened compare.
+    #[test]
+    fn a_non_argon2id_pin_digest_is_a_fatal_config() {
+        let config = super::test_support::config_with_bounds(0, 172_800, "");
+        let bad = config.replacen(&crate::argon2id_normal_phc("1234"), "deadbeef", 1);
+        let err = Node::from_toml_str(&bad)
+            .err()
+            .expect("a SHA-256 digest must be rejected");
+        assert!(
+            err.to_string().contains("pin_normal_hash"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A `max_attempts = 0` budget is fatal (the table's `max_attempts-1` index would
+    /// be undefined).
+    #[test]
+    fn a_zero_max_attempts_budget_is_a_fatal_config() {
+        let err = Node::from_toml_str(&super::test_support::config_with_bounds(
+            0,
+            172_800,
+            "[pin_attempt_budget]\nmax_attempts = 0\n",
+        ))
+        .err()
+        .expect("max_attempts = 0 must be rejected");
+        assert!(
+            err.to_string().contains("max_attempts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An empty `backoff_schedule` is fatal (`len-1` would be undefined).
+    #[test]
+    fn an_empty_backoff_schedule_is_a_fatal_config() {
+        let err = Node::from_toml_str(&super::test_support::config_with_bounds(
+            0,
+            172_800,
+            "[pin_attempt_budget]\nbackoff_schedule = []\n",
+        ))
+        .err()
+        .expect("an empty backoff_schedule must be rejected");
+        assert!(
+            err.to_string().contains("backoff_schedule"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+/// Reboot-death (codex C5): the entire node deployment — OS image, binary, config
+/// (INCLUDING `node_seckey`), and every piece of runtime state — lives on tmpfs
+/// (ADR-0007), so a reboot leaves a BARE machine. The attempt budget dies with the
+/// signing key in the same stroke; the node cannot restart or rejoin the vault.
+///
+/// Lockdown, by contrast, is persisted to a tmpfs flag with durability EQUAL to the
+/// signing key's (both in the tmpfs deployment dir): a machine reboot wipes both
+/// (node death, strictly stronger than Lockdown), but a bare PROCESS restart — which
+/// reloads `node_seckey` from the surviving config and so CAN sign again — must also
+/// reload the latch, or it would resurrect an unlocked signer. The tests below prove
+/// BOTH edges: reboot ⇒ dead, process restart while locked ⇒ still locked.
+#[cfg(test)]
+mod reboot_death_tests {
+    use super::Node;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn scratch_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("btc-policy-v04a-reboot-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch RAMDISK dir");
+        dir
+    }
+
+    #[test]
+    fn a_reboot_destroys_the_config_and_the_node_cannot_rejoin() {
+        let dir = scratch_dir();
+        let path = dir.join("node.toml");
+        let config = super::test_support::config_with_bounds(0, 172_800, "");
+        std::fs::write(&path, &config).expect("write config to the RAMDISK");
+
+        // While the RAMDISK holds its config + node_seckey the node loads and can be
+        // driven into terminal Lockdown.
+        let node = Node::from_toml_str(&std::fs::read_to_string(&path).expect("read config"))
+            .expect("valid config");
+        node.enter_lockdown();
+        assert!(node.is_locked_down());
+
+        // Reboot = tmpfs wiped: destroy the config (INCLUDING node_seckey), its
+        // sibling Lockdown flag, and the whole deployment dir.
+        std::fs::remove_file(&path).expect("wipe config");
+        let _ = std::fs::remove_file(Node::lockdown_flag_path_for(
+            path.to_str().expect("utf-8 path"),
+        ));
+        std::fs::remove_dir(&dir).expect("wipe RAMDISK dir");
+
+        // The rebooted machine is bare — no config, no key, no Lockdown flag. It
+        // cannot restart against the vault; `load` has nothing to read. This is the
+        // machine-reboot edge (config GONE), strictly stronger than Lockdown.
+        let err = Node::load(path.to_str().expect("utf-8 path"))
+            .err()
+            .expect("a rebooted node with no config cannot restart");
+        assert!(
+            err.to_string().contains("cannot read config"),
+            "a rebooted node holds no key/config/budget/lockdown and cannot rejoin: {err}"
+        );
+    }
+
+    /// The edge the reboot test does NOT cover and codex flagged: the MACHINE stays
+    /// up (tmpfs config + node_seckey survive) but the vault-node PROCESS restarts —
+    /// a crash-loop, supervisor respawn, or OOM-kill, none of which need SSH. The key
+    /// reloads (the node CAN sign again), so Lockdown MUST reload with it, or the
+    /// restart resurrects an unlocked signer. Exercises the real `enter_lockdown`
+    /// persistence + `apply_persisted_lockdown` (what `load` calls) — no channel
+    /// config needed to prove the latch's durability.
+    #[test]
+    fn a_process_restart_before_reboot_comes_back_locked_down() {
+        let dir = scratch_dir();
+        let path = dir.join("node.toml");
+        let config_str = super::test_support::config_with_bounds(0, 172_800, "");
+        std::fs::write(&path, &config_str).expect("write config to the RAMDISK");
+        let path_str = path.to_str().expect("utf-8 path");
+        let flag = Node::lockdown_flag_path_for(path_str);
+
+        // Process 1 boots clean: apply_persisted_lockdown pre-opens the latch file
+        // (created empty — content, not existence, means locked), then Lockdown fires.
+        let mut p1 = Node::from_toml_str(&config_str).expect("valid config");
+        p1.apply_persisted_lockdown(path_str).expect("read latch");
+        assert!(!p1.is_locked_down(), "a fresh node starts unlocked");
+        assert!(
+            std::fs::read(&flag).map(|c| c.is_empty()).unwrap_or(true),
+            "the pre-opened latch file is empty (not locked) before enter_lockdown"
+        );
+        p1.enter_lockdown();
+        assert!(p1.is_locked_down());
+        assert!(
+            !std::fs::read(&flag).expect("latch file present").is_empty(),
+            "enter_lockdown must persist a non-empty marker (durability = key durability)"
+        );
+        drop(p1); // the process dies — tmpfs (config + latch) is untouched.
+
+        // Process 2 restarts against the SURVIVING config + flag: it reloads the key
+        // (could sign) but MUST come back terminally locked.
+        let mut p2 = Node::from_toml_str(&config_str).expect("valid config");
+        assert!(
+            !p2.is_locked_down(),
+            "in-RAM default is unlocked before the flag is consulted"
+        );
+        p2.apply_persisted_lockdown(path_str).expect("read latch");
+        assert!(
+            p2.is_locked_down(),
+            "a process restart while locked (config survived) must reload LOCKED — \
+             else a bare respawn resurrects an unlocked signer"
+        );
+
+        // Now a real reboot wipes the flag with everything else: a fresh boot from a
+        // clean tmpfs (no flag) is unlocked — the latch never outlives the key.
+        std::fs::remove_file(&flag).expect("reboot wipes the flag");
+        let mut p3 = Node::from_toml_str(&config_str).expect("valid config");
+        p3.apply_persisted_lockdown(path_str).expect("read latch");
+        assert!(
+            !p3.is_locked_down(),
+            "with the flag gone (reboot), a node is not spuriously locked"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

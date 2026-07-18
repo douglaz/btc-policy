@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::bip32::{DerivationPath, Fingerprint};
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
@@ -173,8 +173,8 @@ fn fixture_config(hold_secs: u64, max_commitment_age_secs: u64, allow_escape: bo
          pin_duress_hash = \"{}\"\n\
          coordinator_auth_pubkey = \"{}\"\n",
         seckey(2).display_secret(),
-        sha256::Hash::hash(NORMAL_PIN.as_bytes()),
-        sha256::Hash::hash(DURESS_PIN.as_bytes()),
+        vault_node::argon2id_normal_phc(NORMAL_PIN),
+        vault_node::argon2id_duress_phc(DURESS_PIN),
         coord_key().1,
     )
 }
@@ -372,7 +372,11 @@ fn missing_pin_field_is_refused_with_bad_pin() {
         "policy_version": POLICY_VERSION,
     });
     let mut request: SignRequest = serde_json::from_value(body).expect("missing pin defaults");
-    assert_eq!(request.pin, "", "an absent pin field must decode as empty");
+    assert_eq!(
+        request.pin.as_str(),
+        "",
+        "an absent pin field must decode as empty"
+    );
     coord_sign(&mut request);
     let response = handle_sign(&fixture.node, &request, NOW).expect("decodable request");
     let refusal = expect_refusal(response);
@@ -1146,8 +1150,16 @@ mod coord_auth {
         // fail, which is exactly what it used to do.)
         let (fixture2, mut req2) = honest_request();
         req2.pin = "0000".into();
-        assert_ne!(req2.pin, NORMAL_PIN, "the pin must actually be wrong");
-        assert_ne!(req2.pin, DURESS_PIN, "the pin must actually be wrong");
+        assert_ne!(
+            req2.pin.as_str(),
+            NORMAL_PIN,
+            "the pin must actually be wrong"
+        );
+        assert_ne!(
+            req2.pin.as_str(),
+            DURESS_PIN,
+            "the pin must actually be wrong"
+        );
         req2.nonce = String::new();
         req2.coord_sig = String::new();
         let refusal2 = expect_refusal(handle_sign(&fixture2.node, &req2, NOW).expect("decodable"));
@@ -1215,16 +1227,28 @@ mod coord_auth {
     /// open: the gate consumes a nonce BEFORE the pin compare, so a request
     /// refused later still burns a slot. `BadPin` on every fill request is
     /// therefore an assertion, not an incidental detail.
+    ///
+    /// The wrong pin is deliberately OVER the `MAX_PIN_BYTES` bound, which forces a
+    /// `Wrong` verdict independent of the fixture's enrolled digests: an over-length
+    /// value is unenrollable, so it can never match either PIN. That is a CORRECTNESS
+    /// choice, not a cost one — `handle_sign` runs BOTH Argon2 evaluations
+    /// unconditionally BEFORE the over-length override (the constant-cost invariant;
+    /// see `every_spendrequest_runs_two_argon2_evaluations_in_a_fixed_order`), so this
+    /// flood still runs 2×FLOOD_BOUND Argon2. It stays fast only because the fixture
+    /// enrols at `MIN_M_COST`, NOT because the hash is skipped. Do NOT add a length
+    /// fast-path ahead of the compare to "speed this up": that would reintroduce the
+    /// exact timing leak the constant-cost compare exists to close.
     #[test]
     fn a_full_nonce_cache_refuses_with_coord_nonce_capacity() {
         let (fixture, template) = honest_request();
         // A bound on the cap, not the cap itself: the test must not restate the
         // private MAX_COORD_NONCES, only outlast it.
         const FLOOD_BOUND: usize = 16_384;
+        let over_length_pin = "x".repeat(vault_proto::MAX_PIN_BYTES + 1);
         let mut capacity_refusal = None;
         for i in 0..FLOOD_BOUND {
             let mut req = template.clone();
-            req.pin = "0000".into();
+            req.pin = over_length_pin.as_str().into();
             coord_sign_as(&mut req, &coord_key().0, &format!("flood-{i}"));
             let refusal = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable"));
             if refusal.code == RefusalCode::CoordNonceCapacity {

@@ -29,6 +29,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # base64 is already compiled (bitcoin's `base64` feature): a direct dep here adds
 # no new transitive crate. Used for the channel envelope's opaque `payload_b64`.
 base64 = "0.22"
+# PIN substrate (V0-4a). Argon2id is the enrolled pin-digest KDF (ADR-0012's
+# constant-cost pin-compare invariant); hand-rolling a password-hashing KDF is not
+# an option, so the audited RustCrypto crate earns its place. `subtle` gives the
+# branch-free constant-time selection of the pin verdict; `zeroize` scrubs the
+# ephemeral pin from every owned buffer (ADR-0008 "never persisted, RAM only").
+argon2 = { version = "0.5", features = ["zeroize"] }
+subtle = "2"
+zeroize = { version = "1", features = ["serde"] }
+# `Bytes::from_owner` lets reqwest carry a zeroizing channel-body owner all the
+# way through the transport; the allocation is wiped when the last body clone drops.
+bytes = "1"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"

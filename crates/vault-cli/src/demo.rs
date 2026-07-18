@@ -47,7 +47,8 @@ use bitcoin::{
 use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::json;
 use vault_node::channel::ceremony;
-use vault_proto::{RefusalCode, SignRequest, SignResponse, TaggedRequest};
+use vault_proto::{RefusalCode, SignRequest, SignResponse, TaggedRequest, MAX_PIN_BYTES};
+use zeroize::Zeroizing;
 
 use crate::bitcoind::Bitcoind;
 use crate::http::{self, Error};
@@ -912,8 +913,8 @@ impl NodeProcess {
              {}",
             actor.seckey.display_secret(),
             allowlist_toml.join(", "),
-            sha256::Hash::hash(NORMAL_PIN.as_bytes()),
-            sha256::Hash::hash(DURESS_PIN.as_bytes()),
+            vault_node::argon2id_normal_phc(NORMAL_PIN),
+            vault_node::argon2id_duress_phc(DURESS_PIN),
             manifest.channel_toml(actor),
         );
         let config_path = nodes_dir.join(format!("node{index}.toml"));
@@ -970,7 +971,26 @@ impl NodeProcess {
     }
 
     fn sign(&self, request: &SignRequest) -> Result<SignResponse, Error> {
-        let body = serde_json::to_string(&TaggedRequest::Spend(request.clone()))?;
+        let tagged = TaggedRequest::Spend(request.clone());
+        let mut shape = tagged.clone();
+        let TaggedRequest::Spend(shape_request) = &mut shape else {
+            unreachable!("the demo sign client only sends Spend requests")
+        };
+        shape_request.pin.clear();
+        // Reserve from a PIN-free shape before writing the real request. This keeps
+        // serde from freeing a grown allocation that already held plaintext PIN
+        // bytes; the one final allocation is wiped on every HTTP/error path.
+        let serialize_capacity = serde_json::to_vec(&shape)?
+            .len()
+            .saturating_add(6 * MAX_PIN_BYTES);
+        let mut body = Zeroizing::new(Vec::with_capacity(serialize_capacity));
+        let allocation = body.as_ptr();
+        serde_json::to_writer(&mut *body, &tagged)?;
+        debug_assert_eq!(
+            body.as_ptr(),
+            allocation,
+            "secret demo request serialization must not reallocate"
+        );
         let response = http::post_json(self.addr(), "/sign", &body, None, Duration::from_secs(30))?;
         if response.status != 200 {
             return Err(format!(
