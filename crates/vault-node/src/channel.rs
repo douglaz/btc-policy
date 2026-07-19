@@ -8747,10 +8747,12 @@ mod duress {
 
     // -- Fail-closed lockout + idempotency ---------------------------------
 
-    /// Fail-closed (invariant v): a valid duress pin arms the SAFETY track even when
-    /// the node is locked out on a wrong-pin flood — arming runs before the locked-pin
-    /// refusal, and the budget never charges a valid pin, so it can't be rate-limited
-    /// away.
+    /// Fail-closed (invariant v): a valid duress pin still arms the SAFETY track even
+    /// when the node is locked out on a wrong-pin flood. The INTENT is recorded before
+    /// the locked-pin refusal and the carrier is staged for peers regardless, so the
+    /// §0 confirmations can still land and commit the arm; the budget never charges a
+    /// valid pin, so none of this can be rate-limited away. Note what the lockout does
+    /// NOT do: it refuses SIGNING, never arming.
     #[test]
     fn a_valid_duress_pin_arms_even_when_locked_out() {
         let fx = Fixture::new(3, 5);

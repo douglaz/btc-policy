@@ -1344,8 +1344,11 @@ impl Node {
         }
     }
 
-    /// How many times the duress arm-hook has fired (test-only observable for the
-    /// fail-closed test: a valid duress pin arms even while the node is locked out).
+    /// How many times the duress arm-hook has fired — i.e. how many valid duress pins
+    /// recorded an [`channel::ArmIntent`], NOT how many arms committed (§0: the arm
+    /// commits later, on the `/channel` receipt path). Test-only observable for the
+    /// fail-closed property: a valid duress pin still records its intent — and can
+    /// therefore still arm on confirmation — while the node is locked out.
     #[cfg(test)]
     pub(crate) fn duress_arm_count(&self) -> u64 {
         self.duress_arm.load(Ordering::Relaxed)
@@ -2537,12 +2540,21 @@ fn handle_sign_after_lock(
     // Fail-closed (ADR-0012): a valid DURESS pin ALWAYS fires the arm-hook — even
     // when the node is locked out on a wrong-pin flood, and even though V0-4a still
     // signs a not-locked duress request identically to a normal one. The budget
-    // never charges a valid pin, so this arming can never be rate-limited away. The
-    // hook runs UNCONDITIONALLY here and selects its +1/+0 delta in constant time, so
-    // normal and duress do identical observable work on this line too. It also drives
-    // the SAFETY track (freeze hot-class finalization + record the unconditional
-    // Lockdown time T on the channel store) — placed above `charge.refuse`, so a valid
-    // duress pin arms even when the node is locked out (fail-closed, invariant v).
+    // never charges a valid pin, so this can never be rate-limited away. The hook
+    // runs UNCONDITIONALLY here and selects its +1/+0 delta in constant time, so
+    // normal and duress do identical observable work on this line too.
+    //
+    // **The hook RECORDS INTENT; it does not arm (V0-4b §0).** Nothing on this path
+    // freezes hot-class finalization or schedules Lockdown/Firing: it writes the
+    // same-shaped per-carrier `ArmIntent` and the pre-arm cover overlay
+    // (`record_arm_intent` passes `arm = false` unconditionally). The freeze commits
+    // asynchronously in `confirm_carrier`, off the `/sign` response path, once `t`
+    // distinct members are known to hold the carrier — so a hostile coordinator
+    // cannot freeze THIS node while leaving `t−1` free to finalize the coerced hot
+    // spend. Do not "restore" an arm here; that is the theft class §0 closes.
+    //
+    // Placed above `charge.refuse` so a locked-out node still records the intent and
+    // can therefore still arm on confirmation (fail-closed, invariant v).
     node.fire_arm_hook(verdict, &request.nonce, request.expiry, now);
     if charge.refuse {
         // Propagation belongs to the coordinator-authenticated request, not to this
@@ -2601,8 +2613,11 @@ fn handle_sign_after_lock(
         acceptance_replay_key(&[(&commitment_id, &spend), (&escape_commitment_id, &escape)]);
     // The two ids must remain distinct for an escape-class request: its spend completes
     // immediately, while the mandatory escape is the disjoint residual swept at T.
-    // The structural equality check sits after both node validations below; a valid
-    // duress pin has already armed the SAFETY track, so this never becomes an arm gate.
+    // The structural equality check sits after both node validations below, and it is
+    // never an arm gate: arming is decided solely by the §0 confirmation count, and
+    // this refusal is a deterministic function of the request pair under the
+    // federation-uniform static policy — so every node refuses it alike, none
+    // propagates, none reaches `t`, and none arms. Clean censorship, not a split.
 
     // 4. Anti-replay log: prune expired entries (retention is bounded by each
     //    entry's expiry), then return idempotently for an identical, unexpired
@@ -2640,9 +2655,21 @@ fn handle_sign_after_lock(
     }
     if let Some(recorded) = state.replay.get(&commitment_id, now) {
         // A commitment-keyed hit is a recorded REFUSAL (never an acceptance — those are
-        // keyed by the pair above), so the request is refused, not propagated. The
-        // SAFETY arm still ran at ingress, so a duress pin here still freezes + Locks
-        // Down at T.
+        // keyed by the pair above), so the request is refused, not propagated.
+        //
+        // Not propagating is safe here for the SAME uniformity reason that licenses
+        // staging only after policy validation below: [`is_recordable_verdict`] admits
+        // exactly DestNotAllowed / ChangeNotDerivable / FeeExceedsCap, each a
+        // deterministic function of the spend commitment under the federation-uniform
+        // static policy. So a cached refusal here means EVERY node refuses this
+        // commitment — from its own cache or by re-deriving it — hence no node
+        // propagates, no node reaches t-confirmation, and no node arms: clean
+        // censorship, not a one-node freeze (§0). The uniformity is what matters:
+        // a per-node, coordinator-steerable refusal that skipped propagation while the
+        // node still counted ITSELF as a holder would let a carrier arm this node off
+        // peer receipts without contributing one back — the asymmetry §0 forbids.
+        // Escape-derived refusals are deliberately NOT cached under the spend id
+        // (see `verify_escape` below), so a corrupt escape cannot poison this entry.
         return Ok(recorded);
     }
     state.pending.prune(now);
@@ -4723,7 +4750,8 @@ mod pin_substrate_tests {
         assert_eq!(
             node.duress_arm_count(),
             arm_before + 1,
-            "a valid duress pin must arm even when the node is locked out (fail-closed)"
+            "a valid duress pin must record its arm intent even when the node is locked out, so \
+             it can still arm on t-confirmation (fail-closed)"
         );
 
         // After lockout_secs the node recovers and a valid normal pin signs again.
