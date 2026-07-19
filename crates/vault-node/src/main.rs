@@ -23,6 +23,10 @@ async fn run() -> Result<(), vault_node::Error> {
         _ => return Err("usage: vault-node --config <policy-config.toml>".into()),
     };
     let node = Arc::new(Node::load(config_path)?);
+    // Escape-class union coverage needs reliable confirmed-transaction lookup.
+    // Check the production backend before binding or consuming this tmpfs key's
+    // one allowed process generation.
+    node.validate_chain_backend()?;
     // v0 nodes bind loopback only (DESIGN.md, node API access control). All
     // surfaces share the one port on tokio; each connection is its own task, so
     // a stalled client no longer wedges signing.
@@ -32,8 +36,10 @@ async fn run() -> Result<(), vault_node::Error> {
     // With a chain backend configured, start the two background drivers: the
     // watchtower (ADR-0001, V0-6b) scanning this node's own chain view, and the
     // fire driver (V0-8b) that releases partials at each candidate's authorized
-    // fire event and then combines + broadcasts. We are inside the runtime here,
-    // so the tasks spawn cleanly.
+    // fire event and then combines + broadcasts. The public serving boundary
+    // claims the one-shot process generation before accepting this already-bound
+    // listener, so no request can reach these fresh tasks before reboot-death is
+    // enforced. We are inside the runtime here, so the tasks spawn cleanly.
     spawn_drivers(&node);
     println!("vault-node listening on 127.0.0.1:{}", node.listen_port);
     server::serve(listener, Arc::clone(&node))

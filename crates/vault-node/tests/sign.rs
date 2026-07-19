@@ -325,6 +325,17 @@ impl Fixture {
         user_sign(self, &mut escape);
         escape
     }
+
+    /// Escape-class spends complete immediately, so their mandatory escape is a
+    /// distinct residual over disjoint vault inputs (ADR-0012 class-aware coverage).
+    fn disjoint_escape_for(&self, spend: &Psbt) -> Psbt {
+        let mut escape = self.escape_for(spend);
+        for (index, input) in escape.unsigned_tx.input.iter_mut().enumerate() {
+            input.previous_output = OutPoint::new(Txid::from_byte_array([8; 32]), index as u32);
+        }
+        user_sign(self, &mut escape);
+        escape
+    }
 }
 
 fn refresh_request(psbt: &Psbt) -> RefreshRequest {
@@ -896,8 +907,14 @@ fn an_escape_class_spend_fires_immediately_even_under_a_hold() {
     // oracle (ADR-0012).
     let mut psbt = vault_psbt(&fixture, vec![(fixture.escape_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
+    let residual = fixture.disjoint_escape_for(&psbt);
     let accepted = expect_accepted(
-        handle_sign(&fixture.node, &fixture.held_request(&psbt), NOW).expect("decodable request"),
+        handle_sign(
+            &fixture.node,
+            &fixture.request_with_escape(&psbt, &residual, NORMAL_PIN, NOW + MAX_AGE),
+            NOW,
+        )
+        .expect("decodable request"),
     );
     assert_eq!(
         accepted.remaining_secs, 0,
@@ -999,10 +1016,11 @@ fn expiry_too_short_does_not_apply_to_an_escape_class_spend() {
     let fixture = held_fixture(HOLD);
     let mut psbt = vault_psbt(&fixture, vec![(fixture.escape_spk.clone(), 99_990_000)]);
     user_sign(&fixture, &mut psbt);
+    let residual = fixture.disjoint_escape_for(&psbt);
     let response = handle_sign(
         &fixture.node,
         // Far short of the hot-class bound, but it fires immediately.
-        &fixture.request_at(&psbt, NORMAL_PIN, NOW + HOLD),
+        &fixture.request_with_escape(&psbt, &residual, NORMAL_PIN, NOW + HOLD),
         NOW,
     )
     .expect("decodable request");

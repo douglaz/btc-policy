@@ -140,9 +140,18 @@ struct AppState {
 }
 
 /// Serve the one axum app (`/sign` + `/events`) over `listener`.
+///
+/// `listener` is already bound, so this is the last production startup boundary
+/// before any request can arm or register a candidate. Claim the config inode's
+/// one-shot process generation here rather than relying on a particular binary
+/// caller to remember it: every embedding that uses the public serving API then
+/// preserves ADR-0012 reboot-death, and path-less test construction cannot be
+/// exposed accidentally as a restartable signer.
 pub async fn serve(listener: tokio::net::TcpListener, node: Arc<Node>) -> std::io::Result<()> {
     node.require_channel_mode()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    node.claim_process_generation()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
     axum::serve(listener, app(node)).await
 }
 
@@ -598,6 +607,13 @@ mod tests {
         // This backend exists to stall the watchtower scan; the fire path is not
         // under test here, so its three methods are unreachable stubs.
         fn prevout(&self, _outpoint: &OutPoint) -> Result<Option<Prevout>, Error> {
+            Err("SlowBackend has no chain view".into())
+        }
+        fn vault_unspent(
+            &self,
+            _scripts: &[ScriptBuf],
+            _authorized: &std::collections::HashSet<Txid>,
+        ) -> Result<Vec<(OutPoint, Prevout)>, Error> {
             Err("SlowBackend has no chain view".into())
         }
         fn mempool_transaction(&self, _txid: &Txid) -> Result<Option<Vec<u8>>, Error> {
