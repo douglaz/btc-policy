@@ -69,8 +69,12 @@ The Policy config's set of permitted destination wallets — descriptors with a 
 _Avoid_: whitelist, address list
 
 **Hot wallet**:
-The user's day-to-day spending wallet; an allowlisted destination and the accepted risk budget.
+The user's day-to-day spending wallet; an allowlisted destination and the accepted risk budget, bounded by the **Hot budget**.
 _Avoid_: spending wallet, mobile wallet
+
+**Hot budget**:
+The enforced ceiling on Hot-class outflow — a per-transaction cap and a rolling-window velocity cap on the sum of a spend's outputs to non-vault (non-change) destinations (ADR-0014). Federation-uniform (pinned in the Manifest); enforced by each Node at ingress before signing; window ≥ `max_commitment_age_secs` so no still-completable spend ages out early. This is what makes the Hot wallet's "risk budget" a real bound, not an assumption: it caps what a coerced Hot spend can move even when the Duress freeze is censored from a sub-quorum (bounding that residual to ~2× the window cap per window; lifetime exposure is bounded by detection + Recovery, not the cap). Escape and Refresh are not Hot-class → never consume it.
+_Avoid_: spend limit, rate limit (that's the pin-attempt budget)
 
 **Escape wallet**:
 A single-sig offline cold wallet, allowlisted at setup, whose only job is receiving incident sweeps (Rotate, races). Keys independent of every other component.
