@@ -255,6 +255,15 @@ pub(crate) struct NonceLog {
 }
 
 impl NonceLog {
+    /// The rollback-guarded lower-bound clock shared by every piece of state whose
+    /// lifetime is coupled to coordinator nonce freshness. Carrier intents must use
+    /// this same value: pruning or confirming them against raw wall time after the
+    /// nonce log has advanced would let a clock rollback revive logically-expired
+    /// confirmation state.
+    pub(crate) fn effective_now(&self, now_input: u64) -> u64 {
+        self.high_water.max(now_input)
+    }
+
     /// Apply the complete post-auth freshness decision atomically. The caller
     /// invokes this only after `coord_sig` verifies, so forged traffic cannot
     /// advance the high-water mark or consume capacity.
@@ -267,7 +276,7 @@ impl NonceLog {
     ) -> NonceDecision {
         // Never let the freshness lower bound read further back than an accepted
         // request has already established; a rollback cannot revive a pruned nonce.
-        let effective_now = self.high_water.max(now_input);
+        let effective_now = self.effective_now(now_input);
 
         if nonce.is_empty() || nonce.len() > MAX_COORD_NONCE_BYTES {
             return NonceDecision::InvalidLength;

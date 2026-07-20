@@ -18,8 +18,8 @@ use bytes::BytesMut;
 use vault_proto::TaggedRequest;
 use zeroize::Zeroize;
 
-use crate::channel::{self, ChannelReply, RejectReason};
-use crate::{handle_channel_body, handle_refresh_now, handle_sign_now, propagate_outbox, Node};
+use crate::channel::{ChannelReply, RejectReason};
+use crate::{handle_channel_body_now, handle_refresh_now, handle_sign_now, propagate_outbox, Node};
 
 /// Unchanged 1 MiB cap applied while the zeroizing accumulator reads `/sign`.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -375,10 +375,10 @@ async fn channel(State(state): State<AppState>, body: Body) -> Response {
             // guard and exhausting the blocking pool. Tying the permit to the job caps
             // in-flight work at the bound regardless of cancellation.
             let _permit = permit;
-            // `handle_channel_body`, not `channel.ingest`: a `request` envelope has to
+            // `handle_channel_body_now`, not `channel.ingest`: a `request` envelope has to
             // pass THIS node's own coordinator-auth + policy gates, which live on the
             // node, not the channel (§3).
-            handle_channel_body(&node, bytes.as_ref(), channel::unix_now())
+            handle_channel_body_now(&node, bytes.as_ref())
         })
         .await;
         // A `request` this node accepted now goes to every peer (§3), so delivery to

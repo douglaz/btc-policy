@@ -70,7 +70,7 @@
 //! | digest (tag)                                    | preimage fields, in order (LE; `var`=u32-len+bytes; `eps`=u32-count then each `var`) |
 //! |-------------------------------------------------|-------------------------------------------------------------------------------------|
 //! | channel-key  `btc-policy/channel-key/v0`        | `node_seckey[32]` (then `‖ counter:u8` on retry)                                    |
-//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
+//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), `max_msg_bytes:u64`, node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
 //! | endorsement  `btc-policy/channel-endorsement/v0`| `wallet_id[32]`, `manifest_hash[32]`, `node_id:u16`, `channel_pubkey[33]`, `protocol_version:u32`, `endpoints:eps` |
 //! | envelope     `btc-policy/channel-envelope/v0`   | `msg_type:var`, `protocol_version:u32`, `wallet_id[32]`, `manifest_hash[32]`, `sender_node_id:u16`, `recipient_node_id:u16`, `payload_b64_bytes:var`, `nonce:var`, `timestamp:u64` |
 //! | user-sig     `btc-policy/user-sig-hash/v0`      | per input in order: `user_der_sig:var`, `sighash_type:u8`                            |
@@ -106,7 +106,7 @@ use zeroize::{Zeroize, Zeroizing};
 // shared with the coordinator-request preimage, so the two provably cannot drift.
 use vault_proto::{push_var, tagged_hash, TaggedRequest, MAX_PIN_BYTES};
 
-use crate::replay::MAX_COORD_NONCE_BYTES;
+use crate::replay::{MAX_COORD_NONCES, MAX_COORD_NONCE_BYTES};
 use crate::watchtower::{AlertQueue, FreshnessEvent, FreshnessKind};
 use crate::Error;
 
@@ -323,8 +323,7 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-#[allow(dead_code)] // nonce source for the outbound envelope builder (V0-8b caller)
-fn random_bytes<const N: usize>() -> Result<[u8; N], Error> {
+pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N], Error> {
     let mut buf = [0u8; N];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))
@@ -625,7 +624,7 @@ pub(crate) enum Ingested {
     /// An authenticated `request` envelope. The channel layer deliberately does
     /// NOT process it: it carries policy, and the channel carries signatures and
     /// assembly only. The node applies its own gates (see
-    /// [`crate::handle_channel_body`]).
+    /// [`crate::handle_channel_body_now`]).
     Request {
         /// The authenticated `sender_node_id` from the envelope. A peer propagates a
         /// request only after it received AND processed one, so this identifies a
@@ -985,18 +984,29 @@ pub(crate) struct DuressTiming {
 /// `t−1` UNFROZEN nodes, still enough to finalize the coerced hot spend. That is a
 /// theft class, not an inconvenience. Gating on t-confirmation collapses every one of
 /// those vectors (and network partition) into the SAME already-accepted residual:
-/// nobody reaches `t`, so nobody arms, so the outcome is clean **censorship** — never
-/// a split. It also keeps arming off the `/sign` response path entirely, so the
-/// coordinator can neither observe nor steer it.
+/// nobody reaches `t`, so nobody arms, so the outcome is ADR-0012's **censorship** —
+/// never a split. Censorship is strictly weaker than a split but is NOT "nothing
+/// fires": an already-pending hot spend still finalizes at its Hold-expiry, bounded to
+/// the user-authored hot balance (see [`ChannelState::confirm_carrier`]). It also
+/// keeps arming off the `/sign` response path entirely, so the coordinator can neither
+/// observe nor steer it.
 ///
 /// RAMDISK/node-lifetime like every other duress artifact (reboot-death, ADR-0007):
 /// a rebooted node holds no intents, no verdict, and no confirmations.
 struct ArmIntent {
     /// Distinct federation members known to hold this carrier: this node (recorded
-    /// when it processed the carrier at ingress) plus every peer whose propagation of
-    /// it arrived on `/channel`. A `HashSet` because a compromised peer re-sending its
-    /// propagation must count ONCE — otherwise one node could manufacture `t`.
+    /// only after it stages the carrier for fan-out) plus every peer whose propagation
+    /// of it arrived on `/channel`. A `HashSet` because a compromised peer re-sending
+    /// its propagation must count ONCE — otherwise one node could manufacture `t`.
     holders: HashSet<u16>,
+    /// True only once this node has staged the carrier for federation-wide fan-out.
+    /// Staging is also when this node enters `holders`: §0 counts a member that
+    /// received AND processed the authenticated safety carrier, not only one that was
+    /// able to sign its PSBT pair. That distinction is load-bearing for fail-closed
+    /// lockout—a valid duress pin must still arm with self + `t−1` peer receipts even
+    /// when lockout prevents PSBT validation. A request that returns before the outbox
+    /// write keeps a same-shaped intent but cannot be confirmed at all.
+    ready_to_propagate: bool,
     /// This node's OWN internal pin verdict for this carrier. Written under both pins
     /// in the same-shaped record; only this bit differs, and it is what decides
     /// whether reaching `t` commits an arm or is a same-shaped no-op.
@@ -1006,6 +1016,11 @@ struct ArmIntent {
     /// Held here rather than re-read at commit so confirmation latency cannot silently
     /// stretch the hostage window past what the user was promised.
     first_seen: u64,
+    /// The immediate/spend slot registered by this carrier. Together with
+    /// `escape_commitment_id`, this lets the t-holder decision open (NORMAL) or
+    /// atomically freeze (DURESS) the exact candidate pair. Empty when the request
+    /// never registered a pair (lockout/policy/capacity refusal).
+    spend_commitment_id: String,
     /// The delayed-slot escape this carrier registered, recorded once its pair is
     /// admitted. The commit restores it into the overlay: between ingress and
     /// t-confirmation, later NORMAL requests keep rewriting the cover slot (they must,
@@ -1019,9 +1034,71 @@ struct ArmIntent {
     /// coord-authenticated, fresh-nonce request, and the node caps every accepted
     /// expiry at `now + max_commitment_age_secs`.
     expiry: u64,
-    /// Set once the arm is committed, so repeated confirmations past `t` are idempotent
-    /// (the `Armed + peer duress → arm idempotently` row).
+    /// Set once this exact request reaches `t`, under BOTH verdicts. A normal verdict
+    /// performs the same-shaped confirmation work once and remains a no-op; a duress
+    /// verdict commits the arm. Repeated receipts past `t` are idempotent.
     committed: bool,
+}
+
+struct CarrierMemo {
+    outcome: MemoOutcome,
+    /// This memo's own eviction horizon (the request expiry), using the same strict
+    /// `expiry > now` rule as the coordinator nonce log.
+    expiry: u64,
+}
+
+/// What consuming a coordinator nonce left behind on this node.
+enum MemoOutcome {
+    /// Ingress derived a carrier for the body carrying `signature_tag`.
+    Derived {
+        carrier: String,
+        /// Domain-separated digest of the canonical verified coordinator signature
+        /// bytes. Unlike a digest of the authenticated request, this does not let a
+        /// later memory capture test PIN guesses: producing a matching signature
+        /// requires the coordinator secret key. Hashing decoded bytes also makes hex
+        /// case aliases hit the memo. It is only a FAST PATH, never an identity: see
+        /// [`CarrierMemoLookup`].
+        signature_tag: [u8; 32],
+        /// Peers already granted their one conflicting-signature derivation for this
+        /// nonce. Bounds the work a hostile coordinator can induce (see
+        /// [`CarrierMemoLookup::DeriveForConfirmation`]) without letting one
+        /// compromised peer spend the budget honest peers' confirmations need.
+        resolved_senders: HashSet<u16>,
+    },
+}
+
+/// Result of the nonce-indexed carrier replay lookup.
+///
+/// The signature tag is a fast path, NOT the carrier identity: `canonical_bytes`
+/// deliberately excludes `coord_sig`, so one body has ONE carrier id no matter which
+/// valid signature accompanies it. Treating a signature mismatch as "different
+/// carrier" would let a hostile coordinator sign the identical body once per node
+/// with distinct ECDSA nonces: every peer relay would then carry a signature the
+/// receiver had never memoized, no receipt would be counted, `holders` would stay at
+/// 1 everywhere, and NO node would arm — while the coerced hot spend it delivered
+/// still finalized. That is theft, not censorship, so a mismatch must resolve the
+/// real carrier by derivation instead of skipping the confirmation.
+pub(crate) enum CarrierMemoLookup {
+    /// Nonce unseen after the authoritative ingress handler returned: that handler
+    /// did not record an intent (for example freshness/capacity refused it), so
+    /// there is no carrier this receipt can confirm.
+    Vacant,
+    /// This exact signature is memoized; reuse its carrier with no derivation.
+    Exact(String),
+    /// A different valid signature under a live nonce. Derive the incoming body's own
+    /// carrier and confirm THAT — it is correct whether the body is the memoized one
+    /// re-signed (same carrier, receipt counts) or a different body under a reused
+    /// nonce (different carrier, no local intent, confirmation is a no-op).
+    ///
+    /// Eligible at most once per (nonce, sender). A successful reservation records the
+    /// sender through [`ChannelState::claim_carrier_derivation`] before doing the work;
+    /// a busy global slot leaves it eligible for the sender's bounded retry. An exact
+    /// legitimate fan-out costs zero derivations, while hostile re-signing can cost at
+    /// most `n−1` for one nonce. Cross-nonce work remains bounded by the 4,096 live
+    /// memos and, separately, by the one-active/zero-queued global KDF reservation.
+    DeriveForConfirmation { memoized_carrier: String },
+    /// Nothing here can be confirmed: this sender already spent its one derivation.
+    Skip,
 }
 
 /// A read-only view of the [`Armed`] overlay for the fire driver (which drives
@@ -1116,6 +1193,15 @@ pub(crate) struct Candidate {
     /// The sibling candidate's `commitment_id` — the pairing is by request, so a
     /// spend always names its escape and vice versa.
     paired_commitment_id: String,
+    /// Whether some coordinator-authenticated carrier for this exact pair has reached
+    /// the t-holder decision. A fire time alone is not release authority: before this
+    /// bit is set, `t-1` malicious peers could withhold holder receipts, collect this
+    /// node's matured share, and complete the request before eventual duress arming.
+    ///
+    /// Monotonic and pin-uniform. A NORMAL carrier reaching t opens the pair; a DURESS
+    /// carrier sets this bit under the same store lock that activates the hot freeze,
+    /// so the hot candidate is never observable in an open-but-not-yet-frozen state.
+    holder_quorum_reached: bool,
     /// This node's canonical PSBT; verified peer partials are imported here (never
     /// blind-merged from a peer PSBT). This node's OWN partial is present from
     /// registration: Model B signs at ingress (ADR-0012).
@@ -1159,6 +1245,10 @@ pub(crate) struct CandidateSpec<'a> {
     pub(crate) commitment_id: &'a str,
     /// The sibling's commitment id (the pairing, §4).
     pub(crate) paired_commitment_id: &'a str,
+    /// Initial holder-decision state. SpendRequest pairs start closed and are opened
+    /// by [`ChannelState::confirm_carrier`]; pin-less refreshes have no safety carrier
+    /// and start open.
+    pub(crate) holder_quorum_reached: bool,
     pub(crate) role: CandidateRole,
     /// Whether this is a hot-class spend the duress arm freezes (see
     /// [`Candidate::hot`]). `false` for escape-class spends, refreshes, and escapes.
@@ -1174,13 +1264,20 @@ pub(crate) struct CandidateSpec<'a> {
 /// and duress both populate the same delayed slot, while `duress` selects sweep
 /// versus no-op.
 pub(crate) struct ArmDirective<'a> {
-    /// The delayed slot's escape commitment. Both pins write it; `duress` selects
-    /// whether the slot is live or a no-op. An already-live armed sweep remains
-    /// first-wins, so a later normal request cannot replace it.
+    /// The delayed slot's escape commitment. Both pins write it; `duress` (with the
+    /// other two conjuncts below) selects whether the slot is live or a no-op. An
+    /// already-live armed sweep remains first-wins, so a later normal request cannot
+    /// replace it.
     pub(crate) sweep_escape: &'a str,
-    /// Whether THIS request carried the duress pin — gates the sweep-escape adoption
-    /// above. The freeze + T-shrink apply to any hot spend accepted while armed,
-    /// regardless of pin; only the sweep-escape adoption is duress-gated.
+    /// The immediate slot paired with `sweep_escape`.
+    pub(crate) spend_commitment_id: &'a str,
+    /// The coordinator-authenticated carrier whose intent owns this pair.
+    pub(crate) carrier: &'a str,
+    /// Whether THIS request carried the duress pin — one of the three conjuncts
+    /// gating the sweep-escape adoption above (the node must also already be Armed,
+    /// and `sweep_escape` must already be holder-confirmed). The freeze + T-shrink
+    /// apply to any hot spend accepted while armed, regardless of pin; only the
+    /// sweep-escape adoption is duress-gated.
     pub(crate) duress: bool,
     /// ε, so a hot spend accepted while armed shrinks `T` to its Hold-expiry − ε
     /// (ADR-0012 "T ← min(T, its Hold-expiry − ε)").
@@ -1267,6 +1364,7 @@ impl Candidate {
             role: spec.role,
             hot: spec.hot,
             paired_commitment_id: spec.paired_commitment_id.to_string(),
+            holder_quorum_reached: spec.holder_quorum_reached,
             psbt,
             sighashes,
             user_sig_hash,
@@ -1368,18 +1466,44 @@ pub(crate) struct PartialStore {
     /// because a duress pin was seen at ingress. Guarded by the store lock so the
     /// freeze is atomic with release/finalize. See [`Armed`].
     armed: Armed,
-    /// Confirmation-gated arming state, keyed by the carrier's coordinator nonce
-    /// (§0). The nonce is unique per request by the freshness gate and IDENTICAL
-    /// across every peer's propagation of the same carrier, so it is the natural
-    /// carrier identity — and unlike a hash over the request bytes it carries no pin
-    /// material (ADR-0012: the pin is never written anywhere). See [`ArmIntent`].
+    /// Confirmation-gated arming state, keyed by the coordinator-auth digest of the
+    /// exact request (§0). A coordinator controls the signing key and can validly reuse
+    /// one nonce across DIFFERENT signed bodies delivered to different nodes, so the
+    /// nonce alone is not a carrier identity. The digest binds the variant, PSBTs,
+    /// PIN, nonce, expiry, and policy version without retaining the plaintext PIN;
+    /// RAMDISK/node-lifetime deletion still applies. See [`ArmIntent`].
     intents: HashMap<String, ArmIntent>,
+    /// Fast replay lookup from the coordinator's single-use nonce to the already
+    /// memory-hard carrier id. Exact peer replays are the normal confirmation path;
+    /// without this memo each replay repeats the serialized carrier Argon2 and a
+    /// compromised peer can starve `/sign`. Values remain the stretched ids, never a
+    /// fast PIN-committing digest, and are pruned with their intent.
+    carriers_by_nonce: HashMap<String, CarrierMemo>,
 }
 
 impl PartialStore {
-    /// Whether `candidate`'s partial-release/finalize slot is live. Spend slots are
-    /// governed by their own fire window (and the hot freeze); an Escape slot is a
-    /// no-op unless it is the one delayed slot selected by an active duress schedule.
+    /// Keep confirmation state and its replay memo on the same strict freshness
+    /// boundary as the coordinator nonce log (`expiry > now`). Expiry is the ONLY
+    /// bound applied here; there is no count cap in this function. It is the shared
+    /// horizon that keeps both maps a subset of the live nonces the log itself caps,
+    /// so a stalled backend/fire pass cannot make intent memory grow without bound;
+    /// ingress calls this independently of the fire driver. The corresponding count
+    /// invariant is only checked, never enforced, at
+    /// [`ChannelState::record_arm_intent`]'s `debug_assert!`.
+    fn prune_intents(&mut self, now: u64) {
+        self.intents.retain(|_, intent| intent.expiry > now);
+        // Memos carry their own horizon rather than following their intent: a memo
+        // outlives nothing longer than the nonce whose replay it short-circuits, and
+        // pinning it to its intent instead would keep it alive across the eviction
+        // `confirm_carrier` performs when a receipt lands past expiry.
+        self.carriers_by_nonce.retain(|_, memo| memo.expiry > now);
+    }
+
+    /// Whether `candidate`'s partial-release/finalize slot is live. Every SpendRequest
+    /// candidate first needs its carrier's t-holder decision; after that, spend slots
+    /// are governed by their own fire window (and the hot freeze), while an Escape slot
+    /// is a no-op unless selected by an active duress schedule. Pin-less refreshes are
+    /// born holder-confirmed because they have no safety carrier.
     fn slot_active(&self, candidate: &Candidate) -> bool {
         // Evaluate the complete selector for every role. Short-circuiting after
         // `role != Escape` or `active == false` would make the always-running pre-T
@@ -1387,7 +1511,8 @@ impl PartialStore {
         let selected_escape = self.armed.active
             & self.armed.sweep_active
             & (self.armed.escape_commitment_id == candidate.commitment_id);
-        (candidate.role != CandidateRole::Escape) | selected_escape
+        candidate.holder_quorum_reached
+            & ((candidate.role != CandidateRole::Escape) | selected_escape)
     }
 
     /// Register `c` unless the store is at capacity. No live candidate is evicted;
@@ -1452,7 +1577,7 @@ impl PartialStore {
         // bounds that log. Pin-independent: both verdicts write and evict identically.
         // A COMMITTED intent is dropped too — the arm it produced lives in the `armed`
         // overlay, which is terminal and never re-derived from here.
-        self.intents.retain(|_, intent| intent.expiry >= now);
+        self.prune_intents(now);
         // Snapshot the selected slot and its pair eagerly before the mutable retain.
         // Normal and duress histories both pay the same lookup/allocation work; the
         // internal sweep bit only selects whether the already-built exemption is live.
@@ -1977,6 +2102,7 @@ impl ChannelState {
                     combine_slack_secs: 0,
                 },
                 intents: HashMap::new(),
+                carriers_by_nonce: HashMap::new(),
             }),
             ingress_guards: Mutex::new(IngressGuards::default()),
             freshness_counts: Mutex::new(HashMap::new()),
@@ -2084,16 +2210,40 @@ impl ChannelState {
             .map(|candidate| store.register(candidate))
             .collect();
         self.apply_arm_directive(&mut store, &arm, &hot_holds);
+        // Attach the resident pair to this carrier's intent under the SAME store lock
+        // that inserted it. In particular, a zero-Hold fire tick cannot observe a new
+        // candidate before its closed holder gate and intent association exist. A
+        // refresh has no ArmIntent, so this is the same-shaped no-op for that variant.
+        if let Some(intent) = store.intents.get_mut(arm.carrier) {
+            intent.spend_commitment_id = arm.spend_commitment_id.to_string();
+            intent.escape_commitment_id = arm.sweep_escape.to_string();
+        }
         outcomes
     }
 
     /// Atomically write the request's fixed two-slot schedule under an already-held
     /// store lock: the spend candidate is the immediate/normal slot and this method
     /// writes the delayed escape slot under BOTH pins. The normal delayed slot is a
-    /// no-op; duress makes it the live sweep. If already Armed, every accepted hot
-    /// spend also shrinks `T`. Only the selector bits differ by pin — record shape,
-    /// allocation, lock count, and candidate-window write are identical.
+    /// no-op; duress makes it the live sweep, but ONLY for an escape that is already
+    /// holder-confirmed — a fresh pair's slot goes live through its own carrier's
+    /// t-confirmation in [`Self::confirm_carrier`], never here. If already Armed, every
+    /// accepted hot spend also shrinks `T`. Only the selector bits differ by pin —
+    /// record shape, allocation, lock count, and candidate-window write are identical.
     fn apply_arm_directive(&self, store: &mut PartialStore, arm: &ArmDirective, hot_holds: &[u64]) {
+        // Adopting the sweep slot here is only sound for an escape that is ALREADY
+        // holder-confirmed. `sweep_active` is monotonic (nothing ever clears it) and
+        // `slot_active` demands an exact id match, so latching it onto a freshly
+        // registered escape — born `holder_quorum_reached: false` — would pin the sweep
+        // to a candidate that can never fire if its own carrier is censored, AND make
+        // first-wins reject every later duress escape: permanent Lockdown-only. That is
+        // the same regression `confirm_carrier` refuses an empty id to avoid. The
+        // ordinary route for a fresh pair is that carrier's own t-confirmation, which
+        // sets this bit and pins the slot under one store lock. Evaluated under BOTH
+        // pins — one unconditional lookup, no pin-dependent work.
+        let escape_live = store
+            .candidates
+            .get(arm.sweep_escape)
+            .is_some_and(|candidate| candidate.holder_quorum_reached);
         let armed = &mut store.armed;
         // Iterate every accepted hot Hold under BOTH pins. Only the internal Armed bit
         // selects whether the computed minimum is committed, so the normal cover path
@@ -2128,7 +2278,7 @@ impl ChannelState {
             request_escape
         };
         armed.escape_commitment_id = selected_escape;
-        armed.sweep_active |= armed.active & arm.duress;
+        armed.sweep_active |= armed.active & arm.duress & escape_live;
         let selected_escape = armed.escape_commitment_id.clone();
         #[cfg(test)]
         self.schedule_work
@@ -2177,9 +2327,13 @@ impl ChannelState {
 
     /// Apply the same delayed-slot write to an already-registered cached pair.
     /// Idempotency is consulted only after the pin/safety hook, so a normal-pending
-    /// pair resubmitted with a fresh duress nonce reaches this method Armed and its
-    /// resident escape becomes the sweep candidate instead of degrading to
-    /// Lockdown-only.
+    /// pair resubmitted with a fresh duress nonce still reaches the safety path — but
+    /// under §0 it reaches this method UN-armed, so the sweep selection inside
+    /// [`Self::apply_arm_directive`] is a no-op here unless the node was already armed
+    /// by an earlier carrier. What keeps the resident escape from degrading to
+    /// Lockdown-only is the caller's paired [`Self::record_intent_pair`], which
+    /// attaches it to the resubmission's own intent so the eventual t-confirmation
+    /// commit selects it.
     pub(crate) fn apply_cached_schedule(
         &self,
         escape_commitment_id: &str,
@@ -2192,6 +2346,8 @@ impl ChannelState {
             &mut store,
             &ArmDirective {
                 sweep_escape: escape_commitment_id,
+                spend_commitment_id: "",
+                carrier: "",
                 duress,
                 epsilon_secs,
                 now,
@@ -2210,10 +2366,13 @@ impl ChannelState {
     /// node cannot prove any peer shares, which is precisely the splittable state a
     /// hostile coordinator exploits. Arming is committed later, off this path, by
     /// [`Self::confirm_carrier`] once `t` distinct members are known to hold the
-    /// carrier. What this call does establish is (a) this node's own verdict and
-    /// self-holding for the carrier, (b) `first_seen` for `T`, and (c) the pre-arm
-    /// cover values of the overlay — plus, once armed, the shrink-only `T`
-    /// recomputation ADR-0012 requires when a new hot spend is accepted.
+    /// carrier. What this call establishes is (a) this node's own verdict, (b)
+    /// `first_seen` for `T`, and (c) the pre-arm cover values of the overlay.
+    /// [`Self::mark_carrier_propagated`] records self-holding only after the carrier is
+    /// staged for fan-out. Full PSBT validation is deliberately NOT the holder gate:
+    /// the safety verdict is pin-only, and fail-closed lockout still needs self +
+    /// `t−1` peer receipts to arm. Once Armed, accepted hot-candidate registration
+    /// performs ADR-0012's shrink-only `T` recomputation.
     ///
     /// Fail-closed: the caller invokes this even when the node is locked out (before
     /// the wrong/locked-pin refusal), so a valid duress pin still records its intent
@@ -2224,10 +2383,13 @@ impl ChannelState {
     /// `fire_at` over live hot spends. Shrinks only once Armed. If that formula is
     /// already past, the effective `T` is `now`: Lockdown and the escape fire now with
     /// a fresh `[now, now + combine_slack_secs]` window rather than an empty past one.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_arm_intent(
         &self,
         duress: bool,
         carrier: &str,
+        nonce: &str,
+        signature_tag: [u8; 32],
         expiry: u64,
         now: u64,
         timing: DuressTiming,
@@ -2248,39 +2410,151 @@ impl ChannelState {
                 .fetch_add(store.candidates.len(), Relaxed);
         }
         // `arm = false`: ingress only maintains the cover overlay and (when already
-        // armed) shrinks `T`. See the doc comment — the arm itself is confirmation-gated.
+        // armed) leaves the committed schedule untouched. Accepted post-arm hot
+        // spends shrink `T` atomically with candidate registration instead. See the
+        // doc comment — the arm itself is confirmation-gated.
         Self::write_safety_overlay(&mut store, false, now, now, timing);
         #[cfg(test)]
         self.schedule_work
             .safety_overlay_writes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Record this node's own verdict + self-holding for the carrier, under the
-        // SAME lock and in the same shape under both pins. `self_id` counts because a
-        // node that processed the carrier does hold it — including when its own policy
-        // later refuses it, which keeps arming chain-view- and policy-independent
-        // (invariant ii) without weakening `arm ⟹ t nodes hold it`: the other `t−1`
-        // holders are peers that provably propagated.
-        let self_id = self.node_id;
+        // Bound/prune independently of the periodic fire driver. Coordinator auth
+        // admitted this nonce under the same MAX_COORD_NONCES/live-expiry bound, so
+        // finding the intent table full after this prune would indicate an internal
+        // accounting bug rather than attacker-controlled capacity.
+        store.prune_intents(now);
+        // NOT a hard `assert!`. This runs while holding `store` and while the caller
+        // holds `sign_state`, so a panic here poisons BOTH and every later
+        // `.expect("... lock poisoned")` aborts — bricking a node that, under
+        // reboot-death (ADR-0007), can never restart. Turning an internal accounting
+        // invariant into a remote kill switch is strictly worse than the bounded
+        // over-count it would be guarding against: the map is already pruned on the
+        // nonce log's own horizon just above, so live intents are a subset of live
+        // nonces and one extra entry is bounded either way. `debug_assert!` keeps the
+        // invariant enforced under test, where a regression in the 1:1 intent/nonce
+        // correspondence should still fail loudly.
+        debug_assert!(
+            store.intents.contains_key(carrier) || store.intents.len() < MAX_COORD_NONCES,
+            "arm-intent count must remain bounded by the coordinator nonce log"
+        );
         let intent = store
             .intents
             .entry(carrier.to_string())
             .or_insert(ArmIntent {
                 holders: HashSet::new(),
+                ready_to_propagate: false,
                 duress: false,
                 first_seen: now,
+                spend_commitment_id: String::new(),
                 escape_commitment_id: String::new(),
                 expiry,
                 committed: false,
             });
-        intent.holders.insert(self_id);
         // Monotonic: a carrier's verdict is decided once, by the first processing of
         // it. Re-processing (a peer's propagation racing the coordinator's copy) must
         // not be able to CLEAR a duress bit already recorded.
         intent.duress |= duress;
+        store.carriers_by_nonce.insert(
+            nonce.to_string(),
+            CarrierMemo {
+                outcome: MemoOutcome::Derived {
+                    carrier: carrier.to_string(),
+                    signature_tag,
+                    resolved_senders: HashSet::new(),
+                },
+                expiry,
+            },
+        );
         // Do not float an older normal no-op slot forward on a later request. Each
         // request writes its own finite cover window in `apply_arm_directive`; the
         // selected live escape is refreshed there only when a successfully retained
         // request can actually shrink T.
+    }
+
+    /// Mark the local intent as staged for federation fan-out and count this node as a
+    /// holder. At this point the node has coordinator-authenticated, freshness-checked,
+    /// PIN-processed, and retained the carrier for propagation: that is §0's
+    /// "received AND processed" evidence. It is intentionally independent of PSBT
+    /// validation so the attempt budget cannot suppress a valid duress arm while the
+    /// node is locked out (ADR-0012 invariant v). A tolerated compromised minority can
+    /// falsely over-arm such a node with `t−1` claims, but the task explicitly classifies
+    /// over-arming as safe nuisance denial; withholding must not defeat fail-closed arm.
+    pub(crate) fn mark_carrier_propagated(&self, carrier: &str) {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        if let Some(intent) = store.intents.get_mut(carrier) {
+            intent.ready_to_propagate = true;
+            intent.holders.insert(self.node_id);
+        }
+    }
+
+    /// Look up the stretched carrier id already associated with a live coordinator
+    /// nonce. Peer copies normally hit the exact path after the direct request consumed
+    /// the nonce, avoiding a second memory-hard derivation.
+    ///
+    /// `sender` is the authenticated peer whose propagation is being resolved; it
+    /// rations the one conflicting-signature derivation each peer may induce per nonce.
+    /// See [`CarrierMemoLookup`] for why a signature mismatch must NOT skip the
+    /// confirmation.
+    pub(crate) fn carrier_memo_lookup(
+        &self,
+        nonce: &str,
+        signature_tag: [u8; 32],
+        sender: u16,
+        now: u64,
+    ) -> CarrierMemoLookup {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        store.prune_intents(now);
+        let Some(memo) = store.carriers_by_nonce.get_mut(nonce) else {
+            return CarrierMemoLookup::Vacant;
+        };
+        match &mut memo.outcome {
+            MemoOutcome::Derived {
+                carrier,
+                signature_tag: remembered,
+                ..
+            } if *remembered == signature_tag => CarrierMemoLookup::Exact(carrier.clone()),
+            // A sender becomes spent only AFTER the caller owns the global
+            // derivation reservation. Contention must leave it retryable; otherwise a
+            // RATE_LIMITED response would consume the one receipt the retry exists to
+            // deliver.
+            MemoOutcome::Derived {
+                carrier,
+                resolved_senders,
+                ..
+            } => {
+                if resolved_senders.contains(&sender) {
+                    CarrierMemoLookup::Skip
+                } else {
+                    CarrierMemoLookup::DeriveForConfirmation {
+                        memoized_carrier: carrier.clone(),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spend one sender's conflicting-signature derivation budget after the caller has
+    /// reserved the global KDF slot. `memoized_carrier` binds the claim to the memo the
+    /// lookup observed: if expiry pruning and nonce reuse replaced it while admission
+    /// was decided, the stale work is skipped instead of charging the new carrier.
+    pub(crate) fn claim_carrier_derivation(
+        &self,
+        nonce: &str,
+        sender: u16,
+        memoized_carrier: &str,
+    ) -> bool {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        let Some(memo) = store.carriers_by_nonce.get_mut(nonce) else {
+            return false;
+        };
+        match &mut memo.outcome {
+            MemoOutcome::Derived {
+                carrier,
+                resolved_senders,
+                ..
+            } if carrier == memoized_carrier => resolved_senders.insert(sender),
+            MemoOutcome::Derived { .. } => false,
+        }
     }
 
     /// The shared `T` computation + fixed-shape overlay write, under an already-held
@@ -2315,11 +2589,22 @@ impl ChannelState {
         // non-settlement during the hostage window would itself reveal duress.
         let effective_t = t.max(now);
         let was_active = store.armed.active;
-        let retained_t = store.armed.fire_at.min(effective_t);
-        store.armed.fire_at = u64::conditional_select(
+        // A threshold-confirmed NORMAL intent is a same-shaped no-op once Armed. A
+        // later DURESS intent is idempotent for the arm bit but may carry an EARLIER
+        // first_seen, so its confirmed deadline must shrink the live T. Otherwise a
+        // coordinator could let a later intent arm first and then suppress the older
+        // intent's tighter deadline, extending the hostage window. Accepted post-arm
+        // hot spends also shrink through `apply_arm_directive`.
+        let retained_or_initial = u64::conditional_select(
             &effective_t,
-            &retained_t,
+            &store.armed.fire_at,
             Choice::from(u8::from(was_active)),
+        );
+        let shrunk = retained_or_initial.min(effective_t);
+        store.armed.fire_at = u64::conditional_select(
+            &retained_or_initial,
+            &shrunk,
+            Choice::from(u8::from(was_active & arm)),
         );
         store.armed.combine_slack_secs = timing.combine_slack_secs;
         // THE ONE WRITE that can set the arm bit, anywhere in the node. Its only two
@@ -2332,13 +2617,19 @@ impl ChannelState {
         store.armed.active = was_active | arm;
     }
 
-    /// Record the delayed-slot escape this carrier registered, so a §0 commit can
-    /// restore THIS carrier's escape rather than whatever later cover traffic left in
-    /// the overlay. Written under both pins in the same shape; the intent's internal
-    /// duress bit alone decides whether it ever becomes a live sweep.
-    pub(crate) fn record_intent_escape(&self, carrier: &str, escape_commitment_id: &str) {
+    /// Attach an already-resident cached pair to this carrier's intent. Fresh pairs are
+    /// attached atomically by [`Self::register_candidates`]; this separate path exists
+    /// only because idempotent ingress does not re-register candidates. Written under
+    /// both pins in the same shape.
+    pub(crate) fn record_intent_pair(
+        &self,
+        carrier: &str,
+        spend_commitment_id: &str,
+        escape_commitment_id: &str,
+    ) {
         let mut store = self.store.lock().expect("store lock poisoned");
         if let Some(intent) = store.intents.get_mut(carrier) {
+            intent.spend_commitment_id = spend_commitment_id.to_string();
             intent.escape_commitment_id = escape_commitment_id.to_string();
         }
     }
@@ -2346,8 +2637,9 @@ impl ChannelState {
     /// **The §0 confirmation-gated arm commit.** Count `sender`'s propagation of
     /// `carrier` as evidence that `sender` holds it, then commit the arm iff the
     /// holder set has reached `threshold` AND this node's own verdict for the carrier
-    /// was duress. Returns whether this call committed the arm (for the caller's
-    /// Lockdown/Firing wiring and for tests).
+    /// was duress. Returns whether this call committed the arm; production Lockdown/
+    /// Firing are driven by the always-running periodic poll, while tests use the flag
+    /// to identify the exact receipt that crossed the threshold.
     ///
     /// Only an EXISTING intent is counted into. Intents are created solely by
     /// [`Self::record_arm_intent`], i.e. only for a carrier this node itself
@@ -2356,21 +2648,95 @@ impl ChannelState {
     /// unauthenticated traffic.
     ///
     /// Safety properties this gives, all from the one invariant:
-    ///  - **Un-splittable.** If any honest node reaches `threshold`, then `threshold`
-    ///    nodes hold the carrier and — symmetrically, since propagation is to ALL
-    ///    peers — they all reach it and arm. If the carrier cannot reach `threshold`
-    ///    nodes (a corrupt escape every node refuses, an oversized carrier, a lapsing
-    ///    expiry, or a partition), NO node reaches it and NO node arms: clean
-    ///    censorship, the residual ADR-0012 already accepts, never a 1-armed split
-    ///    that leaves `t−1` nodes free to finalize the coerced hot spend.
+    ///  - **No PERSISTENT split among locally validating holders — no armed set left
+    ///    coexisting with an unfrozen signing quorum.** If any honest node reaches
+    ///    `threshold`, then `threshold` nodes hold the carrier and, because each
+    ///    processed request fans out to ALL peers, every locally validating node that
+    ///    recorded an intent and receives those fan-outs reaches it too. That symmetry
+    ///    is what carries the property, and it rests on
+    ///    ADR-0012's DIRECT node-to-node transport: the coordinator is a relay for
+    ///    `/sign`, not for `/channel`, so the post-wrench coordinator this bead defends
+    ///    against cannot deliver one holder's propagation to a second holder while
+    ///    withholding it from a third. A pre-PIN delivery-horizon refusal can leave a
+    ///    complement without an intent; startup's `n = 2t - 1` invariant makes that
+    ///    complement smaller than a signing quorum.
+    ///
+    ///    Two limits on that guarantee, both stated deliberately rather than implied:
+    ///
+    ///    **It is EVENTUAL, not instantaneous.** Fan-out is detached
+    ///    (`spawn_fan_out`), and a peer relays only after its own handler returns, so
+    ///    receipts land in whatever order the network delivers them. Nodes therefore
+    ///    cross `threshold` at different instants, and in the interval an early node
+    ///    can be armed while the not-yet-confirmed remainder is still quorum-sized.
+    ///    That window is inherent to distributed arming, not to receipt counting: a
+    ///    commit barrier would only relocate it into an all-unarmed prefix, where the
+    ///    same pending hot spend is equally unsuppressed. What §0 rules out is the
+    ///    window never CLOSING — an arm that stays split because the remainder has no
+    ///    path to confirmation.
+    ///
+    ///    **An adversary with per-link control of the inter-node network does get a
+    ///    real split, not the censorship residual below.** Feeding `threshold - 1`
+    ///    peers' propagations to one node while blocking the links among the rest arms
+    ///    that node and leaves the other `n - 1 = 2t - 2 >= t` unarmed — a signing
+    ///    quorum. Such an adversary is strictly stronger than ADR-0010's untrusted
+    ///    relay and out of this model, and `holders` cannot detect it because
+    ///    `spawn_fan_out` carries no delivery acknowledgement back. What bounds it is
+    ///    that each send retries with backoff until the carrier's own expiry
+    ///    (`deadline: expiry`), so it takes a SUSTAINED targeted partition holding an
+    ///    exact link pattern for the carrier's whole life — not transient loss, and not
+    ///    merely dropping traffic. Closing it outright needs an echo/commit round on
+    ///    the channel wire, which this bead's scope guard excludes.
+    ///  - **Below `threshold`, the outcome is CENSORSHIP — which is not the same as
+    ///    "funds safe".** If fewer than `threshold` nodes can hold the carrier, NO node
+    ///    arms, so all `n` stay unfrozen. Per ADR-0012's "Total coordinator censorship"
+    ///    residual, an ALREADY-PENDING hot spend then finalizes at its Hold-expiry:
+    ///    under Model-B sign-at-ingress its partials already exist and no node
+    ///    suppresses them. That is the accepted residual, bounded because such a spend
+    ///    is user-authored and user-destined — the attacker lacks the normal pin and
+    ///    cannot manufacture an attacker-destined one — so it reaches at most the hot
+    ///    balance and never vault funds. What §0 removes is the strictly worse SPLIT:
+    ///    an armed minority whose freeze is defeated by an unarmed quorum finalizing
+    ///    the very spend the arm was meant to suppress. Do not read this bullet as
+    ///    "nothing fires"; ADR-0012 explicitly calls that phrasing too strong.
     ///  - **Silence-clean.** This runs on the `/channel` receipt path, off the `/sign`
     ///    response path entirely, so the coordinator's view of a duress request is
     ///    byte-identical to a normal one and it can neither observe nor manufacture a
     ///    partial arm.
-    ///  - **Robust to a compromised minority (< t).** False "I hold it" claims only
-    ///    make MORE nodes arm, and freezing is the safe direction (at worst nuisance
-    ///    denial → recovery). Suppression by fewer than `t` compromised nodes still
-    ///    leaves an honest `t` that confirm each other.
+    ///  - **Robust to a compromised minority, asymmetrically.** False "I hold it"
+    ///    claims are the benign direction, but state the reason precisely: a receipt is
+    ///    authenticated only as coming from a federation member, NEVER as evidence that
+    ///    the member processed anything, so the tolerated `t−1` compromised nodes can
+    ///    always emit `t−1` of them. What that buys is bounded by the SIGNER argument,
+    ///    not by the holder count: every node that signs — and every node that refuses
+    ///    on its own clock — fans the carrier out first, so each honest signer counts
+    ///    the entire honest set that saw the carrier. Either that set reaches `t` (every
+    ///    honest SIGNER in it freezes — an honest node that refused on its own clock does
+    ///    NOT, having recorded no intent, but it never signed THIS request either, so the
+    ///    only releasable partials for it are the `≤ t−1` compromised ones, below quorum)
+    ///    or it does not (fewer than `t` nodes ever signed, so no quorum of partials
+    ///    exists). Both branches bound partials for the carrier's OWN request. Partials
+    ///    that already exist because the same commitment was submitted earlier under a
+    ///    NORMAL pin are NOT bounded here — an unarmed node still releases those, which
+    ///    is exactly the censorship bullet above, not a gap in this argument.
+    ///    Forged receipts can therefore make a PROPER SUBSET of honest nodes arm — an
+    ///    admitter plus `t−1` forgeries, while peers that refused pre-intent hold none —
+    ///    which costs the sweep its escape quorum and lands on the accepted two-track
+    ///    residual (Lockdown at `T` → recovery), but they cannot produce an unfrozen
+    ///    signing quorum that a censoring coordinator could not produce anyway. Freezing
+    ///    is safe; over-arming is at worst nuisance denial → recovery. Selective
+    ///    WITHHOLDING is the direction that bites, because `spawn_fan_out` carries no
+    ///    delivery
+    ///    acknowledgement back into `holders` — a compromised node can process a
+    ///    carrier and simply not relay it. Startup requires `n = 2t − 1`, so after
+    ///    every tolerated `c < t` withholder is removed, at least `t` honest nodes
+    ///    remain. Every such node counts itself once it has processed and staged the
+    ///    authenticated carrier, then confirms the other `t−1` honest holders. Lockout
+    ///    does not change that holder rule: it prevents signing, not the fail-closed
+    ///    safety arm. The inverse composition is deliberately benign under the stated
+    ///    threat model: `t−1` false claims can over-arm one node that processed a
+    ///    carrier its peers rejected, but freezing is safe and that outcome is nuisance
+    ///    denial → recovery, never extra signing authority. This is why merely
+    ///    intersecting 4-of-5 is rejected.
     pub(crate) fn confirm_carrier(
         &self,
         sender: u16,
@@ -2380,20 +2746,67 @@ impl ChannelState {
         timing: DuressTiming,
     ) -> bool {
         let mut store = self.store.lock().expect("store lock poisoned");
+        #[cfg(test)]
+        self.schedule_work
+            .safety_locks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(intent) = store.intents.get_mut(carrier) else {
             return false;
         };
-        intent.holders.insert(sender);
-        // A normal verdict reaching `t` is a same-shaped no-op: the identical lock,
-        // the identical set insert, the identical threshold comparison — only the
-        // internal `duress` bit decides that nothing further happens.
-        if intent.committed || intent.holders.len() < threshold || !intent.duress {
+        // Expiry is enforced HERE, atomically with the count, not only by the
+        // periodic prune. Both sites use the same strict `expiry > now` rule as
+        // coordinator freshness, but a late receipt that arrives between expiry and
+        // the next prune tick
+        // would otherwise commit an arm on one node while a node that had already
+        // pruned ignored the identical receipt — making "who armed" a function of
+        // poll phase rather than of the carrier, which is the one thing §0 exists to
+        // rule out. Refusing uniformly keeps a lapsed carrier a clean censorship
+        // (nobody arms) instead of a scheduling-dependent split. Pin-independent:
+        // both verdicts evict on the same clock comparison.
+        if intent.expiry <= now {
+            store.intents.remove(carrier);
+            store.carriers_by_nonce.retain(|_, remembered| {
+                !matches!(&remembered.outcome, MemoOutcome::Derived { carrier: c, .. } if c == carrier)
+            });
             return false;
         }
+        if !intent.ready_to_propagate {
+            return false;
+        }
+        intent.holders.insert(sender);
+        if intent.committed || intent.holders.len() < threshold {
+            return false;
+        }
+        // Crossing `t` is processed ONCE under both verdicts. In particular, do not
+        // early-return for NORMAL here: the coordinator can keep concurrent `/sign`
+        // probes in flight and observe store-lock contention caused only by the DURESS
+        // commit. Both verdicts therefore run the same candidate scan, overlay write,
+        // String selection, and delayed-window refresh; `commit_arm` is only the
+        // internal selector bit passed to the overlay.
         intent.committed = true;
+        let commit_arm = intent.duress;
         let first_seen = intent.first_seen;
+        let spend_commitment_id = intent.spend_commitment_id.clone();
         let escape_commitment_id = intent.escape_commitment_id.clone();
-        Self::write_safety_overlay(&mut store, true, first_seen, now, timing);
+        #[cfg(test)]
+        self.schedule_work
+            .safety_candidate_visits
+            .fetch_add(store.candidates.len(), std::sync::atomic::Ordering::Relaxed);
+        Self::write_safety_overlay(&mut store, commit_arm, first_seen, now, timing);
+        // The holder decision is release authority for BOTH candidates, under BOTH
+        // verdicts. NORMAL opens the pair. DURESS performs the same writes while the
+        // overlay above atomically activates the hot freeze, so no zero-Hold release or
+        // local finalize can linearize between "confirmed" and "armed". Empty ids are
+        // the ordinary lockout/policy/capacity-refusal shape and update nothing.
+        for commitment_id in [&spend_commitment_id, &escape_commitment_id] {
+            if let Some(candidate) = store.candidates.get_mut(commitment_id) {
+                candidate.holder_quorum_reached = true;
+            }
+        }
+        #[cfg(test)]
+        self.schedule_work
+            .safety_overlay_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Restore THIS carrier's escape as the live sweep slot. Between ingress and
         // now, later normal requests kept rewriting the cover slot (they must, or
         // pre-`T` candidate capacity would leak the pin), so the overlay's current id
@@ -2409,13 +2822,41 @@ impl ChannelState {
         // confirmation because the FREEZE is already committed federation-wide; the
         // sweep is best-effort, and peers that never converge on one escape simply
         // never reach quorum on it → no sweep → Lockdown + recovery.
-        if !store.armed.sweep_active && !escape_commitment_id.is_empty() {
-            store.armed.escape_commitment_id = escape_commitment_id;
-            store.armed.sweep_active = true;
-        }
+        //
+        // Build BOTH selector inputs eagerly, exactly as `apply_arm_directive` does:
+        // allocating the request's id only on the duress branch would make the commit
+        // that arms do strictly more work under the store lock than the same-shaped
+        // normal commit, and a coordinator can keep concurrent `/sign` probes in
+        // flight to sample that lock.
+        let resident_escape = store.armed.escape_commitment_id.clone();
+        #[cfg(test)]
+        self.schedule_work
+            .selector_allocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request_escape = escape_commitment_id.clone();
+        #[cfg(test)]
+        self.schedule_work
+            .selector_allocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let select_request =
+            commit_arm & !store.armed.sweep_active & !escape_commitment_id.is_empty();
+        let selected_escape = if select_request {
+            request_escape
+        } else {
+            resident_escape
+        };
+        store.armed.escape_commitment_id = selected_escape;
+        store.armed.sweep_active |= select_request;
+        // Refresh both fixed-shape selector inputs under BOTH verdicts. They are often
+        // the same id; the duplicate idempotent write is intentional cover work.
+        Self::refresh_escape_window(&mut store, &escape_commitment_id);
         let selected = store.armed.escape_commitment_id.clone();
+        #[cfg(test)]
+        self.schedule_work
+            .selector_allocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self::refresh_escape_window(&mut store, &selected);
-        true
+        commit_arm
     }
 
     /// Fixed-work deadline poll for the always-running SAFETY timer. Both states take
@@ -2456,13 +2897,20 @@ impl ChannelState {
         {
             let mut store = self.store.lock().expect("store lock poisoned");
             let self_id = self.node_id;
+            let spend_commitment_id = store
+                .candidates
+                .get(escape_commitment_id)
+                .map(|escape| escape.paired_commitment_id.clone())
+                .unwrap_or_default();
             let intent = store
                 .intents
                 .entry(carrier.to_string())
                 .or_insert_with(|| ArmIntent {
                     holders: HashSet::new(),
+                    ready_to_propagate: true,
                     duress: false,
                     first_seen: now,
+                    spend_commitment_id,
                     escape_commitment_id: String::new(),
                     expiry: u64::MAX,
                     committed: false,
@@ -3638,7 +4086,16 @@ mod fixture {
     impl Fixture {
         /// `t`-of-`n` fixture with explicit listen ports (endpoint = 127.0.0.1:port).
         pub(crate) fn with_ports(t: usize, ports: &[u16]) -> Fixture {
-            Fixture::with_ports_seed(t, ports, 0xF0, 1)
+            // Older transport-focused tests name only the two live endpoints they
+            // exercise. Confirmation-gated production now requires 2-of-3, so append
+            // one deliberately unreachable member rather than constructing an unsafe
+            // 2-of-2 vault. Fan-out is concurrent; the dead peer costs redundancy but
+            // does not change the two live paths under test.
+            let mut federation_ports = ports.to_vec();
+            if t == 2 && federation_ports.len() == 2 {
+                federation_ports.push(9);
+            }
+            Fixture::with_ports_seed(t, &federation_ports, 0xF0, 1)
         }
 
         /// A DISTINCT-vault fixture (different user + federation keys ⇒ different
@@ -3912,6 +4369,23 @@ mod fixture {
             request.coord_sig = sig.serialize_der().to_lower_hex_string();
         }
 
+        /// Re-sign an ALREADY-signed request, leaving every authenticated byte alone
+        /// and producing a DIFFERENT, equally valid `coord_sig`.
+        ///
+        /// `sign_ecdsa` is RFC 6979-deterministic, so distinct signatures over one body
+        /// need explicit nonce data. A hostile coordinator owns the key and has exactly
+        /// this ability, which is what makes signature-keyed confirmation unsound: the
+        /// body — not the signature — is the carrier identity.
+        pub(crate) fn coord_resign(&self, request: &mut SignRequest, noncedata: u8) {
+            let digest = request.coord_request().auth_digest();
+            let sig = Secp256k1::signing_only().sign_ecdsa_with_noncedata(
+                &Message::from_digest(digest),
+                &self.coord_sk,
+                &[noncedata; 32],
+            );
+            request.coord_sig = sig.serialize_der().to_lower_hex_string();
+        }
+
         /// A coordinator-authenticated `SpendRequest` for `spend`, carrying the
         /// mandatory escape over the same input. Every `SpendRequest` needs a real
         /// escape-class escape (§4), so this is how channel tests reach `/sign`.
@@ -4075,6 +4549,8 @@ mod fixture {
                     // These fixtures register one candidate at a time, so it is its
                     // own pair; `register_pair` is what builds real pairs.
                     paired_commitment_id: commitment_id,
+                    // Focused store fixtures do not model a SpendRequest carrier.
+                    holder_quorum_reached: true,
                     role: CandidateRole::Spend,
                     // These store-level fixtures never exercise the duress freeze;
                     // `false` keeps them on the plain V0-8b fire path.
@@ -4706,8 +5182,21 @@ impl ChannelState {
     pub(crate) fn store_len(&self) -> usize {
         self.store.lock().expect("store lock").candidates.len()
     }
+    pub(crate) fn intent_counts(&self) -> (usize, usize) {
+        let store = self.store.lock().expect("store lock");
+        (store.intents.len(), store.carriers_by_nonce.len())
+    }
     pub(crate) fn schedule_work_trace(&self) -> ScheduleWorkTrace {
         self.schedule_work.snapshot()
+    }
+    /// Whether `cid`'s release/finalize slot is authorized — the holder-quorum gate
+    /// AND (for an Escape) the live sweep selector. `false` for an unknown id.
+    pub(crate) fn slot_is_active(&self, cid: &str) -> bool {
+        let store = self.store.lock().expect("store lock");
+        store
+            .candidates
+            .get(cid)
+            .is_some_and(|candidate| store.slot_active(candidate))
     }
     /// A candidate's fire window, or `None` when nothing has scheduled it.
     pub(crate) fn fire_window(&self, cid: &str) -> Option<FireWindow> {
@@ -6007,6 +6496,8 @@ mod partial {
             crate::handle_sign(&node, &request, NOW).expect("accepted verdict"),
             SignResponse::Accepted(_)
         ));
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        assert!(!node.confirm_carrier(0, &carrier, NOW));
         let channel = node.channel.as_ref().expect("channel");
         let cid = crate::commitment_id_for(&node, &psbt, NOW + 3_600);
 
@@ -6357,7 +6848,18 @@ mod net {
             "the spend names its escape"
         );
 
-        // node0 releases at its fire event (hold_secs = 0 ⇒ now) and sends its
+        // node1's processed propagation must return to node0 before the matured pair
+        // is release-authorized. Candidate registration happens just before node1
+        // spawns that return fan-out, so wait for the t-holder decision explicitly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ch0.due_for_fire(unix_now()).contains(&cid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node0 never received node1's holder confirmation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // node0 now releases at its fire event (hold_secs = 0 ⇒ now) and sends its
         // partial to node1 over the real /channel.
         let release = ch0
             .release_partials(&cid, unix_now())
@@ -6380,6 +6882,66 @@ mod net {
             ch1.partial_stored(&cid, 0, 0),
             "node1 stored node0's partial"
         );
+    }
+
+    /// §0 over the production HTTP paths: one coordinator delivery causes both LIVE
+    /// nodes of a 2-of-3 federation to process and fan out the same request (the third
+    /// member is [`Fixture::with_ports`]'s deliberately unreachable endpoint, so `t = 2`
+    /// receipts is exactly what the two live nodes can supply). The receiving node arms
+    /// from self + sender, then its detached fan-out supplies the reciprocal receipt
+    /// that arms the ingress node. This covers the actual outbox, peer set, envelope,
+    /// loop-suppression, and `/channel` receipt path rather than synthetic confirms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_duress_request_delivered_to_one_node_arms_the_reachable_quorum() {
+        let (l0, p0) = ephemeral().await;
+        let (l1, p1) = ephemeral().await;
+        let fx = Fixture::with_ports(2, &[p0, p1]);
+        let node0 = Arc::new(crate::Node::from_toml_str(&fx.config(0, 3_600, "")).expect("node0"));
+        let node1 = Arc::new(crate::Node::from_toml_str(&fx.config(1, 3_600, "")).expect("node1"));
+        tokio::spawn(serve_pathless_fixture(l0, Arc::clone(&node0)));
+        tokio::spawn(serve_pathless_fixture(l1, Arc::clone(&node1)));
+
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let expiry = unix_now() + 7_200;
+        let mut request = fx.spend_request(&psbt, expiry, "net-duress-confirmation");
+        request.pin = "9999".into();
+        fx.coord_sign(&mut request, "net-duress-confirmation");
+
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{p0}/sign"))
+            .json(&TaggedRequest::Spend(request))
+            .send()
+            .await
+            .expect("sign send");
+        assert!(response.status().is_success());
+        assert!(matches!(
+            response.json::<SignResponse>().await.expect("sign body"),
+            SignResponse::Accepted(_)
+        ));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let armed0 = node0
+                .channel
+                .as_ref()
+                .expect("channel0")
+                .armed_snapshot()
+                .is_some();
+            let armed1 = node1
+                .channel
+                .as_ref()
+                .expect("channel1")
+                .armed_snapshot()
+                .is_some();
+            if armed0 && armed1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real fan-out did not arm both quorum members: node0={armed0}, node1={armed1}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[test]
@@ -7155,6 +7717,12 @@ mod fire {
             crate::handle_sign(&node, &request, NOW).expect("decodable"),
             SignResponse::Accepted(_)
         ));
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        assert!(!node.confirm_carrier(1, &carrier, NOW));
+        assert!(
+            !node.confirm_carrier(2, &carrier, NOW),
+            "a normal holder decision opens the pair but never arms"
+        );
         let cid = crate::commitment_id_for(&node, &psbt, EXPIRY);
         (fx, node, cid, psbt)
     }
@@ -7282,6 +7850,9 @@ mod fire {
             crate::handle_sign(&node, &request, NOW).expect("decodable"),
             SignResponse::Accepted(_)
         ));
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        assert!(!node.confirm_carrier(1, &carrier, NOW));
+        assert!(!node.confirm_carrier(2, &carrier, NOW));
         let cid = crate::commitment_id_for(&node, &psbt, expiry);
         deliver_peer_partials(&fx, node.channel.as_ref().expect("channel"), &psbt, &cid, 2);
 
@@ -7456,6 +8027,9 @@ mod fire {
             crate::handle_sign(&node, &request, NOW).expect("decodable"),
             SignResponse::Accepted(_)
         ));
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        assert!(!node.confirm_carrier(1, &carrier, NOW));
+        assert!(!node.confirm_carrier(2, &carrier, NOW));
         let cid = crate::commitment_id_for(&node, &psbt, EXPIRY);
         let channel = node.channel.as_ref().expect("channel");
         let mut backend = MockBackend::default();
@@ -7771,6 +8345,9 @@ mod fire {
             crate::handle_sign(&node, &child_request, NOW).expect("decodable"),
             SignResponse::Accepted(_)
         ));
+        let child_carrier = crate::arm_carrier_id(&node, child_request.coord_request());
+        assert!(!node.confirm_carrier(1, &child_carrier, NOW));
+        assert!(!node.confirm_carrier(2, &child_carrier, NOW));
         let child_cid = crate::commitment_id_for(&node, &child, EXPIRY);
         let channel = node.channel.as_ref().expect("channel");
         deliver_peer_partials(&fx, channel, &child, &child_cid, 2);
@@ -7892,6 +8469,9 @@ mod fire {
             crate::handle_sign(&node, &request, NOW).expect("decodable"),
             SignResponse::Accepted(_)
         ));
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        assert!(!node.confirm_carrier(1, &carrier, NOW));
+        assert!(!node.confirm_carrier(2, &carrier, NOW));
         deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
         let backend = backend_for(&psbt);
         assert_eq!(
@@ -8259,12 +8839,11 @@ mod fire {
         assert!(node.authorized.lock().expect("authorized").is_empty());
     }
 
-    /// A policy refusal is not an eligible safety carrier. Propagating it would
-    /// consume every peer's coordinator nonce, so a later direct check would see
-    /// NONCE_REPLAYED instead of the peer's own policy verdict (the first-light
-    /// theft demonstration depends on all five nodes independently refusing).
+    /// A refusal that can depend on per-node policy is not a local holder. Even if
+    /// compromised peers selectively claim to hold the same signed carrier, the
+    /// refusing node cannot arm because it never staged its own propagation.
     #[test]
-    fn a_policy_refused_request_is_not_propagated() {
+    fn a_policy_refused_request_is_non_propagating_and_non_armable() {
         let fx = Fixture::new(3, 5);
         let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
         let unallowlisted = bitcoin::ScriptBuf::from_bytes(
@@ -8274,15 +8853,26 @@ mod fire {
                 .collect(),
         );
         let spend = fx.spend_psbt(&unallowlisted, 7);
-        let request = fx.spend_request(&spend, EXPIRY, "policy-refusal");
+        let mut request = fx.spend_request(&spend, EXPIRY, "policy-refusal");
+        request.pin = "9999".into();
+        fx.coord_sign(&mut request, "policy-refusal");
 
         assert!(matches!(
             crate::handle_sign(&node, &request, NOW).expect("decodable"),
             SignResponse::Refusal(r) if r.code == vault_proto::RefusalCode::DestNotAllowed
         ));
+        assert!(node.outbox.lock().expect("outbox").is_empty());
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        for sender in 1..=4 {
+            assert!(!node.confirm_carrier(sender, &carrier, NOW));
+        }
         assert!(
-            node.outbox.lock().expect("outbox").is_empty(),
-            "a policy-refused request must not poison peer nonce state"
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .is_none(),
+            "a node that did not contribute a propagation is not a holder and cannot arm"
         );
     }
 
@@ -8406,23 +8996,34 @@ mod duress {
     /// alone never arms; the node commits only once `t` distinct federation members
     /// are known to hold the carrier, and it learns that from peers relaying the SAME
     /// coordinator-signed request back. This drives exactly the production receipt
-    /// path ([`crate::Node::confirm_carrier`]) with `t−1` distinct senders, node 0
-    /// itself being the `t`-th holder.
+    /// path ([`crate::Node::confirm_carrier`]).
+    ///
+    /// `t−1` peers suffice, and that does NOT depend on whether node 0 validated the
+    /// request. Staging the carrier for fan-out is what claims this node's holder slot
+    /// ([`ChannelState::mark_carrier_propagated`]), and BOTH the fully-validated path
+    /// and the pre-validation PIN refusals stage it ([`crate::stage_spend_carrier`]), so
+    /// node 0 counts itself either way. That is deliberate: §0 counts a member that
+    /// received and PROCESSED the authenticated safety carrier, never one that was
+    /// eligible to sign it, so lockout must not raise a valid duress arm's cost from
+    /// self + `t−1` to `t` OTHER peers — see fail-closed lockout (invariant v) and
+    /// `a_valid_duress_pin_arms_even_when_locked_out`, which arms a 3-of-5 node with
+    /// `confirm_peers(.., 2, ..)`.
     ///
     /// Returns whether the arm committed, so a test can assert BOTH that it did and
     /// (by confirming one peer short) that it did not.
-    fn confirm_peers(node: &crate::Node, carrier: &str, peers: u16, now: u64) -> bool {
+    fn confirm_peers(node: &crate::Node, request: &SignRequest, peers: u16, now: u64) -> bool {
+        let carrier = crate::arm_carrier_id(node, request.coord_request());
         let mut armed = false;
         for sender in 1..=peers {
-            armed |= node.confirm_carrier(sender, carrier, now);
+            armed |= node.confirm_carrier(sender, &carrier, now);
         }
         armed
     }
 
     /// The common case: bring `carrier` to the 3-of-5 fixture's quorum (node 0 plus
     /// peers 1 and 2).
-    fn confirm_to_quorum(node: &crate::Node, carrier: &str) -> bool {
-        confirm_peers(node, carrier, 2, NOW)
+    fn confirm_to_quorum(node: &crate::Node, request: &SignRequest) -> bool {
+        confirm_peers(node, request, 2, NOW)
     }
 
     /// Deliver `count` peer partials for `cid`/`psbt` input 0 (node 0 signed at
@@ -8458,7 +9059,7 @@ mod duress {
         // Ingress records intent and propagates; the arm commits only at
         // t-of-n confirmation (§0).
         assert!(
-            confirm_to_quorum(&node, "arm"),
+            confirm_to_quorum(&node, &request),
             "the duress carrier reaching t holders must commit the arm"
         );
         let escape_cid = crate::commitment_id_for(&node, &escape, EXPIRY);
@@ -8514,7 +9115,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "arm", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
 
         let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
         let escape_cid = crate::commitment_id_for(&node, &escape, EXPIRY);
@@ -8576,7 +9177,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "arm", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         // T = min(now + 100000, (now + 300) − 60) = now + 240.
         assert_eq!(
             channel.armed_snapshot().expect("armed").fire_at,
@@ -8614,7 +9215,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "arm", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         // The formula yields `now − ε` (past), whose specified effective T is now.
         // That opens a fresh full combine window rather than an already-closed one.
         assert_eq!(channel.armed_snapshot().expect("armed").fire_at, NOW);
@@ -8655,7 +9256,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "arm-after-expiry", 2, arm_now);
+        confirm_peers(&node, &request, 2, arm_now);
         assert_eq!(
             channel.armed_snapshot().expect("armed").fire_at,
             arm_now + DELAY,
@@ -8802,8 +9403,24 @@ mod duress {
             crate::handle_sign(&node, &request, NOW).expect("decodable"),
             SignResponse::Refusal(r) if r.code == vault_proto::RefusalCode::BadPin
         ));
-        // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "duress-locked", 2, NOW);
+        // Ingress alone never arms (§0); peer confirmations commit it. Lockout prevents
+        // PSBT validation and signing, but this node still processed and staged the
+        // authenticated safety carrier, so it IS the self-holder required by invariant
+        // (v). One peer remains short of threshold.
+        assert!(
+            !confirm_peers(&node, &request, 1, NOW),
+            "self plus one peer is still short of the 3-of-5 arm threshold"
+        );
+        assert!(
+            channel.armed_snapshot().is_none(),
+            "still unarmed one receipt short of t"
+        );
+        // Self + `t−1` peer receipts arms it even though lockout refused signing:
+        // fail-closed lockout (invariant v), under confirmation-gated commit.
+        assert!(
+            confirm_peers(&node, &request, 2, NOW),
+            "a valid duress pin must arm the SAFETY track even when locked out"
+        );
         assert!(
             channel.armed_snapshot().is_some(),
             "a valid duress pin must arm the SAFETY track even when locked out"
@@ -8882,12 +9499,10 @@ mod duress {
         w.pin = "0000".into();
         fx.coord_sign(&mut w, "wrong-locked");
         let locked_wrong = crate::handle_sign(&big, &w, NOW).expect("locked refusal");
-        let locked_duress = crate::handle_sign(
-            &big,
-            &duress_request(&fx, &spend, &default_escape(&fx), "duress-locked"),
-            NOW,
-        )
-        .expect("locked refusal");
+        let locked_duress_request =
+            duress_request(&fx, &spend, &default_escape(&fx), "duress-locked");
+        let locked_duress =
+            crate::handle_sign(&big, &locked_duress_request, NOW).expect("locked refusal");
         assert_eq!(
             locked_duress, locked_wrong,
             "a locked-out node answers every pin class identically"
@@ -8902,8 +9517,9 @@ mod duress {
                 .is_none(),
             "ingress alone never arms, locked out or not (§0)"
         );
+        // Lockout blocks signing, not §0 self-holding: self + `t−1` peers commits.
         assert!(
-            confirm_to_quorum(&big, "duress-locked"),
+            confirm_peers(&big, &locked_duress_request, 2, NOW),
             "a valid duress pin arms on confirmation even when the node is locked out"
         );
     }
@@ -8950,7 +9566,7 @@ mod duress {
             channel.armed_snapshot().is_none(),
             "ingress alone never arms, not even on the idempotency path (§0)"
         );
-        confirm_peers(&node, "duress-resubmit", 2, NOW);
+        confirm_peers(&node, &duress, 2, NOW);
         assert!(
             channel.armed_snapshot().is_some(),
             "the duress resubmission must arm the SAFETY track before the cached verdict"
@@ -9021,7 +9637,8 @@ mod duress {
             crate::handle_sign(&node, &duress, NOW).expect("decodable"),
             SignResponse::Refusal(r) if r.code == vault_proto::RefusalCode::BadPin
         ));
-        confirm_peers(&node, "duress-locked", 2, NOW);
+        // Lockout blocks signing, not the processed carrier's self-holder slot.
+        confirm_peers(&node, &duress, 2, NOW);
         let armed = channel.armed_snapshot().expect("armed escape-less");
         assert!(
             armed.escape_commitment_id.is_none(),
@@ -9075,7 +9692,7 @@ mod duress {
             SignResponse::Refusal(r) if r.code == vault_proto::RefusalCode::CandidateCapacity
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "duress-capacity", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         assert!(
             channel.armed_snapshot().is_some(),
             "capacity refusal must not suppress the duress freeze/Lockdown schedule"
@@ -9127,8 +9744,8 @@ mod duress {
             .expect("channel")
             .armed_snapshot()
             .is_none());
-        confirm_peers(&node_d, "same-nonce", 2, NOW);
-        confirm_peers(&node_n, "same-nonce", 2, NOW);
+        confirm_peers(&node_d, &duress, 2, NOW);
+        confirm_peers(&node_n, &normal, 2, NOW);
         assert!(
             node_n
                 .channel
@@ -9175,8 +9792,8 @@ mod duress {
         // Commit the arm the §0 way, so the SECOND request below lands on an ARMED
         // duress node and a Scheduled normal node — the two histories whose ingress
         // work shape must still be indistinguishable.
-        confirm_peers(&duress_node, "work-first", 2, NOW);
-        confirm_peers(&normal_node, "work-first", 2, NOW);
+        confirm_peers(&duress_node, &duress_first, 2, NOW);
+        confirm_peers(&normal_node, &normal_first, 2, NOW);
 
         // The second request is NORMAL on both nodes. On the duress node it must keep
         // the first-wins live escape refreshed while also writing this request's cover
@@ -9205,12 +9822,18 @@ mod duress {
         assert!(duress_channel.armed_snapshot().is_some());
 
         let expected = ScheduleWorkTrace {
-            safety_locks: 2,
-            safety_candidate_visits: 2,
-            safety_overlay_writes: 2,
+            // Two ingress records plus two peer receipts. The t-th receipt scans and
+            // writes the overlay under BOTH verdicts; this is the confirmation-path
+            // cover that keeps the async arm invisible to concurrent `/sign` probes.
+            safety_locks: 4,
+            safety_candidate_visits: 4,
+            safety_overlay_writes: 3,
             registration_locks: 2,
             hot_hold_steps: 2,
-            selector_allocations: 6,
+            // Three per registration directive, plus three more on the t-th receipt:
+            // the confirmation commit builds BOTH selector inputs eagerly under either
+            // verdict, so the duress commit allocates no more than the normal one.
+            selector_allocations: 9,
             delayed_window_writes: 4,
             // Each fresh handler prunes before registration (0 then 2 candidates),
             // followed by the explicit pre-T driver pass over all four candidates.
@@ -9241,7 +9864,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "arm", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         let channel = node.channel.as_ref().expect("channel");
         let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
 
@@ -9383,7 +10006,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "arm", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         let residual_cid = crate::commitment_id_for(&node, &residual, expiry);
         let armed_t = channel.armed_snapshot().expect("armed").fire_at;
         assert_eq!(
@@ -9517,7 +10140,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "arm", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         assert!(node
             .channel
             .as_ref()
@@ -9687,7 +10310,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "escape-class-union", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         let channel = node.channel.as_ref().expect("channel");
         let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
         let residual_cid = crate::commitment_id_for(&node, &residual, EXPIRY);
@@ -9742,7 +10365,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "escape-class-unconfirmed", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         let channel = node.channel.as_ref().expect("channel");
         let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
         let residual_cid = crate::commitment_id_for(&node, &residual, EXPIRY);
@@ -9805,7 +10428,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "escape-class-change-union", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         let channel = node.channel.as_ref().expect("channel");
         let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
         let residual_cid = crate::commitment_id_for(&node, &residual, EXPIRY);
@@ -10079,7 +10702,7 @@ mod duress {
             );
             // Ingress alone never arms (§0); the peer confirmations commit it.
             assert!(
-                confirm_peers(&node, case.label, 2, NOW),
+                confirm_peers(&node, &request, 2, NOW),
                 "{}: the duress carrier reaching t holders commits the arm",
                 case.label
             );
@@ -10208,7 +10831,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node_d, "ec-duress", 2, NOW);
+        confirm_peers(&node_d, &duress, 2, NOW);
         let chan_d = node_d.channel.as_ref().expect("channel");
         let spend_cid = crate::commitment_id_for(&node_d, &spend, EXPIRY);
         let residual_cid = crate::commitment_id_for(&node_d, &residual, EXPIRY);
@@ -10244,7 +10867,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Ingress alone never arms (§0); the peer confirmations commit it.
-        confirm_peers(&node, "ec-conflict", 2, NOW);
+        confirm_peers(&node, &request, 2, NOW);
         let residual_cid = crate::commitment_id_for(&node, &residual, EXPIRY);
         deliver_partials(
             &fx,
@@ -10301,12 +10924,14 @@ mod duress {
         }
         assert!(!crate::lockdown_tick(&node, NOW + DELAY));
         assert!(!node.is_locked_down());
-        // No freeze: the hot spend still releases at its own Hold-expiry, exactly as
-        // it would have without the duress pin.
+        // No Armed freeze exists, but the pair's pin-uniform holder-decision gate is
+        // still closed. Releasing merely because Hold elapsed would let t−1 malicious
+        // peers withhold confirmations and steal this one honest share before the
+        // asynchronous arm lands.
         let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
         assert!(
-            channel.release_partials(&spend_cid, NOW + HOLD).is_some(),
-            "an unconfirmed duress request must not freeze the hot spend"
+            channel.release_partials(&spend_cid, NOW + HOLD).is_none(),
+            "an unconfirmed carrier must not authorize its pair's partial release"
         );
         // And no sweep is scheduled on the escape.
         let escape_cid = crate::commitment_id_for(&node, &escape, EXPIRY);
@@ -10318,6 +10943,56 @@ mod duress {
         // node eventually reaches t. Censorship must be the coordinator's doing, never
         // the node's.
         assert_eq!(node.outbox.lock().expect("outbox").len(), 1);
+    }
+
+    /// A matured fire window is not enough to release or finalize a SpendRequest pair.
+    /// Without the holder-decision gate, `hold_secs = 0` lets t−1 malicious peers
+    /// withhold their carrier receipts, contribute their own signatures, and collect
+    /// the one honest share before asynchronous fan-out commits the duress arm.
+    #[test]
+    fn zero_hold_cannot_release_or_finalize_before_the_holder_decision() {
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let escape = default_escape(&fx);
+
+        let duress = duress_node(&fx, 0, &format!("duress_delay_secs = {DELAY}"));
+        let duress_request = duress_request(&fx, &spend, &escape, "zero-hold-duress");
+        assert!(matches!(
+            crate::handle_sign(&duress, &duress_request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let channel = duress.channel.as_ref().expect("channel");
+        let spend_cid = crate::commitment_id_for(&duress, &spend, EXPIRY);
+        // Model the malicious minority handing its own two signatures to this node.
+        deliver_partials(&fx, channel, &spend, &spend_cid, 2);
+        assert!(channel.release_partials(&spend_cid, NOW).is_none());
+        assert!(channel.try_finalize(&spend_cid, 3, NOW).is_none());
+        assert!(!confirm_peers(&duress, &duress_request, 1, NOW));
+        assert!(channel.release_partials(&spend_cid, NOW).is_none());
+        assert!(channel.try_finalize(&spend_cid, 3, NOW).is_none());
+
+        // The t-th holder commits duress under the same store lock that records the
+        // holder decision. The candidate never becomes open between those writes.
+        assert!(confirm_peers(&duress, &duress_request, 2, NOW));
+        assert!(channel.release_partials(&spend_cid, NOW).is_none());
+        assert!(channel.try_finalize(&spend_cid, 3, NOW).is_none());
+
+        // NORMAL takes the same confirmation path, but its t-holder decision opens the
+        // matured pair instead of arming the hot freeze.
+        let normal = duress_node(&fx, 0, &format!("duress_delay_secs = {DELAY}"));
+        let normal_request = fx.spend_request(&spend, EXPIRY, "zero-hold-normal");
+        assert!(matches!(
+            crate::handle_sign(&normal, &normal_request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let normal_channel = normal.channel.as_ref().expect("channel");
+        let normal_cid = crate::commitment_id_for(&normal, &spend, EXPIRY);
+        deliver_partials(&fx, normal_channel, &spend, &normal_cid, 2);
+        assert!(normal_channel.release_partials(&normal_cid, NOW).is_none());
+        assert!(normal_channel.try_finalize(&normal_cid, 3, NOW).is_none());
+        assert!(!confirm_peers(&normal, &normal_request, 2, NOW));
+        assert!(normal_channel.release_partials(&normal_cid, NOW).is_some());
+        assert!(normal_channel.try_finalize(&normal_cid, 3, NOW).is_some());
     }
 
     /// The commit: a peer's propagation of the SAME coordinator-signed carrier,
@@ -10339,28 +11014,41 @@ mod duress {
             crate::handle_sign(&node, &request, NOW).expect("decodable"),
             SignResponse::Accepted(_)
         ));
+        let derivations = node.carrier_derivation_count();
+        assert_eq!(derivations, 1, "direct ingress derives the carrier once");
         assert!(channel.armed_snapshot().is_none());
 
         // Peer 1 relays the identical carrier back. Its local outcome is the
         // loop-suppression NONCE_REPLAYED refusal — which says nothing about whether
         // PEER 1 holds it, so the receipt still counts.
-        let tagged = vault_proto::TaggedRequest::Spend(request.clone());
-        let payload = request_payload(&tagged);
-        let envelope = |from: u16| {
+        let envelope = |from: u16, request: &SignRequest, now: u64| {
+            let tagged = vault_proto::TaggedRequest::Spend(request.clone());
+            let payload = request_payload(&tagged);
             let env = fx
                 .channel_state(from)
-                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, now)
                 .expect("envelope");
             serde_json::to_vec(&env).expect("json")
         };
-        crate::handle_channel_body(&node, &envelope(1), NOW);
+        // Hex case is not part of a verified ECDSA signature's identity. This alias
+        // must hit the canonical-byte memo rather than paying another carrier Argon2.
+        let mut hex_case_alias = request.clone();
+        hex_case_alias.coord_sig.make_ascii_uppercase();
+        crate::handle_channel_body(&node, &envelope(1, &hex_case_alias, NOW), NOW);
+        assert_eq!(
+            node.carrier_derivation_count(),
+            derivations,
+            "an exact peer replay must use the nonce/signature memo instead of \
+             re-entering the serialized carrier Argon2"
+        );
         assert!(
             channel.armed_snapshot().is_none(),
             "two holders is one short of the 3-of-5 threshold"
         );
 
         // Peer 2 is the third holder: commit.
-        crate::handle_channel_body(&node, &envelope(2), NOW);
+        crate::handle_channel_body(&node, &envelope(2, &request, NOW), NOW);
+        assert_eq!(node.carrier_derivation_count(), derivations);
         let armed = channel
             .armed_snapshot()
             .expect("t distinct holders commits the arm");
@@ -10383,6 +11071,472 @@ mod duress {
         assert!(channel.lockdown_due(NOW + DELAY));
     }
 
+    /// Terminal Lockdown and a stale request are both knowable before the carrier
+    /// KDF. A compromised peer replaying either class must not enter the serialized
+    /// memory-hard path merely to receive the same rejection the node already owes.
+    #[test]
+    fn locked_down_and_expired_channel_requests_skip_carrier_derivation() {
+        let fx = Fixture::new(3, 5);
+        let envelope = |from: u16, request: &SignRequest| {
+            let payload = request_payload(&vault_proto::TaggedRequest::Spend(request.clone()));
+            let envelope = fx
+                .channel_state(from)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                .expect("envelope");
+            serde_json::to_vec(&envelope).expect("json")
+        };
+
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "locked-channel");
+        let locked = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        locked.enter_lockdown();
+        let _ = crate::handle_channel_body(&locked, &envelope(1, &request), NOW);
+        assert_eq!(
+            locked.carrier_derivation_count(),
+            0,
+            "terminal Lockdown is checked before carrier Argon2"
+        );
+
+        let mut expired = duress_request(&fx, &spend, &default_escape(&fx), "expired-channel");
+        expired.expiry = NOW;
+        fx.coord_sign(&mut expired, "expired-channel");
+        let stale = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let _ = crate::handle_channel_body(&stale, &envelope(1, &expired), NOW);
+        assert_eq!(
+            stale.carrier_derivation_count(),
+            0,
+            "request expiry is checked before carrier Argon2"
+        );
+    }
+
+    /// The OTHER expiry bound, and the one that actually starves `/sign`. A body whose
+    /// expiry sits beyond `now + max_commitment_age_secs` is coordinator-signed and
+    /// passes both the lower expiry bound and the delivery horizon, so a pre-KDF gate
+    /// checking only those derives a carrier for it — and then `verify_coord_auth`
+    /// refuses it `OutsideWindow`, so `record_arm_intent` never runs and no
+    /// nonce/signature memo is ever written. Every redelivery therefore repeats the
+    /// serialized Argon2: exactly the captured-request replay convoy the memo exists to
+    /// prevent, available to any compromised peer inside the tolerated `t-1` at its
+    /// per-peer quota, and aimed at the same `derive_lock` a duress arm's ingress needs.
+    /// Repeat the delivery so a memo-shaped fix cannot pass this by accident.
+    #[test]
+    fn an_over_long_expiry_channel_request_skips_carrier_derivation() {
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let mut over_long = duress_request(&fx, &spend, &default_escape(&fx), "over-long-channel");
+        // `check_and_record` refuses `expiry > now + max_age`; the fixture config sets
+        // `max_commitment_age_secs = 172800`, so one second past the cap is the first
+        // refused value. `EXPIRY` itself sits exactly AT the cap and must still work.
+        over_long.expiry = NOW + 172_801;
+        fx.coord_sign(&mut over_long, "over-long-channel");
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(over_long));
+        for _ in 0..3 {
+            let envelope = fx
+                .channel_state(1)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                .expect("envelope");
+            let body = serde_json::to_vec(&envelope).expect("json");
+            let _ = crate::handle_channel_body(&node, &body, NOW);
+        }
+        assert_eq!(
+            node.carrier_derivation_count(),
+            0,
+            "an expiry beyond max_commitment_age_secs is refused before carrier Argon2, so \
+             replaying it cannot starve the shared derive_lock"
+        );
+    }
+
+    /// The THIRD deterministic-refusal bound, and the one the expiry gates miss. A body
+    /// whose nonce is longer than `MAX_COORD_NONCE_BYTES` is coordinator-signed and sits
+    /// inside BOTH expiry bounds, so a pre-KDF gate checking only those derives a carrier
+    /// for it — and then `check_and_record` refuses it `InvalidLength`, so
+    /// `record_arm_intent` never runs and no nonce/signature memo is ever written.
+    /// Nonce length is a pure function of the signed bytes, exactly like the outbound
+    /// size bound beside it: this body can NEVER be accepted here, so every redelivery
+    /// repeats the serialized Argon2 forever. That is the same un-memoizable convoy on
+    /// the shared `derive_lock` a duress ingress needs, reachable by any compromised peer
+    /// inside the tolerated `t-1`. Repeat the delivery so a memo-shaped fix cannot pass
+    /// this by accident.
+    #[test]
+    fn an_over_long_nonce_channel_request_skips_carrier_derivation() {
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let long_nonce = "n".repeat(crate::MAX_COORD_NONCE_BYTES + 1);
+        let mut over_long = duress_request(&fx, &spend, &default_escape(&fx), &long_nonce);
+        fx.coord_sign(&mut over_long, &long_nonce);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(over_long));
+        for _ in 0..3 {
+            let envelope = fx
+                .channel_state(1)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                .expect("envelope");
+            let body = serde_json::to_vec(&envelope).expect("json");
+            let _ = crate::handle_channel_body(&node, &body, NOW);
+        }
+        assert_eq!(
+            node.carrier_derivation_count(),
+            0,
+            "a nonce beyond MAX_COORD_NONCE_BYTES is refused before carrier Argon2, so \
+             replaying it cannot starve the shared derive_lock"
+        );
+    }
+
+    /// Receipt identity must come from the freshness decision made by the
+    /// authoritative sign handler. The request is one second beyond the cap at
+    /// socket receipt, but exactly at the cap when the queued handler samples its
+    /// later processing clock. A separately-clocked prefilter drops sender 1 while
+    /// the handler accepts and stages, leaving this node permanently at `t−1` after
+    /// sender 2 arrives.
+    #[test]
+    fn a_future_expiry_straddle_counts_the_carrier_the_handler_accepted() {
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let mut request = duress_request(&fx, &spend, &default_escape(&fx), "expiry-straddle");
+        request.expiry = NOW + 172_801;
+        fx.coord_sign(&mut request, "expiry-straddle");
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request));
+
+        let envelope = fx
+            .channel_state(1)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        assert_eq!(
+            crate::handle_channel_body_with_clocks(&node, &body, NOW, || NOW + 1, || NOW + 1,),
+            ChannelReply::Accepted
+        );
+        assert!(
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .is_none(),
+            "self + sender 1 is still below 3"
+        );
+
+        let envelope = fx
+            .channel_state(2)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW + 1)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        assert_eq!(
+            crate::handle_channel_body_with_clocks(&node, &body, NOW + 1, || NOW + 1, || NOW + 1,),
+            ChannelReply::Accepted
+        );
+        assert!(
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .is_some(),
+            "self + both peer receipts must reach t; sender 1 cannot be lost to an older clock"
+        );
+    }
+
+    /// Once the coordinator nonce log is full, a fresh peer-relayed body is refused
+    /// before it can record an arm intent. Receipt resolution happens afterward and
+    /// sees a vacant memo, so repeated delivery must not pay an un-memoizable carrier
+    /// KDF on the same lock a real duress ingress needs.
+    #[test]
+    fn an_at_capacity_channel_request_skips_carrier_derivation() {
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "capacity-channel");
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        {
+            let mut state = node.sign_state.lock().expect("sign_state");
+            for i in 0..MAX_COORD_NONCES {
+                assert_eq!(
+                    state.coord_nonces.check_and_record(
+                        &format!("capacity-{i}"),
+                        EXPIRY,
+                        NOW,
+                        node.max_commitment_age_secs,
+                    ),
+                    crate::replay::NonceDecision::Accepted
+                );
+            }
+        }
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request));
+        for _ in 0..3 {
+            let envelope = fx
+                .channel_state(1)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                .expect("envelope");
+            let body = serde_json::to_vec(&envelope).expect("json");
+            assert_eq!(
+                crate::handle_channel_body(&node, &body, NOW),
+                ChannelReply::Accepted
+            );
+        }
+        assert_eq!(
+            node.carrier_derivation_count(),
+            0,
+            "capacity refusals create no intent, so their receipts must never derive a carrier"
+        );
+    }
+
+    /// A peer-first ingress needs its OWN full delivery horizon. Otherwise `t−1`
+    /// compromised peers can delay one valid carrier until near expiry, deliver it
+    /// concurrently to a single honest node, and let that node count self + their
+    /// receipts before its async fan-out can reach the remaining honest nodes.
+    #[test]
+    fn a_peer_first_ingress_without_a_full_delivery_horizon_never_becomes_a_holder() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let mut request = duress_request(&fx, &spend, &default_escape(&fx), "horizon-budget");
+        // The default horizon is 60 seconds. It would clear a coordinator ingress at
+        // NOW, but this node first sees it one second later and must refuse before PIN.
+        request.expiry = NOW + 60;
+        fx.coord_sign(&mut request, "horizon-budget");
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request));
+
+        let deliver_at = |from: u16, now: u64| {
+            let envelope = fx
+                .channel_state(from)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, now)
+                .expect("envelope");
+            let body = serde_json::to_vec(&envelope).expect("json");
+            crate::handle_channel_body(&node, &body, now)
+        };
+
+        assert_eq!(deliver_at(1, NOW + 1), ChannelReply::Accepted);
+        assert_eq!(deliver_at(2, NOW + 2), ChannelReply::Accepted);
+        assert!(
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .is_none(),
+            "a peer-first carrier without enough life to re-fan-out must never arm this node"
+        );
+        assert_eq!(
+            node.channel.as_ref().expect("channel").intent_counts().0,
+            0,
+            "the pre-PIN horizon refusal must record no intent, so no set of peer \
+             receipts — genuine or forged — can arm this node off this carrier"
+        );
+        // It DOES fan out, exactly like its sibling EXPIRY_TOO_SHORT: a node-local
+        // clock refusal that withheld its receipt would let a boundary-tuned expiry
+        // strand an honest signer below `t`. Propagating without an intent is the
+        // combination that keeps both properties — see
+        // `a_boundary_expiry_cannot_strand_a_signing_node_below_the_arm_threshold`.
+        assert_eq!(
+            node.outbox.lock().expect("outbox").len(),
+            1,
+            "the horizon refusal still forwards the carrier once"
+        );
+    }
+
+    /// The theft vector the horizon refusal's fan-out closes. `expiry` tuned to
+    /// exactly `now + delivery_horizon_secs` is admitted by the node the coordinator
+    /// reaches first and refused pre-PIN by every peer whose clock has since advanced.
+    /// If those peers withheld their receipts, the admitting node — which validated
+    /// and SIGNED — could sit below `t` holders while the tolerated `t−1` compromised
+    /// minority withheld theirs, stay unarmed, release its partial at fire, and let
+    /// that partial plus the compromised ones finalize the coerced hot spend with NO
+    /// node armed. Because a clock refuser still forwards the carrier, the signer
+    /// instead counts every honest node that saw it and freezes.
+    #[test]
+    fn a_boundary_expiry_cannot_strand_a_signing_node_below_the_arm_threshold() {
+        let fx = Fixture::new(3, 5);
+        // The signer, reached by the coordinator at NOW: `expiry = NOW + 60` clears
+        // its horizon exactly, and HOLD leaves room to sign rather than refuse.
+        let signer = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        // A peer reached one second later by the signer's fan-out: same request, same
+        // config, refused pre-PIN purely because its clock advanced.
+        let peer = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let mut request = duress_request(&fx, &spend, &default_escape(&fx), "boundary-expiry");
+        request.expiry = NOW + HOLD + 60;
+        fx.coord_sign(&mut request, "boundary-expiry");
+
+        // The signer admits and validates: it is a holder of its own carrier.
+        assert!(crate::handle_sign(&signer, &request, NOW).is_ok());
+        assert_eq!(
+            signer.channel.as_ref().expect("channel").intent_counts().0,
+            1,
+            "the signing node records its intent"
+        );
+
+        // The peer sees the same bytes `delivery_horizon_secs` later, so its own
+        // horizon gate refuses before the PIN — and must still forward the carrier.
+        let mut late = request.clone();
+        late.expiry = NOW + HOLD + 60;
+        fx.coord_sign(&mut late, "boundary-expiry-peer");
+        let peer_now = NOW + HOLD + 1;
+        assert!(crate::handle_sign(&peer, &late, peer_now).is_ok());
+        assert_eq!(
+            peer.channel.as_ref().expect("channel").intent_counts().0,
+            0,
+            "the horizon-refusing peer records no intent"
+        );
+        assert_eq!(
+            peer.outbox.lock().expect("outbox").len(),
+            1,
+            "but it still forwards the carrier, so its receipt reaches the signer"
+        );
+    }
+
+    /// A nonce is only a freshness token, not a request commitment. A hostile
+    /// coordinator can sign different bodies with the same nonce and selectively
+    /// deliver them to peers. Their replay-refused propagations must NOT count toward
+    /// the duress body's holder set; only the coordinator-auth digest of the exact body
+    /// is a confirmation key.
+    #[test]
+    fn confirmations_are_bound_to_the_exact_authenticated_request_not_just_its_nonce() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let duress = duress_request(&fx, &spend, &default_escape(&fx), "reused-nonce");
+        assert!(matches!(
+            crate::handle_sign(&node, &duress, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let derivations = node.carrier_derivation_count();
+
+        // Two different, coordinator-signed NORMAL bodies deliberately reuse the
+        // duress body's nonce. At this node both return NONCE_REPLAYED after channel
+        // authentication, but their authenticated digests are distinct and therefore
+        // cannot manufacture confirmations for the duress intent.
+        let alternate_spend_1 = fx.spend_psbt(&fx.hot_spk, 8);
+        let alternate_1 = fx.spend_request(&alternate_spend_1, EXPIRY, "reused-nonce");
+        let alternate_spend_2 = fx.spend_psbt(&fx.hot_spk, 9);
+        let alternate_2 = fx.spend_request(&alternate_spend_2, EXPIRY, "reused-nonce");
+        let deliver_request = |from: u16, request: &SignRequest| {
+            let payload = request_payload(&vault_proto::TaggedRequest::Spend(request.clone()));
+            let envelope = fx
+                .channel_state(from)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                .expect("envelope");
+            let body = serde_json::to_vec(&envelope).expect("json");
+            crate::handle_channel_body(&node, &body, NOW)
+        };
+        let _ = deliver_request(1, &alternate_1);
+        let _ = deliver_request(2, &alternate_2);
+        assert!(
+            channel.armed_snapshot().is_none(),
+            "different signed bodies reusing one nonce are not confirmations of each other"
+        );
+        // Each of those bodies did cost one carrier derivation — that is what makes the
+        // assertion above a real check rather than an accident of a skipped lookup: the
+        // node resolved each body's OWN carrier and found no intent for it. The work is
+        // rationed per (nonce, sender), so a peer repeating its body is free and the
+        // total a hostile coordinator can induce stays at one fan-out's worth.
+        assert_eq!(
+            node.carrier_derivation_count(),
+            derivations + 2,
+            "one derivation per distinct sender resolving a conflicting signature"
+        );
+        let _ = deliver_request(1, &alternate_1);
+        let _ = deliver_request(1, &alternate_2);
+        assert_eq!(
+            node.carrier_derivation_count(),
+            derivations + 2,
+            "a sender that already spent its derivation for this nonce must not induce more"
+        );
+
+        // Two exact-body propagations are the missing holders and do commit.
+        let _ = deliver_request(3, &duress);
+        assert!(channel.armed_snapshot().is_none());
+        let _ = deliver_request(4, &duress);
+        assert!(channel.armed_snapshot().is_some());
+    }
+
+    /// The carrier identity is the BODY, not the signature over it. `canonical_bytes`
+    /// excludes `coord_sig`, so one body has one carrier id however many valid
+    /// signatures the coordinator produces for it.
+    ///
+    /// This is the load-bearing case: a post-wrench coordinator signs the identical
+    /// duress body once per node with distinct ECDSA nonces and gives node `i` copy
+    /// `B+Sᵢ`. Every node accepts, schedules the coerced hot spend, and fans out the
+    /// copy it holds — so every relay any node receives carries some `Sⱼ ≠ Sᵢ`. If a
+    /// signature mismatch skipped the confirmation, `holders` would stay at 1
+    /// everywhere, no node would ever freeze or lock down at `T`, and the coerced spend
+    /// would finalize at its Hold-expiry. That is THEFT, not the accepted censorship
+    /// residual: the coordinator gets its spend AND suppresses the duress response, at
+    /// zero cost, using only the signing key the threat model already grants it.
+    #[test]
+    fn re_signed_copies_of_one_body_confirm_each_other_and_arm() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let duress = duress_request(&fx, &spend, &default_escape(&fx), "one-body");
+
+        // This node's own copy carries the coordinator's first signature.
+        assert!(matches!(
+            crate::handle_sign(&node, &duress, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(
+            channel.armed_snapshot().is_none(),
+            "ingress never arms (§0)"
+        );
+
+        // Its peers relay the SAME body under different valid signatures.
+        let deliver_resigned = |from: u16, noncedata: u8| {
+            let mut copy = duress.clone();
+            fx.coord_resign(&mut copy, noncedata);
+            assert_ne!(
+                copy.coord_sig, duress.coord_sig,
+                "the re-signed copy must actually differ"
+            );
+            assert_eq!(
+                copy.coord_request().auth_digest(),
+                duress.coord_request().auth_digest(),
+                "…while authenticating byte-identical content"
+            );
+            let payload = request_payload(&vault_proto::TaggedRequest::Spend(copy));
+            let envelope = fx
+                .channel_state(from)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                .expect("envelope");
+            let body = serde_json::to_vec(&envelope).expect("json");
+            crate::handle_channel_body(&node, &body, NOW)
+        };
+
+        // Hold the one global carrier-KDF reservation to model an already-running
+        // conflicting-signature resolution. This receipt must be shed immediately as
+        // RATE_LIMITED rather than queueing while it retains an ordinary `/channel`
+        // permit; crucially, its per-(nonce, sender) budget remains retryable.
+        let derivations = node.carrier_derivation_count();
+        let busy = node
+            .carrier_kdf
+            .try_reserve()
+            .expect("reserve the carrier KDF for the contention test");
+        assert_eq!(
+            deliver_resigned(1, 0xA1),
+            ChannelReply::RateLimited {
+                retry_after_secs: 1
+            }
+        );
+        assert_eq!(
+            node.carrier_derivation_count(),
+            derivations,
+            "a contended receipt must not start or queue memory-hard work"
+        );
+        drop(busy);
+
+        assert_eq!(deliver_resigned(1, 0xA1), ChannelReply::Accepted);
+        assert!(
+            channel.armed_snapshot().is_none(),
+            "one peer short of t is still unarmed"
+        );
+        assert_eq!(deliver_resigned(2, 0xB2), ChannelReply::Accepted);
+        assert!(
+            channel.armed_snapshot().is_some(),
+            "a re-signed copy of the same body is a genuine receipt: distinct coordinator \
+             signatures must not be able to suppress every confirmation in the federation"
+        );
+    }
+
     /// A NORMAL verdict reaching t confirmations is a same-shaped no-op: the same
     /// receipts, the same holder set, the same threshold comparison — and no freeze.
     /// Ordinary traffic reaches t constantly; only the internal duress bit separates
@@ -10399,7 +11553,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         assert!(
-            !confirm_peers(&node, "normal-quorum", 4, NOW),
+            !confirm_peers(&node, &normal, 4, NOW),
             "a normal carrier confirmed by the WHOLE federation must never arm"
         );
         assert!(channel.armed_snapshot().is_none());
@@ -10407,6 +11561,111 @@ mod duress {
         assert!(
             channel.release_partials(&spend_cid, NOW + HOLD).is_some(),
             "a normal spend confirmed by everyone still fires at its Hold-expiry"
+        );
+    }
+
+    /// A threshold-crossing NORMAL receipt after the node is already Armed must be
+    /// a true schedule no-op. Its older `first_seen + delay` may be in the past; using
+    /// that cover value to rewrite the live overlay would collapse T to `now` and
+    /// visibly fire Lockdown early.
+    #[test]
+    fn a_late_normal_confirmation_preserves_the_armed_deadline() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, 10_000, &format!("duress_delay_secs = {DELAY}"));
+        let normal_spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let normal = fx.spend_request(&normal_spend, EXPIRY, "old-normal");
+        assert!(matches!(
+            crate::handle_sign(&node, &normal, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        let duress_spend = fx.spend_psbt(&fx.hot_spk, 8);
+        let duress_escape = fx.spend_psbt(&fx.escape_spk, 9);
+        let armed_at = NOW + DELAY;
+        let duress = duress_request(&fx, &duress_spend, &duress_escape, "later-duress");
+        assert!(matches!(
+            crate::handle_sign(&node, &duress, armed_at).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(confirm_peers(&node, &duress, 2, armed_at));
+        let expected_t = armed_at + DELAY;
+        assert_eq!(
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .expect("armed")
+                .fire_at,
+            expected_t
+        );
+
+        let normal_confirmation_at = NOW + DELAY + 1;
+        assert!(!confirm_peers(&node, &normal, 2, normal_confirmation_at));
+        assert_eq!(
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .expect("still armed")
+                .fire_at,
+            expected_t,
+            "the normal threshold crossing must preserve the committed duress T"
+        );
+        assert!(!node
+            .channel
+            .as_ref()
+            .expect("channel")
+            .lockdown_due(normal_confirmation_at));
+    }
+
+    /// An older duress intent may cross the holder threshold after a newer intent has
+    /// already armed the node. Its earlier `first_seen + delay` is still authoritative:
+    /// ignoring it lets the coordinator extend the hostage window by steering receipt
+    /// order. NORMAL confirmations remain no-ops (the sibling test above).
+    #[test]
+    fn an_older_duress_confirmation_shrinks_the_armed_deadline() {
+        let fx = Fixture::new(3, 5);
+        let delay = 3_600;
+        let node = duress_node(&fx, 10_000, &format!("duress_delay_secs = {delay}"));
+
+        let older_spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let older_escape = fx.spend_psbt(&fx.escape_spk, 9);
+        let older = duress_request(&fx, &older_spend, &older_escape, "older-duress");
+        assert!(matches!(
+            crate::handle_sign(&node, &older, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        let newer_seen = NOW + 1_000;
+        let newer_spend = fx.spend_psbt(&fx.hot_spk, 8);
+        let newer_escape = fx.spend_psbt(&fx.escape_spk, 10);
+        let newer = duress_request(&fx, &newer_spend, &newer_escape, "newer-duress");
+        assert!(matches!(
+            crate::handle_sign(&node, &newer, newer_seen).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(confirm_peers(&node, &newer, 2, newer_seen));
+        assert_eq!(
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .expect("armed by newer intent")
+                .fire_at,
+            newer_seen + delay
+        );
+
+        let older_confirmation = newer_seen + 1;
+        assert!(confirm_peers(&node, &older, 2, older_confirmation));
+        assert_eq!(
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .expect("still armed")
+                .fire_at,
+            NOW + delay,
+            "the confirmed older duress first_seen must shrink T"
         );
     }
 
@@ -10424,15 +11683,16 @@ mod duress {
             crate::handle_sign(&node, &request, NOW).expect("decodable"),
             SignResponse::Accepted(_)
         ));
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
         for _ in 0..10 {
             assert!(
-                !node.confirm_carrier(1, "dupes", NOW),
+                !node.confirm_carrier(1, &carrier, NOW),
                 "one peer repeating itself is still one holder"
             );
         }
         assert!(channel.armed_snapshot().is_none());
         // A genuinely distinct second peer completes the threshold.
-        assert!(node.confirm_carrier(2, "dupes", NOW));
+        assert!(node.confirm_carrier(2, &carrier, NOW));
         assert!(channel.armed_snapshot().is_some());
     }
 
@@ -10451,7 +11711,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         // Only ONE peer is reachable: two holders against a threshold of three.
-        assert!(!confirm_peers(&node, "partitioned", 1, NOW));
+        assert!(!confirm_peers(&node, &request, 1, NOW));
         assert!(
             channel.armed_snapshot().is_none(),
             "a partitioned minority must not arm"
@@ -10477,7 +11737,7 @@ mod duress {
             SignResponse::Accepted(_)
         ));
         assert!(
-            confirm_peers(&honest, "minority", 2, NOW),
+            confirm_peers(&honest, &request, 2, NOW),
             "two compromised nodes cannot hold a 3-of-5 federation below its threshold"
         );
 
@@ -10491,7 +11751,7 @@ mod duress {
             crate::handle_sign(&liar, &normal, NOW).expect("decodable"),
             SignResponse::Accepted(_)
         ));
-        assert!(!confirm_peers(&liar, "liar", 4, NOW));
+        assert!(!confirm_peers(&liar, &normal, 4, NOW));
         assert!(liar
             .channel
             .as_ref()
@@ -10514,9 +11774,10 @@ mod duress {
         let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
         let channel = node.channel.as_ref().expect("channel");
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
-        // An "escape" that pays the HOT wallet is not an escape at all: `verify_escape`
-        // requires every output to pay the escape descriptor.
-        let corrupt = fx.spend_psbt(&fx.hot_spk, 8);
+        // Corrupt the user-authorized bytes after signing. Signature validity is
+        // federation-uniform and this carrier is never eligible for fan-out.
+        let mut corrupt = default_escape(&fx);
+        corrupt.unsigned_tx.output[0].value = Amount::from_sat(1);
         let request = duress_request(&fx, &spend, &corrupt, "corrupt-escape");
         assert!(matches!(
             crate::handle_sign(&node, &request, NOW).expect("decodable"),
@@ -10524,16 +11785,183 @@ mod duress {
         ));
         assert!(
             node.outbox.lock().expect("outbox").is_empty(),
-            "a policy-refused request is not propagated, so no peer can come to hold it"
+            "a bad-signature escape is not propagated, so no peer can come to hold it"
         );
         assert!(
             channel.armed_snapshot().is_none(),
             "the refusing node must not be the ONE armed node — that is the split"
         );
-        // Even the node itself counts as only one holder, so the threshold is
-        // unreachable without the peers the refusal never reached.
-        assert!(!confirm_peers(&node, "corrupt-escape", 1, NOW));
+        // The pre-validation intent does not count this node as a holder. Even a
+        // compromised `t-1` minority (indeed, every peer in this focused model)
+        // claiming the bad carrier cannot arm a node that never staged it.
+        assert!(!confirm_peers(&node, &request, 4, NOW));
         assert!(channel.armed_snapshot().is_none());
+    }
+
+    /// Split vector (a) against a LOCKED-OUT node — the case the plain corrupt-escape
+    /// test cannot reach. A locked-out node refuses on the attempt budget BEFORE it
+    /// decodes either PSBT, so it never learns the escape is corrupt and it does still
+    /// propagate (a lockout must not hold the federation below `t`). It therefore counts
+    /// itself as a holder: the task explicitly accepts that `t−1` false minority claims
+    /// can over-arm a node. The safe outcome is nuisance denial—this node signed no
+    /// candidate, schedules no sweep, and locks down into recovery—not extra authority
+    /// for any spend.
+    #[test]
+    fn false_minority_claims_only_over_arm_a_locked_out_node_safely() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(
+            &fx,
+            HOLD,
+            "duress_delay_secs = 600\n[pin_attempt_budget]\nmax_attempts = 1\nwindow_secs = 3600\n\
+             backoff_schedule = [0]\nlockout_secs = 100",
+        );
+        let channel = node.channel.as_ref().expect("channel");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+
+        // One wrong pin trips the lockout (max_attempts = 1).
+        let mut wrong = fx.spend_request(&spend, EXPIRY, "wrong");
+        wrong.pin = "0000".into();
+        fx.coord_sign(&mut wrong, "wrong");
+        crate::handle_sign(&node, &wrong, NOW).expect("decodable");
+        node.outbox.lock().expect("outbox").clear();
+
+        // A valid duress pin carrying a corrupt escape, delivered only here.
+        let mut corrupt = default_escape(&fx);
+        corrupt.unsigned_tx.output[0].value = Amount::from_sat(1);
+        let request = duress_request(&fx, &spend, &corrupt, "corrupt-while-locked");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Refusal(r) if r.code == vault_proto::RefusalCode::BadPin
+        ));
+        assert_eq!(
+            node.outbox.lock().expect("outbox").len(),
+            1,
+            "a locked-out node still propagates, or lockout becomes a censorship lever"
+        );
+        assert!(
+            confirm_peers(&node, &request, 2, NOW),
+            "self plus t−1 false holder claims may over-arm; freezing is the safe direction"
+        );
+        let armed = channel.armed_snapshot().expect("safety track armed");
+        assert!(
+            armed.escape_commitment_id.is_none(),
+            "the refused corrupt pair supplied no sweep candidate"
+        );
+        let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        assert!(
+            channel.release_partials(&spend_cid, NOW + HOLD).is_none(),
+            "lockout signed and registered nothing, so over-arming cannot authorize a spend"
+        );
+        assert!(
+            channel.lockdown_due(NOW + 600),
+            "safe over-arming still terminates in Lockdown and recovery"
+        );
+    }
+
+    /// Split vector (b)/(c) via a PEER RELAY. The size bound is a pure function of the
+    /// bytes against a manifest-uniform cap, so it applies to relays exactly as it does
+    /// to direct ingress. Exempting relays reopened the vector: the `/channel` pre-KDF
+    /// guard is a short-circuiting `&&`, so a body failing ONLY the size bound arrived
+    /// with `carrier = None` and was then processed with the gate skipped — deriving
+    /// its carrier, reaching the outbox, and making this node a holder of a carrier it
+    /// can never actually fan out. A compromised peer could hand that to one node and,
+    /// with the rest of the tolerated minority, leave it armed alone.
+    #[test]
+    fn an_oversized_peer_relay_is_rejected_and_never_makes_this_node_a_holder() {
+        let mut fx = Fixture::new(3, 5);
+        fx.reseal_max_msg_bytes(100);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "oversized-relay");
+
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request.clone()));
+        let envelope = fx
+            .channel_state(1)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        assert_eq!(
+            crate::handle_channel_body(&node, &body, NOW),
+            ChannelReply::Rejected(RejectReason::MalformedPayload),
+            "an undeliverable carrier is refused on the relay path too"
+        );
+        assert!(
+            node.outbox.lock().expect("outbox").is_empty(),
+            "a carrier this node cannot fan out must not be staged for fan-out"
+        );
+        // No intent, no holder, and the whole tolerated minority cannot change that.
+        assert!(!confirm_peers(&node, &request, 4, NOW));
+        assert!(channel.armed_snapshot().is_none());
+    }
+
+    /// A pre-PIN §0 refusal consumes the coordinator nonce but returns before any
+    /// carrier is derived. Receipt resolution runs after the authoritative handler,
+    /// so its vacant carrier memo means "nothing to confirm" and remains KDF-free on
+    /// every replay without adding refusal-only memo state.
+    #[test]
+    fn a_delivery_horizon_refusal_replay_stays_free_without_a_carrier_memo() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let mut request = duress_request(&fx, &spend, &default_escape(&fx), "horizon-convoy");
+        // Well inside coordinator freshness, far short of the 60s delivery horizon.
+        request.expiry = NOW + 5;
+        fx.coord_sign(&mut request, "horizon-convoy");
+
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Refusal(r) if r.check == "delivery_horizon"
+        ));
+        let after_refusal = node.carrier_derivation_count();
+
+        // A compromised peer now replays that exact body at its quota.
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request));
+        for _ in 0..5 {
+            let envelope = fx
+                .channel_state(1)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                .expect("envelope");
+            let body = serde_json::to_vec(&envelope).expect("json");
+            let _ = crate::handle_channel_body(&node, &body, NOW);
+        }
+        assert_eq!(
+            node.carrier_derivation_count(),
+            after_refusal,
+            "a pre-PIN refusal must never re-derive: it can produce no \
+             intent and therefore no confirmation"
+        );
+    }
+
+    /// Delivery-horizon refusals return before a carrier exists, so they must not add
+    /// either an intent or a carrier memo. This makes the bound structural instead of
+    /// relying on a second refusal-only cache to prune in sync with coordinator nonces.
+    #[test]
+    fn delivery_horizon_refusals_do_not_create_carrier_state() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        for i in 0..64u64 {
+            // Each body is authentic and nonce-fresh, and each is refused before the pin
+            // for sitting inside the 60s delivery horizon. The clock outruns every
+            // previous expiry, so every coordinator nonce is independently bounded.
+            let now = NOW + i * 10;
+            let nonce = format!("horizon-flood-{i}");
+            let mut request = duress_request(&fx, &spend, &default_escape(&fx), &nonce);
+            request.expiry = now + 5;
+            fx.coord_sign(&mut request, &nonce);
+            assert!(matches!(
+                crate::handle_sign(&node, &request, now).expect("decodable"),
+                SignResponse::Refusal(r) if r.check == "delivery_horizon"
+            ));
+        }
+        let (intents, memos) = channel.intent_counts();
+        assert_eq!(intents, 0, "a pre-pin refusal records no arm intent");
+        assert_eq!(
+            memos, 0,
+            "a refusal before carrier derivation needs no memo"
+        );
     }
 
     /// Split vector (b)/(c): an oversized carrier. It is refused at ingress BEFORE the
@@ -10557,7 +11985,7 @@ mod duress {
             "an undeliverable carrier must never arm — it can never reach t peers"
         );
         assert!(node.outbox.lock().expect("outbox").is_empty());
-        assert!(!confirm_peers(&node, "oversized", 4, NOW));
+        assert!(!confirm_peers(&node, &request, 4, NOW));
     }
 
     /// Split vector (c), structurally: `max_msg_bytes` is hashed into the manifest, so
@@ -10634,8 +12062,46 @@ mod duress {
             channel.armed_snapshot().is_none(),
             "a carrier that cannot survive its own fan-out must never arm"
         );
-        assert!(!confirm_peers(&node, "near-duress", 4, NOW));
+        assert!(!confirm_peers(&node, &duress, 4, NOW));
         assert!(channel.armed_snapshot().is_none());
+    }
+
+    /// `EXPIRY_TOO_SHORT` depends on the local Hold clock, so retain its existing
+    /// all-peer propagation instead of introducing avoidable carrier censorship at a
+    /// per-node boundary. This request becomes a holder only AFTER the outbox write;
+    /// other refused requests that skip staging remain non-armable even if peers later
+    /// claim the carrier.
+    #[test]
+    fn a_clock_refused_carrier_still_participates_in_confirmation() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        // Comfortably past the 60s delivery horizon, but under the hot-class floor
+        // (`now + hold_secs 3600 + combine_slack_secs 60`) — so it clears the 0b
+        // preconditions and dies at step 8, the clock-dependent refusal.
+        let short = NOW + 1_800;
+        let mut request = fx.spend_request(&spend, short, "clock-refused");
+        request.escape_psbt = default_escape(&fx).to_string();
+        request.pin = "9999".into();
+        fx.coord_sign(&mut request, "clock-refused");
+
+        match crate::handle_sign(&node, &request, NOW).expect("decodable") {
+            SignResponse::Refusal(r) => {
+                assert_eq!(r.code, vault_proto::RefusalCode::ExpiryTooShort);
+                assert_eq!(r.check, "commitment_expiry");
+            }
+            other => panic!("expected a commitment_expiry refusal, got {other:?}"),
+        }
+        assert_eq!(
+            node.outbox.lock().expect("outbox").len(),
+            1,
+            "the clock-dependent refusal retains its all-peer propagation"
+        );
+        // Because it staged, self is a real holder and distinct peer receipts can
+        // bring the intent to the threshold.
+        assert!(confirm_to_quorum(&node, &request));
+        assert!(channel.armed_snapshot().is_some());
     }
 
     /// An escape-LESS arm (the fail-closed lockout branch: SAFETY armed, but the pair
@@ -10668,7 +12134,8 @@ mod duress {
         }
         let locked = duress_request(&fx, &spend, &default_escape(&fx), "locked-arm");
         let _ = crate::handle_sign(&node, &locked, NOW);
-        assert!(confirm_peers(&node, "locked-arm", 2, NOW));
+        // Lockout blocks signing, not the processed carrier's self-holder slot.
+        assert!(confirm_peers(&node, &locked, 2, NOW));
         let armed = channel
             .armed_snapshot()
             .expect("SAFETY armed while locked out");
@@ -10677,8 +12144,11 @@ mod duress {
             "an escape-less arm has nothing to sweep yet"
         );
 
-        // Past the lockout, a fresh DURESS request registers a real pair; its escape
-        // becomes the live sweep even though the node was already armed.
+        // Past the lockout, a fresh DURESS request registers a real pair. INGRESS alone
+        // must not adopt it: the escape is born holder-unconfirmed, and `sweep_active`
+        // is monotonic, so latching it here would pin the sweep to a candidate that can
+        // never fire (and lock out every later escape) the moment its carrier is
+        // censored — the §0 case the whole confirmation gate models.
         let after = NOW + 200;
         let spend2 = fx.spend_psbt(&fx.hot_spk, 8);
         let escape2 = default_escape(&fx);
@@ -10687,6 +12157,18 @@ mod duress {
             crate::handle_sign(&node, &second, after).expect("decodable"),
             SignResponse::Accepted(_)
         ));
+        assert!(
+            channel
+                .armed_snapshot()
+                .expect("still armed")
+                .escape_commitment_id
+                .is_none(),
+            "an unconfirmed escape must not latch the monotonic sweep slot at ingress"
+        );
+
+        // Its own t-confirmation is what adopts it — and the adopted escape is
+        // holder-confirmed, so it can actually fire.
+        assert!(confirm_peers(&node, &second, 2, after));
         let escape2_cid = crate::commitment_id_for(&node, &escape2, EXPIRY);
         assert_eq!(
             channel
@@ -10697,16 +12179,442 @@ mod duress {
             Some(escape2_cid.as_str()),
             "an escape-less arm must still be able to adopt a later duress escape"
         );
+        assert!(
+            channel.slot_is_active(&escape2_cid),
+            "the adopted sweep slot must be live, not pinned to an unfirable candidate"
+        );
+    }
+
+    /// A duress escape whose own carrier never reaches `t` (the §0 censorship residual)
+    /// must NOT capture the monotonic first-wins sweep slot. If it did, the node would
+    /// be permanently reduced to Lockdown-only: `sweep_active` never clears and
+    /// `slot_active` demands an exact id match, so the pinned-but-unfirable escape would
+    /// beat every later duress escape that DOES reach quorum.
+    #[test]
+    fn a_censored_duress_escape_never_captures_the_sweep_slot() {
+        let fx = Fixture::new(3, 5);
+        let base = fx.config(0, HOLD, "");
+        let cfg = base.replacen(
+            "\n\n[chain_backend]",
+            "\nduress_delay_secs = 600\n[pin_attempt_budget]\nmax_attempts = 3\n\
+             window_secs = 3600\nbackoff_schedule = [0, 0, 0]\nlockout_secs = 100\n\
+             [chain_backend]",
+            1,
+        );
+        let node = crate::Node::from_toml_str(&cfg).expect("config");
+        let channel = node.channel.as_ref().expect("channel");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+
+        // Arm escape-lessly (the fail-closed lockout branch): SAFETY commits, but the
+        // pair never registered, so the commit pins nothing.
+        for i in 0..3 {
+            let mut wrong = fx.spend_request(&spend, EXPIRY, &format!("w-{i}"));
+            wrong.pin = "0000".into();
+            fx.coord_sign(&mut wrong, &format!("w-{i}"));
+            let _ = crate::handle_sign(&node, &wrong, NOW);
+        }
+        let first = duress_request(&fx, &spend, &default_escape(&fx), "locked-arm");
+        let _ = crate::handle_sign(&node, &first, NOW);
+        assert!(confirm_peers(&node, &first, 2, NOW), "SAFETY arms");
+        assert!(channel
+            .armed_snapshot()
+            .expect("armed")
+            .escape_commitment_id
+            .is_none());
+
+        // Past the lockout, a duress request registers a real pair — but it is CENSORED:
+        // no peer ever relays it back, so it never reaches `t`.
+        let after = NOW + 200;
+        let censored = duress_request(
+            &fx,
+            &fx.spend_psbt(&fx.hot_spk, 8),
+            &fx.spend_psbt(&fx.escape_spk, 8),
+            "censored",
+        );
+        assert!(matches!(
+            crate::handle_sign(&node, &censored, after).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(
+            channel
+                .armed_snapshot()
+                .expect("armed")
+                .escape_commitment_id
+                .is_none(),
+            "a censored escape must leave the slot adoptable"
+        );
+
+        // A later duress request that DOES reach `t` must still win the slot.
+        let escape3 = fx.spend_psbt(&fx.escape_spk, 10);
+        let confirmed = duress_request(
+            &fx,
+            &fx.spend_psbt(&fx.hot_spk, 10),
+            &escape3,
+            "confirmed-escape",
+        );
+        assert!(matches!(
+            crate::handle_sign(&node, &confirmed, after).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(confirm_peers(&node, &confirmed, 2, after));
+        let escape3_cid = crate::commitment_id_for(&node, &escape3, EXPIRY);
+        assert_eq!(
+            channel
+                .armed_snapshot()
+                .expect("armed")
+                .escape_commitment_id
+                .as_deref(),
+            Some(escape3_cid.as_str()),
+            "the censored escape must not latch the slot ahead of a confirmed one"
+        );
+        assert!(
+            channel.slot_is_active(&escape3_cid),
+            "and it must be firable"
+        );
+    }
+
+    /// A carrier id must not be a bare `auth_digest`. That digest's preimage contains
+    /// the plaintext PIN (which is why `vault-proto` returns it `Zeroizing`), and the
+    /// id is the key of the `intents` map — so it outlives the request bytes it came
+    /// from. A fast hash, even salted, would be an offline-grindable commitment after
+    /// a full process-memory capture (the salt is captured too), bypassing the PIN's
+    /// Argon2id work factor. `arm_carrier_id` therefore stretches spend digests with
+    /// the elementwise maximum of both enrolled slots' work parameters. Distinct requests must still get
+    /// distinct ids.
+    #[test]
+    fn a_carrier_id_is_not_a_fast_commitment_to_the_pin() {
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let escape = default_escape(&fx);
+        let duress = duress_request(&fx, &spend, &escape, "salted");
+
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let id = crate::arm_carrier_id(&node, duress.coord_request());
+        assert_ne!(
+            id,
+            duress.coord_request().auth_digest().to_lower_hex_string(),
+            "the carrier id must be memory-hard, not the PIN-committing auth digest itself"
+        );
+        // Stable within the process (the same request always keys the same intent)...
+        assert_eq!(id, crate::arm_carrier_id(&node, duress.coord_request()));
+        // ...and still collision-free across distinct carriers.
+        let other = duress_request(&fx, &spend, &escape, "salted-2");
+        assert_ne!(id, crate::arm_carrier_id(&node, other.coord_request()));
+    }
+
+    /// A pair the registry REFUSED must never be named as the carrier's sweep slot.
+    /// `record_intent_escape` used to run before `register_candidates`, so a duress
+    /// request refused `AtCapacity` still wrote its escape id into the §0 intent. The
+    /// commit then saw a non-empty id, set the monotonic `sweep_active`, and pinned
+    /// the arm to a candidate that is not in the store — and since `slot_active`
+    /// demands an exact id match and nothing ever clears `sweep_active`, the sweep
+    /// could never fire AND first-wins rejected every later duress escape. That is
+    /// the permanent Lockdown-only regression
+    /// [`an_escape_less_arm_still_adopts_a_later_duress_escape`] guards, reachable by
+    /// a hostile coordinator that simply floods one node's registry first.
+    #[test]
+    fn a_capacity_refused_pair_never_pins_the_sweep_slot() {
+        let fx = Fixture::new(3, 5);
+        let base = fx.config(0, HOLD, "max_active_candidates = 1\n");
+        let cfg = base.replacen(
+            "\n\n[chain_backend]",
+            "\nduress_delay_secs = 600\n[chain_backend]",
+            1,
+        );
+        let node = crate::Node::from_toml_str(&cfg).expect("valid capacity config");
+        let channel = node.channel.as_ref().expect("channel");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let escape = default_escape(&fx);
+        let request = duress_request(&fx, &spend, &escape, "capacity-sweep");
+
+        // The pair needs two slots and the registry holds one, so it is refused.
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Refusal(r) if r.code == vault_proto::RefusalCode::CandidateCapacity
+        ));
+        assert_eq!(channel.store_len(), 0, "nothing registered");
+
+        // SAFETY still arms on confirmation (invariant v, fail-closed)...
+        assert!(confirm_peers(&node, &request, 2, NOW));
+        let armed = channel.armed_snapshot().expect("SAFETY armed");
+        // ...but the SWEEP stays unselected, exactly like the lockout branch, so a
+        // later duress escape can still be adopted rather than losing first-wins to a
+        // candidate that was never registered.
+        assert_eq!(
+            armed.escape_commitment_id, None,
+            "a refused pair must leave the sweep slot unselected, not pin it to an \
+             unregistered escape"
+        );
+    }
+
+    /// A refresh must not be able to hijack a live duress carrier's §0 intent. The
+    /// refresh arm used to key its delayed-slot write by the raw `nonce`, while spends
+    /// key by the coordinator-auth digest. `MAX_COORD_NONCE_BYTES` is exactly the
+    /// 64 chars of a hex carrier id, so a post-wrench coordinator — which computed
+    /// that digest itself in order to sign the duress request — could set a refresh's
+    /// nonce to it and overwrite the intent's escape slot with the refresh's own
+    /// commitment. A refresh self-pairs and registers with role `Spend`, which both
+    /// `refresh_escape_window` and `slot_active` reject, so the later confirmation
+    /// pinned the sweep to a slot that can never fire: Lockdown-only, permanently.
+    /// Keying the refresh by its own `REFRESH_TAG` digest makes the two namespaces
+    /// disjoint by construction.
+    #[test]
+    fn a_refresh_cannot_hijack_a_duress_carriers_intent() {
+        let fx = Fixture::new(3, 5);
+        // Capacity 1 keeps the duress PAIR out of the registry (so no pending spend
+        // subordinates the refresh) while still admitting the self-paired refresh.
+        let base = fx.config(0, HOLD, "max_active_candidates = 1\n");
+        let cfg = base.replacen(
+            "\n\n[chain_backend]",
+            "\nduress_delay_secs = 600\n[chain_backend]",
+            1,
+        );
+        let node = crate::Node::from_toml_str(&cfg).expect("valid capacity config");
+        let channel = node.channel.as_ref().expect("channel");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let duress = duress_request(&fx, &spend, &default_escape(&fx), "hijack-target");
+        assert!(matches!(
+            crate::handle_sign(&node, &duress, NOW).expect("decodable"),
+            SignResponse::Refusal(_)
+        ));
+
+        // The coordinator replays the duress carrier id as the refresh's nonce.
+        let carrier = crate::arm_carrier_id(&node, duress.coord_request());
+        assert_eq!(carrier.len(), crate::replay::MAX_COORD_NONCE_BYTES);
+        let (_refresh, refresh_request) = fx.refresh_request(EXPIRY, 1_000, &carrier);
+        assert!(
+            matches!(
+                crate::handle_refresh(&node, &refresh_request, NOW).expect("decodable"),
+                SignResponse::Accepted(_)
+            ),
+            "the refresh itself is valid and must still be served"
+        );
+
+        // The duress intent is untouched: its sweep slot is still empty, so the arm
+        // stays adoptable instead of being pinned to the refresh's Spend-role row.
+        assert!(confirm_peers(&node, &duress, 2, NOW));
+        let armed = channel.armed_snapshot().expect("SAFETY armed");
+        assert_eq!(
+            armed.escape_commitment_id, None,
+            "a refresh must not be able to name a duress carrier's sweep slot"
+        );
+    }
+
+    /// Expiry is enforced inside the confirmation commit, not only by the periodic
+    /// prune. Otherwise a receipt landing between a carrier's expiry and the next
+    /// prune tick arms whichever node had not pruned yet, while a node that had
+    /// ignores the identical receipt — making "who armed" a function of poll phase
+    /// rather than of the carrier. Both sites use the coordinator freshness rule
+    /// `expiry > now`, so the boundary second is already stale.
+    #[test]
+    fn a_lapsed_carrier_cannot_arm_on_a_late_receipt() {
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let escape = default_escape(&fx);
+
+        // The final confirmation arrives one second past the carrier's expiry.
+        let late = duress_node(&fx, HOLD, "duress_delay_secs = 600");
+        let request = duress_request(&fx, &spend, &escape, "lapsed-carrier");
+        assert!(matches!(
+            crate::handle_sign(&late, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(!confirm_peers(&late, &request, 1, NOW), "still below t");
+        assert!(
+            !confirm_peers(&late, &request, 2, EXPIRY + 1),
+            "a receipt past the carrier's expiry must not commit the arm"
+        );
+        assert!(
+            late.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .is_none(),
+            "a lapsed carrier is clean censorship — nobody arms — not a split"
+        );
+
+        // The boundary second is stale, matching coordinator freshness exactly.
+        let boundary = duress_node(&fx, HOLD, "duress_delay_secs = 600");
+        assert!(matches!(
+            crate::handle_sign(&boundary, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(!confirm_peers(&boundary, &request, 1, NOW));
+        assert!(
+            !confirm_peers(&boundary, &request, 2, EXPIRY),
+            "a receipt AT the expiry second is stale and must not arm"
+        );
+
+        // Production samples confirmation time again after local processing. A
+        // receipt accepted just before expiry must not arm if KDF/sign handling
+        // finishes on the stale boundary.
+        let queued = duress_node(&fx, HOLD, "duress_delay_secs = 600");
+        assert!(matches!(
+            crate::handle_sign(&queued, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(!confirm_peers(&queued, &request, 1, NOW));
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request.clone()));
+        let envelope = fx
+            .channel_state(2)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, EXPIRY - 1)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        crate::handle_channel_body_with_clock(&queued, &body, EXPIRY - 1, || EXPIRY);
+        assert!(
+            queued
+                .channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .is_none(),
+            "post-processing time, not the pre-KDF receipt timestamp, owns expiry"
+        );
+
+        // And the confirmation clock is resampled AFTER the carrier is resolved, not
+        // once for both steps. The memo lookup can admit a receipt one second before
+        // expiry and then spend a full memory-hard derivation resolving it; if that work
+        // crosses the boundary the commit must refuse, or "who armed" becomes a function
+        // of how fast each node's KDF happened to run.
+        let crossing = duress_node(&fx, HOLD, "duress_delay_secs = 600");
+        assert!(matches!(
+            crate::handle_sign(&crossing, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(!confirm_peers(&crossing, &request, 1, NOW));
+        let reads = std::cell::Cell::new(0u32);
+        crate::handle_channel_body_with_clock(&crossing, &body, EXPIRY - 1, || {
+            let n = reads.get();
+            reads.set(n + 1);
+            // Lookup sees a live carrier; the commit lands on the expiry second.
+            if n == 0 {
+                EXPIRY - 1
+            } else {
+                EXPIRY
+            }
+        });
+        assert!(
+            crossing
+                .channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .is_none(),
+            "a carrier that lapsed DURING confirmation processing must not arm"
+        );
+        assert_eq!(
+            reads.get(),
+            2,
+            "the commit must resample rather than reuse the lookup's timestamp"
+        );
+    }
+
+    /// Coordinator freshness and carrier confirmation share one monotonic lower-bound
+    /// clock. Once the nonce log has logically passed a carrier's expiry, rolling raw
+    /// wall time backwards must not revive the retained RAMDISK intent and arm it.
+    #[test]
+    fn a_clock_rollback_cannot_revive_a_logically_expired_carrier() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, "duress_delay_secs = 600");
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "rollback-carrier");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(!confirm_peers(&node, &request, 1, NOW), "still below t");
+
+        // Model another authenticated request advancing freshness past this carrier
+        // without touching the candidate store (for example, a request that fails to
+        // decode after its nonce is accepted).
+        {
+            let mut state = node.sign_state.lock().expect("sign_state");
+            assert_eq!(
+                state.coord_nonces.check_and_record(
+                    "advance-high-water",
+                    EXPIRY + 100,
+                    EXPIRY + 1,
+                    node.max_commitment_age_secs,
+                ),
+                crate::replay::NonceDecision::Accepted
+            );
+        }
+
+        // Raw time rolls back below EXPIRY. The exact peer replay is otherwise valid,
+        // but logical time has already expired its carrier and must prevent the final
+        // confirmation from committing an arm.
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request));
+        let envelope = fx
+            .channel_state(2)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW + 1)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        crate::handle_channel_body(&node, &body, NOW + 1);
+        assert!(
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .armed_snapshot()
+                .is_none(),
+            "rollback-guarded expiry must win over the raw wall-clock rollback"
+        );
+    }
+
+    /// Intent pruning runs on ingress itself, not only from the backend-dependent
+    /// fire driver. A hung chain RPC therefore cannot turn fresh authenticated
+    /// traffic into unbounded RAM growth; the table and replay memo stay at the same
+    /// hard cap as the coordinator nonce log and expired generations are reclaimed.
+    #[test]
+    fn arm_intents_remain_bounded_when_the_fire_driver_does_not_run() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, "duress_delay_secs = 600");
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: 60,
+            combine_slack_secs: SLACK,
+        };
+        for i in 0..MAX_COORD_NONCES {
+            channel.record_arm_intent(
+                false,
+                &format!("carrier-{i}"),
+                &format!("nonce-{i}"),
+                [i as u8; 32],
+                NOW + 1,
+                NOW,
+                timing,
+            );
+        }
+        assert_eq!(
+            channel.intent_counts(),
+            (MAX_COORD_NONCES, MAX_COORD_NONCES)
+        );
+
+        channel.record_arm_intent(
+            false,
+            "next-generation",
+            "next-nonce",
+            [0xA5; 32],
+            NOW + 100,
+            NOW + 2,
+            timing,
+        );
+        assert_eq!(
+            channel.intent_counts(),
+            (1, 1),
+            "a new ingress prunes the expired intent generation without a fire tick"
+        );
     }
 
     /// `delivery_horizon_secs` is a provisioning invariant, not advice: zero (no
-    /// guarantee at all) and a value past the node's own expiry cap (every request
-    /// refused) are both fatal.
+    /// guarantee at all) and a value at/past the node's own expiry cap (no usable
+    /// authenticated-expiry window) are both fatal.
     #[test]
     fn an_out_of_range_delivery_horizon_is_a_fatal_config() {
         let fx = Fixture::new(3, 5);
         for bad in [
             "delivery_horizon_secs = 0",
+            "delivery_horizon_secs = 172800",
             "delivery_horizon_secs = 172801",
         ] {
             let base = fx.config(0, HOLD, "");
@@ -10724,13 +12632,57 @@ mod duress {
                 "unexpected error for {bad}: {err}"
             );
         }
-        // The boundary value loads.
+        // The largest value strictly below the cap leaves a non-empty window.
         let base = fx.config(0, HOLD, "");
         crate::Node::from_toml_str(&base.replacen(
             "\n\n[chain_backend]",
-            "\ndelivery_horizon_secs = 172800\n[chain_backend]",
+            "\ndelivery_horizon_secs = 172799\n[chain_backend]",
             1,
         ))
-        .expect("a horizon equal to max_commitment_age_secs loads");
+        .expect("a horizon strictly below max_commitment_age_secs loads");
+    }
+
+    /// §0 authorizes the arm only on a peer receipt, so a production channel vault
+    /// with t=1 has no valid trigger for its self-only quorum. Reject the descriptor at
+    /// startup instead of accepting duress spends that can never freeze or Lock down.
+    #[test]
+    fn a_channel_federation_with_threshold_one_is_rejected_at_startup() {
+        let fx = Fixture::new(1, 1);
+        let err = match crate::Node::from_toml_str(&fx.config(0, HOLD, "")) {
+            Err(err) => err,
+            Ok(_) => panic!("a t=1 channel vault cannot satisfy confirmation-gated arming"),
+        };
+        assert!(
+            err.to_string().contains("threshold of at least 2"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The receipt protocol must both tolerate every `t-1` withholding minority and
+    /// leave no unfrozen signing quorum. Those two inequalities force `n = 2t - 1`;
+    /// quorum intersection alone is insufficient (4-of-5 intersects, but three
+    /// withholders leave only two honest nodes below the arm threshold).
+    #[test]
+    fn a_channel_federation_requires_exact_byzantine_quorum_shape() {
+        let non_intersecting = Fixture::new(2, 5);
+        let err = match crate::Node::from_toml_str(&non_intersecting.config(0, HOLD, "")) {
+            Err(err) => err,
+            Ok(_) => panic!("a 2-of-5 channel vault leaves an unfrozen signing quorum"),
+        };
+        assert!(
+            err.to_string().contains("n = 2t - 1"),
+            "unexpected error: {err}"
+        );
+
+        let insufficient_honest = Fixture::new(4, 5);
+        let err = match crate::Node::from_toml_str(&insufficient_honest.config(0, HOLD, "")) {
+            Err(err) => err,
+            Ok(_) => panic!("4-of-5 cannot tolerate three withholding members"),
+        };
+        assert!(err.to_string().contains("n = 2t - 1"));
+
+        let intersecting = Fixture::new(3, 5);
+        crate::Node::from_toml_str(&intersecting.config(0, HOLD, ""))
+            .expect("the default 3-of-5 channel vault has intersecting quorums");
     }
 }

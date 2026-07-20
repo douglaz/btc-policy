@@ -1009,6 +1009,65 @@ fn a_hot_spend_expiring_exactly_at_the_bound_is_accepted() {
     assert_eq!(expect_accepted(response).remaining_secs, HOLD);
 }
 
+/// The V0-4b §0 delivery horizon does NOT apply in absent-channel mode, exactly like
+/// its sibling `max_msg_bytes` precondition. Both exist to guarantee that a carrier
+/// this node accepts can still reach every PEER in time, which is what
+/// confirmation-gated arming rests on. A node with no `[channel]` block has no peers,
+/// no fan-out, and no confirmation path — it can never arm — so refusing a spend
+/// whose expiry falls inside the horizon would be pure availability loss with nothing
+/// bought for it. Here the horizon is set FAR past the commitment's own expiry, so an
+/// ungated check would certainly refuse.
+#[test]
+fn the_delivery_horizon_does_not_apply_without_a_channel() {
+    let config = format!(
+        "{}delivery_horizon_secs = 7200\n",
+        fixture_config(HOLD, MAX_AGE, true)
+    );
+    let node = Node::from_toml_str(&config).expect("valid config");
+    let fixture = Fixture {
+        node,
+        descriptor: Descriptor::<PublicKey>::from_str(&descriptor_str()).expect("valid descriptor"),
+        hot_spk: hot_dest().1,
+        escape_spk: escape_dest().1,
+    };
+    let mut psbt = vault_psbt(&fixture, vec![(fixture.hot_spk.clone(), 99_990_000)]);
+    user_sign(&fixture, &mut psbt);
+    // Satisfies the commitment-expiry bound, but sits 3540s inside the horizon.
+    let expiry = NOW + HOLD + COMBINE_SLACK;
+    assert!(expiry < NOW + 7200, "the test must exercise the horizon");
+    let response = handle_sign(
+        &fixture.node,
+        &fixture.request_at(&psbt, NORMAL_PIN, expiry),
+        NOW,
+    )
+    .expect("decodable request");
+    assert_eq!(
+        expect_accepted(response).remaining_secs,
+        HOLD,
+        "a channel-less node has no propagation window to protect"
+    );
+}
+
+/// The startup bound follows the runtime gate. `1 ≤ delivery_horizon_secs <
+/// max_commitment_age_secs` exists to keep a non-empty authenticated-expiry window for
+/// carrier propagation, and `ensure_delivery_horizon` returns early without a
+/// `[channel]` block, so there is no window to keep. Enforcing the cross-field bound
+/// anyway would make a field the node provably never reads fatal at load — rejecting
+/// working channel-less configs, starting with the default 60s horizon against a 60s
+/// `max_commitment_age_secs`. Channel mode keeps the bound
+/// (`an_out_of_range_delivery_horizon_is_a_fatal_config`).
+#[test]
+fn the_delivery_horizon_bound_is_not_enforced_without_a_channel() {
+    for horizon in [0, MAX_AGE, MAX_AGE + 1] {
+        let config = format!(
+            "{}delivery_horizon_secs = {horizon}\n",
+            fixture_config(HOLD, MAX_AGE, true)
+        );
+        Node::from_toml_str(&config)
+            .unwrap_or_else(|e| panic!("horizon {horizon} is inert without a channel: {e}"));
+    }
+}
+
 /// The bound is hot-class only: an escape-class spend fires NOW, so it needs only
 /// the combine window, not a Hold it does not have.
 #[test]
