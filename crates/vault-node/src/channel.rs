@@ -70,7 +70,7 @@
 //! | digest (tag)                                    | preimage fields, in order (LE; `var`=u32-len+bytes; `eps`=u32-count then each `var`) |
 //! |-------------------------------------------------|-------------------------------------------------------------------------------------|
 //! | channel-key  `btc-policy/channel-key/v0`        | `node_seckey[32]` (then `‖ counter:u8` on retry)                                    |
-//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), `max_msg_bytes:u64`, node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
+//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), `max_msg_bytes:u64`, Hot-budget triple, canonical hot allowlist, escape descriptor, `max_derivation_index:u32`, node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
 //! | endorsement  `btc-policy/channel-endorsement/v0`| `wallet_id[32]`, `manifest_hash[32]`, `node_id:u16`, `channel_pubkey[33]`, `protocol_version:u32`, `endpoints:eps` |
 //! | envelope     `btc-policy/channel-envelope/v0`   | `msg_type:var`, `protocol_version:u32`, `wallet_id[32]`, `manifest_hash[32]`, `sender_node_id:u16`, `recipient_node_id:u16`, `payload_b64_bytes:var`, `nonce:var`, `timestamp:u64` |
 //! | user-sig     `btc-policy/user-sig-hash/v0`      | per input in order: `user_der_sig:var`, `sighash_type:u8`                            |
@@ -87,7 +87,7 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -108,7 +108,7 @@ use vault_proto::{push_var, tagged_hash, TaggedRequest, MAX_PIN_BYTES};
 
 use crate::replay::{MAX_COORD_NONCES, MAX_COORD_NONCE_BYTES};
 use crate::watchtower::{AlertQueue, FreshnessEvent, FreshnessKind};
-use crate::Error;
+use crate::{Error, HotBudget};
 
 /// The pinned wire/protocol version for v0 (ADR-0013 §4 `BaseManifest`). The
 /// minimal in-memory manifest sets it here and the envelope check compares
@@ -226,6 +226,24 @@ fn default_max_concurrent_channel_requests() -> usize {
 /// The federation-uniform channel message cap the ceremony seals into the manifest
 /// when the vault does not agree another value (V0-4b §0).
 pub const DEFAULT_MAX_MSG_BYTES: u64 = 1_048_576;
+
+/// The Hot budget every channel test fixture seals unless it is re-sealing to test
+/// the uniformity invariant itself. There is deliberately NO production default:
+/// ADR-0014's caps are a per-vault sizing decision, and a default would silently
+/// restore unbounded hot outflow for any config that forgot the field.
+///
+/// Both caps sit orders of magnitude above anything these fixtures spend (the
+/// largest is the ~2 BTC two-input spend), so the budget stays inert for every test
+/// that is not about it — a fixture cap that quietly bit would turn unrelated tests
+/// into Hot-budget tests and, worse, could make one pass for the wrong reason. Tests
+/// that DO exercise the budget re-seal to a tight cap of their own. The window is
+/// the `>= max_commitment_age_secs` floor for the 172_800 those configs use.
+#[cfg(test)]
+pub(crate) const TEST_HOT_BUDGET: HotBudget = HotBudget {
+    max_per_tx_sat: 10_000_000_000,
+    max_per_window_sat: 1_000_000_000_000,
+    window_secs: 172_800,
+};
 
 fn default_max_msg_bytes() -> usize {
     DEFAULT_MAX_MSG_BYTES as usize
@@ -375,10 +393,12 @@ struct ManifestNode {
 }
 
 /// Canonical bytes of the provisional, endorsement-FREE BaseManifest slice
-/// (ADR-0013 §4). It still carries V0-8a's limited fields rather than the complete
-/// §4 schema: `wallet_id` transitively binds the descriptor, while
-/// `policy_version`, `hot_allowlist`, and `escape_descriptor` are not yet explicit
-/// preimage fields. Within this minimal V0-9 slice, `channel_pubkey` IS in the
+/// (ADR-0013 §4). It still carries a limited slice of the complete §4 schema:
+/// `wallet_id` transitively binds the vault descriptor, while `policy_version` is
+/// not yet an explicit preimage field. The hot allowlist and escape descriptor ARE
+/// explicit because they decide which outputs consume the sealed Hot budget; caps
+/// without uniform classification inputs would not produce a uniform bound. Within
+/// this slice, `channel_pubkey` IS in the
 /// hashed structure (deterministic, known at setup), and
 /// `coordinator_auth_pubkey` is hashed in right after `protocol_version` as its 33
 /// compressed bytes. Every vault is sealed to exactly one coordinator, so changing
@@ -395,18 +415,49 @@ struct ManifestNode {
 /// fails the sealed `expected_manifest_hash` check and is rejected as
 /// `WRONG_MANIFEST` by every peer), so at run time the value is provably identical
 /// federation-wide.
+///
+/// **The `HotBudget` triple is pinned for the same reason (ADR-0014 §6).** A
+/// federation-uniform cap is only as strong as its laxest node: if one node's
+/// `hot_max_per_window` were larger than its peers', a coordinator would route
+/// coerced hot spends at that node's rate, and ADR-0014's routing bound would not
+/// hold. With `c < t` compromised signers able to bypass their ledgers, that bound
+/// is `((n−c)/(t−c))·V`; hashing all three proves every honest signer in it reserves
+/// against the SAME `V`. Disagreement becomes a startup failure rather than a
+/// silently weaker vault.
+/// Ordered after `max_msg_bytes` and before the classification inputs and node
+/// count, so the V0-9 prefix through `max_msg_bytes` keeps its byte offsets.
+#[allow(clippy::too_many_arguments)]
 fn base_manifest_bytes(
     wallet_id: &[u8; 32],
     protocol_version: u32,
     coordinator_auth_pubkey: &PublicKey,
     nodes: &[ManifestNode],
     max_msg_bytes: u64,
+    hot_budget: HotBudget,
+    hot_allowlist: &[String],
+    escape_descriptor: &str,
+    max_derivation_index: u32,
 ) -> Vec<u8> {
     let mut e = Enc::new();
     e.fixed(wallet_id);
     e.u32(protocol_version);
     e.fixed(&coordinator_auth_pubkey.inner.serialize());
     e.u64(max_msg_bytes);
+    e.u64(hot_budget.max_per_tx_sat);
+    e.u64(hot_budget.max_per_window_sat);
+    e.u64(hot_budget.window_secs);
+    // Allowlist order has no policy meaning, so hash the canonical set. Two nodes
+    // that list the same hot wallets in a different TOML order must still agree;
+    // adding/removing a wallet must not.
+    let mut canonical_hot = hot_allowlist.to_vec();
+    canonical_hot.sort_unstable();
+    canonical_hot.dedup();
+    e.u32(canonical_hot.len() as u32);
+    for descriptor in &canonical_hot {
+        e.var(descriptor.as_bytes());
+    }
+    e.var(escape_descriptor.as_bytes());
+    e.u32(max_derivation_index);
     e.u32(nodes.len() as u32);
     for n in nodes {
         e.u16(n.node_id);
@@ -417,12 +468,17 @@ fn base_manifest_bytes(
     e.0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_manifest_hash(
     wallet_id: &[u8; 32],
     protocol_version: u32,
     coordinator_auth_pubkey: &PublicKey,
     nodes: &[ManifestNode],
     max_msg_bytes: u64,
+    hot_budget: HotBudget,
+    hot_allowlist: &[String],
+    escape_descriptor: &str,
+    max_derivation_index: u32,
 ) -> [u8; 32] {
     tagged_hash(
         MANIFEST_TAG,
@@ -432,6 +488,10 @@ fn compute_manifest_hash(
             coordinator_auth_pubkey,
             nodes,
             max_msg_bytes,
+            hot_budget,
+            hot_allowlist,
+            escape_descriptor,
+            max_derivation_index,
         ),
     )
 }
@@ -657,11 +717,15 @@ fn reject(reason: RejectReason) -> Ingested {
 pub mod ceremony {
     use super::{
         channel_pubkey_of, compute_manifest_hash, derive_channel_seckey, endorsement_digest,
-        ManifestNode, PROTOCOL_VERSION_V0,
+        HotBudget, ManifestNode, PROTOCOL_VERSION_V0,
     };
     use bitcoin::hex::DisplayHex;
     use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
     use bitcoin::PublicKey;
+    use miniscript::{Descriptor, DescriptorPublicKey};
+    use std::str::FromStr;
+
+    use crate::Error;
 
     /// One node as the ceremony knows it, before the manifest exists.
     pub struct CeremonyNode {
@@ -685,21 +749,68 @@ pub mod ceremony {
     /// to (V0-4b §0): the ceremony agrees it here and every node's configured value
     /// must equal it, or that node's computed `manifest_hash` differs and it fails
     /// startup. Pass [`super::DEFAULT_MAX_MSG_BYTES`] unless the vault agreed another.
+    ///
+    /// `hot_budget` is the same kind of value for the **Hot budget** (ADR-0014 §6):
+    /// the per-tx cap, the per-window cap, and the window width the whole federation
+    /// is sealed to. With `c < t` compromised signers able to bypass their ledgers,
+    /// the federation routing bound is `((n−c)/(t−c))·V`; for production
+    /// `n = 2t−1`, it is `< 2V` when `c = 0` and reaches `tV` at the full
+    /// `c = t−1` soft-vault boundary. Size `V` for the compromise assumption the
+    /// deployment actually makes (ADR-0014 consequences).
+    ///
+    /// The three values sealed beside it close the two ways a uniform cap can still
+    /// be evaded, and they are NOT the same way:
+    ///
+    /// * `escape_descriptor` and `max_derivation_index` decide what
+    ///   [`policy_core::hot_outflow`] METERS — it skips vault and escape outputs and
+    ///   scans each descriptor to that index — so a node with either one different
+    ///   would compute a different outflow for the same transaction.
+    /// * `hot_allowlist` feeds no metering at all; it decides ADMISSIBILITY. A node
+    ///   whose allowlist is wider signs a spend to a destination its peers refuse
+    ///   outright, which routes coerced outflow at one node's discretion just as
+    ///   surely as a laxer cap would.
+    ///
+    /// **`hot_allowlist` must be the node allowlist MINUS `escape_descriptor`.** The
+    /// escape wallet is required to be an allowlist entry (its sweep has to pass the
+    /// destination check) but is never a hot destination, so `Node::load` derives its
+    /// sealed list by dropping it. A ceremony that passes the raw allowlist here
+    /// seals a hash no node can reproduce and the whole federation fails startup.
+    /// Valid descriptor strings are canonicalized here before hashing, exactly as
+    /// `Node::load` canonicalizes them; callers may therefore supply equivalent forms
+    /// with or without a checksum without sealing an unreproducible manifest.
+    #[allow(clippy::too_many_arguments)]
     pub fn manifest_hash(
         wallet_id: &[u8; 32],
         coordinator_auth_pubkey: &PublicKey,
         nodes: &[CeremonyNode],
         channel_pubkeys: &[PublicKey],
         max_msg_bytes: u64,
-    ) -> [u8; 32] {
+        hot_budget: HotBudget,
+        hot_allowlist: &[String],
+        escape_descriptor: &str,
+        max_derivation_index: u32,
+    ) -> Result<[u8; 32], Error> {
+        let canonical_hot = hot_allowlist
+            .iter()
+            .map(|descriptor| {
+                Descriptor::<DescriptorPublicKey>::from_str(descriptor)
+                    .map(|parsed| parsed.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let canonical_escape =
+            Descriptor::<DescriptorPublicKey>::from_str(escape_descriptor)?.to_string();
         let manifest = manifest_nodes(nodes, channel_pubkeys);
-        compute_manifest_hash(
+        Ok(compute_manifest_hash(
             wallet_id,
             PROTOCOL_VERSION_V0,
             coordinator_auth_pubkey,
             &manifest,
             max_msg_bytes,
-        )
+            hot_budget,
+            &canonical_hot,
+            &canonical_escape,
+            max_derivation_index,
+        ))
     }
 
     /// One node's channel-key endorsement, as lowercase-hex DER: that node's
@@ -1451,6 +1562,248 @@ struct ParsedPartial<'a> {
     der: &'a [u8],
 }
 
+/// One accepted hot spend's claim on the window's budget.
+#[derive(Debug, Clone, Copy)]
+struct HotReservation {
+    outflow_sat: u64,
+    /// The [`HotClock`] reading (MONOTONIC seconds, never wall time) at the accept
+    /// that took the reservation. Fixed there and never refreshed, so a resubmit
+    /// cannot slide the window forward.
+    reserved_at: u64,
+    /// The metered commitment's own WALL expiry, as the coordinator signed it.
+    ///
+    /// This is the second half of the liveness rule and it exists because the two
+    /// lifetimes this ledger has to dominate are anchored to DIFFERENT clocks. The
+    /// reservation is a monotonic duration ([`HotClock`]); the candidate it meters
+    /// dies at an absolute wall instant (`prune` keeps it while `expiry >= now`,
+    /// `accept_partial` evicts on `expiry < now`, `due_for_fire` opens while
+    /// `now <= deadline`, and `deadline <= expiry`). A wall-clock adjustment moves
+    /// one and not the other, so neither alone dominates. Keeping the expiry lets
+    /// [`HotBudgetLedger::is_live`] hold the reservation until BOTH clocks agree
+    /// the spend is dead.
+    expiry: u64,
+}
+
+/// The velocity half of the **Hot budget** (ADR-0014 §4): a rolling-window ledger
+/// of the hot outflow this node has ACCEPTED, keyed by `commitment_id`.
+///
+/// Accounting is pending + settled, which is the whole point. Metering only
+/// broadcast spends would let an attacker queue several vault-sized hot spends
+/// into one Hold and have them all clear together; because a reservation is taken
+/// at accept, the second and later ones exceed the cap at ingress and every node
+/// refuses. Combined with the per-tx cap in `policy-core` this bounds newly
+/// completable outflow admitted under the V0-4b censorship residual. With `c < t`
+/// compromised signers able to bypass their ledgers, the federation routing factor
+/// is `(n−c)/(t−c)`; for production `n = 2t−1`, it is `< 2` when `c = 0` and reaches
+/// `t` at the full `c = t−1` soft-vault boundary (ADR-0014 consequences).
+///
+/// RAMDISK/node-lifetime, like every other node store: reboot clears it. That is
+/// deliberate (ADR-0014 non-goals) — the long-horizon defense is the Watchtower
+/// surfacing anomalous hot outflow plus Recovery, not a durable ledger.
+///
+/// Ages against [`HotClock`] (monotonic elapsed time), NOT the wall clock every
+/// other deadline in this file uses. See that type for why.
+///
+/// Lives inside [`PartialStore`], under the SAME lock as the candidate registry
+/// and the `armed` overlay, so terminal candidate removal and the release it earns
+/// are atomic. Ingress reserves before signing under the outer `/sign` lock,
+/// explicitly unwinds every later refusal, and revalidates the claim under the
+/// candidate-registration lock so terminal removal cannot race a retry into an
+/// unmetered insertion.
+struct HotBudgetLedger {
+    budget: HotBudget,
+    reservations: HashMap<String, HotReservation>,
+}
+
+/// Hard cap on live reservations, mirroring the candidate registry's count cap and
+/// the coordinator nonce log's [`MAX_COORD_NONCES`].
+///
+/// The per-window budget does NOT bound this map by itself, because it bounds the
+/// SUM and not the COUNT: `hot_max_per_window` sats can arrive as one spend or as
+/// `hot_max_per_window` one-sat spends. Nor does the candidate registry's count+byte
+/// cap cover it — a reservation deliberately OUTLIVES the candidate that took it (a
+/// released or broadcast spend holds its reservation until age-out, while the
+/// candidate evicts at commitment expiry), and a coordinator picks each commitment's
+/// expiry, so candidates can be churned far faster than `hot_window_secs`. Without a
+/// cap that is authenticated traffic buying a heap entry per satoshi for a whole
+/// window.
+///
+/// Refusing at the cap is the fail-safe direction — it can only refuse a hot spend,
+/// never admit an over-budget one — and it keeps the registry's "no generic FIFO/LRU
+/// eviction" rule, since evicting a live reservation is precisely how an attacker
+/// would buy back spent budget. Same trade `COORD_NONCE_CAPACITY` already makes.
+const MAX_HOT_RESERVATIONS: usize = 4_096;
+
+/// Why [`HotBudgetLedger::reserve`] refused. Both arms answer `HOT_VELOCITY_EXCEEDED`
+/// on the wire and both stage the duress carrier; the split exists only so the
+/// refusal detail names the bound that actually bit.
+pub(crate) enum HotReserveRefusal {
+    /// The rolling window would pass `hot_max_per_window`. Carries the window sum the
+    /// refused outflow would have been added to.
+    Window(u64),
+    /// The ledger is already holding [`MAX_HOT_RESERVATIONS`] in-window reservations.
+    Capacity,
+}
+
+/// The Hot-budget claim production candidate admission must revalidate while it
+/// holds the candidate-store lock.
+///
+/// `/sign` takes the same claim before signing, but an idempotent hit can belong to
+/// an older unexposed candidate. A concurrent expiry sweep may remove that candidate
+/// and release its reservation before the retry reaches registration. Re-running the
+/// idempotent reserve under the registration lock closes that gap: either the old
+/// reservation is still present, or this admission restores it before inserting the
+/// replacement candidate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HotReserveSpec<'a> {
+    pub(crate) commitment_id: &'a str,
+    pub(crate) outflow_sat: u64,
+    pub(crate) wall_now: u64,
+    pub(crate) expiry: u64,
+}
+
+impl HotBudgetLedger {
+    fn new(budget: HotBudget) -> HotBudgetLedger {
+        HotBudgetLedger {
+            budget,
+            reservations: HashMap::new(),
+        }
+    }
+
+    /// The monotonic window floor: the earliest `reserved_at` that the [`HotClock`]
+    /// term still counts at `now`. Inclusive; see [`Self::is_live`], which owns the
+    /// full liveness rule and the reason both of its boundaries are closed.
+    fn floor(&self, now: u64) -> u64 {
+        now.saturating_sub(self.budget.window_secs)
+    }
+
+    /// Whether a reservation still meters, given BOTH clocks.
+    ///
+    /// **The reservation must dominate the commitment lifetime it meters, and that
+    /// takes two clocks because the two lifetimes are anchored to two different
+    /// ones.** The reservation is a pure local DURATION and so ages on [`HotClock`]
+    /// (monotonic, unsteppable — see that type for why wall time alone would let one
+    /// forward step free a live window). The candidate it meters dies at an ABSOLUTE
+    /// wall instant, because that is the only thing a coordinator-signed expiry can
+    /// mean. A wall-clock adjustment moves the second and not the first:
+    ///
+    /// * A BACKWARD step (rollback, VM restore) after the accept stretches the
+    ///   candidate's real lifetime — `prune`, `accept_partial`, and `due_for_fire`
+    ///   all read raw wall time — while monotonic seconds keep ticking. On the
+    ///   monotonic term alone the reservation ages out while its spend is still
+    ///   resident and still broadcastable, and the vault admits a second full window
+    ///   alongside a live first one.
+    /// * A FORWARD excursion AT ingress buys the same divergence from the other
+    ///   side: `NonceLog`'s high-water guards rollback only (`effective_now` is a
+    ///   `max`), so a request timed against the excursion is accepted with an expiry
+    ///   up to `stepped_now + max_commitment_age_secs`, which after correction sits
+    ///   an excursion's width beyond where the monotonic window closes.
+    ///
+    /// So a reservation is live while EITHER clock still says it is, and dies only
+    /// when both agree. The union is the fail-safe direction in both senses: it can
+    /// only ever over-count, which refuses a later hot spend but never admits an
+    /// over-budget one. It also costs nothing under a coherent clock — config forces
+    /// `hot_window_secs >= max_commitment_age_secs` and a node caps every accepted
+    /// expiry at `now + max_commitment_age_secs`, so the wall term is already inside
+    /// the monotonic one and the union is exactly the monotonic window.
+    ///
+    /// Both boundaries are INCLUSIVE, and that is load-bearing rather than a style
+    /// choice: a candidate survives `prune` while `expiry >= now`, a fire window is
+    /// open while `now <= deadline`, and `hot_max_per_tx` admits a spend exactly AT
+    /// the cap. Config permits `hot_window_secs == max_commitment_age_secs`, so an
+    /// exclusive floor would drop a reservation at exactly `reserved_at + window`
+    /// while the candidate it pays for is still resident and still broadcastable in
+    /// that same second — one instant in which a second full-budget spend is
+    /// admitted alongside a live first one, i.e. 2× the bound this ledger enforces.
+    fn is_live(r: &HotReservation, floor: u64, wall_now: u64) -> bool {
+        r.reserved_at >= floor || wall_now <= r.expiry
+    }
+
+    /// Σ of the reservations still metering at `now` (monotonic) / `wall_now`.
+    fn window_sum(&self, now: u64, wall_now: u64) -> u64 {
+        let floor = self.floor(now);
+        self.reservations
+            .values()
+            .filter(|r| Self::is_live(r, floor, wall_now))
+            .fold(0u64, |sum, r| sum.saturating_add(r.outflow_sat))
+    }
+
+    /// Drop reservations both clocks call dead. Memory hygiene only —
+    /// [`Self::window_sum`] already ignores them.
+    ///
+    /// Destructive, so its monotonic term may only ever be driven by [`HotClock`].
+    /// That reading is elapsed process time, which no clock adjustment can step
+    /// forward; driving deletion by wall time ALONE would let one NTP correction or
+    /// VM restore permanently forget reservations for spends that are still
+    /// broadcastable, which is why the wall-clock periodic fire sweep does not call
+    /// this at all. `wall_now` can only ever KEEP a reservation here (see
+    /// [`Self::is_live`]) — it never brings a deletion forward — so a transient
+    /// forward wall step deletes nothing the monotonic window had not already
+    /// retired.
+    fn prune(&mut self, now: u64, wall_now: u64) {
+        let floor = self.floor(now);
+        self.reservations
+            .retain(|_, r| Self::is_live(r, floor, wall_now));
+    }
+
+    /// Claim `outflow_sat` of the window's budget for `commitment_id`, or refuse
+    /// with the window sum that would have been exceeded.
+    ///
+    /// **Idempotent per `commitment_id`.** A resubmission of a spend this node
+    /// already accepted must hit the existing reservation rather than adding a
+    /// second one: the coordinator legitimately retries a timed-out `/sign`, and a
+    /// ledger that double-counted the retry would refuse the vault's own honest
+    /// traffic while doing nothing to bound an attacker (who would simply use
+    /// fresh commitments). The original `reserved_at` is kept for the same reason
+    /// the Hold schedule is never reset on resubmit — otherwise a repeated
+    /// resubmit could hold a reservation open forever.
+    fn reserve(
+        &mut self,
+        commitment_id: &str,
+        outflow_sat: u64,
+        now: u64,
+        wall_now: u64,
+        expiry: u64,
+    ) -> Result<bool, HotReserveRefusal> {
+        // Physically remove age-outs here and nowhere else. `now` is [`HotClock`]'s
+        // monotonic reading, so this deletion measures real elapsed time and no
+        // clock adjustment can bring it forward; the wall-clock periodic fire sweep
+        // must never prune, since a transient forward step there would delete
+        // reservations that are still live once the clock corrects. `window_sum`
+        // stays a pure view everywhere else.
+        self.prune(now, wall_now);
+        if self.reservations.contains_key(commitment_id) {
+            return Ok(false);
+        }
+        let sum = self.window_sum(now, wall_now);
+        if sum.saturating_add(outflow_sat) > self.budget.max_per_window_sat {
+            return Err(HotReserveRefusal::Window(sum));
+        }
+        // Tested AFTER the window so an over-budget spend still reports the bound it
+        // actually broke. This reserve call already pruned the map above against
+        // [`HotClock`]'s monotonic reading, so capacity fires on live-reservation
+        // pressure rather than aged-out debris.
+        if self.reservations.len() >= MAX_HOT_RESERVATIONS {
+            return Err(HotReserveRefusal::Capacity);
+        }
+        self.reservations.insert(
+            commitment_id.to_string(),
+            HotReservation {
+                outflow_sat,
+                reserved_at: now,
+                expiry,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Free `commitment_id`'s reservation. Idempotent, and a no-op for any id that
+    /// never held one (an escape, a refresh, an unknown id).
+    fn release(&mut self, commitment_id: &str) {
+        self.reservations.remove(commitment_id);
+    }
+}
+
 /// The candidate registry: `commitment_id -> Candidate`, with a hard count + byte
 /// cap. No generic FIFO/LRU eviction — a compromised peer must not be able to
 /// evict quorum-useful partials; only commitment expiry evicts.
@@ -1479,9 +1832,76 @@ pub(crate) struct PartialStore {
     /// compromised peer can starve `/sign`. Values remain the stretched ids, never a
     /// fast PIN-committing digest, and are pruned with their intent.
     carriers_by_nonce: HashMap<String, CarrierMemo>,
+    /// The Hot budget's velocity ledger (ADR-0014 §4). Under this same lock so a
+    /// terminal candidate removal and its reservation release are one atomic step.
+    hot_budget: HotBudgetLedger,
 }
 
 impl PartialStore {
+    /// Free the Hot-budget reservation of a candidate being REMOVED from the
+    /// registry, if neither its partial left this node nor this node broadcast it.
+    ///
+    /// This rule hangs off removal rather than each individual terminal transition
+    /// on purpose: a locally-unbroadcast candidate leaves this store through the
+    /// expiry sweep in [`Self::prune`], the fire-complete deletion of an armed
+    /// escape and its superseded paired spend (also `prune`, and
+    /// [`ChannelState::mark_broadcast`]), or the lookup eviction in
+    /// [`Self::accept_partial`]. Routing those paths through one predicate keeps
+    /// the "release only if this node never exposed a usable share" rule consistent.
+    ///
+    /// **A broadcast candidate keeps its reservation until age-out** (ADR-0014
+    /// §4), which is why `broadcast` gates this. So does a candidate whose partial
+    /// was already `released`: expiry is a local scheduling boundary, not part of
+    /// Bitcoin's signature digest, so peers may still hold enough released shares
+    /// to broadcast the transaction later. Refunding that candidate would meter it
+    /// as dead while it remains completable. Mempool eviction and re-org are
+    /// deliberately not tracked: over-counting a broadcast-then-vanished spend can
+    /// only refuse a LATER spend, never admit an over-budget one, so the untracked
+    /// direction is the safe one — the same "mempool-presence = settled" reading
+    /// V0-8b already takes.
+    ///
+    /// The DURESS FREEZE needs no hook of its own. It removes nothing: it sets a
+    /// store-level bit, and the frozen hot candidate stays resident until its
+    /// commitment expires and `prune` collects it here. Adding a release to the
+    /// arm path would also be actively harmful — [`ChannelState::write_safety_overlay`]
+    /// is written in constant-time selects precisely so the normal and duress
+    /// histories do the same work, and a map mutation that happened only under
+    /// duress would put a timing signal back into the one place ADR-0012 spent the
+    /// most effort removing it. The freed budget would buy an attacker nothing
+    /// anyway: an armed node does not REFUSE a later hot spend — it accepts and
+    /// freezes it, exactly as it froze this one (`armed & c.hot` makes a frozen
+    /// candidate permanently not-due in [`ChannelState::due_for_fire`], so its partial
+    /// never releases) — and then enters Lockdown at `T`, which is terminal. So
+    /// budget released at the arm could only ever be re-reserved by another spend
+    /// that is equally frozen; no hot spend completes on an armed node either way.
+    ///
+    /// The load-bearing half of that argument is OBSERVABILITY, not attacker gain,
+    /// and it lives in another file — so state it here, where the tempting edit is.
+    /// Not releasing at the arm means a frozen candidate stays `!released`, so it
+    /// IS refunded when `prune` collects it at expiry; the same candidate on a
+    /// non-armed node has released its partial and keeps its reservation. That is a
+    /// budget difference between an armed and a censored node, and the ONLY reason
+    /// it is not a duress oracle is ordering: [`ChannelState::write_safety_overlay`]
+    /// shrinks `T` to `earliest pending hot fire_at − ε`, and `fire_at < expiry`
+    /// always, so Lockdown — which gates `/sign` before any ledger access — strictly
+    /// precedes the refund. Releasing at the arm would move that same difference
+    /// EARLIER, in front of `T`, where it is observable. The constant-time-select
+    /// argument above is the second reason, not the only one.
+    fn release_if_unexposed(hot_budget: &mut HotBudgetLedger, candidate: &Candidate) {
+        if Self::is_unexposed_hot(candidate) {
+            hot_budget.release(&candidate.commitment_id);
+        }
+    }
+
+    /// The release predicate itself: a hot candidate whose partial has neither been
+    /// released to peers nor broadcast, so nothing that could still complete the
+    /// spend has left this node. Extracted so `prune` — which cannot call
+    /// [`Self::release_if_unexposed`] from inside `retain`'s mutable borrow and
+    /// collects ids for a second pass instead — still decides with the SAME rule.
+    /// One predicate, three call sites, no drift.
+    fn is_unexposed_hot(candidate: &Candidate) -> bool {
+        candidate.hot && !candidate.released && !candidate.broadcast
+    }
     /// Keep confirmation state and its replay memo on the same strict freshness
     /// boundary as the coordinator nonce log (`expiry > now`). Expiry is the ONLY
     /// bound applied here; there is no count cap in this function. It is the shared
@@ -1613,6 +2033,10 @@ impl PartialStore {
         let fire_complete_escape = fire_complete.then_some(selected_escape);
         let fire_complete_pair = fire_complete.then_some(selected_pair).flatten();
         let mut removed = 0usize;
+        // `retain` holds a mutable borrow of `candidates`, so the Hot-budget
+        // releases are collected here and applied just below rather than inside
+        // the closure. Same store lock either way, so the two stay atomic.
+        let mut freed: Vec<String> = Vec::new();
         self.candidates.retain(|id, c| {
             let fire_complete = fire_complete_escape.as_deref() == Some(id.as_str())
                 || fire_complete_pair.as_deref() == Some(id.as_str());
@@ -1620,10 +2044,28 @@ impl PartialStore {
                 true
             } else {
                 removed = removed.saturating_add(c.capacity_bytes);
+                if Self::is_unexposed_hot(c) {
+                    freed.push(id.clone());
+                }
                 false
             }
         });
         self.reserved_bytes = self.reserved_bytes.saturating_sub(removed);
+        // Two terminal-pre-release shapes land here (ADR-0014 §4): a hot spend
+        // whose commitment expired before its partial left this node — including
+        // one the duress freeze held down until expiry — and the hot spend an armed
+        // escape SUPERSEDED before release, deleted above at fire-complete. Both
+        // free their reservation so a legitimate replacement is not blocked by a
+        // spend that can no longer complete. A released partial remains usable
+        // after local expiry and therefore keeps its reservation until age-out.
+        for id in &freed {
+            self.hot_budget.release(id);
+        }
+        // Do not destructively prune exposed reservations on this generic sweep:
+        // the fire driver passes raw wall time, which may jump forward and later be
+        // corrected. `HotBudgetLedger::reserve` prunes instead, against [`HotClock`]'s
+        // monotonic reading, which no clock adjustment can step; `window_sum` ignores
+        // age-outs without deleting them in the meantime.
     }
 
     /// Verify and store a partial against the registered candidate. Enforced at
@@ -1650,11 +2092,16 @@ impl PartialStore {
             None => return ChannelReply::UnknownCandidate,
         };
         if expired {
-            let bytes = self
-                .candidates
-                .remove(p.commitment_id)
-                .map(|c| c.capacity_bytes)
-                .unwrap_or(0);
+            let bytes = match self.candidates.remove(p.commitment_id) {
+                Some(candidate) => {
+                    // The same expired removal `prune` handles, reached by lookup
+                    // instead of by the sweep. Only a share that never left this
+                    // node refunds its reservation.
+                    Self::release_if_unexposed(&mut self.hot_budget, &candidate);
+                    candidate.capacity_bytes
+                }
+                None => 0,
+            };
             self.reserved_bytes = self.reserved_bytes.saturating_sub(bytes);
             return ChannelReply::UnknownCandidate;
         }
@@ -1851,8 +2298,72 @@ pub struct ChannelState {
     limits: ChannelLimits,
     /// Shared with the node so freshness-reject events surface through `/events`.
     alerts: Arc<Mutex<AlertQueue>>,
+    /// The Hot budget's own clock (ADR-0014 §4). See [`HotClock`] for why this one
+    /// piece of node state must NOT read wall time.
+    hot_clock: HotClock,
     #[cfg(test)]
     schedule_work: ScheduleWorkCounters,
+}
+
+/// The clock the **Hot budget**'s rolling window ages against: MONOTONIC elapsed
+/// time since this channel was built, deliberately NOT the wall clock.
+///
+/// A reservation is the only node state here whose lifetime is a pure local
+/// DURATION. Every other deadline in this file — a commitment's expiry, a fire
+/// window's, a coordinator nonce's freshness — is compared against an
+/// ABSOLUTE instant the coordinator signed, so those must read wall time to mean
+/// anything. The velocity window is compared against nothing external: it only ever
+/// asks "how long ago did this node accept that spend?".
+///
+/// This clock is therefore only HALF of a reservation's lifetime, not all of it.
+/// The candidate a reservation meters dies at one of those absolute wall instants,
+/// so a clock adjustment moves the candidate and not the reservation; holding the
+/// reservation until BOTH clocks call the spend dead is what keeps the two coupled.
+/// [`HotBudgetLedger::is_live`] owns that rule and states both directions.
+///
+/// Aging it by wall time would hand a forward clock step — an NTP correction, a VM
+/// restore, an RTC fault — the power to erase live reservations. That is not
+/// hypothetical: a coordinator request timed against the SAME excursion passes the
+/// freshness gate (`replay::NonceLog`'s high-water mark guards rollback, i.e.
+/// BACKWARD steps only — `effective_now` is a `max`, so a forward reading passes
+/// straight through), and `HotBudgetLedger::reserve` prunes on that path. One such
+/// accepted request during the excursion would permanently forget reservations for
+/// spends whose signatures have already left this node, admitting a second full
+/// window of hot outflow while the first window's spends are still broadcastable —
+/// exactly the doubling the ledger exists to prevent.
+///
+/// `Instant` is `CLOCK_MONOTONIC`: it cannot be stepped by any clock adjustment. Its
+/// one deviation from real time is that a host suspend does not advance it, which
+/// makes reservations age SLOWER than real time — over-counting, which can only
+/// refuse a hot spend, never admit an over-budget one. Same fail-safe direction the
+/// rest of ADR-0014 takes.
+///
+/// Node-lifetime, like the ledger it serves: a reboot clears both together, so the
+/// baseline is never stale relative to the reservations measured against it.
+struct HotClock {
+    start: Instant,
+    /// Test-only: pin the clock to a chosen second so the suite can roll a 48-hour
+    /// window without sleeping through it. Absent from every non-test build.
+    #[cfg(test)]
+    pinned: Mutex<Option<u64>>,
+}
+
+impl HotClock {
+    fn new() -> HotClock {
+        HotClock {
+            start: Instant::now(),
+            #[cfg(test)]
+            pinned: Mutex::new(None),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(secs) = *self.pinned.lock().expect("hot clock lock poisoned") {
+            return secs;
+        }
+        self.start.elapsed().as_secs()
+    }
 }
 
 impl ChannelState {
@@ -1870,6 +2381,20 @@ impl ChannelState {
         // Hashed into `manifest_hash` (via [`base_manifest_bytes`]) so the sealed
         // manifest binds it: a different coordinator is a different vault.
         coordinator_auth: PublicKey,
+        // The federation-uniform Hot budget (ADR-0014 §6). Hashed into
+        // `manifest_hash` (via [`base_manifest_bytes`]) for exactly the reason
+        // `max_msg_bytes` is, and handed to the velocity ledger below.
+        hot_budget: HotBudget,
+        // The canonical hot destinations, escape destination, and derivation bound.
+        // Sealing only the numeric caps would leave two ways around them:
+        // `escape_descriptor`/`max_derivation_index` are what `hot_outflow` skips
+        // and scans, so a node with either different METERS the same output
+        // differently; `hot_allowlist` decides ADMISSIBILITY, so a node with a wider
+        // one signs spends to destinations its peers refuse outright. See
+        // `ceremony::manifest_hash` for the contract on each.
+        hot_allowlist: &[String],
+        escape_descriptor: &str,
+        max_derivation_index: u32,
         alerts: Arc<Mutex<AlertQueue>>,
     ) -> Result<ChannelState, Error> {
         // Tokio's constructor panics above this implementation limit. Treat a
@@ -2003,12 +2528,16 @@ impl ChannelState {
             &coordinator_auth,
             &nodes,
             cfg.max_msg_bytes as u64,
+            hot_budget,
+            hot_allowlist,
+            escape_descriptor,
+            max_derivation_index,
         );
         if let Some(expected) = &cfg.expected_manifest_hash {
             let expected = from_hex_32(expected)
                 .map_err(|_| Error::from("[channel] expected_manifest_hash is not 32-byte hex"))?;
             if expected != manifest_hash {
-                return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes disagreeing with the federation-uniform manifest value is one cause)".into());
+                return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes, Hot budget, or Hot-budget classification input disagreeing with the federation-uniform manifest values is one cause)".into());
             }
         }
 
@@ -2103,6 +2632,7 @@ impl ChannelState {
                 },
                 intents: HashMap::new(),
                 carriers_by_nonce: HashMap::new(),
+                hot_budget: HotBudgetLedger::new(hot_budget),
             }),
             ingress_guards: Mutex::new(IngressGuards::default()),
             freshness_counts: Mutex::new(HashMap::new()),
@@ -2114,6 +2644,7 @@ impl ChannelState {
                 per_send_deadline_secs: cfg.per_send_deadline_secs,
             },
             alerts,
+            hot_clock: HotClock::new(),
             #[cfg(test)]
             schedule_work: ScheduleWorkCounters::default(),
         })
@@ -2157,22 +2688,51 @@ impl ChannelState {
         &self,
         mut candidates: Vec<Candidate>,
         arm: ArmDirective,
-    ) -> Vec<RegisterOutcome> {
+        hot_reserve: Option<HotReserveSpec<'_>>,
+    ) -> Result<Vec<RegisterOutcome>, HotReserveRefusal> {
         for candidate in &mut candidates {
             candidate.reserve_partial_capacity(&self.nodes, self.node_id);
         }
+        // Keep HotClock -> store as the one lock order, matching
+        // `reserve_hot_budget`. In production this is the second, registration-time
+        // reading; absent a test pin, monotonic time cannot move backwards.
+        let hot_now = hot_reserve.map(|_| self.hot_clock.now());
         let mut store = self.store.lock().expect("store lock poisoned");
         #[cfg(test)]
         self.schedule_work
             .registration_locks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The first reserve happens before `add_node_signatures`, as ADR-0014
+        // requires. Revalidate it under THIS lock because `PartialStore::prune`
+        // releases an expired unexposed candidate's reservation under the same lock.
+        // Without this second idempotent check, prune can land between the first
+        // reserve and this registration and leave a newly inserted signed candidate
+        // unmetered. Remember only a reservation created here: on an admission
+        // refusal it belongs to this attempt and must be unwound here, whereas an
+        // idempotent hit still belongs to the resident candidate.
+        let registration_reserve = match (hot_reserve, hot_now) {
+            (Some(spec), Some(now)) => store.hot_budget.reserve(
+                spec.commitment_id,
+                spec.outflow_sat,
+                now,
+                spec.wall_now,
+                spec.expiry,
+            )?,
+            (None, None) => false,
+            _ => unreachable!("Hot reserve spec and clock reading are paired"),
+        };
         if candidates.iter().any(|candidate| {
             store
                 .candidates
                 .get(&candidate.commitment_id)
                 .is_some_and(|resident| !resident.matches_registration(candidate))
         }) {
-            return vec![RegisterOutcome::Conflict; candidates.len()];
+            if registration_reserve {
+                store
+                    .hot_budget
+                    .release(hot_reserve.expect("reserve was inserted").commitment_id);
+            }
+            return Ok(vec![RegisterOutcome::Conflict; candidates.len()]);
         }
 
         let new_candidates: Vec<&Candidate> = candidates
@@ -2185,7 +2745,7 @@ impl ChannelState {
         if store.candidates.len().saturating_add(new_candidates.len()) > store.max_active_candidates
             || store.reserved_bytes.saturating_add(added_bytes) > store.max_bytes
         {
-            return candidates
+            let outcomes = candidates
                 .iter()
                 .map(|candidate| {
                     if store.candidates.contains_key(&candidate.commitment_id) {
@@ -2195,6 +2755,12 @@ impl ChannelState {
                     }
                 })
                 .collect();
+            if registration_reserve {
+                store
+                    .hot_budget
+                    .release(hot_reserve.expect("reserve was inserted").commitment_id);
+            }
+            return Ok(outcomes);
         }
         // Snapshot the hot-class Hold-expiries this request adds BEFORE `candidates`
         // is consumed — a hot spend accepted while armed shrinks `T` to its
@@ -2218,7 +2784,7 @@ impl ChannelState {
             intent.spend_commitment_id = arm.spend_commitment_id.to_string();
             intent.escape_commitment_id = arm.sweep_escape.to_string();
         }
-        outcomes
+        Ok(outcomes)
     }
 
     /// Atomically write the request's fixed two-slot schedule under an already-held
@@ -2961,6 +3527,77 @@ impl ChannelState {
         store.prune(now);
     }
 
+    // -- the Hot budget's velocity ledger (ADR-0014 §4) ---------------------
+
+    /// Claim `outflow_sat` of this window's Hot budget for `commitment_id`, at
+    /// ingress. `Ok(true)` means this call inserted the reservation; `Ok(false)`
+    /// is an idempotent hit owned by an earlier accepted request. `Err` names which
+    /// bound refused it — the rolling window, or the ledger's live-entry cap.
+    ///
+    /// Called from `/sign` BEFORE the node signs, which is what makes the refusal
+    /// meaningful: an over-cap coerced hot spend leaves this node having produced
+    /// no partial at all, so it cannot contribute to a quorum anywhere.
+    ///
+    /// **Amount-based and therefore PIN-INDEPENDENT.** It must never read the pin,
+    /// and it does not: both PIN classes take the identical path here and get the
+    /// identical verdict for the identical spend. That is what preserves ADR-0012's
+    /// constant-observable ingress — an over-cap DURESS carrier is still staged,
+    /// still records its arm intent, and still propagates to peers, so the duress
+    /// freeze fires federation-wide exactly as it would have. The coerced spend
+    /// simply also cannot complete.
+    ///
+    /// The window's own aging is against [`HotClock`], this channel's MONOTONIC
+    /// clock, NOT against `wall_now` — see that type for why wall time alone here
+    /// would let one forward clock step free a live window's budget. `wall_now` and
+    /// `expiry` are taken for the other half of the rule: the metered candidate dies
+    /// at an absolute wall instant, so the reservation must outlive that instant too
+    /// or a clock adjustment separates the two. See [`HotBudgetLedger::is_live`].
+    pub(crate) fn reserve_hot_budget(
+        &self,
+        commitment_id: &str,
+        outflow_sat: u64,
+        wall_now: u64,
+        expiry: u64,
+    ) -> Result<bool, HotReserveRefusal> {
+        let now = self.hot_clock.now();
+        let mut store = self.store.lock().expect("store lock poisoned");
+        store
+            .hot_budget
+            .reserve(commitment_id, outflow_sat, now, wall_now, expiry)
+    }
+
+    /// Free `commitment_id`'s reservation from OUTSIDE the store's own removal
+    /// paths — the `/sign` unwind below, where a later step refuses a spend this
+    /// call already reserved for.
+    pub(crate) fn release_hot_budget(&self, commitment_id: &str) {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        store.hot_budget.release(commitment_id);
+    }
+
+    /// The window sum at the ledger's own clock — the quantity `reserve` tests
+    /// against. Test-only: every production decision is made inside
+    /// [`HotBudgetLedger::reserve`] under the store lock, so exposing a separately-read
+    /// sum to the node would only invite a check that races the reservation it is
+    /// checking.
+    #[cfg(test)]
+    pub(crate) fn hot_window_sum(&self, wall_now: u64) -> u64 {
+        let now = self.hot_clock.now();
+        let store = self.store.lock().expect("store lock poisoned");
+        store.hot_budget.window_sum(now, wall_now)
+    }
+
+    /// Pin the Hot budget's monotonic clock to `secs`. Test-only, and the ONLY way
+    /// the suite can roll a 48-hour velocity window: [`HotClock`] is deliberately
+    /// unsteppable in production, which is the whole point of it.
+    #[cfg(test)]
+    pub(crate) fn pin_hot_clock(&self, secs: u64) {
+        *self
+            .hot_clock
+            .pinned
+            .lock()
+            .expect("hot clock lock poisoned") = Some(secs);
+    }
+
     // -- the fire path (§1): release, combine ------------------------------
 
     /// Every live candidate whose combine window is open at `now`, in stable
@@ -3221,6 +3858,12 @@ impl ChannelState {
                     store.reserved_bytes = store
                         .reserved_bytes
                         .saturating_sub(candidate.capacity_bytes);
+                    // The paired hot spend is SUPERSEDED by the escape that just
+                    // broadcast. If its share never left this node, it can no longer
+                    // complete with this node and gives the budget back. A share that
+                    // already left remains metered because peers may still broadcast
+                    // the conflicting spend later.
+                    PartialStore::release_if_unexposed(&mut store.hot_budget, &candidate);
                 }
             }
         } else if let Some(candidate) = store.candidates.get_mut(commitment_id) {
@@ -4081,6 +4724,9 @@ mod fixture {
         /// (V0-4b §0). Emitted into every generated `[channel]` block so the config
         /// and the manifest preimage can never silently disagree.
         pub(crate) max_msg_bytes: u64,
+        /// The federation-uniform Hot budget this manifest is sealed to (ADR-0014
+        /// §6). Emitted into every generated config for the same reason.
+        pub(crate) hot_budget: HotBudget,
     }
 
     impl Fixture {
@@ -4170,6 +4816,10 @@ mod fixture {
                 &coord_pk,
                 &nodes,
                 DEFAULT_MAX_MSG_BYTES,
+                TEST_HOT_BUDGET,
+                std::slice::from_ref(&hot_desc),
+                &escape_desc,
+                5,
             );
 
             let mut entries = Vec::new();
@@ -4212,6 +4862,7 @@ mod fixture {
                 entries,
                 ports: ports.to_vec(),
                 max_msg_bytes: DEFAULT_MAX_MSG_BYTES,
+                hot_budget: TEST_HOT_BUDGET,
             }
         }
 
@@ -4223,6 +4874,22 @@ mod fixture {
         /// property that makes "fits my cap" imply "fits every peer's cap".
         pub(crate) fn reseal_max_msg_bytes(&mut self, max_msg_bytes: u64) {
             self.max_msg_bytes = max_msg_bytes;
+            self.reseal();
+        }
+
+        /// Re-seal the federation to a different Hot budget (ADR-0014 §6). Exactly
+        /// the same story as [`Self::reseal_max_msg_bytes`]: the caps are manifest
+        /// preimage fields, so changing them is a NEW manifest and every endorsement
+        /// must be rebuilt. A test that edits only the TOML gets a startup failure,
+        /// which is the property making the caps provably federation-uniform.
+        pub(crate) fn reseal_hot_budget(&mut self, hot_budget: HotBudget) {
+            self.hot_budget = hot_budget;
+            self.reseal();
+        }
+
+        /// Recompute `manifest_hash` and every channel-key endorsement from the
+        /// fixture's CURRENT sealed fields — what the setup ceremony would do.
+        fn reseal(&mut self) {
             let nodes: Vec<ManifestNode> = self
                 .entries
                 .iter()
@@ -4238,7 +4905,11 @@ mod fixture {
                 PROTOCOL_VERSION_V0,
                 &self.coord_pk,
                 &nodes,
-                max_msg_bytes,
+                self.max_msg_bytes,
+                self.hot_budget,
+                std::slice::from_ref(&self.hot_desc),
+                &self.escape_desc,
+                5,
             );
             for entry in &mut self.entries {
                 let digest = endorsement_digest(
@@ -4265,36 +4936,7 @@ mod fixture {
         /// without weakening the production endpoint/endorsement invariants.
         pub(crate) fn replace_endpoints(&mut self, node_id: u16, endpoints: Vec<String>) {
             self.entries[node_id as usize].endpoints = endpoints;
-            let nodes: Vec<ManifestNode> = self
-                .entries
-                .iter()
-                .map(|e| ManifestNode {
-                    node_id: e.node_id,
-                    signing_pubkey: e.fed_pk,
-                    channel_pubkey: e.channel_pk,
-                    endpoints: e.endpoints.clone(),
-                })
-                .collect();
-            self.manifest_hash = compute_manifest_hash(
-                &self.wallet_id,
-                PROTOCOL_VERSION_V0,
-                &self.coord_pk,
-                &nodes,
-                DEFAULT_MAX_MSG_BYTES,
-            );
-            for entry in &mut self.entries {
-                let digest = endorsement_digest(
-                    &self.wallet_id,
-                    &self.manifest_hash,
-                    entry.node_id,
-                    &entry.channel_pk,
-                    PROTOCOL_VERSION_V0,
-                    &entry.endpoints,
-                );
-                let sig = Secp256k1::signing_only()
-                    .sign_ecdsa(&Message::from_digest(digest), &entry.fed_sk);
-                entry.endorsement_hex = to_hex(&sig.serialize_der());
-            }
+            self.reseal();
         }
 
         /// The `[channel]` TOML block for `self_id`, with `opts` (scalar overrides)
@@ -4340,14 +4982,20 @@ mod fixture {
             // here ever dials it — only `spawn_drivers` does, which these tests do
             // not call — so the address only has to parse. Table headers end the
             // top-level section, so it and `{channel}` come last.
+            // The Hot budget is emitted from the fixture's own SEALED values, so a
+            // fixture that re-sealed to different caps produces configs that match
+            // its manifest — and a test that wants the mismatch has to ask for it.
             format!(
-                "listen_port = {}\nnode_seckey = \"{}\"\ndescriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nmax_commitment_age_secs = 172800\npolicy_version = 1\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
+                "listen_port = {}\nnode_seckey = \"{}\"\ndescriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nhot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\nmax_commitment_age_secs = 172800\npolicy_version = 1\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
                 self.ports[self_id as usize],
                 e.fed_sk.display_secret(),
                 self.descriptor,
                 self.hot_desc,
                 self.escape_desc,
                 self.escape_desc,
+                self.hot_budget.max_per_tx_sat,
+                self.hot_budget.max_per_window_sat,
+                self.hot_budget.window_secs,
                 crate::argon2id_normal_phc("1234"),
                 crate::argon2id_duress_phc("9999"),
                 self.coord_pk,
@@ -4494,9 +5142,41 @@ mod fixture {
             }
         }
 
+        /// The single vault UTXO value every fixture spend consumes.
+        pub(crate) const INPUT_SAT: u64 = 100_000_000;
+        /// The flat fee those spends pay — far under the 10% cap.
+        pub(crate) const SPEND_FEE_SAT: u64 = 10_000;
+
         /// A user-signed spend PSBT paying `dest_spk`, spending one vault UTXO at
         /// `input_txid:0`.
         pub(crate) fn spend_psbt(&self, dest_spk: &ScriptBuf, input_txid: u8) -> Psbt {
+            self.spend_psbt_paying(dest_spk, input_txid, Self::INPUT_SAT - Self::SPEND_FEE_SAT)
+        }
+
+        /// [`Self::spend_psbt`] with the destination amount chosen — what the
+        /// Hot-budget tests need, since the outflow IS the quantity under test.
+        /// Whatever the flat fee leaves over goes back to the vault as change, so
+        /// the fee stays constant while the outflow varies: that separation is what
+        /// lets a test show the fee and the change are not metered.
+        pub(crate) fn spend_psbt_paying(
+            &self,
+            dest_spk: &ScriptBuf,
+            input_txid: u8,
+            sats: u64,
+        ) -> Psbt {
+            let change = Self::INPUT_SAT
+                .checked_sub(sats + Self::SPEND_FEE_SAT)
+                .expect("fixture spend must fit its one input plus the flat fee");
+            let mut output = vec![TxOut {
+                script_pubkey: dest_spk.clone(),
+                value: Amount::from_sat(sats),
+            }];
+            if change > 0 {
+                output.push(TxOut {
+                    script_pubkey: self.vault_spk.clone(),
+                    value: Amount::from_sat(change),
+                });
+            }
             let tx = Transaction {
                 version: Version::TWO,
                 lock_time: LockTime::ZERO,
@@ -4506,13 +5186,10 @@ mod fixture {
                     sequence: Sequence::MAX,
                     witness: Witness::new(),
                 }],
-                output: vec![TxOut {
-                    script_pubkey: dest_spk.clone(),
-                    value: Amount::from_sat(99_990_000),
-                }],
+                output,
             };
             let mut psbt = Psbt::from_unsigned_tx(tx).expect("unsigned tx");
-            let value = Amount::from_sat(100_000_000);
+            let value = Amount::from_sat(Self::INPUT_SAT);
             psbt.inputs[0].witness_utxo = Some(TxOut {
                 script_pubkey: self.vault_spk.clone(),
                 value,
@@ -4646,6 +5323,8 @@ mod golden {
     use super::*;
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use bitcoin::PublicKey;
+    use miniscript::{Descriptor, DescriptorPublicKey};
+    use std::str::FromStr;
 
     fn pk(seed: u8) -> PublicKey {
         let sk = SecretKey::from_slice(&[seed; 32]).expect("sk");
@@ -4669,6 +5348,13 @@ mod golden {
         assert_eq!(derived.secret_bytes(), dig);
     }
 
+    /// Regenerated when ADR-0014 added the Hot budget and its classification
+    /// descriptors to the preimage; the V0-9 prefix through `max_msg_bytes` is
+    /// byte-identical, which is what the offset assertions below check.
+    const FROZEN_MANIFEST_PREIMAGE_HEX: &str = "222222222222222222222222222222222222222222222222222222222222222200000000038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c2360000100000000000111111110000000022222222000000003333333300000000010000000900000077706b6828686f74290c00000077706b68286573636170652905000000020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031";
+    const FROZEN_MANIFEST_HASH_HEX: &str =
+        "e22e9d0fc88579f0507adde529985265de61aa5509bec7d00b5a91dff228d3fb";
+
     #[test]
     fn manifest_vector_is_frozen() {
         let wallet_id = [0x22u8; 32];
@@ -4688,19 +5374,36 @@ mod golden {
         ];
         // The frozen provisional BaseManifest-slice preimage (ADR-0013 §4):
         // wallet_id[32], protocol_version:u32, coordinator_auth_pubkey[33],
-        // max_msg_bytes:u64, node-count:u32, then each node by id. The coordinator
-        // key is unconditional — every vault is sealed to exactly one coordinator —
-        // so it always occupies offsets 36..69, and the federation-uniform
-        // `max_msg_bytes` (V0-4b §0) follows it at 69..77.
+        // max_msg_bytes:u64, hot_max_per_tx:u64, hot_max_per_window:u64,
+        // hot_window_secs:u64, canonical hot descriptors, escape descriptor,
+        // max_derivation_index:u32, node-count:u32, then each node by id. The
+        // coordinator key is unconditional
+        // — every vault is sealed to exactly one coordinator — so it always occupies offsets 36..69, the federation-uniform
+        // `max_msg_bytes` (V0-4b §0) follows it at 69..77, and the ADR-0014 Hot
+        // budget triple follows THAT at 77..101.
         let coord = pk(0xC0);
+        // Three distinct values, so a field swapped with its neighbour in the
+        // encoder would move the offsets below and fail rather than pass by
+        // coincidence.
+        let hot_budget = HotBudget {
+            max_per_tx_sat: 0x1111_1111,
+            max_per_window_sat: 0x2222_2222,
+            window_secs: 0x3333_3333,
+        };
+        let hot_allowlist = vec!["wpkh(hot)".to_string()];
+        let escape_descriptor = "wpkh(escape)";
         let bytes = base_manifest_bytes(
             &wallet_id,
             PROTOCOL_VERSION_V0,
             &coord,
             &nodes,
             DEFAULT_MAX_MSG_BYTES,
+            hot_budget,
+            &hot_allowlist,
+            escape_descriptor,
+            5,
         );
-        assert_eq!(to_hex(&bytes), "222222222222222222222222222222222222222222222222222222222222222200000000038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c2360000100000000000020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031");
+        assert_eq!(to_hex(&bytes), FROZEN_MANIFEST_PREIMAGE_HEX);
         assert_eq!(
             bytes[36..69],
             coord.inner.serialize(),
@@ -4713,9 +5416,22 @@ mod golden {
              coordinator key, so a node configured with a different cap cannot boot \
              into this federation (V0-4b §0)"
         );
+        for (range, expected, field) in [
+            (77..85, hot_budget.max_per_tx_sat, "hot_max_per_tx"),
+            (85..93, hot_budget.max_per_window_sat, "hot_max_per_window"),
+            (93..101, hot_budget.window_secs, "hot_window_secs"),
+        ] {
+            assert_eq!(
+                u64::from_le_bytes(bytes[range].try_into().expect("8 bytes")),
+                expected,
+                "{field} is a federation-uniform preimage field (ADR-0014 §6): a node \
+                 configured with a different Hot budget computes a different manifest_hash \
+                 and cannot boot into this federation"
+            );
+        }
         assert_eq!(
             to_hex(&tagged_hash(MANIFEST_TAG, &bytes)),
-            "d7260c76cd8eeca2bea36d9a0e8bcba8d4242cd3a2c5c338673782a14db1fa6c"
+            FROZEN_MANIFEST_HASH_HEX
         );
     }
 
@@ -4732,12 +5448,18 @@ mod golden {
             channel_pubkey: pk(2),
             endpoints: vec!["127.0.0.1:9000".to_string()],
         }];
+        let hot_allowlist = vec!["wpkh(hot)".to_string()];
+        let escape_descriptor = "wpkh(escape)";
         let with_a = compute_manifest_hash(
             &wallet_id,
             PROTOCOL_VERSION_V0,
             &pk(0xC0),
             &nodes,
             DEFAULT_MAX_MSG_BYTES,
+            TEST_HOT_BUDGET,
+            &hot_allowlist,
+            escape_descriptor,
+            5,
         );
         let with_b = compute_manifest_hash(
             &wallet_id,
@@ -4745,10 +5467,185 @@ mod golden {
             &pk(0xC1),
             &nodes,
             DEFAULT_MAX_MSG_BYTES,
+            TEST_HOT_BUDGET,
+            &hot_allowlist,
+            escape_descriptor,
+            5,
         );
         assert_ne!(
             with_a, with_b,
             "a different coordinator key ⇒ a different vault"
+        );
+    }
+
+    /// The uniformity property at the hash level (ADR-0014 §6): each of the three
+    /// caps independently changes `manifest_hash`, so a node that disagrees on ANY
+    /// of them computes a different hash and fails its sealed-manifest check.
+    /// Without this, a federation could run with one node metering hot outflow at a
+    /// laxer rate than its peers — and the cap would only be as strong as that node.
+    #[test]
+    fn manifest_hash_changes_when_any_hot_budget_cap_changes() {
+        let wallet_id = [0x22u8; 32];
+        let nodes = vec![ManifestNode {
+            node_id: 0,
+            signing_pubkey: pk(1),
+            channel_pubkey: pk(2),
+            endpoints: vec!["127.0.0.1:9000".to_string()],
+        }];
+        let hot_allowlist = vec!["wpkh(hot)".to_string()];
+        let escape_descriptor = "wpkh(escape)";
+        let hash_of = |budget| {
+            compute_manifest_hash(
+                &wallet_id,
+                PROTOCOL_VERSION_V0,
+                &pk(0xC0),
+                &nodes,
+                DEFAULT_MAX_MSG_BYTES,
+                budget,
+                &hot_allowlist,
+                escape_descriptor,
+                5,
+            )
+        };
+        let sealed = hash_of(TEST_HOT_BUDGET);
+        for (label, altered) in [
+            (
+                "hot_max_per_tx",
+                HotBudget {
+                    max_per_tx_sat: TEST_HOT_BUDGET.max_per_tx_sat + 1,
+                    ..TEST_HOT_BUDGET
+                },
+            ),
+            (
+                "hot_max_per_window",
+                HotBudget {
+                    max_per_window_sat: TEST_HOT_BUDGET.max_per_window_sat + 1,
+                    ..TEST_HOT_BUDGET
+                },
+            ),
+            (
+                "hot_window_secs",
+                HotBudget {
+                    window_secs: TEST_HOT_BUDGET.window_secs + 1,
+                    ..TEST_HOT_BUDGET
+                },
+            ),
+        ] {
+            assert_ne!(
+                sealed,
+                hash_of(altered),
+                "a node disagreeing on {label} must compute a different manifest_hash"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_hash_changes_when_hot_budget_classification_changes() {
+        let wallet_id = [0x22u8; 32];
+        let nodes = vec![ManifestNode {
+            node_id: 0,
+            signing_pubkey: pk(1),
+            channel_pubkey: pk(2),
+            endpoints: vec!["127.0.0.1:9000".to_string()],
+        }];
+        let hash_of = |hot_allowlist: &[String], escape_descriptor: &str, max_derivation_index| {
+            compute_manifest_hash(
+                &wallet_id,
+                PROTOCOL_VERSION_V0,
+                &pk(0xC0),
+                &nodes,
+                DEFAULT_MAX_MSG_BYTES,
+                TEST_HOT_BUDGET,
+                hot_allowlist,
+                escape_descriptor,
+                max_derivation_index,
+            )
+        };
+        let hot = vec!["wpkh(hot)".to_string()];
+        let sealed = hash_of(&hot, "wpkh(escape)", 5);
+        assert_ne!(
+            sealed,
+            hash_of(&["wpkh(other-hot)".to_string()], "wpkh(escape)", 5),
+            "nodes with different hot destinations must not share a manifest"
+        );
+        assert_ne!(
+            sealed,
+            hash_of(&hot, "wpkh(other-escape)", 5),
+            "nodes with different escape destinations must not share a manifest"
+        );
+        assert_ne!(
+            sealed,
+            hash_of(&hot, "wpkh(escape)", 6),
+            "nodes with different derivation bounds must not share a manifest"
+        );
+        assert_eq!(
+            sealed,
+            hash_of(
+                &["wpkh(hot)".to_string(), "wpkh(hot)".to_string()],
+                "wpkh(escape)",
+                5,
+            ),
+            "duplicate allowlist entries have no policy meaning"
+        );
+        // The other half of the canonicalization, and the load-bearing one: a node
+        // builds `hot_allowlist` in raw TOML order (`Node::load`), so two nodes that
+        // agree on the SET while listing it differently must still reach the same
+        // manifest — otherwise a cosmetic config edit is an unbootable federation.
+        let two = vec!["wpkh(a)".to_string(), "wpkh(b)".to_string()];
+        let reversed = vec!["wpkh(b)".to_string(), "wpkh(a)".to_string()];
+        assert_eq!(
+            hash_of(&two, "wpkh(escape)", 5),
+            hash_of(&reversed, "wpkh(escape)", 5),
+            "allowlist ORDER has no policy meaning either"
+        );
+        assert_ne!(
+            hash_of(&two, "wpkh(escape)", 5),
+            hash_of(&["wpkh(a)".to_string()], "wpkh(escape)", 5),
+            "but membership does: dropping an entry must change the manifest"
+        );
+    }
+
+    #[test]
+    fn ceremony_manifest_hash_canonicalizes_descriptor_strings() {
+        let descriptor = |seed| {
+            Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({})", pk(seed)))
+                .expect("valid descriptor")
+                .to_string()
+        };
+        let hot = descriptor(0xA0);
+        let escape = descriptor(0xB0);
+        let without_checksum = |descriptor: &str| {
+            descriptor
+                .split_once('#')
+                .expect("canonical descriptor has checksum")
+                .0
+                .to_string()
+        };
+        let nodes = vec![ceremony::CeremonyNode {
+            node_id: 0,
+            signing_pubkey: pk(1),
+            endpoints: vec!["127.0.0.1:9000".to_string()],
+        }];
+        let channel_pubkeys = vec![pk(2)];
+        let hash_of = |hot: String, escape: String| {
+            ceremony::manifest_hash(
+                &[0x22; 32],
+                &pk(0xC0),
+                &nodes,
+                &channel_pubkeys,
+                DEFAULT_MAX_MSG_BYTES,
+                TEST_HOT_BUDGET,
+                &[hot],
+                &escape,
+                5,
+            )
+            .expect("valid ceremony descriptors")
+        };
+
+        assert_eq!(
+            hash_of(hot.clone(), escape.clone()),
+            hash_of(without_checksum(&hot), without_checksum(&escape)),
+            "ceremony and Node::load must hash equivalent descriptor spellings identically"
         );
     }
 
@@ -12684,5 +13581,1615 @@ mod duress {
         let intersecting = Fixture::new(3, 5);
         crate::Node::from_toml_str(&intersecting.config(0, HOLD, ""))
             .expect("the default 3-of-5 channel vault has intersecting quorums");
+    }
+}
+
+#[cfg(test)]
+mod hot_budget {
+    //! The **Hot budget** (ADR-0014): a per-transaction cap on hot outflow plus a
+    //! rolling-window velocity cap, enforced at every node at ingress BEFORE
+    //! signing, federation-uniform, and pin-independent.
+    //!
+    //! This is what makes ADR-0012's censorship residual a BOUND rather than an
+    //! assumption. V0-4b established that a compromised coordinator can censor the
+    //! duress freeze from a sub-quorum, letting a Hot spend already pending there
+    //! complete; that is only the accepted "hot wallet is the risk budget" residual
+    //! if the amount is bounded, and before this it was not — nothing capped a hot
+    //! spend's amount or rate, so ONE coerced spend could pay the whole vault to
+    //! the hot wallet.
+    use super::fixture::Fixture;
+    use super::*;
+    use vault_proto::{RefusalCode, SignRequest, SignResponse};
+
+    const NOW: u64 = 1_752_000_000;
+    const HOLD: u64 = 3_600;
+    /// The velocity window every fixture here seals. Equal to the configs'
+    /// `max_commitment_age_secs`, which is the floor the node enforces at load.
+    const WINDOW: u64 = 172_800;
+    /// A commitment expiry well INSIDE the velocity window. ADR-0014 §3 makes the
+    /// window at least the commitment lifetime, so at the maximum expiry the two
+    /// boundaries coincide and a spend's reservation ages out in the same second its
+    /// candidate is pruned. The release tests need those two events separated to say
+    /// anything, so they use a nearer expiry — which is also the realistic case.
+    const EXPIRY: u64 = NOW + 7_200;
+
+    /// A fixture sealed to `(per_tx, per_window)` — a NEW manifest, endorsements
+    /// and all, exactly as re-provisioning the vault would be.
+    fn fx_with_caps(per_tx: u64, per_window: u64) -> Fixture {
+        let mut fx = Fixture::new(3, 5);
+        fx.reseal_hot_budget(HotBudget {
+            max_per_tx_sat: per_tx,
+            max_per_window_sat: per_window,
+            window_secs: WINDOW,
+        });
+        fx
+    }
+
+    /// Node `id` of `fx`, with `extra_toplevel` spliced in before the first table
+    /// header (the fixture only parameterizes `[channel]`).
+    fn node_of(fx: &Fixture, id: u16, extra_toplevel: &str) -> crate::Node {
+        let base = fx.config(id, HOLD, "");
+        let cfg = if extra_toplevel.is_empty() {
+            base
+        } else {
+            base.replacen(
+                "\n\n[chain_backend]",
+                &format!("\n{extra_toplevel}\n[chain_backend]"),
+                1,
+            )
+        };
+        let node = crate::Node::from_toml_str(&cfg).expect("valid config");
+        // Pin the Hot budget's monotonic clock to the same synthetic instant these
+        // tests hand `handle_sign`, so a test can read one clock rather than two.
+        // Production has no such lever — [`HotClock`] is unsteppable on purpose —
+        // so every test that rolls the window does so explicitly via
+        // `pin_hot_clock`, and a test that never touches it keeps the whole run
+        // inside one window, which is what the non-time-sensitive cases want.
+        if let Some(channel) = &node.channel {
+            channel.pin_hot_clock(NOW);
+        }
+        node
+    }
+
+    /// A hot spend of `sats` over input `input_txid`, and its coordinator-signed
+    /// request. `pin` selects the PIN class: `"1234"` normal, `"9999"` duress.
+    fn hot_request(fx: &Fixture, input_txid: u8, sats: u64, pin: &str) -> (Psbt, SignRequest) {
+        hot_request_expiring(fx, input_txid, sats, pin, EXPIRY)
+    }
+
+    /// [`hot_request`] with the commitment expiry chosen — the age-out test submits
+    /// a spend a whole window later, when the default expiry is long past.
+    fn hot_request_expiring(
+        fx: &Fixture,
+        input_txid: u8,
+        sats: u64,
+        pin: &str,
+        expiry: u64,
+    ) -> (Psbt, SignRequest) {
+        let spend = fx.spend_psbt_paying(&fx.hot_spk, input_txid, sats);
+        let nonce = format!("hot-{input_txid}-{sats}-{pin}-{expiry}");
+        let mut request = fx.spend_request(&spend, expiry, &nonce);
+        request.pin = pin.into();
+        fx.coord_sign(&mut request, &nonce);
+        (spend, request)
+    }
+
+    fn refusal_of(response: SignResponse) -> vault_proto::Refusal {
+        match response {
+            SignResponse::Refusal(r) => r,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    // -- the per-transaction cap (ADR-0014 §1) ------------------------------
+
+    /// The ship-gate property: a hot spend over `hot_max_per_tx` is refused
+    /// `HOT_BUDGET_EXCEEDED` at EVERY node and never signed. "Every node" is the
+    /// load-bearing half — a cap only some nodes enforce is no cap at all, since a
+    /// spend needs only `t` signers.
+    #[test]
+    fn a_hot_spend_over_the_per_tx_cap_is_refused_at_every_node_and_never_signed() {
+        let fx = fx_with_caps(50_000_000, 1_000_000_000);
+        let (spend, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        let cid = {
+            let probe = node_of(&fx, 0, "");
+            crate::commitment_id_for(&probe, &spend, EXPIRY)
+        };
+        for id in 0..5u16 {
+            let node = node_of(&fx, id, "");
+            let refusal = refusal_of(crate::handle_sign(&node, &request, NOW).expect("decodable"));
+            assert_eq!(
+                refusal.code,
+                RefusalCode::HotBudgetExceeded,
+                "node {id} must refuse an over-cap hot spend"
+            );
+            assert_eq!(refusal.check, "hot_budget");
+            // Never signed ⇒ never registered: the refusal returns long before
+            // `add_node_signatures`, so no partial for this spend exists anywhere.
+            let channel = node.channel.as_ref().expect("channel");
+            assert!(
+                !channel.has_candidate(&cid),
+                "node {id} registered a candidate for a refused over-cap spend"
+            );
+            assert!(
+                channel.release_partials(&cid, NOW + HOLD).is_none(),
+                "node {id} produced a releasable partial for a refused spend"
+            );
+        }
+    }
+
+    /// The per-tx cap alone would be unbounded in the NUMBER of spends, which is
+    /// why the window cap exists — but equally, the window cap alone would let a
+    /// single spend take the whole window. Exactly at the per-tx cap passes.
+    #[test]
+    fn a_hot_spend_exactly_at_the_per_tx_cap_is_accepted() {
+        let fx = fx_with_caps(50_000_000, 1_000_000_000);
+        let node = node_of(&fx, 0, "");
+        let (_, request) = hot_request(&fx, 7, 50_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+    }
+
+    // -- the velocity cap (ADR-0014 §2/§4) ----------------------------------
+
+    /// **The load-bearing aggregate test.** Three hot spends, each comfortably
+    /// under the per-tx cap, together over the window cap: the third is refused at
+    /// every node WHILE the first two are still PENDING — signed at ingress, held,
+    /// unbroadcast.
+    ///
+    /// This is the whole reason accounting is pending + settled rather than
+    /// settled-only. Under a settled-only ledger all three would be admitted into
+    /// one Hold and clear together, and the "bound" would be the per-tx cap times
+    /// however many spends a coercer cared to submit.
+    #[test]
+    fn hot_spends_summing_past_the_window_cap_are_refused_while_the_earlier_ones_are_still_pending()
+    {
+        // per-tx 40M, window 100M: 40 + 40 fits, the third 40 does not.
+        let fx = fx_with_caps(40_000_000, 100_000_000);
+        for id in 0..5u16 {
+            let node = node_of(&fx, id, "");
+            let channel = node.channel.as_ref().expect("channel");
+            let mut pending = Vec::new();
+            for (input_txid, label) in [(7u8, "first"), (8, "second")] {
+                let (spend, request) = hot_request(&fx, input_txid, 40_000_000, "1234");
+                assert!(
+                    matches!(
+                        crate::handle_sign(&node, &request, NOW).expect("decodable"),
+                        SignResponse::Accepted(_)
+                    ),
+                    "node {id}: the {label} under-cap spend must be accepted"
+                );
+                pending.push(crate::commitment_id_for(&node, &spend, EXPIRY));
+            }
+            // Both earlier spends are genuinely still PENDING: registered, inside
+            // their Hold, and nothing has broadcast. The refusal below is therefore
+            // aggregation over in-flight spends, not over settled history.
+            for cid in &pending {
+                assert!(
+                    channel.has_candidate(cid),
+                    "node {id}: {cid} must be resident"
+                );
+                assert!(
+                    channel.release_partials(cid, NOW).is_none(),
+                    "node {id}: {cid} must still be inside its Hold"
+                );
+            }
+            assert_eq!(
+                channel.hot_window_sum(NOW),
+                80_000_000,
+                "node {id}: two accepted spends of 40M each"
+            );
+
+            let (over, over_request) = hot_request(&fx, 9, 40_000_000, "1234");
+            let refusal =
+                refusal_of(crate::handle_sign(&node, &over_request, NOW).expect("decodable"));
+            assert_eq!(
+                refusal.code,
+                RefusalCode::HotVelocityExceeded,
+                "node {id} must refuse the spend that crosses the window cap"
+            );
+            assert_eq!(refusal.check, "hot_budget_velocity");
+            // Refused BEFORE signing: no candidate, no partial, and the window sum
+            // is unchanged — a refused spend must not consume budget either.
+            let over_cid = crate::commitment_id_for(&node, &over, EXPIRY);
+            assert!(!channel.has_candidate(&over_cid), "node {id}");
+            assert_eq!(channel.hot_window_sum(NOW), 80_000_000, "node {id}");
+        }
+    }
+
+    /// A spend that exactly fills the remaining window is admitted; one satoshi
+    /// more is not. Pins the boundary so a future `>=`/`>` slip is caught.
+    #[test]
+    fn the_window_cap_admits_exactly_up_to_the_remainder() {
+        let fx = fx_with_caps(60_000_000, 100_000_000);
+        let node = node_of(&fx, 0, "");
+        let (_, first) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &first, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        // 40M exactly fills the remaining budget.
+        let (_, exact) = hot_request(&fx, 8, 40_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &exact, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        // Anything further does not.
+        let (_, over) = hot_request(&fx, 9, 1, "1234");
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &over, NOW).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded
+        );
+    }
+
+    /// Idempotency (ADR-0014 §4): a coordinator legitimately retries a timed-out
+    /// `/sign`, and a resubmit must hit the EXISTING reservation. A ledger that
+    /// double-counted the retry would refuse the vault's own honest traffic while
+    /// doing nothing to an attacker, who would simply use fresh commitments.
+    #[test]
+    fn an_idempotent_resubmit_does_not_double_reserve() {
+        let fx = fx_with_caps(60_000_000, 100_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(channel.hot_window_sum(NOW), 60_000_000);
+
+        // The same spend, re-sent with a fresh coordinator nonce — a retry, not a
+        // new spend. Were it double-counted the window would read 120M and the
+        // 40M below would be refused.
+        let mut retry = fx.spend_request(&spend, EXPIRY, "retry-nonce");
+        fx.coord_sign(&mut retry, "retry-nonce");
+        assert!(matches!(
+            crate::handle_sign(&node, &retry, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(
+            channel.hot_window_sum(NOW),
+            60_000_000,
+            "a resubmit of the same commitment must not take a second reservation"
+        );
+        let (_, more) = hot_request(&fx, 8, 40_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &more, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+    }
+
+    /// The pre-sign idempotency check and candidate admission are separated by
+    /// validation, signing, and carrier staging. A concurrent wall-clock-driven
+    /// expiry sweep can therefore remove the old unexposed candidate and release its
+    /// reservation after the retry saw `Ok(false)` but before it registers. Admission
+    /// must revalidate under the store lock or that retry creates a live signed
+    /// candidate with no ledger entry.
+    #[test]
+    fn candidate_admission_revalidates_an_idempotent_reservation_after_expiry_pruning() {
+        const OUTFLOW: u64 = 60_000_000;
+
+        let fx = fx_with_caps(OUTFLOW, OUTFLOW);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (mut spend, request) = hot_request(&fx, 7, OUTFLOW, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+
+        // This is the retry's first reserve, before signing: it sees the accepted
+        // candidate's existing claim and correctly does not double-count it.
+        assert!(matches!(
+            channel.reserve_hot_budget(&spend_cid, OUTFLOW, NOW, EXPIRY),
+            Ok(false)
+        ));
+
+        // Interleave the periodic expiry sweep before candidate admission. Model a
+        // transient forward wall step followed by correction: the old candidate and
+        // its unexposed reservation are removed together, but the in-flight retry is
+        // still valid at the corrected time.
+        channel.prune_store(EXPIRY + 1);
+        assert!(!channel.has_candidate(&spend_cid));
+        assert_eq!(channel.hot_window_sum(NOW + 1), 0);
+
+        let mut escape = Psbt::from_str(&request.escape_psbt).expect("escape psbt");
+        crate::add_node_signatures(&node, &mut spend).expect("sign retry spend");
+        crate::add_node_signatures(&node, &mut escape).expect("sign retry escape");
+        let escape_cid = crate::commitment_id_for(&node, &escape, EXPIRY);
+        let corrected = NOW + 1;
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        crate::register_pair(
+            &node,
+            crate::RegisterPair {
+                spend: &spend,
+                spend_commitment_id: &spend_cid,
+                spend_hot: true,
+                duress: false,
+                confirmation_required: true,
+                escape: &escape,
+                escape_commitment_id: &escape_cid,
+                fire: FireWindow {
+                    fire_at: corrected + HOLD,
+                    deadline: EXPIRY.min(corrected + HOLD + node.combine_slack_secs),
+                },
+                expiry: EXPIRY,
+                now: corrected,
+                hot_reserve: Some(HotReserveSpec {
+                    commitment_id: &spend_cid,
+                    outflow_sat: OUTFLOW,
+                    wall_now: corrected,
+                    expiry: EXPIRY,
+                }),
+                carrier: &carrier,
+            },
+        )
+        .expect("the retry is admitted after clock correction");
+
+        assert!(channel.has_candidate(&spend_cid));
+        assert_eq!(
+            channel.hot_window_sum(corrected),
+            OUTFLOW,
+            "candidate insertion and reservation restoration must be atomic"
+        );
+        let (_, next) = hot_request(&fx, 8, 1, "1234");
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &next, corrected).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded,
+            "the restored claim must keep a second spend out"
+        );
+    }
+
+    /// An idempotent ledger hit belongs to the earlier accepted candidate, not to
+    /// the resubmission. If the same spend arrives paired with a different valid
+    /// escape, accepted-replay identity misses and candidate registration refuses
+    /// the conflict AFTER the ledger hit. Unwinding a reservation this call did not
+    /// create would leave the original signed, pending spend unmetered.
+    #[test]
+    fn a_conflicting_resubmit_cannot_release_the_live_candidates_reservation() {
+        let fx = fx_with_caps(60_000_000, 100_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        assert_eq!(channel.hot_window_sum(NOW), 60_000_000);
+
+        // Same spend commitment, different valid paired escape: this bypasses the
+        // pair-keyed accepted replay cache, hits the ledger's idempotent branch,
+        // then conflicts with the resident candidate's original pairing.
+        let replacement_escape = fx.spend_psbt(&fx.escape_spk, 8);
+        let mut conflicting = fx.spend_request(&spend, EXPIRY, "replacement-pair");
+        conflicting.escape_psbt = replacement_escape.to_string();
+        fx.coord_sign(&mut conflicting, "replacement-pair-signed");
+        channel.pin_hot_clock(NOW + 1);
+        let refusal =
+            refusal_of(crate::handle_sign(&node, &conflicting, NOW + 1).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::PsbtInconsistent);
+        assert_eq!(refusal.check, "candidate_identity");
+        assert!(
+            channel.has_candidate(&spend_cid),
+            "the original candidate remains live after the pair conflict"
+        );
+        assert_eq!(
+            channel.hot_window_sum(NOW + 1),
+            60_000_000,
+            "the failed request must not unwind the live candidate's reservation"
+        );
+
+        // The remaining 40M, and only that remainder, is still available.
+        let (_, remainder) = hot_request(&fx, 8, 40_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &remainder, NOW + 1).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(channel.hot_window_sum(NOW + 1), 100_000_000);
+    }
+
+    // -- release and age-out (ADR-0014 §4) ----------------------------------
+
+    /// A hot spend whose commitment expires before its partial leaves this node
+    /// frees its reservation, so a legitimate replacement of the same amount is
+    /// admitted. Without this, Approach B's whole usability argument fails: one
+    /// cancelled spend would cost the user a full window of budget.
+    #[test]
+    fn an_expired_unreleased_spend_releases_its_reservation_for_a_replacement() {
+        let fx = fx_with_caps(60_000_000, 100_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        assert_eq!(channel.hot_window_sum(NOW), 60_000_000);
+
+        // One second past the commitment expiry the sweep evicts it, unbroadcast.
+        // Still well inside the velocity window, so age-out is NOT what frees it.
+        let after = EXPIRY + 1;
+        assert!(
+            after < NOW + WINDOW,
+            "the reservation must still be in-window"
+        );
+        channel.pin_hot_clock(after);
+        channel.prune_store(after);
+        assert!(!channel.has_candidate(&cid));
+        assert_eq!(
+            channel.hot_window_sum(after),
+            0,
+            "an expired spend whose partial never left must hand its budget back"
+        );
+    }
+
+    /// Once this node releases its partial, peers can retain a finalizable Bitcoin
+    /// transaction beyond the request's local expiry: expiry is not part of the
+    /// signature digest. Pruning the candidate must therefore keep its reservation
+    /// until age-out even when this node never observed a broadcast.
+    #[test]
+    fn an_expired_spend_with_a_released_partial_holds_until_age_out() {
+        let fx = fx_with_caps(60_000_000, 100_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+
+        // A normal carrier's t-holder decision opens the release gate at Hold fire.
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        for peer in 1..=2u16 {
+            node.confirm_carrier(peer, &carrier, NOW);
+        }
+        assert!(
+            channel.release_partials(&cid, NOW + HOLD).is_some(),
+            "the node's partial must actually leave before the expiry sweep"
+        );
+
+        let after = EXPIRY + 1;
+        channel.pin_hot_clock(after);
+        channel.prune_store(after);
+        assert!(!channel.has_candidate(&cid));
+        assert_eq!(
+            channel.hot_window_sum(after),
+            60_000_000,
+            "a released transaction remains completable and must stay metered"
+        );
+
+        // Only 40M remains, so another under-per-tx 50M spend is still refused.
+        let (_, over_remainder) = hot_request_expiring(&fx, 8, 50_000_000, "1234", after + 7_200);
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &over_remainder, after).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded
+        );
+        channel.pin_hot_clock(NOW + WINDOW + 1);
+        assert_eq!(channel.hot_window_sum(NOW + WINDOW + 1), 0);
+    }
+
+    /// A BROADCAST spend keeps its reservation until age-out (ADR-0014 §4). It is
+    /// on the network and the money is gone, so releasing at broadcast would let a
+    /// coercer recycle the same budget indefinitely — broadcast, release, spend
+    /// again — which is exactly the aggregate bound this ledger exists to hold.
+    #[test]
+    fn a_broadcast_spend_holds_its_reservation_until_age_out() {
+        let fx = fx_with_caps(60_000_000, 100_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        // Settle it the way the fire path does.
+        crate::settle_candidate(&node, channel, &cid);
+        assert_eq!(
+            channel.hot_window_sum(NOW),
+            60_000_000,
+            "broadcast must not release the reservation"
+        );
+        // Even once the candidate itself is pruned at expiry, a BROADCAST spend
+        // keeps metering — the eviction is bookkeeping, not a reason to refund.
+        let after = EXPIRY + 1;
+        channel.pin_hot_clock(after);
+        channel.prune_store(after);
+        assert!(!channel.has_candidate(&cid));
+        assert_eq!(
+            channel.hot_window_sum(after),
+            60_000_000,
+            "a broadcast spend keeps its reservation while it is in-window"
+        );
+        // Only the window rolling past it frees the budget.
+        channel.pin_hot_clock(NOW + WINDOW + 1);
+        assert_eq!(channel.hot_window_sum(NOW + WINDOW + 1), 0);
+    }
+
+    /// The window rolls: reservations age out after `hot_window_secs` and the
+    /// budget recovers, whether or not the spend broadcast.
+    #[test]
+    fn reservations_age_out_and_the_budget_recovers() {
+        let fx = fx_with_caps(60_000_000, 100_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (_, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        // The boundary is INCLUSIVE — `reserved_at >= now − window` — so the
+        // reservation counts for the whole CLOSED interval
+        // `[reserved_at, reserved_at + window]` and ages out the second after. See
+        // `a_reservation_still_meters_at_the_exact_window_boundary` for why that
+        // last second is load-bearing rather than a rounding preference.
+        channel.pin_hot_clock(NOW + WINDOW);
+        assert_eq!(channel.hot_window_sum(NOW + WINDOW), 60_000_000);
+        channel.pin_hot_clock(NOW + WINDOW + 1);
+        assert_eq!(channel.hot_window_sum(NOW + WINDOW + 1), 0);
+        // And the recovered budget is genuinely usable: a full-cap spend lands.
+        let then = NOW + WINDOW + 1;
+        let (_, later) = hot_request_expiring(&fx, 8, 60_000_000, "1234", then + 7_200);
+        assert!(matches!(
+            crate::handle_sign(&node, &later, then).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn a_transient_forward_fire_clock_cannot_permanently_forget_an_exposed_reservation() {
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        crate::settle_candidate(&node, channel, &cid);
+
+        // The periodic fire sweep receives raw wall time. A transient jump beyond
+        // the window makes the reservation absent from that instant's rolling view,
+        // but must not destructively delete it: after clock correction, it is still
+        // inside the real window and must meter again.
+        channel.prune_store(NOW + WINDOW + 1);
+        channel.pin_hot_clock(NOW + WINDOW + 1);
+        assert_eq!(channel.hot_window_sum(NOW + WINDOW + 1), 0);
+        channel.pin_hot_clock(NOW + 1);
+        assert_eq!(
+            channel.hot_window_sum(NOW + 1),
+            60_000_000,
+            "clock correction must restore the exposed in-window reservation"
+        );
+
+        let (_, next) = hot_request(&fx, 8, 1, "1234");
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &next, NOW + 1).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded,
+            "the corrected clock must not admit outflow on budget erased by the jump"
+        );
+    }
+
+    /// The ingress half of the same hazard, and the one the fire-sweep guard above
+    /// does NOT cover: an authenticated `/sign` accepted DURING a forward wall-clock
+    /// excursion must not free the window's budget either.
+    ///
+    /// The excursion is reachable. `replay::NonceLog`'s high-water mark guards clock
+    /// ROLLBACK — `effective_now` is `high_water.max(now_input)`, so a forward
+    /// reading passes straight through — and a coordinator request timed against
+    /// that same excursion satisfies both freshness bounds
+    /// (`a_accepted_request_during_a_forward_clock_step_does_not_latch_raw_time` in
+    /// `replay`). Were the ledger aged by that wall time, its destructive prune
+    /// would permanently forget every reservation older than the bogus window,
+    /// including ones whose signatures have already left this node, and the vault
+    /// would admit a second full window of hot outflow while the first window's
+    /// spends were still broadcastable.
+    ///
+    /// So the ledger ages against [`HotClock`] instead: monotonic elapsed time,
+    /// which no clock adjustment can step. Here the hot clock stays pinned at `NOW`
+    /// — no real time has passed — while `handle_sign` is handed the jumped wall
+    /// reading, exactly as the excursion presents it.
+    #[test]
+    fn a_forward_wall_clock_step_at_ingress_cannot_free_the_window() {
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        // Exposed: this node's partial is on the network, so nothing can un-spend it.
+        crate::settle_candidate(&node, channel, &cid);
+
+        // The host clock steps past the whole window and a coordinator request timed
+        // against the same excursion arrives. Monotonic time has NOT moved.
+        let jumped = NOW + WINDOW + 1;
+        let (_, during) = hot_request_expiring(&fx, 8, 1, "1234", jumped + 7_200);
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &during, jumped).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded,
+            "a wall-clock jump must not age out a reservation that is still live"
+        );
+        assert_eq!(
+            channel.hot_window_sum(jumped),
+            60_000_000,
+            "the exposed reservation must survive the excursion intact"
+        );
+
+        // And once the clock is corrected the budget is still spent, rather than
+        // having been silently handed back. The expiry has to clear the nonce log's
+        // rollback high-water, which the excursion legitimately ratcheted forward —
+        // that guard is doing its own job here and is not what is under test.
+        let (_, next) = hot_request_expiring(&fx, 9, 1, "1234", NOW + WINDOW);
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &next, NOW + 1).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded
+        );
+        assert_eq!(channel.hot_window_sum(NOW + 1), 60_000_000);
+    }
+
+    /// **A BACKWARD wall step must not separate a reservation from the spend it
+    /// meters.** The two lifetimes ride different clocks: the reservation is a
+    /// monotonic duration ([`HotClock`]), while the candidate dies at the absolute
+    /// wall instant its coordinator signed — `prune` keeps it while `expiry >= now`,
+    /// `accept_partial` evicts on `expiry < now`, and `due_for_fire` opens while
+    /// `now <= deadline`, all against raw `unix_now()`.
+    ///
+    /// So a rollback (VM restore, RTC fault, a corrected NTP overshoot) stretches
+    /// the candidate's REAL lifetime while monotonic seconds keep ticking. On the
+    /// monotonic term alone the reservation ages out while its spend is still
+    /// resident, still exposed, and still broadcastable — and the vault admits a
+    /// second full window's outflow alongside a live first one, which is precisely
+    /// the doubling this ledger exists to prevent.
+    #[test]
+    fn a_backward_wall_step_cannot_age_out_a_still_live_reservation() {
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        // Exposed: this node's partial is on the network, so nothing can un-spend it.
+        crate::settle_candidate(&node, channel, &cid);
+
+        // A full monotonic window of real time passes, but the host clock was
+        // stepped back, so wall time is barely past the accept. The candidate is
+        // therefore still resident and still inside its own commitment lifetime.
+        let rolled_back = NOW + 100;
+        channel.pin_hot_clock(NOW + WINDOW + 1);
+        channel.prune_store(rolled_back);
+        assert!(
+            channel.has_candidate(&cid),
+            "the rolled-back wall clock keeps the candidate live, which is the hazard"
+        );
+        assert_eq!(
+            channel.hot_window_sum(rolled_back),
+            60_000_000,
+            "a reservation must outlive the candidate it meters on EITHER clock"
+        );
+
+        // And the budget is genuinely still spent: a second full-cap spend, which
+        // would put 2× the window in flight at once, is refused.
+        let (_, second) = hot_request_expiring(&fx, 8, 60_000_000, "1234", rolled_back + 7_200);
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &second, rolled_back).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded,
+            "admitting this would double the bound a clock rollback happens to cross"
+        );
+    }
+
+    /// The wall half of reservation liveness must use the SAME raw clock as
+    /// candidate pruning and firing, not the nonce log's rollback-guarded logical
+    /// time. Those clocks intentionally answer different questions: nonce freshness
+    /// must never revive pruned coordinator state, while an absolute candidate expiry
+    /// remains live whenever the host's raw wall clock is at or before it.
+    ///
+    /// A nonce high-water can therefore sit past an older spend's expiry after a
+    /// rollback. Its paired delayed escape keeps that spend resident until `T`, so
+    /// treating the high-water as wall time would age out the spend's reservation and
+    /// admit a second full window even though the first candidate can still complete.
+    #[test]
+    fn nonce_high_water_cannot_age_out_a_raw_wall_live_reservation() {
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, &format!("duress_delay_secs = {WINDOW}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, first) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &first, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let first_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+
+        // Ratchet logical nonce time just past the first spend's expiry without
+        // running the candidate sweep. `high_water` advances only through an expiry
+        // actually pruned by a later accepted nonce, so model both accepted requests.
+        {
+            let mut state = node.sign_state.lock().expect("sign_state");
+            assert_eq!(
+                state.coord_nonces.check_and_record(
+                    "hot-high-water-source",
+                    EXPIRY + 100,
+                    NOW,
+                    node.max_commitment_age_secs,
+                ),
+                crate::replay::NonceDecision::Accepted
+            );
+            assert_eq!(
+                state.coord_nonces.check_and_record(
+                    "hot-high-water-ratchet",
+                    EXPIRY + 7_200,
+                    EXPIRY + 100,
+                    node.max_commitment_age_secs,
+                ),
+                crate::replay::NonceDecision::Accepted
+            );
+        }
+
+        // A full monotonic window elapses, then raw wall time rolls back. The nonce
+        // high-water is past `EXPIRY`, but raw time is not; the inert delayed escape
+        // slot keeps the paired hot spend resident through T on either PIN history.
+        channel.pin_hot_clock(NOW + WINDOW + 1);
+        let raw_rolled_back = NOW + 100;
+        let (_, second) = hot_request_expiring(&fx, 8, 60_000_000, "1234", EXPIRY + 7_200);
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &second, raw_rolled_back).expect("decodable"))
+                .code,
+            RefusalCode::HotVelocityExceeded,
+            "nonce logical time must not retire budget for a raw-wall-live candidate"
+        );
+        assert!(
+            channel.has_candidate(&first_cid),
+            "the delayed-slot exemption demonstrates that the metered candidate is still live"
+        );
+        assert_eq!(
+            channel.hot_window_sum(raw_rolled_back),
+            60_000_000,
+            "the first full-window reservation must still meter on the raw wall term"
+        );
+    }
+
+    /// The same divergence from the other side, and the half the forward-step test
+    /// above does NOT cover: a forward excursion AT INGRESS buys the accepted
+    /// commitment an expiry an excursion's width beyond where the monotonic window
+    /// closes, so after the clock corrects the candidate outlives its reservation.
+    ///
+    /// `NonceLog`'s high-water guards ROLLBACK only (`effective_now` is a `max`), so
+    /// a request timed against the excursion is accepted, and the retention cap is
+    /// applied against the RAW reading — `expiry <= now_input + max_commitment_age_secs`
+    /// — which is the stepped one. Config forces `hot_window_secs >=
+    /// max_commitment_age_secs` precisely so a reservation dominates a commitment
+    /// lifetime, but that argument holds only while both are measured on one clock.
+    #[test]
+    fn a_forward_excursion_at_ingress_cannot_outlive_its_reservation() {
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+
+        // The excursion: wall time reads a full window ahead of real time, and the
+        // coordinator's request is timed against it. Monotonic time is still at the
+        // accept, because no real time has passed.
+        let jumped = NOW + WINDOW + 5_000;
+        let far_expiry = jumped + 7_200;
+        let (spend, request) = hot_request_expiring(&fx, 7, 60_000_000, "1234", far_expiry);
+        assert!(matches!(
+            crate::handle_sign(&node, &request, jumped).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &spend, far_expiry);
+        crate::settle_candidate(&node, channel, &cid);
+
+        // The clock is corrected and a real monotonic window elapses. The candidate
+        // is still resident — its expiry is an absolute instant the excursion put
+        // well into the future — so its reservation must still meter.
+        let corrected = NOW + WINDOW + 1;
+        channel.pin_hot_clock(corrected);
+        channel.prune_store(corrected);
+        assert!(
+            channel.has_candidate(&cid),
+            "the excursion bought this candidate a lifetime past the monotonic window"
+        );
+        assert_eq!(
+            channel.hot_window_sum(corrected),
+            60_000_000,
+            "the reservation must cover the commitment lifetime the excursion created"
+        );
+
+        let (_, second) = hot_request_expiring(&fx, 8, 60_000_000, "1234", corrected + 7_200);
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &second, corrected).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded,
+            "a stepped clock must not buy back a window of budget"
+        );
+    }
+
+    /// **The window must dominate the commitment lifetime at its LAST second, not
+    /// its second-to-last.** Config permits `hot_window_secs == max_commitment_age_secs`
+    /// (`Node::load`), and a node caps a commitment's expiry at
+    /// `now + max_commitment_age_secs`, so a spend accepted at `t` with a maximal
+    /// expiry is still resident and still broadcastable at exactly `t + window` —
+    /// candidates survive `prune` while `expiry >= now`, and a fire window is open
+    /// while `now <= deadline`. An EXCLUSIVE reservation floor would stop metering
+    /// it in that same second, admitting a second full-budget spend alongside a live
+    /// first one: 2× the bound, for one second, once per window.
+    ///
+    /// So the reservation must still count AT the boundary and drop only after it.
+    #[test]
+    fn a_reservation_still_meters_at_the_exact_window_boundary() {
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        // A maximal expiry: exactly `now + max_commitment_age_secs`, which the
+        // fixture sets equal to WINDOW. This is the case where the reservation
+        // boundary and the candidate's own expiry coincide.
+        let max_expiry = NOW + WINDOW;
+        let (spend, request) = hot_request_expiring(&fx, 7, 60_000_000, "1234", max_expiry);
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let cid = crate::commitment_id_for(&node, &spend, max_expiry);
+
+        // At the boundary second the first spend is demonstrably still live.
+        let boundary = NOW + WINDOW;
+        channel.pin_hot_clock(boundary);
+        channel.prune_store(boundary);
+        assert!(
+            channel.has_candidate(&cid),
+            "a candidate whose expiry is exactly `now` is still resident, so it is \
+             still completable and must still be metered"
+        );
+        assert_eq!(
+            channel.hot_window_sum(boundary),
+            60_000_000,
+            "the reservation must cover the whole closed interval its candidate lives in"
+        );
+
+        // Therefore a second full-budget spend is refused in that second.
+        let (_, overlapping) = hot_request_expiring(&fx, 8, 60_000_000, "1234", boundary + 7_200);
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &overlapping, boundary).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded,
+            "admitting this would put 2× the window cap in flight at once"
+        );
+
+        // One second later the first spend has aged out and the budget is back.
+        let after = boundary + 1;
+        channel.pin_hot_clock(after);
+        assert_eq!(channel.hot_window_sum(after), 0);
+        let (_, later) = hot_request_expiring(&fx, 9, 60_000_000, "1234", after + 7_200);
+        assert!(matches!(
+            crate::handle_sign(&node, &later, after).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+    }
+
+    /// The ledger is bounded in COUNT, not merely in sum. The per-window budget
+    /// bounds Σ outflow, which says nothing about entries: `hot_max_per_window`
+    /// sats can arrive as one spend or as that many one-sat spends. And the
+    /// candidate registry's own count+byte cap does not cover the ledger, because a
+    /// reservation deliberately outlives its candidate — so without
+    /// [`MAX_HOT_RESERVATIONS`] authenticated traffic buys a heap entry per satoshi
+    /// for a whole window.
+    ///
+    /// Refusing at the cap is the fail-safe direction: it can only refuse a hot
+    /// spend, never admit an over-budget one.
+    #[test]
+    fn the_reservation_ledger_is_bounded_in_count_not_only_in_sum() {
+        let mut ledger = HotBudgetLedger::new(HotBudget {
+            // A window cap far larger than the entry cap, so the SUM can never be
+            // what refuses here — only the count can.
+            max_per_tx_sat: 1,
+            max_per_window_sat: u64::MAX,
+            window_secs: WINDOW,
+        });
+        // Both clocks read `NOW` and every dust commitment expires there too, so
+        // this test turns on the count alone: neither the sum nor either half of
+        // the liveness rule can be what refuses.
+        for i in 0..MAX_HOT_RESERVATIONS {
+            assert!(
+                matches!(
+                    ledger.reserve(&format!("dust-{i}"), 1, NOW, NOW, NOW),
+                    Ok(true)
+                ),
+                "reservation {i} is within the cap"
+            );
+        }
+        assert!(
+            matches!(
+                ledger.reserve("one-too-many", 1, NOW, NOW, NOW),
+                Err(HotReserveRefusal::Capacity)
+            ),
+            "the ledger must refuse rather than grow without bound"
+        );
+        // An existing reservation is still idempotent at the cap — a coordinator
+        // retrying a spend this node already accepted must not be refused for
+        // capacity it is already occupying.
+        assert!(matches!(
+            ledger.reserve("dust-0", 1, NOW, NOW, NOW),
+            Ok(false)
+        ));
+        // And the cap is a live-entry cap, not a lifetime one: age-out reopens it.
+        // Both clocks have to pass the entries for that, which is the rule itself.
+        let rolled = NOW + WINDOW + 1;
+        ledger.prune(rolled, rolled);
+        assert!(matches!(
+            ledger.reserve("after-the-window", 1, rolled, rolled, rolled),
+            Ok(true)
+        ));
+    }
+
+    // -- composition with the rest of the machine (ADR-0014 §7) --------------
+
+    /// Escape and Refresh are not losses — an escape pays the user's own wallet, a
+    /// refresh never leaves the vault — so neither may consume the budget. A vault
+    /// whose escape sweep could be throttled by the hot budget would be one where
+    /// spending the hot wallet blocks the duress response.
+    #[test]
+    fn escape_and_refresh_never_consume_the_hot_budget() {
+        // A cap far below the amounts moved below, so any metering at all shows up.
+        let fx = fx_with_caps(1_000, 1_000);
+
+        // An escape-class spend: every destination pays the escape descriptor.
+        // Its own node, because a refresh is subordinate to any pending spend
+        // (ADR-0012) and would be refused for that unrelated reason.
+        let escape_node = node_of(&fx, 0, "");
+        let escape_spend = fx.spend_psbt(&fx.escape_spk, 7);
+        let mut escape_request = fx.spend_request(&escape_spend, EXPIRY, "escape-class");
+        // Its mandatory paired escape must be a DISJOINT residual candidate.
+        escape_request.escape_psbt = fx.spend_psbt(&fx.escape_spk, 8).to_string();
+        fx.coord_sign(&mut escape_request, "escape-class");
+        assert!(matches!(
+            crate::handle_sign(&escape_node, &escape_request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(
+            escape_node
+                .channel
+                .as_ref()
+                .expect("channel")
+                .hot_window_sum(NOW),
+            0,
+            "an escape sweep pays the user's own wallet and is not Hot-class outflow"
+        );
+
+        // A refresh: a pure self-spend, over the pin-less RefreshRequest path.
+        let refresh_node = node_of(&fx, 0, "");
+        let (_, refresh_request) = fx.refresh_request(EXPIRY, 1_000, "refresh-nonce");
+        assert!(matches!(
+            crate::handle_refresh(&refresh_node, &refresh_request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(
+            refresh_node
+                .channel
+                .as_ref()
+                .expect("channel")
+                .hot_window_sum(NOW),
+            0,
+            "a refresh never leaves the vault and is not Hot-class outflow"
+        );
+    }
+
+    /// Outflow is what LEAVES the vault to the hot wallet: vault change never
+    /// leaves, and the fee goes to miners rather than to a coercer (and the 10%
+    /// guard already bounds it). Metering either would make the cap mean something
+    /// other than "how much a coerced spend can move".
+    #[test]
+    fn vault_change_and_the_fee_do_not_consume_the_budget() {
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        // 100M in: 60M to hot, 10_000 fee, the rest back to the vault as change.
+        // Only the 60M may count — were change or the fee metered, the window sum
+        // would exceed the cap and this very spend could not have been accepted.
+        let (_, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(channel.hot_window_sum(NOW), 60_000_000);
+    }
+
+    /// **Constant-observable ingress is preserved** (ADR-0012 / ADR-0014 §
+    /// composition). The reserve verdict is amount-based and reads no pin, so an
+    /// over-budget spend is refused identically under BOTH PIN classes — and the
+    /// duress carrier still records its intent and still PROPAGATES on that
+    /// refusal path, so the freeze fires federation-wide exactly as it would have.
+    ///
+    /// If the budget could silence the duress signal it would be a serious
+    /// regression: a coercer would deliberately submit an over-cap spend to
+    /// suppress the freeze. Here the coerced spend is refused AND the vault still
+    /// arms — strictly better than before ADR-0014.
+    #[test]
+    fn an_over_budget_duress_carrier_still_arms_and_propagates_while_the_spend_is_refused() {
+        let fx = fx_with_caps(10_000_000, 10_000_000);
+        let node = node_of(&fx, 0, "duress_delay_secs = 600");
+        let channel = node.channel.as_ref().expect("channel");
+        let (spend, duress) = hot_request(&fx, 7, 60_000_000, "9999");
+
+        // Same spend under the NORMAL pin, for the pin-uniformity comparison.
+        let normal_node = node_of(&fx, 0, "duress_delay_secs = 600");
+        let (_, normal) = hot_request(&fx, 7, 60_000_000, "1234");
+        let normal_refusal =
+            refusal_of(crate::handle_sign(&normal_node, &normal, NOW).expect("decodable"));
+
+        let duress_refusal =
+            refusal_of(crate::handle_sign(&node, &duress, NOW).expect("decodable"));
+        assert_eq!(
+            duress_refusal.code, normal_refusal.code,
+            "the budget refusal must not depend on which PIN was submitted"
+        );
+        assert_eq!(duress_refusal.code, RefusalCode::HotBudgetExceeded);
+        assert_eq!(duress_refusal.check, normal_refusal.check);
+        assert_eq!(
+            duress_refusal.detail, normal_refusal.detail,
+            "identical spend, identical refusal — no pin signal in the observable"
+        );
+
+        // The spend never registered under either pin.
+        let cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        assert!(!channel.has_candidate(&cid));
+
+        // But the SAFETY track ran: the carrier was staged for propagation, and the
+        // peer confirmations that follow commit the arm.
+        assert!(
+            !node.outbox.lock().expect("outbox").is_empty(),
+            "the duress carrier must still be staged for peer fan-out on the refusal path"
+        );
+        let carrier = crate::arm_carrier_id(&node, duress.coord_request());
+        let mut armed = false;
+        for peer in 1..=2u16 {
+            armed |= node.confirm_carrier(peer, &carrier, NOW);
+        }
+        assert!(
+            armed,
+            "t-of-n confirmation of a refused-but-propagated duress carrier must still arm"
+        );
+        assert!(
+            channel.armed_snapshot().is_some(),
+            "the duress freeze must fire even though the coerced spend was refused"
+        );
+    }
+
+    /// The same property on the OTHER refusal path. The test above seals caps that
+    /// make the per-tx check fire first, so it only ever exercises `verify_spend`'s
+    /// staging branch. The velocity refusal is a physically separate call site,
+    /// several steps later in `handle_sign_after_lock` and after classification —
+    /// and it is the one a coercer actually reaches once the vault has been spending
+    /// normally. If only one of the two staged the carrier, a coercer could pick the
+    /// bound that silences the freeze.
+    #[test]
+    fn an_over_velocity_duress_carrier_still_arms_and_propagates() {
+        // Per-tx == per-window, so a 60M spend passes the PURE per-tx check and can
+        // only be refused by the velocity ledger.
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "duress_delay_secs = 600");
+        let channel = node.channel.as_ref().expect("channel");
+
+        // Exhaust the window with an ordinary, accepted normal-pin spend.
+        let (_, first) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &first, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        // Now the coerced one, under the per-tx cap but over the window.
+        let (spend, duress) = hot_request(&fx, 8, 60_000_000, "9999");
+        let duress_refusal =
+            refusal_of(crate::handle_sign(&node, &duress, NOW).expect("decodable"));
+        assert_eq!(duress_refusal.code, RefusalCode::HotVelocityExceeded);
+
+        // Pin-uniform: the identical spend on an identically-loaded node under the
+        // NORMAL pin produces a byte-identical refusal, so the velocity path leaks
+        // no pin signal either.
+        let normal_node = node_of(&fx, 0, "duress_delay_secs = 600");
+        let (_, warm) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&normal_node, &warm, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let (_, normal) = hot_request(&fx, 8, 60_000_000, "1234");
+        let normal_refusal =
+            refusal_of(crate::handle_sign(&normal_node, &normal, NOW).expect("decodable"));
+        assert_eq!(duress_refusal.code, normal_refusal.code);
+        assert_eq!(duress_refusal.check, normal_refusal.check);
+        assert_eq!(
+            duress_refusal.detail, normal_refusal.detail,
+            "identical spend and identical ledger state — no pin signal in the observable"
+        );
+
+        // The coerced spend never registered...
+        let cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        assert!(!channel.has_candidate(&cid));
+        // ...but the safety track still ran and the freeze still fires.
+        let carrier = crate::arm_carrier_id(&node, duress.coord_request());
+        let mut armed = false;
+        for peer in 1..=2u16 {
+            armed |= node.confirm_carrier(peer, &carrier, NOW);
+        }
+        assert!(
+            armed,
+            "a velocity-refused duress carrier must still reach t-of-n confirmation"
+        );
+        assert!(
+            channel.armed_snapshot().is_some(),
+            "the duress freeze must fire even though the coerced spend was velocity-refused"
+        );
+    }
+
+    #[test]
+    fn an_invalid_paired_escape_cannot_shadow_an_over_velocity_duress_carrier() {
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "duress_delay_secs = 600");
+        let channel = node.channel.as_ref().expect("channel");
+
+        let (_, first) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &first, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        // The primary spend is over this node's remaining velocity budget, while
+        // the mandatory escape is also policy-invalid because it pays the hot
+        // wallet. Velocity must surface first and stage the carrier; otherwise a
+        // coordinator could use the invalid escape to suppress the budget-specific
+        // duress propagation guarantee.
+        let (_, mut duress) = hot_request(&fx, 8, 60_000_000, "9999");
+        duress.escape_psbt = fx.spend_psbt(&fx.hot_spk, 9).to_string();
+        fx.coord_sign(&mut duress, "velocity-with-invalid-escape");
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &duress, NOW).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded
+        );
+        assert!(!node.outbox.lock().expect("outbox").is_empty());
+
+        let carrier = crate::arm_carrier_id(&node, duress.coord_request());
+        let mut armed = false;
+        for peer in 1..=2u16 {
+            armed |= node.confirm_carrier(peer, &carrier, NOW);
+        }
+        assert!(armed);
+        assert!(channel.armed_snapshot().is_some());
+    }
+
+    /// **`HOT_BUDGET_EXCEEDED` must never be cached in the replay log.** It is a
+    /// pure function of the commitment, so the ordinary rule at
+    /// `is_recordable_verdict` would happily record it — and recording it would be a
+    /// silent duress-suppression bug, because a commitment-keyed replay hit returns
+    /// BEFORE the branch that stages the carrier.
+    ///
+    /// The attack that closes: a coercer submits the over-cap spend once under the
+    /// normal pin to poison the cache, then submits the same commitment under the
+    /// duress pin. With the verdict cached, the second submission is answered from
+    /// the log, never staged, never counted toward t-of-n — and the vault never
+    /// freezes. So the SECOND submission must stage exactly like the first.
+    #[test]
+    fn resubmitting_an_over_cap_commitment_still_stages_the_duress_carrier() {
+        let fx = fx_with_caps(10_000_000, 10_000_000);
+        let node = node_of(&fx, 0, "duress_delay_secs = 600");
+        let channel = node.channel.as_ref().expect("channel");
+
+        // 1. Poison attempt: the over-cap spend under the NORMAL pin.
+        let (spend, normal) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &normal, NOW).expect("decodable")).code,
+            RefusalCode::HotBudgetExceeded
+        );
+        node.outbox.lock().expect("outbox").clear();
+
+        // 2. The SAME commitment (the id binds the unsigned transaction, not the
+        //    pin or the nonce) resubmitted under the DURESS pin.
+        let (duress_spend, duress) = hot_request(&fx, 7, 60_000_000, "9999");
+        assert_eq!(
+            crate::commitment_id_for(&node, &duress_spend, EXPIRY),
+            crate::commitment_id_for(&node, &spend, EXPIRY),
+            "the fixture must actually resubmit the same commitment for this to test anything"
+        );
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &duress, NOW).expect("decodable")).code,
+            RefusalCode::HotBudgetExceeded,
+            "the verdict is re-derived, not replayed"
+        );
+
+        // 3. The safety track ran on the RESUBMISSION, not just the first attempt.
+        assert!(
+            !node.outbox.lock().expect("outbox").is_empty(),
+            "a cached per-tx verdict would have returned before staging and silenced the freeze"
+        );
+        let carrier = crate::arm_carrier_id(&node, duress.coord_request());
+        let mut armed = false;
+        for peer in 1..=2u16 {
+            armed |= node.confirm_carrier(peer, &carrier, NOW);
+        }
+        assert!(armed);
+        assert!(
+            channel.armed_snapshot().is_some(),
+            "the freeze must fire on a resubmitted over-cap duress carrier"
+        );
+    }
+
+    /// A hot spend SUPERSEDED by the armed escape frees its reservation. The escape
+    /// sweeps the vault, so the frozen hot spend it displaced will never move a
+    /// satoshi — metering it would charge the user for a spend that did not happen.
+    #[test]
+    fn an_escape_sweep_releases_the_hot_spend_it_supersedes() {
+        let fx = fx_with_caps(60_000_000, 100_000_000);
+        let node = node_of(&fx, 0, "duress_delay_secs = 600");
+        let channel = node.channel.as_ref().expect("channel");
+
+        // A duress hot spend, under both caps, so it is ACCEPTED and reserves.
+        let spend = fx.spend_psbt_paying(&fx.hot_spk, 7, 60_000_000);
+        let escape = fx.spend_psbt(&fx.escape_spk, 7);
+        let mut request = fx.spend_request(&spend, EXPIRY, "supersede");
+        request.escape_psbt = escape.to_string();
+        request.pin = "9999".into();
+        fx.coord_sign(&mut request, "supersede");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(channel.hot_window_sum(NOW), 60_000_000);
+
+        // t-of-n confirmation commits the arm: the hot spend is frozen and the
+        // escape is scheduled to sweep at T.
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        let mut armed = false;
+        for peer in 1..=2u16 {
+            armed |= node.confirm_carrier(peer, &carrier, NOW);
+        }
+        assert!(armed, "the duress carrier must arm at t-of-n");
+        let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        let escape_cid = crate::commitment_id_for(&node, &escape, EXPIRY);
+        assert!(
+            channel.release_partials(&spend_cid, NOW + HOLD).is_none(),
+            "the armed freeze must hold the hot spend down"
+        );
+        // Frozen but still resident, so it still meters — a freeze is not yet a
+        // terminal state. A later Hot spend is likewise accepted and frozen while
+        // armed; neither candidate becomes due or releases its partial.
+        assert_eq!(channel.hot_window_sum(NOW), 60_000_000);
+
+        // The escape sweeps. `mark_broadcast` removes the armed escape AND the hot
+        // spend it superseded, which is where the reservation goes back.
+        crate::settle_candidate(&node, channel, &escape_cid);
+        assert!(!channel.has_candidate(&spend_cid));
+        assert_eq!(
+            channel.hot_window_sum(NOW),
+            0,
+            "a hot spend superseded by the escape sweep must release its budget"
+        );
+    }
+
+    /// A refusal that lands AFTER the reservation was taken must hand it back. The
+    /// reserve runs before signing (so an over-cap coerced spend produces no
+    /// partial), which puts it ahead of candidate admission — and admission can
+    /// still refuse. The candidate that would own the reservation never exists, so
+    /// the store's release-on-removal rule cannot see it; without an explicit unwind
+    /// the budget would be charged for a whole window to a spend this node never
+    /// accepted, blocking the honest retry. (Leaking is the SAFE direction — it can
+    /// only refuse a later spend — but it is still wrong.) Each unwind is a separate
+    /// call a future edit could drop, so this test walks the whole stretch rather
+    /// than sampling it.
+    ///
+    /// The full enumeration of that stretch, so a reader can check the coverage
+    /// rather than trusting the name. Six `unwind_hot_reservation()` sites:
+    ///
+    /// * `verify_escape`, `EXPIRY_TOO_SHORT`, and `register_pair`
+    ///   `CANDIDATE_CAPACITY` — every reachable site, each exercised below.
+    /// * `escape_class_residual` — VACUOUS, not uncovered: it is guarded by
+    ///   `class == Escape`, and only `class == Hot` ever reserves, so
+    ///   `hot_reservation` is provably `None` on that branch. The call is there for
+    ///   uniformity along the stretch, not because it can free anything.
+    /// * The two `add_node_signatures` failures — unreachable from the public path,
+    ///   and deliberately not faked. Both PSBTs have already cleared full policy
+    ///   evaluation, input ownership, and descriptor satisfaction by then (a missing
+    ///   `witness_utxo`, the one failure the signer actually returns, is refused
+    ///   `PSBT_INCONSISTENT` back in `policy_core::check_psbt_consistency`), so
+    ///   driving a signing failure would mean constructing a state the validated
+    ///   path cannot produce; the test would then pin the mock rather than the
+    ///   unwind. They are the sites the enumeration above exists to keep visible.
+    #[test]
+    fn every_refusal_between_the_reserve_and_admission_hands_the_budget_back() {
+        // An INVALID PAIRED ESCAPE, refused at `verify_escape`. The escape must pay
+        // the escape wallet; this one pays the hot wallet.
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (_, mut bad_escape) = hot_request(&fx, 7, 60_000_000, "1234");
+        // UNDER the per-tx cap deliberately: at 60M the escape's own `evaluate` would
+        // refuse it `HOT_BUDGET_EXCEEDED` before `classify` ever ran, and the unwind
+        // this test is about would be exercised on the wrong branch. 10M reaches the
+        // class check, which is the refusal the comment above names.
+        bad_escape.escape_psbt = fx.spend_psbt_paying(&fx.hot_spk, 9, 10_000_000).to_string();
+        fx.coord_sign(&mut bad_escape, "hot-with-invalid-escape");
+        let refused = refusal_of(crate::handle_sign(&node, &bad_escape, NOW).expect("decodable"));
+        assert_eq!(refused.code, RefusalCode::PsbtInconsistent);
+        assert_eq!(
+            refused.check, "escape:transaction_class",
+            "the escape pays the hot wallet, so it is the CLASS check that must refuse it"
+        );
+        assert_eq!(
+            channel.hot_window_sum(NOW),
+            0,
+            "an escape-derived refusal must not charge the spend's budget"
+        );
+        // And the budget is genuinely usable again: the same spend with a VALID
+        // escape lands, which it could not if the failed attempt still held 60M.
+        let (_, corrected) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &corrected, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        // EXPIRY_TOO_SHORT, refused between the escape checks and signing: the
+        // commitment cannot outlive its own Hold plus the combine window.
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+        let (_, too_short) = hot_request_expiring(&fx, 7, 60_000_000, "1234", NOW + HOLD - 1);
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &too_short, NOW).expect("decodable")).code,
+            RefusalCode::ExpiryTooShort
+        );
+        assert_eq!(
+            channel.hot_window_sum(NOW),
+            0,
+            "a clock-derived refusal must not charge the spend's budget"
+        );
+        let (_, long_enough) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &long_enough, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        // CANDIDATE_CAPACITY, the last reachable site: refused inside `register_pair`,
+        // the furthest the stretch goes. One candidate slot, but a SpendRequest
+        // registers a PAIR (spend + escape), so admission cannot fit it — after the
+        // reserve. This is the site where a leak would block the honest retry exactly
+        // when capacity frees up again.
+        let fx = fx_with_caps(60_000_000, 60_000_000);
+        let node = crate::Node::from_toml_str(&fx.config(0, HOLD, "max_active_candidates = 1\n"))
+            .expect("valid capacity config");
+        let channel = node.channel.as_ref().expect("channel");
+        let (_, request) = hot_request(&fx, 7, 60_000_000, "1234");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Refusal(r) if r.code == RefusalCode::CandidateCapacity
+        ));
+        assert_eq!(
+            channel.hot_window_sum(NOW),
+            0,
+            "a capacity-refused spend must not go on consuming the window's budget"
+        );
+    }
+
+    // -- federation uniformity (ADR-0014 §6) --------------------------------
+
+    /// A node whose configured caps differ from the sealed manifest computes a
+    /// different `manifest_hash` and fails startup. Uniformity is the whole basis of
+    /// ADR-0014's honest-ledger routing bound: with one lax node a coordinator would
+    /// route coerced hot spends at that node's rate, so "federation-uniform" has to
+    /// be enforced, not assumed.
+    #[test]
+    fn a_node_whose_hot_budget_or_classification_disagrees_with_the_manifest_fails_startup() {
+        let fx = fx_with_caps(50_000_000, 100_000_000);
+        let sealed = format!(
+            "expected_manifest_hash = \"{}\"\n",
+            to_hex(&fx.manifest_hash)
+        );
+        // The agreed caps boot.
+        crate::Node::from_toml_str(&fx.config(0, HOLD, &sealed))
+            .expect("the agreed Hot budget boots");
+        // Each cap independently. The fixture emits its own sealed values, so
+        // overriding one in the raw TOML is exactly what a mis-provisioned — or a
+        // deliberately laxer — operator would do.
+        for (from, to, field) in [
+            (
+                "hot_max_per_tx = 50000000",
+                "hot_max_per_tx = 90000000",
+                "per-tx",
+            ),
+            (
+                "hot_max_per_window = 100000000",
+                "hot_max_per_window = 900000000",
+                "per-window",
+            ),
+            (
+                "hot_window_secs = 172800",
+                "hot_window_secs = 200000",
+                "window",
+            ),
+        ] {
+            let divergent = fx.config(0, HOLD, &sealed).replacen(from, to, 1);
+            assert_ne!(
+                divergent,
+                fx.config(0, HOLD, &sealed),
+                "the {field} override must actually have applied"
+            );
+            let err = match crate::Node::from_toml_str(&divergent) {
+                Err(e) => e,
+                Ok(_) => panic!("a {field} cap the federation did not agree must not boot"),
+            };
+            assert!(
+                err.to_string().contains("manifest_hash"),
+                "unexpected {field} error: {err}"
+            );
+        }
+
+        // The descriptors that decide whether an output consumes the budget are
+        // just as load-bearing as the numbers. First make the sealed hot wallet be
+        // treated as escape, then swap the escape role onto the hot wallet; both
+        // configs still parse and satisfy escape-in-allowlist, but neither may boot
+        // under the original manifest.
+        let base = fx.config(0, HOLD, &sealed);
+        let different_hot = base.replacen(&fx.hot_desc, &fx.escape_desc, 1);
+        let different_escape = base.replacen(
+            &format!("escape_descriptor = \"{}\"", fx.escape_desc),
+            &format!("escape_descriptor = \"{}\"", fx.hot_desc),
+            1,
+        );
+        let different_derivation_bound =
+            base.replacen("max_derivation_index = 5", "max_derivation_index = 6", 1);
+        for (field, divergent) in [
+            ("hot allowlist", different_hot),
+            ("escape descriptor", different_escape),
+            ("derivation bound", different_derivation_bound),
+        ] {
+            let err = match crate::Node::from_toml_str(&divergent) {
+                Err(e) => e,
+                Ok(_) => panic!("a {field} the federation did not agree must not boot"),
+            };
+            assert!(
+                err.to_string().contains("manifest_hash"),
+                "unexpected {field} error: {err}"
+            );
+        }
+    }
+
+    /// `hot_window_secs >= max_commitment_age_secs` is a fatal config error
+    /// (ADR-0014 §3, sibling to `hold_secs < max_commitment_age_secs`). A shorter
+    /// window lets a reservation age out while its spend can still broadcast, so the
+    /// aggregate bound would silently not bind.
+    #[test]
+    fn a_window_shorter_than_the_commitment_lifetime_is_a_fatal_config() {
+        let fx = fx_with_caps(50_000_000, 100_000_000);
+        // Equality is the floor and must boot: the fixture already seals
+        // `hot_window_secs == max_commitment_age_secs == 172800`.
+        crate::Node::from_toml_str(&fx.config(0, HOLD, "")).expect("equality is admissible");
+        // One second short is fatal — and it is the CONFIG check that fires, before
+        // any manifest comparison, so it fails even with no sealed hash.
+        let short = fx.config(0, HOLD, "").replacen(
+            "hot_window_secs = 172800",
+            "hot_window_secs = 172799",
+            1,
+        );
+        let err = match crate::Node::from_toml_str(&short) {
+            Err(e) => e,
+            Ok(_) => panic!("a window shorter than the commitment lifetime must not boot"),
+        };
+        assert!(
+            err.to_string().contains("hot_window_secs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The two remaining Hot-budget shapes that would boot a vault whose caps do
+    /// not mean what they say. Both are the same class as `combine_slack_secs = 0`
+    /// and `escape_coverage_pct = 0`: a config that looks provisioned and silently
+    /// is not, caught at load rather than at "the money never moved".
+    #[test]
+    fn incoherent_hot_caps_are_fatal_config() {
+        let fx = fx_with_caps(50_000_000, 100_000_000);
+        let boot_err = |from: &str, to: &str| -> String {
+            let cfg = fx.config(0, HOLD, "").replacen(from, to, 1);
+            match crate::Node::from_toml_str(&cfg) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("`{to}` must not boot"),
+            }
+        };
+
+        // Either cap at zero refuses every hot spend of even one satoshi, reducing
+        // the vault to escape-and-refresh-only without saying so.
+        for (from, to, field) in [
+            ("hot_max_per_tx = 50000000", "hot_max_per_tx = 0", "per_tx"),
+            (
+                "hot_max_per_window = 100000000",
+                "hot_max_per_window = 0",
+                "per_window",
+            ),
+        ] {
+            let err = boot_err(from, to);
+            assert!(
+                err.contains("must both be greater than 0"),
+                "unexpected {field} error: {err}"
+            );
+        }
+
+        // A per-tx cap above the window cap can never be reached: the ledger
+        // reserves the whole outflow, so the effective per-tx bound would silently
+        // be the window cap and ADR-0014's operator sizing would misread.
+        let err = boot_err("hot_max_per_tx = 50000000", "hot_max_per_tx = 100000001");
+        assert!(
+            err.contains("must not exceed hot_max_per_window"),
+            "unexpected error: {err}"
+        );
+        // Equality is the intended "one maximal spend may take the whole window",
+        // and must boot. Its own fixture, because the caps are sealed into the
+        // manifest — editing one in the TOML alone would fail the endorsement check
+        // rather than the bound under test.
+        let equal = fx_with_caps(100_000_000, 100_000_000);
+        crate::Node::from_toml_str(&equal.config(0, HOLD, ""))
+            .expect("a per-tx cap equal to the window cap is admissible");
+    }
+
+    // -- the bound (ADR-0014 consequences) ----------------------------------
+
+    /// **The bound this whole mechanism buys.** Under a fully-censored duress
+    /// freeze — the coordinator delivers the carrier to no honest node, so nothing
+    /// arms and every pending hot spend at those nodes can still complete — the
+    /// hot outflow newly admitted into the completable set in one window is capped.
+    ///
+    /// With `c < t` compromised signer nodes able to sign without reserving, a newly
+    /// admitted completing spend needs reservations from only `t−c` honest nodes.
+    /// Across the `n−c` honest ledgers, newly completable outflow admitted in the
+    /// window is therefore at most `((n−c)/(t−c))·V`. Production channel mode
+    /// requires `n = 2t−1`, so the pure-censorship case `c = 0` is
+    /// `(2 − 1/t)·V < 2V`, while the full `c = t−1` soft-vault tolerance reaches
+    /// `tV` (ADR-0014 consequences). This test pins the honest per-node fact that the
+    /// argument rests on: no enforcing node signs more than `V` of hot outflow in a
+    /// window, no matter how the coordinator orders or splits the requests.
+    #[test]
+    fn a_censored_duress_freeze_bounds_newly_completable_outflow_admitted_per_window() {
+        const V: u64 = 100_000_000;
+        let fx = fx_with_caps(50_000_000, V);
+        // Every node in the federation, none of which ever sees the duress carrier.
+        for id in 0..5u16 {
+            let node = node_of(&fx, id, "");
+            let channel = node.channel.as_ref().expect("channel");
+            // The coordinator submits far more hot outflow than the budget allows,
+            // in under-per-tx slices so the per-tx cap alone would admit them all.
+            let mut signed = 0u64;
+            for input_txid in 0..8u8 {
+                let (_, request) = hot_request(&fx, input_txid, 50_000_000, "1234");
+                if matches!(
+                    crate::handle_sign(&node, &request, NOW).expect("decodable"),
+                    SignResponse::Accepted(_)
+                ) {
+                    signed += 50_000_000;
+                }
+            }
+            assert!(
+                channel.armed_snapshot().is_none(),
+                "node {id} models the CENSORED case: it never armed"
+            );
+            assert_eq!(
+                signed, V,
+                "node {id} signed more than one window's budget; the per-node half of \
+                 the honest-ledger premise of the routing bound does not hold"
+            );
+            assert_eq!(channel.hot_window_sum(NOW), V, "node {id}");
+        }
+        // The per-node loop above is the whole test: it pins the honest-ledger
+        // premise (`signed == V` at EVERY node) that ADR-0014's routing bound is
+        // stated over. The federation-level arithmetic is derivation, not behaviour
+        // this crate can execute, so it is recorded here rather than asserted —
+        // `(n−c)/(t−c)·V` over local `n`/`t` constants would pass no matter what
+        // the ledger did. For n = 2t − 1 = 5, t = 3: with no compromised signer a
+        // spend must consume three honest reservations, giving (5/3)·V < 2V; with
+        // the full c = t − 1 = 2 compromised signers bypassing their own ledgers a
+        // spend needs only one of the three honest nodes, and the bound reaches tV
+        // = 3V — the soft-vault tolerance, not the < 2V censorship residual.
     }
 }

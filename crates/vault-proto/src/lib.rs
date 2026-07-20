@@ -658,6 +658,34 @@ pub enum RefusalCode {
     /// the pending spend settles. The rule is deliberately COARSE — any pending
     /// spend blocks every refresh.
     RefreshSubordinated,
+    /// A hot-class spend moving more than `hot_max_per_tx` to the hot wallet: the
+    /// per-transaction half of the **Hot budget** (ADR-0014). Sibling to
+    /// [`RefusalCode::DestNotAllowed`] — the allowlist bounds WHERE a hot spend
+    /// pays, this bounds HOW MUCH. Pure and pin-independent, so it is decided in
+    /// `policy-core` alongside the allowlist and fee checks.
+    ///
+    /// The cap is a property of the TRANSACTION, not of the role it was submitted
+    /// in, so the same code also answers a request whose paired ESCAPE carries
+    /// over-cap non-escape outflow — a `check` of `escape:hot_budget` rather than
+    /// `hot_budget` is what tells the two apart. Only the spend-role refusal stages
+    /// the duress carrier; an escape-derived one is neither staged nor recorded, as
+    /// with every other escape-derived refusal.
+    HotBudgetExceeded,
+    /// A hot-class spend that fits the per-transaction cap but would push this
+    /// node's rolling-window hot outflow past `hot_max_per_window` (ADR-0014, the
+    /// velocity half). Needs node state, so it is decided in vault-node at
+    /// ingress, BEFORE signing — an over-cap coerced spend therefore produces no
+    /// partial. Retriable once earlier reservations age out or are released.
+    ///
+    /// Also answers ledger-capacity pressure — the reservation map is bounded in
+    /// COUNT as well as in sum, since `hot_max_per_window` sats can arrive as that
+    /// many one-sat spends. Deliberately NOT a separate code: unlike
+    /// [`RefusalCode::CoordNonceCapacity`], where the coordinator's remedy differs
+    /// (back off and retry vs. this nonce is spent), both arms here mean the same
+    /// thing to a coordinator — this node will not meter more hot outflow until
+    /// reservations age out — and both are retriable on the same condition. The
+    /// refusal `detail` names which bound bit, for an operator reading the log.
+    HotVelocityExceeded,
 }
 
 #[cfg(test)]

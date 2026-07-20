@@ -14,13 +14,16 @@
 //! allowlist"; CONTEXT.md, "Allowlist").
 //!
 //! The checks this crate ships: PSBT consistency, input ownership, destination
-//! allowlist + verified change, and the fee cap (ADR-0006). Sighash
+//! allowlist + verified change, the fee cap (ADR-0006), and the per-transaction
+//! **Hot budget** (ADR-0014) — the allowlist bounds WHERE a hot spend pays, the
+//! Hot budget bounds HOW MUCH. Its rolling-window sibling needs node state, so it
+//! lives in vault-node; only the pure, per-transaction half is here. Sighash
 //! enforcement and the Hold live in vault-node; the chain backend (real prevout
 //! ground truth) is V0-6 — v0 still trusts each input's `witness_utxo` for the
 //! prevout script.
 
 use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{Psbt, Script};
+use bitcoin::{Amount, Psbt, Script};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
 pub mod template;
@@ -55,6 +58,12 @@ pub struct CheckParams {
     /// Bound on the derivation-index scan: an address beyond this index is not
     /// recognized (DESIGN.md config schema, `max_derivation_index`).
     pub max_derivation_index: u32,
+    /// The per-transaction half of the **Hot budget** (ADR-0014): a hot-class
+    /// spend whose [`hot_outflow`] exceeds this is refused `HOT_BUDGET_EXCEEDED`.
+    /// Federation-uniform (pinned in the Manifest preimage by vault-node), so
+    /// every node computes the same verdict on the same spend. The rolling-window
+    /// half needs node state and lives in vault-node.
+    pub hot_max_per_tx: Amount,
 }
 
 /// The transaction class a node DERIVES from a spend's outputs — never trusts
@@ -83,6 +92,23 @@ pub enum TxClass {
     Hot,
 }
 
+/// What [`classify`] decided, plus the [`hot_outflow`] its own output scan already
+/// measured on the way there.
+///
+/// The outflow rides along because the class decision and the Hot-budget meter are
+/// the SAME scan over the SAME outputs: `classify` sorts each output into vault /
+/// escape / hot, and the hot bucket's value is exactly what
+/// [`hot_outflow`] sums. Returning it means a caller that needs both — the velocity
+/// ledger at ingress does — pays for one pass instead of two, and cannot meter a
+/// different quantity than the one it classified on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Classification {
+    pub class: TxClass,
+    /// Zero for [`TxClass::Refresh`] and [`TxClass::Escape`], which have no hot
+    /// destinations at all — "hot-class only" falls out of the definition.
+    pub hot_outflow: Amount,
+}
+
 /// Machine-readable result code for a failed policy check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViolationCode {
@@ -91,6 +117,9 @@ pub enum ViolationCode {
     ChangeNotDerivable,
     FeeExceedsCap,
     PsbtInconsistent,
+    /// A hot-class spend moving more than `hot_max_per_tx` to the hot wallet
+    /// (ADR-0014, the per-transaction half of the Hot budget).
+    HotBudgetExceeded,
 }
 
 /// A failed policy check. vault-node maps this onto its wire `Refusal`.
@@ -163,6 +192,7 @@ pub fn evaluate(psbt: &Psbt, params: &CheckParams) -> Result<(), Violation> {
     check_psbt_consistency(psbt)?;
     check_inputs(psbt, params)?;
     check_destinations(psbt, params)?;
+    check_hot_budget(psbt, params)?;
     check_fee(psbt)?;
     Ok(())
 }
@@ -327,11 +357,19 @@ fn check_destinations(psbt: &Psbt, params: &CheckParams) -> Result<(), Violation
 /// (`DEST_NOT_ALLOWED`), not a class question. So callers run [`evaluate`] first;
 /// this then sees only outputs already known to be vault change or allowlisted,
 /// and any leftover is reported as mixed rather than silently classified.
-pub fn classify(psbt: &Psbt, params: &CheckParams) -> Result<TxClass, Violation> {
+///
+/// Returns a [`Classification`]: the class plus the hot outflow this same scan
+/// measured, so the velocity ledger never re-derives what was just computed.
+pub fn classify(psbt: &Psbt, params: &CheckParams) -> Result<Classification, Violation> {
     let max = params.max_derivation_index;
     let mut escape_outputs = Vec::new();
     let mut hot_outputs = Vec::new();
     let mut unrecognized = Vec::new();
+    // The hot bucket's value, accumulated by the same pass that sorts it: on the
+    // `Ok` path this is exactly `hot_outflow(psbt, params)`, since every output is
+    // then vault change, escape, or hot. `saturating_add` for the same reason
+    // `hot_outflow` uses it — a saturating sum over-counts, which can only refuse.
+    let mut hot_sat = 0u64;
     for (index, txout) in psbt.unsigned_tx.output.iter().enumerate() {
         let spk = txout.script_pubkey.as_script();
         // Vault change: permitted in every class, excluded from the decision.
@@ -355,6 +393,7 @@ pub fn classify(psbt: &Psbt, params: &CheckParams) -> Result<TxClass, Violation>
             .any(|descriptor| derives_within(descriptor, spk, max))
         {
             hot_outputs.push(index);
+            hot_sat = hot_sat.saturating_add(txout.value.to_sat());
             continue;
         }
         unrecognized.push(index);
@@ -369,10 +408,20 @@ pub fn classify(psbt: &Psbt, params: &CheckParams) -> Result<TxClass, Violation>
             ),
         ));
     }
+    let hot_outflow = Amount::from_sat(hot_sat);
     match (hot_outputs.is_empty(), escape_outputs.is_empty()) {
-        (true, true) => Ok(TxClass::Refresh),
-        (true, false) => Ok(TxClass::Escape),
-        (false, true) => Ok(TxClass::Hot),
+        (true, true) => Ok(Classification {
+            class: TxClass::Refresh,
+            hot_outflow,
+        }),
+        (true, false) => Ok(Classification {
+            class: TxClass::Escape,
+            hot_outflow,
+        }),
+        (false, true) => Ok(Classification {
+            class: TxClass::Hot,
+            hot_outflow,
+        }),
         (false, false) => Err(Violation::new(
             ViolationCode::PsbtInconsistent,
             "transaction_class",
@@ -382,6 +431,70 @@ pub fn classify(psbt: &Psbt, params: &CheckParams) -> Result<TxClass, Violation>
             ),
         )),
     }
+}
+
+/// **Hot outflow**: the sum of a spend's outputs to non-vault, non-escape
+/// destinations — what a hot-class spend actually moves out of the vault to the
+/// hot wallet, and the quantity BOTH halves of the Hot budget meter (ADR-0014 §5).
+///
+/// Vault change is excluded because it never leaves the vault, and the fee is
+/// excluded because it goes to miners rather than to the attacker (and is already
+/// bounded by [`MAX_FEE_PERCENT`]). Escape outputs are excluded because an escape
+/// pays the user's own wallet and is not a loss (ADR-0014 §7) — with
+/// `params.escape == None` nothing is escape, exactly as [`classify`] reads it.
+///
+/// Callers run [`evaluate`] first, so every output is already known to be vault
+/// change or allowlisted and this sums exactly the hot destinations. Reached
+/// before that, an unrecognized output is counted too: over-counting can only
+/// refuse a spend, never admit an over-budget one, which is the safe direction.
+/// The `saturating_add` is the same trade — a sum that saturates over-counts.
+pub fn hot_outflow(psbt: &Psbt, params: &CheckParams) -> Amount {
+    let max = params.max_derivation_index;
+    let mut sat = 0u64;
+    for txout in &psbt.unsigned_tx.output {
+        let spk = txout.script_pubkey.as_script();
+        if derives_within(&params.vault, spk, max) {
+            continue;
+        }
+        if params
+            .escape
+            .as_ref()
+            .is_some_and(|escape| derives_within(escape, spk, max))
+        {
+            continue;
+        }
+        sat = sat.saturating_add(txout.value.to_sat());
+    }
+    Amount::from_sat(sat)
+}
+
+/// The per-transaction half of the Hot budget (ADR-0014 §1): hot outflow may not
+/// exceed `hot_max_per_tx`. Exactly at the cap passes, as every other cap in this
+/// crate does.
+///
+/// This is the check that turns "the hot wallet is the accepted risk budget" from
+/// an assumption into a bound: without it the allowlist constrains only WHERE a
+/// coerced hot spend pays, never HOW MUCH, so one spend could pay the entire vault
+/// to the hot wallet. Pure and amount-based — it never reads a pin, which is what
+/// lets it fire at ingress without becoming a duress oracle.
+///
+/// A refresh (no destination outputs) and an escape sweep both have zero hot
+/// outflow, so neither can ever trip this — ADR-0014 §7's "hot-class only" falls
+/// out of [`hot_outflow`]'s definition rather than needing a class argument.
+fn check_hot_budget(psbt: &Psbt, params: &CheckParams) -> Result<(), Violation> {
+    let outflow = hot_outflow(psbt, params);
+    if outflow > params.hot_max_per_tx {
+        return Err(Violation::new(
+            ViolationCode::HotBudgetExceeded,
+            "hot_budget",
+            format!(
+                "hot outflow {} sat exceeds the per-transaction Hot budget of {} sat",
+                outflow.to_sat(),
+                params.hot_max_per_tx.to_sat()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Fee cap: fee (Σ inputs − Σ outputs) must not exceed
@@ -485,12 +598,19 @@ mod tests {
             .script_pubkey()
     }
 
+    /// The per-tx Hot budget every fixture below uses unless it is the thing under
+    /// test. Far above the 99_000-sat spends the other tests build, so the cap is
+    /// inert for them — a fixture whose cap silently bit would turn every unrelated
+    /// test into a Hot-budget test.
+    const HOT_CAP: Amount = Amount::from_sat(1_000_000);
+
     fn params() -> CheckParams {
         CheckParams {
             vault: vault(),
             allowed: vec![ranged(0xA0), ranged(0xB0)],
             escape: None,
             max_derivation_index: MAX,
+            hot_max_per_tx: HOT_CAP,
         }
     }
 
@@ -503,6 +623,15 @@ mod tests {
             allowed: vec![ranged(0xA0), ranged(0xB0)],
             escape: Some(ranged(0xB0)),
             max_derivation_index: MAX,
+            hot_max_per_tx: HOT_CAP,
+        }
+    }
+
+    /// [`class_params`] re-capped, for the Hot-budget tests.
+    fn capped_params(hot_max_per_tx: u64) -> CheckParams {
+        CheckParams {
+            hot_max_per_tx: Amount::from_sat(hot_max_per_tx),
+            ..class_params()
         }
     }
 
@@ -769,7 +898,10 @@ mod tests {
     #[test]
     fn every_output_to_the_vault_is_refresh_class() {
         let psbt = psbt_with(100_000, vec![(vault_spk(), 90_000, false)]);
-        assert_eq!(classify(&psbt, &class_params()), Ok(TxClass::Refresh));
+        assert_eq!(
+            classify(&psbt, &class_params()).map(|c| c.class),
+            Ok(TxClass::Refresh)
+        );
     }
 
     #[test]
@@ -778,7 +910,10 @@ mod tests {
             100_000,
             vec![(hot_spk(5), 60_000, false), (vault_spk(), 30_000, false)],
         );
-        assert_eq!(classify(&psbt, &class_params()), Ok(TxClass::Hot));
+        assert_eq!(
+            classify(&psbt, &class_params()).map(|c| c.class),
+            Ok(TxClass::Hot)
+        );
     }
 
     #[test]
@@ -793,7 +928,10 @@ mod tests {
                 (vault_spk(), 10_000, false),
             ],
         );
-        assert_eq!(classify(&psbt, &class_params()), Ok(TxClass::Escape));
+        assert_eq!(
+            classify(&psbt, &class_params()).map(|c| c.class),
+            Ok(TxClass::Escape)
+        );
     }
 
     /// The duress bypass this predicate exists to close: 99% to the hot wallet
@@ -830,7 +968,10 @@ mod tests {
                 .any(|d| derives_within(d, escape_spk(0).as_script(), MAX)),
             "the escape wallet must be allowlisted, or its sweep could not pass the destination check"
         );
-        assert_eq!(classify(&psbt, &class_params()), Ok(TxClass::Escape));
+        assert_eq!(
+            classify(&psbt, &class_params()).map(|c| c.class),
+            Ok(TxClass::Escape)
+        );
     }
 
     #[test]
@@ -838,7 +979,147 @@ mod tests {
         // `escape: None` — the escape wallet's script is still allowlisted, so it
         // reads as an ordinary hot destination rather than a sweep.
         let psbt = psbt_with(100_000, vec![(escape_spk(0), 90_000, false)]);
-        assert_eq!(classify(&psbt, &params()), Ok(TxClass::Hot));
+        assert_eq!(
+            classify(&psbt, &params()).map(|c| c.class),
+            Ok(TxClass::Hot)
+        );
+    }
+
+    // -- the per-transaction Hot budget (ADR-0014 §1) ------------------------
+
+    #[test]
+    fn a_hot_spend_over_the_per_tx_cap_is_refused() {
+        let psbt = psbt_with(100_000, vec![(hot_spk(3), 90_000, false)]);
+        // Under a 100_000-sat cap this same spend passes, so the refusal below is
+        // the cap talking and not some other check.
+        assert_eq!(evaluate(&psbt, &capped_params(100_000)), Ok(()));
+        let violation = evaluate(&psbt, &capped_params(89_999)).expect_err("over the cap");
+        assert_eq!(violation.code, ViolationCode::HotBudgetExceeded);
+        assert_eq!(violation.check, "hot_budget");
+    }
+
+    #[test]
+    fn hot_outflow_exactly_at_the_cap_passes() {
+        let psbt = psbt_with(100_000, vec![(hot_spk(3), 90_000, false)]);
+        assert_eq!(evaluate(&psbt, &capped_params(90_000)), Ok(()));
+    }
+
+    /// Outflow is what LEAVES the vault to the hot wallet. Vault change never
+    /// leaves, and the fee goes to miners rather than to a coercer (and is already
+    /// bounded by the 10% guard), so counting either would make the cap mean
+    /// something other than "how much a coerced spend can move".
+    #[test]
+    fn vault_change_and_the_fee_do_not_count_against_the_cap() {
+        // 100_000 in: 50_000 to hot, 40_000 back to the vault, 10_000 fee.
+        let psbt = psbt_with(
+            100_000,
+            vec![(hot_spk(3), 50_000, false), (vault_spk(), 40_000, false)],
+        );
+        assert_eq!(
+            hot_outflow(&psbt, &class_params()),
+            Amount::from_sat(50_000)
+        );
+        // A cap at exactly the hot payment admits it. Were change or the fee
+        // counted, the outflow would read 90_000 or 100_000 and this would refuse.
+        assert_eq!(evaluate(&psbt, &capped_params(50_000)), Ok(()));
+    }
+
+    /// ADR-0014 §7: an escape sweep pays the user's own wallet and a refresh never
+    /// leaves the vault, so neither is a loss and neither may consume the budget.
+    /// Both fall out of `hot_outflow` being zero rather than needing a class test.
+    #[test]
+    fn escape_and_refresh_spends_never_consume_the_hot_budget() {
+        let sweep = psbt_with(
+            100_000,
+            vec![(escape_spk(0), 60_000, false), (vault_spk(), 30_000, false)],
+        );
+        let refresh = psbt_with(100_000, vec![(vault_spk(), 90_000, false)]);
+        for (name, psbt) in [("escape", &sweep), ("refresh", &refresh)] {
+            assert_eq!(
+                hot_outflow(psbt, &class_params()),
+                Amount::ZERO,
+                "{name} moves nothing to the hot wallet"
+            );
+            // A zero cap is the strongest possible statement of this: even with no
+            // hot budget at all, these two still pass.
+            assert_eq!(evaluate(psbt, &capped_params(0)), Ok(()), "{name}");
+        }
+    }
+
+    /// `classify` returns the outflow its own scan measured and vault-node meters
+    /// THAT value, so the class decision and the Hot budget can never be taken over
+    /// different quantities. This pins the two definitions together: whatever
+    /// `hot_outflow` says for a classifiable spend, `classify` must say too.
+    #[test]
+    fn the_classification_carries_the_same_outflow_hot_outflow_computes() {
+        let cases = [
+            // hot with vault change
+            vec![(hot_spk(5), 60_000, false), (vault_spk(), 30_000, false)],
+            // several hot outputs, summed
+            vec![
+                (hot_spk(1), 40_000, false),
+                (hot_spk(2), 40_000, false),
+                (vault_spk(), 15_000, false),
+            ],
+            // escape sweep — zero hot outflow
+            vec![(escape_spk(0), 60_000, false), (vault_spk(), 30_000, false)],
+            // pure refresh — zero hot outflow
+            vec![(vault_spk(), 90_000, false)],
+        ];
+        for outputs in cases {
+            let psbt = psbt_with(100_000, outputs);
+            let classification = classify(&psbt, &class_params()).expect("classifiable");
+            assert_eq!(
+                classification.hot_outflow,
+                hot_outflow(&psbt, &class_params()),
+                "classify and hot_outflow must agree for a {:?}-class spend",
+                classification.class
+            );
+        }
+    }
+
+    /// The cap must not shadow the allowlist. A non-allowlisted destination is
+    /// `DEST_NOT_ALLOWED` whether or not it is also over the cap — the demo's act-two
+    /// theft assertion depends on exactly this ordering.
+    #[test]
+    fn a_non_allowlisted_destination_is_still_dest_not_allowed_when_it_is_also_over_the_cap() {
+        let psbt = psbt_with(100_000, vec![(random_spk(0xEE), 90_000, false)]);
+        let violation = evaluate(&psbt, &capped_params(1)).expect_err("theft");
+        assert_eq!(violation.code, ViolationCode::DestNotAllowed);
+    }
+
+    #[test]
+    fn an_over_budget_hot_spend_is_identified_before_the_fee_guard() {
+        // 80k hot outflow from a 100k input is over the 70k Hot cap and the 20k
+        // fee is also over the 10% fee guard. The budget verdict must surface so
+        // vault-node takes its duress-carrier propagation path; the destination
+        // check above still retains precedence for transactions that cannot pay an
+        // authorized wallet at all.
+        let psbt = psbt_with(100_000, vec![(hot_spk(3), 80_000, false)]);
+        let violation = evaluate(&psbt, &capped_params(70_000)).expect_err("over both caps");
+        assert_eq!(violation.code, ViolationCode::HotBudgetExceeded);
+    }
+
+    /// Several hot outputs are one payment for budget purposes: capping each
+    /// output separately would let a coercer split one vault-sized spend into `k`
+    /// under-cap outputs of the same transaction and move the whole thing.
+    #[test]
+    fn multiple_hot_outputs_are_summed_not_capped_individually() {
+        let psbt = psbt_with(
+            100_000,
+            vec![
+                (hot_spk(1), 40_000, false),
+                (hot_spk(2), 40_000, false),
+                (vault_spk(), 15_000, false),
+            ],
+        );
+        assert_eq!(
+            hot_outflow(&psbt, &class_params()),
+            Amount::from_sat(80_000)
+        );
+        let violation = evaluate(&psbt, &capped_params(50_000))
+            .expect_err("each output is under 50_000, but together they are not");
+        assert_eq!(violation.code, ViolationCode::HotBudgetExceeded);
     }
 
     #[test]
