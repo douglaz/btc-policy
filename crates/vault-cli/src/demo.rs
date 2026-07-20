@@ -83,6 +83,29 @@ const FUND: Amount = Amount::from_sat(1_000_000_000);
 const HOT_SPEND: Amount = Amount::from_sat(400_000_000);
 /// Flat demo fee — far under the 10% cap.
 const FEE: Amount = Amount::from_sat(10_000);
+/// The demo's **Hot budget** (ADR-0014), sealed into the manifest and configured
+/// on every node. Set generously relative to `HOT_SPEND` so the honest act-one
+/// spend is well under both caps: the demo proves the vault WORKS, and a cap
+/// tuned to bite here would only prove the demo was mis-provisioned. A real vault
+/// that sizes for the full `c = t−1` compromised-signer tolerance sets
+/// `HOT_MAX_PER_WINDOW` no higher than the tolerable per-window loss divided by `t`.
+/// With no compromised signer (`c = 0`), production `n = 2t−1` gives the tighter
+/// `(2 − 1/t)·V < 2V` pure-censorship bound (ADR-0014 consequences).
+const HOT_MAX_PER_TX: Amount = Amount::from_sat(600_000_000);
+const HOT_MAX_PER_WINDOW: Amount = Amount::from_sat(900_000_000);
+/// The velocity window. Equal to `MAX_COMMITMENT_AGE_SECS`, the floor the node
+/// enforces at load: the window must cover every candidate throughout its
+/// node-authorized completion lifetime.
+const HOT_WINDOW_SECS: u64 = MAX_COMMITMENT_AGE_SECS;
+
+/// The demo's Hot budget in the shape the ceremony and the nodes both take.
+fn hot_budget() -> vault_node::HotBudget {
+    vault_node::HotBudget {
+        max_per_tx_sat: HOT_MAX_PER_TX.to_sat(),
+        max_per_window_sat: HOT_MAX_PER_WINDOW.to_sat(),
+        window_secs: HOT_WINDOW_SECS,
+    }
+}
 
 pub fn run_first_light() -> Result<(), Error> {
     let secp = Secp256k1::new();
@@ -165,6 +188,22 @@ pub fn run_first_light() -> Result<(), Error> {
     let nodes_dir = temp.path.join("nodes");
     std::fs::create_dir_all(&nodes_dir)?;
     let node_ports: Vec<u16> = ports[1..=NODE_COUNT].to_vec();
+    // The ONE destination allowlist, written once. Every node gets exactly this in
+    // its config, and the ceremony's sealed `hot_allowlist` is DERIVED from it by
+    // the same rule `Node::load` applies — drop the escape descriptor, which is an
+    // allowlist entry so its sweep passes the destination check but is never a hot
+    // destination. Two hand-maintained copies would let a later edit to one of them
+    // seal a `manifest_hash` no node can reproduce, and every node would then fail
+    // startup on the manifest check.
+    let node_allowlist = [
+        hot_wallet.descriptor.as_str(),
+        escape_wallet.descriptor.as_str(),
+    ];
+    let ceremony_hot_allowlist: Vec<String> = node_allowlist
+        .iter()
+        .filter(|descriptor| **descriptor != escape_wallet.descriptor.as_str())
+        .map(|descriptor| (*descriptor).to_string())
+        .collect();
     // The setup ceremony (ADR-0013 §4): assemble the manifest over every node's
     // keys + endpoints, hash it, and endorse each channel key with that node's own
     // signing key. Every byte is computed by the node's own code (see
@@ -175,7 +214,10 @@ pub fn run_first_light() -> Result<(), Error> {
         &coordinator.pubkey,
         &node_actors,
         &node_ports,
-    );
+        &ceremony_hot_allowlist,
+        &escape_wallet.descriptor,
+        MAX_DERIVATION_INDEX,
+    )?;
     let mut nodes = Vec::new();
     for (index, actor) in node_actors.iter().enumerate() {
         nodes.push(NodeProcess::spawn(
@@ -186,7 +228,7 @@ pub fn run_first_light() -> Result<(), Error> {
                 port: node_ports[index],
                 actor,
                 descriptor: &descriptor_str,
-                allowlist: &[&hot_wallet.descriptor, &escape_wallet.descriptor],
+                allowlist: &node_allowlist,
                 escape_descriptor: &escape_wallet.descriptor,
                 // The one coordinator auth root, provisioned identically into
                 // every node's per-vault config (ADR-0013 §2/§4).
@@ -755,7 +797,10 @@ impl Manifest {
         coord_auth_pubkey: &PublicKey,
         node_actors: &[Actor],
         ports: &[u16],
-    ) -> Manifest {
+        hot_allowlist: &[String],
+        escape_descriptor: &str,
+        max_derivation_index: u32,
+    ) -> Result<Manifest, Error> {
         // `node_id` is the node key's 0-based position in the descriptor's
         // CANONICAL order — lexicographic over the full key expression (§1), which
         // for these concrete keys is the compressed-pubkey hex. Every party derives
@@ -779,14 +824,19 @@ impl Manifest {
         // The demo leaves every node's `max_msg_bytes` at the default, so the ceremony
         // seals that same value into the manifest (V0-4b §0: the cap is a
         // federation-uniform preimage field, and a node configured otherwise fails
-        // startup).
+        // startup). The Hot budget is sealed the same way (ADR-0014 §6) and from the
+        // same constants the generated configs emit, so the two cannot drift.
         let hash = ceremony::manifest_hash(
             wallet_id,
             coord_auth_pubkey,
             &ceremony_nodes,
             &channel_pubkeys,
             vault_node::channel::DEFAULT_MAX_MSG_BYTES,
-        );
+            hot_budget(),
+            hot_allowlist,
+            escape_descriptor,
+            max_derivation_index,
+        )?;
         let entries = canonical
             .iter()
             .zip(&ceremony_nodes)
@@ -809,10 +859,10 @@ impl Manifest {
                 endpoint: node.endpoints[0].clone(),
             })
             .collect();
-        Manifest {
+        Ok(Manifest {
             entries,
             manifest_hash: hash.to_lower_hex_string(),
-        }
+        })
     }
 
     /// This node's `node_id` — its position in the canonical order.
@@ -916,6 +966,9 @@ impl NodeProcess {
              escape_descriptor = \"{escape_descriptor}\"\n\
              max_derivation_index = {MAX_DERIVATION_INDEX}\n\
              hold_secs = {HOLD_SECS}\n\
+             hot_max_per_tx = {}\n\
+             hot_max_per_window = {}\n\
+             hot_window_secs = {HOT_WINDOW_SECS}\n\
              max_commitment_age_secs = {MAX_COMMITMENT_AGE_SECS}\n\
              policy_version = {POLICY_VERSION}\n\
              pin_normal_hash = \"{}\"\n\
@@ -927,6 +980,8 @@ impl NodeProcess {
              {}",
             actor.seckey.display_secret(),
             allowlist_toml.join(", "),
+            HOT_MAX_PER_TX.to_sat(),
+            HOT_MAX_PER_WINDOW.to_sat(),
             vault_node::argon2id_normal_phc(NORMAL_PIN),
             vault_node::argon2id_duress_phc(DURESS_PIN),
             manifest.channel_toml(actor),

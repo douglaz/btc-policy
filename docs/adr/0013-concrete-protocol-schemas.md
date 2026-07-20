@@ -57,8 +57,9 @@ BaseManifest {                     # everything EXCEPT endorsements and config_h
   coordinator_auth_pubkey,         # pins the coord auth key (§2, §7)
   nodes: [ { node_id, signing_pubkey, channel_pubkey, transport_endpoints } ],
   t, n, recovery_timelock,
-  hot_allowlist: [descriptor…], escape_descriptor,
   max_msg_bytes,                   # V0-4b §0 — see below; federation-UNIFORM
+  hot_max_per_tx, hot_max_per_window, hot_window_secs,  # ADR-0014 Hot budget — see below; federation-UNIFORM
+  hot_allowlist: [descriptor…], escape_descriptor, max_derivation_index,
 }
 manifest_hash = H(canonical_bytes(BaseManifest))
 # THEN: each node's channel_endorsement is computed OVER manifest_hash and
@@ -88,6 +89,24 @@ CHANGES `manifest_hash` for a given federation — a vault sealed under the earl
 preimage does not load against this build and must be re-provisioned (greenfield
 until v1; the workspace ships both ends together).
 
+**The `Hot budget` triple IS in `BaseManifest`** (2026-07-20, [ADR-0014](0014-hot-spend-bound.md)
+§6 — three new preimage fields, encoded as three `u64`s immediately after
+`max_msg_bytes` and before the node count, so the V0-9 prefix keeps its byte
+offsets). `hot_max_per_tx`, `hot_max_per_window`, and `hot_window_secs` are also
+`[channel]`-adjacent config knobs (§5), and they are hashed here for the same
+reason `max_msg_bytes` is: a federation-uniform cap is only as strong as its
+laxest node. If one node's `hot_max_per_window` exceeded its peers', a coordinator
+would simply route coerced hot spends at that node's rate, and ADR-0014's routing
+bound would not hold. With `c < t` compromised signer Nodes able to bypass their
+ledgers, the bound is `((n−c)/(t−c))·V`; manifest uniformity proves that every honest
+signer in that argument reserves against the *same* `V`. Hashing all three makes
+disagreement a **startup** failure rather than a silently weaker vault, by exactly
+the mechanism above. This likewise CHANGES `manifest_hash` for a given federation.
+The canonical hot-allowlist descriptors, escape descriptor, and
+`max_derivation_index` are hashed beside the triple: they decide whether a given
+output consumes the cap, so uniform numbers with non-uniform classification inputs
+would still be a non-uniform budget.
+
 Each node's `channel_pubkey` is **endorsed by that node's Bitcoin signing key** over a domain-separated `(wallet_id, manifest_hash, node_id, channel_pubkey, protocol_version, transport_endpoints)` (ADR-0012 channel identity), so peers accept a channel identity only if a federation signing key vouches for it and the coordinator cannot mint/impersonate a node. The channel key itself is RAM-only, re-derived at startup (ADR-0007); the manifest pins only its public half. `node_id` = the node's 0-based index in the descriptor's canonical (lexicographic) node-key order — derivable from the descriptor, so the node_id → descriptor-key mapping is definitionally total (2026-07-16). **Endpoints are deliberately pinned** (anti-redirection: nobody, including a compromised coordinator or a later config writer, can repoint one node's view of a peer): v0 endpoints are localhost and never change; **v1 onion addresses must be derived deterministically from node key material** — like the channel key — so they are known at the setup ceremony and stable for the node's lifetime; clearnet dynamic-IP topologies are unsupported by design (2026-07-16).
 
 **Trust establishment (the root — re-review: this was undefined).** The manifest is not *signed* by an external authority; it is **agreed at the setup ceremony** and then frozen. Concretely: setup collects each node's signing pubkey + channel-key endorsement and the coordinator auth pubkey, assembles the `Manifest`, computes `manifest_hash`, and **provisions every node with that exact `manifest_hash`** as sealed config (ADR-0005 sealing). Thereafter a node trusts the coordinator auth key **because** its pubkey is in the manifest whose hash the node was sealed with, and trusts a peer channel identity **because** it is endorsed by a signing key in that same manifest. The manifest_hash is the single root every other trust decision chains to; it is included in the config (`manifest_hash`, §5) and in every channel endorsement's domain separator, so a manifest from a different vault cannot be substituted. Backed up alongside the descriptor (public-ish; needed to reconstruct/verify, not secret).
@@ -101,7 +120,8 @@ listen_port, node_seckey (v0 only; T1 removes at-rest keys), descriptor, policy_
 hot_allowlist = [descriptor…], escape_descriptor,
 max_derivation_index, max_commitment_age_secs,
 hold_secs,                         # hot-class Hold (default 86400)
-max_fee_pct,                       # hot-class fee cap (default 10)
+# NO fee-cap field. The 10% guard is `MAX_FEE_PERCENT`, a const in policy-core applying to ALL classes (ADR-0006) — it was listed here as `max_fee_pct` while DESIGN's sample still had one, but `ConfigFile` is `#[serde(deny_unknown_fields)]`, so a config written from this schema carrying that key is a FATAL startup error. A fee cap that is not configurable cannot be made non-uniform by a config writer, which is why it needs no manifest pin either.
+hot_max_per_tx, hot_max_per_window, hot_window_secs,  # ADR-0014 Hot budget. MANDATORY, no defaults, all three ALSO manifest preimage fields (§4) — a default would silently restore unbounded hot outflow for a config that forgot the field, and a non-uniform cap is only as strong as the laxest node. `hot_max_per_tx` (sats) caps ONE hot spend's outflow (Σ outputs to non-vault, non-escape destinations; fee excluded — it pays miners, not the coercer, and the 10% guard already bounds it) and is enforced in policy-core's pure `evaluate` as `HOT_BUDGET_EXCEEDED`. `hot_max_per_window` (sats) caps the SUM of hot outflow this node has ACCEPTED within `hot_window_secs`, pending AND broadcast, and is enforced by vault-node's `HotBudgetLedger` at ingress BEFORE signing as `HOT_VELOCITY_EXCEEDED` — so an over-cap coerced spend yields no partial anywhere. Both are needed: a per-tx cap alone is unbounded in the NUMBER of spends, a window cap alone lets one spend take the whole window. `hot_window_secs` must satisfy `hot_window_secs ≥ max_commitment_age_secs` (fatal at load, sibling to `hold_secs < max_commitment_age_secs`): a window shorter than the commitment lifetime lets a reservation age out while its spend can still combine and broadcast, and the aggregate bound stops binding. Both checks are amount-based and PIN-INDEPENDENT — they never read the pin, so ADR-0012's constant-observable ingress survives and an over-cap duress carrier still stages, arms, and propagates on the refusal path (the freeze fires federation-wide; the coerced spend just cannot complete)
 pin_normal_hash, pin_duress_hash,
 duress_delay_secs,                 # hostage window; 0 allowed
 escape_coverage_pct,               # e.g. 95 — §6
@@ -131,7 +151,7 @@ coordinator_auth_pubkey, manifest_hash,
   - *Class-aware*: hot-class ⇒ escape supersedes the frozen spend, coverage = escape alone; escape-class ⇒ escape inputs **disjoint** from the completed spend, coverage = (completed escape-class spend ∪ residual escape).
 - **Feerate floor** (`escape_feerate_floor`): a **static** sats/vB value in config (not a live estimate — static keeps **fire-time sweep admissibility** deterministic across nodes so the sweep doesn't split; ADR-0012 makes feerate a **fire-time sweep check, never an arm gate**). The fixed-panic-fee rebroadcast loop uses the escape's own (≥ floor) feerate.
 - **ε** (`epsilon_secs`): a small bounded margin (default e.g. 60) subtracted in `T = min(first_seen + duress_delay_secs, earliest pending hot Hold-expiry − ε)`, so the escape fires strictly before a frozen spend would settle even under per-node clock skew.
-- **Refresh min interval** (`refresh_min_interval_secs`): per-coin minimum time between refreshes (default ~30d). **Refresh fee cap** (`refresh_max_feerate`): a normal feerate (small multiple of the node's estimate), *not* `max_fee_pct` — a legitimate self-spend never pays near 10%.
+- **Refresh min interval** (`refresh_min_interval_secs`): per-coin minimum time between refreshes (default ~30d). **Refresh fee cap** (`refresh_max_feerate`): a normal feerate (small multiple of the node's estimate), *not* the fixed 10% `MAX_FEE_PERCENT` guard — a legitimate self-spend never pays near 10%.
 
 ## 7. Attempt budget (per-node) and coordinator auth-key lifecycle
 

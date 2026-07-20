@@ -32,6 +32,11 @@ const MAX_DERIV: u32 = 20;
 /// Flat fee on the fixture escape — well under the 10% cap over the 100_000_000
 /// sat per-input fixture value.
 const ESCAPE_FEE: u64 = 10_000;
+/// The Hot budget (ADR-0014) these handler tests configure. Far above the largest
+/// spend they build, so the budget never bites a test that is about something else;
+/// the budget's own tests set caps explicitly.
+const HOT_MAX_PER_TX: u64 = 10_000_000_000;
+const HOT_MAX_PER_WINDOW: u64 = 1_000_000_000_000;
 
 fn seckey(index: u8) -> SecretKey {
     SecretKey::from_slice(&[index; 32]).expect("32 nonzero bytes")
@@ -173,6 +178,9 @@ fn fixture_config(hold_secs: u64, max_commitment_age_secs: u64, allow_escape: bo
          escape_descriptor = \"{escape_desc}\"\n\
          max_derivation_index = {MAX_DERIV}\n\
          hold_secs = {hold_secs}\n\
+         hot_max_per_tx = {HOT_MAX_PER_TX}\n\
+         hot_max_per_window = {HOT_MAX_PER_WINDOW}\n\
+         hot_window_secs = {max_commitment_age_secs}\n\
          max_commitment_age_secs = {max_commitment_age_secs}\n\
          policy_version = {POLICY_VERSION}\n\
          pin_normal_hash = \"{}\"\n\
