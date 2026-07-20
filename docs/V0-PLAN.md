@@ -207,8 +207,12 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
   propagation) cannot split the armed set below `t` (this is the arm-split conditional-theft fix) — but the
   **freeze of hot-class finalization + lockdown-at-T commit only once ≥ t nodes are confirmed to hold the
   request**, on the `/channel` receipt path and off the `/sign` response path. Ingress records intent and
-  propagates; it never arms. That ordering is what makes arming un-splittable: a coordinator that keeps a
-  carrier from reaching `t` nodes achieves censorship (an accepted residual), never a one-armed split. Escape admissibility (class-aware coverage, feerate floor,
+  propagates; it never arms. **What actually makes the freeze un-splittable is the signer/partial coupling +
+  release-gate (ADR-0012 correction 2026-07-20), NOT the confirmation count** — with `n=2t−1` a `t`-count
+  can't prove `t` honest froze; the count schedules timing, the release-gate (no honest node releases a
+  coerced partial) is the safety, and the pending-spend-censorship residual is bounded by the Hot budget
+  (ADR-0014). A coordinator that keeps a carrier from reaching `t` nodes achieves censorship (an accepted,
+  Hot-budget-bounded residual), never an unbounded one-armed split. Escape admissibility (class-aware coverage, feerate floor,
   package `testmempoolaccept`) is **ENTIRELY a fire-time check** that gates only whether the best-effort
   sweep fires; a sweep that fails still leaves the node frozen + locked down → recovery. See ADR-0012
   "Duress state machine (per node) — normative".
