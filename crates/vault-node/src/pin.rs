@@ -88,22 +88,252 @@ pub(crate) trait PinEvaluator: Send + Sync {
 pub(crate) struct Argon2Evaluator {
     normal_phc: String,
     duress_phc: String,
+    /// Node-wide memory-hard work slot, shared with [`CarrierKdf`]. The PIN slots are
+    /// already sequential; sharing this guard also prevents an authenticated
+    /// `/channel` carrier derivation from overlapping either one and doubling peak
+    /// Argon2 memory at the reboot-death boundary.
+    work_lock: std::sync::Arc<std::sync::Mutex<()>>,
+}
+
+/// Per-node, per-boot KDF for the long-lived arm-carrier map key.
+///
+/// A spend request's coordinator-auth digest commits to its plaintext PIN. Keeping
+/// that digest (or merely hashing it with a process-resident salt) until request
+/// expiry would give a full process-memory capture a cheap offline PIN oracle: the
+/// capture contains the salt too. Stretching the digest with the enrolled Argon2id
+/// work parameters preserves the PIN's configured offline work factor. The random
+/// salt still makes the resulting identifier node-local and boot-local; it is
+/// initialized fallibly during node construction, never on the request path.
+pub(crate) struct CarrierKdf {
+    version: Version,
+    params: Params,
+    salt: Zeroizing<[u8; 32]>,
+    /// Serializes ALL node Argon2 work: carrier derivations share this lock with the
+    /// production [`Argon2Evaluator`], so the node holds at most one memory matrix —
+    /// never one carrier matrix plus one PIN matrix. The carrier id is derived on the
+    /// `/channel` receipt path OUTSIDE `sign_state`, and that path admits
+    /// `max_concurrent_channel_requests` (default 64) simultaneous `spawn_blocking`
+    /// jobs. A compromised-but-authenticated peer may send conflicting coordinator
+    /// signatures across many live nonces at its full quota. If all such jobs queued
+    /// on this lock while retaining their `/channel` permits, ordinary confirmations
+    /// and partials would be shed until combine windows expired. The receipt path
+    /// therefore uses [`Self::try_reserve`]: at most one conflicting-signature job owns
+    /// a permit while deriving, and every contender returns `RATE_LIMITED` for bounded
+    /// retry. Exact-signature confirmations and partials never need this lock. Direct
+    /// ingress still uses blocking [`Self::derive`], so the lock also keeps peak memory
+    /// at one carrier matrix. Contention is pin-independent, so this adds no duress
+    /// oracle.
+    derive_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// Derivations currently INSIDE the critical section, and the high-water mark of
+    /// that count. Sampled under the lock, which is the only place the observation is
+    /// meaningful: a caller queued on the lock has allocated nothing, so counting
+    /// around the call would report queue depth rather than concurrent matrices.
+    #[cfg(test)]
+    live_derivations: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    peak_derivations: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    total_derivations: std::sync::atomic::AtomicUsize,
+}
+
+impl CarrierKdf {
+    /// Build from the two already-validated PIN PHCs and a fresh per-boot salt.
+    ///
+    /// The work factor is the elementwise MAXIMUM of both enrolled slots, not the
+    /// normal slot's alone. [`validate_digests`] permits the two PHCs to carry
+    /// different costs, and a carrier id is a memory-capture-testable function of the
+    /// submitted PIN: deriving at the normal slot's cost while the duress slot is
+    /// enrolled stronger would hand a capture an oracle for the DURESS pin at the
+    /// weaker of the two work factors. Taking the max keeps the derivation at least
+    /// as strong as either enrolled slot, so neither PIN is testable below its own
+    /// configured cost.
+    pub(crate) fn new(normal_phc: &str, duress_phc: &str, salt: [u8; 32]) -> Result<Self, String> {
+        let normal = parse_digest(normal_phc, "pin_normal_hash")?;
+        let duress = parse_digest(duress_phc, "pin_duress_hash")?;
+        // Version is NOT merely a format revision: Argon2 v0x13 changed the indexing
+        // specifically to resist the tradeoff attack v0x10 admits, and RFC 9106
+        // standardizes v0x13. Deriving at the NORMAL slot's version while the duress
+        // slot is enrolled at v0x13 would hand a memory capture a cheaper attack on the
+        // DURESS pin than its own enrolment declares — the same asymmetry the
+        // elementwise-max cost below exists to prevent. Take the stronger version for
+        // the same reason.
+        let version = Self::stronger_version(
+            slot_version(&normal, "pin_normal_hash")?,
+            slot_version(&duress, "pin_duress_hash")?,
+        );
+        let normal_params = Params::try_from(&normal)
+            .map_err(|e| format!("pin_normal_hash has invalid argon2 params: {e}"))?;
+        let duress_params = Params::try_from(&duress)
+            .map_err(|e| format!("pin_duress_hash has invalid argon2 params: {e}"))?;
+        // Carrier ids are fixed at 32 bytes, but retain the strongest enrolled
+        // memory/time/parallelism work factor.
+        let params = Params::new(
+            normal_params.m_cost().max(duress_params.m_cost()),
+            normal_params.t_cost().max(duress_params.t_cost()),
+            normal_params.p_cost().max(duress_params.p_cost()),
+            Some(32),
+        )
+        .map_err(|e| format!("cannot construct arm-carrier Argon2 parameters: {e}"))?;
+        Ok(Self {
+            version,
+            params,
+            salt: Zeroizing::new(salt),
+            derive_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            #[cfg(test)]
+            live_derivations: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            peak_derivations: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            total_derivations: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// The later of two Argon2 versions. `Version` is a plain field-less enum whose
+    /// discriminants are the wire values (0x10 < 0x13), so ordering them by that value
+    /// is exactly "the revision with the stronger indexing".
+    fn stronger_version(a: Version, b: Version) -> Version {
+        if (a as u32) >= (b as u32) {
+            a
+        } else {
+            b
+        }
+    }
+
+    /// The work factor [`Self::derive`] runs at, so a test can assert it dominates
+    /// BOTH enrolled slots without timing an Argon2 evaluation.
+    #[cfg(test)]
+    pub(crate) fn params(&self) -> &Params {
+        &self.params
+    }
+
+    /// The Argon2 revision [`Self::derive`] runs at, so a test can assert it is at
+    /// least as strong as either enrolled slot's.
+    #[cfg(test)]
+    pub(crate) fn version(&self) -> Version {
+        self.version
+    }
+
+    /// The most derivations ever simultaneously inside the critical section — 1 iff
+    /// `derive_lock` actually bounds concurrent Argon2 matrices.
+    #[cfg(test)]
+    pub(crate) fn peak_derivations(&self) -> usize {
+        self.peak_derivations
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_derivations(&self) -> usize {
+        self.total_derivations
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Stretch one coordinator-auth digest for direct ingress. Caller-owned output is
+    /// wiped after the carrier id has been domain-separated from it. Direct callers
+    /// wait on `derive_lock`; conflicting-signature `/channel` receipts use
+    /// [`Self::try_reserve`] instead so they are shed rather than queued.
+    pub(crate) fn derive(&self, auth_digest: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+        let _serialized = self
+            .derive_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.derive_locked(auth_digest)
+    }
+
+    /// Clone the node-wide Argon2 work slot into the production PIN evaluator.
+    pub(crate) fn work_lock(&self) -> std::sync::Arc<std::sync::Mutex<()>> {
+        std::sync::Arc::clone(&self.derive_lock)
+    }
+
+    /// Reserve the one carrier-derivation slot without queueing. `/channel` uses this
+    /// before resolving a conflicting coordinator signature: a busy slot produces a
+    /// retriable `RATE_LIMITED` reply instead of holding one of the ordinary channel
+    /// permits behind memory-hard work.
+    pub(crate) fn try_reserve(&self) -> Option<CarrierDerivation<'_>> {
+        let guard = match self.derive_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        Some(CarrierDerivation {
+            kdf: self,
+            _guard: guard,
+        })
+    }
+
+    fn derive_locked(&self, auth_digest: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.total_derivations.fetch_add(1, SeqCst);
+            let live = self.live_derivations.fetch_add(1, SeqCst) + 1;
+            self.peak_derivations.fetch_max(live, SeqCst);
+        }
+        let argon2 = Argon2::new(Algorithm::Argon2id, self.version, self.params.clone());
+        let mut memory = Zeroizing::new(vec![Block::default(); self.params.block_count()]);
+        let mut output = Zeroizing::new([0u8; 32]);
+        argon2
+            .hash_password_into_with_memory(
+                auth_digest,
+                self.salt.as_slice(),
+                output.as_mut_slice(),
+                memory.as_mut_slice(),
+            )
+            .expect("arm-carrier KDF executable after startup validation");
+        #[cfg(test)]
+        self.live_derivations
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        output
+    }
+}
+
+/// Exclusive ownership of the carrier KDF's one memory-hard work slot. Keeping this
+/// guard alive while the channel records the sender's derivation budget makes the
+/// budget claim atomic with admission: a contender is either admitted once or told to
+/// retry, never marked resolved merely because somebody else held the KDF.
+pub(crate) struct CarrierDerivation<'a> {
+    kdf: &'a CarrierKdf,
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl CarrierDerivation<'_> {
+    pub(crate) fn derive(self, auth_digest: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+        self.kdf.derive_locked(auth_digest)
+    }
 }
 
 impl Argon2Evaluator {
     /// Build from two PHC strings already validated by [`validate_digests`]. Stored
     /// as owned strings and re-parsed per request (a string parse is negligible
     /// beside the Argon2 evaluation it precedes).
+    #[cfg(test)]
     pub(crate) fn new(normal_phc: String, duress_phc: String) -> Argon2Evaluator {
+        Self::with_work_lock(
+            normal_phc,
+            duress_phc,
+            std::sync::Arc::new(std::sync::Mutex::new(())),
+        )
+    }
+
+    /// Build with the node-wide Argon2 work slot shared by [`CarrierKdf`].
+    pub(crate) fn with_work_lock(
+        normal_phc: String,
+        duress_phc: String,
+        work_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    ) -> Argon2Evaluator {
         Argon2Evaluator {
             normal_phc,
             duress_phc,
+            work_lock,
         }
     }
 }
 
 impl PinEvaluator for Argon2Evaluator {
     fn evaluate(&self, slot: PinSlot, pin: &[u8]) -> Choice {
+        let _work = self
+            .work_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let phc = match slot {
             PinSlot::Normal => &self.normal_phc,
             PinSlot::Duress => &self.duress_phc,
@@ -194,6 +424,18 @@ pub(crate) fn validate_digests(normal_phc: &str, duress_phc: &str) -> Result<(),
         );
     }
     Ok(())
+}
+
+/// The Argon2 revision one enrolled slot declares, defaulting to the crate's current
+/// version when the PHC omits it. Already validated by [`parse_digest`]; re-mapping
+/// here keeps [`CarrierKdf::new`] free of a second error shape.
+fn slot_version(parsed: &PasswordHash<'_>, field: &str) -> Result<Version, String> {
+    Ok(parsed
+        .version
+        .map(Version::try_from)
+        .transpose()
+        .map_err(|e| format!("{field} has unsupported argon2 version: {e}"))?
+        .unwrap_or_default())
 }
 
 /// Parse one PHC digest and require it be Argon2id with a hash and valid params.
@@ -862,6 +1104,177 @@ mod tests {
         assert!(
             !out.locked,
             "a failure older than window_secs must not count toward lockout"
+        );
+    }
+
+    /// Enrol a PHC at EXPLICIT Argon2 params, so a test can pin the two slots at
+    /// different work factors (which [`validate_digests`] permits).
+    fn phc_at(pin: &str, salt: &[u8], m_cost: u32, t_cost: u32, p_cost: u32) -> String {
+        phc_at_version(pin, salt, m_cost, t_cost, p_cost, Version::V0x13)
+    }
+
+    /// As [`phc_at`], but at an explicit Argon2 REVISION. `validate_digests` accepts
+    /// any version the verifier can execute, so the two slots may legally disagree.
+    fn phc_at_version(
+        pin: &str,
+        salt: &[u8],
+        m_cost: u32,
+        t_cost: u32,
+        p_cost: u32,
+        version: Version,
+    ) -> String {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        let salt = SaltString::encode_b64(salt).expect("valid salt bytes");
+        let params = Params::new(m_cost, t_cost, p_cost, None).expect("valid params");
+        Argon2::new(Algorithm::Argon2id, version, params)
+            .hash_password(pin.as_bytes(), &salt)
+            .expect("argon2 hash")
+            .to_string()
+    }
+
+    /// The carrier id is a memory-capture-testable function of the submitted PIN, so
+    /// its derivation must not run BELOW either enrolled slot's own work factor.
+    /// `validate_digests` deliberately permits the two slots to carry different costs;
+    /// deriving at the normal slot's cost alone would hand a full-process-memory
+    /// capture an oracle for a stronger-enrolled DURESS pin at the weaker normal cost,
+    /// silently undoing that slot's configured offline resistance. The derivation
+    /// therefore runs at the elementwise MAXIMUM of both slots.
+    #[test]
+    fn the_carrier_kdf_is_at_least_as_strong_as_both_enrolled_slots() {
+        let m = Params::MIN_M_COST;
+        // Duress enrolled strictly stronger in memory and time than normal.
+        let normal = phc_at("normal-pin", NORMAL_SALT, m, 1, 1);
+        let duress = phc_at("duress-pin", DURESS_SALT, m * 4, 3, 1);
+        validate_digests(&normal, &duress).expect("asymmetric costs are a legal enrolment");
+        let kdf = CarrierKdf::new(&normal, &duress, [7u8; 32]).expect("kdf");
+        assert_eq!(
+            kdf.params().m_cost(),
+            m * 4,
+            "the carrier KDF must not derive below the DURESS slot's memory cost"
+        );
+        assert_eq!(kdf.params().t_cost(), 3);
+
+        // Symmetrically when the NORMAL slot is the stronger one.
+        let normal = phc_at("normal-pin", NORMAL_SALT, m * 4, 5, 1);
+        let duress = phc_at("duress-pin", DURESS_SALT, m, 1, 1);
+        let kdf = CarrierKdf::new(&normal, &duress, [7u8; 32]).expect("kdf");
+        assert_eq!(kdf.params().m_cost(), m * 4);
+        assert_eq!(kdf.params().t_cost(), 5);
+    }
+
+    /// "At least as strong as both slots" covers the Argon2 REVISION too, not only the
+    /// cost parameters. v0x13 changed the indexing specifically to resist the tradeoff
+    /// attack v0x10 admits, and RFC 9106 standardizes v0x13 — so deriving at the normal
+    /// slot's declared version while the duress slot is enrolled at v0x13 would hand a
+    /// memory capture a cheaper attack on the DURESS pin than its own enrolment
+    /// declares. Exactly the asymmetry the elementwise-max cost above exists to prevent.
+    #[test]
+    fn the_carrier_kdf_runs_at_the_stronger_enrolled_argon2_revision() {
+        let m = Params::MIN_M_COST;
+        // Normal enrolled at the legacy revision, duress at the current one.
+        let normal = phc_at_version("normal-pin", NORMAL_SALT, m, 1, 1, Version::V0x10);
+        let duress = phc_at_version("duress-pin", DURESS_SALT, m, 1, 1, Version::V0x13);
+        validate_digests(&normal, &duress).expect("mixed revisions are a legal enrolment");
+        let kdf = CarrierKdf::new(&normal, &duress, [7u8; 32]).expect("kdf");
+        assert_eq!(
+            kdf.version(),
+            Version::V0x13,
+            "the carrier KDF must not derive at a revision weaker than the DURESS slot's"
+        );
+
+        // Symmetrically when the NORMAL slot is the stronger one.
+        let normal = phc_at_version("normal-pin", NORMAL_SALT, m, 1, 1, Version::V0x13);
+        let duress = phc_at_version("duress-pin", DURESS_SALT, m, 1, 1, Version::V0x10);
+        let kdf = CarrierKdf::new(&normal, &duress, [7u8; 32]).expect("kdf");
+        assert_eq!(kdf.version(), Version::V0x13);
+    }
+
+    /// Carrier confirmation and PIN verification are independently reachable request
+    /// paths. They must nevertheless share one memory-hard work slot: at the permitted
+    /// 256 MiB per-matrix ceiling, an overlap would require 512 MiB and an OOM kill is
+    /// permanent node death under reboot-death.
+    #[test]
+    fn pin_and_carrier_kdfs_share_one_node_wide_memory_slot() {
+        let normal = argon2id_normal_phc("normal-pin");
+        let duress = argon2id_duress_phc("duress-pin");
+        let kdf = CarrierKdf::new(&normal, &duress, [7u8; 32]).expect("kdf");
+        let evaluator = Argon2Evaluator::with_work_lock(normal, duress, kdf.work_lock());
+
+        assert!(
+            Arc::ptr_eq(&evaluator.work_lock, &kdf.derive_lock),
+            "production PIN and carrier Argon2 must serialize on the same work slot"
+        );
+    }
+
+    /// Conflicting-signature `/channel` work must never queue behind the one active
+    /// carrier Argon2 while retaining ordinary channel permits. Admission is therefore
+    /// non-blocking: one reservation succeeds, every contender is shed for bounded
+    /// retry, and the slot becomes available again after the owner finishes.
+    #[test]
+    fn carrier_derivation_reservation_sheds_contention_without_queueing() {
+        let kdf = CarrierKdf::new(
+            &argon2id_normal_phc("normal-pin"),
+            &argon2id_duress_phc("duress-pin"),
+            [8u8; 32],
+        )
+        .expect("kdf");
+        let reservation = kdf.try_reserve().expect("first work slot");
+        assert!(
+            kdf.try_reserve().is_none(),
+            "a contender must be shed, not queued behind memory-hard work"
+        );
+        let derived = reservation.derive(&[4u8; 32]);
+        assert_eq!(kdf.total_derivations(), 1);
+        drop(derived);
+        assert!(
+            kdf.try_reserve().is_some(),
+            "the bounded-retry path can acquire the slot after the owner finishes"
+        );
+    }
+
+    /// `derive` is reached from the `/channel` receipt path OUTSIDE `sign_state`, where
+    /// `max_concurrent_channel_requests` jobs run at once and an authenticated peer can
+    /// replay one captured coordinator-signed body at its quota. Unserialized, that is
+    /// `max_concurrent_channel_requests × m_cost` of simultaneous Argon2 memory — an
+    /// abort, which under reboot-death (ADR-0007) is a permanently dead node. Assert
+    /// the derivations actually serialize, and that concurrency does not corrupt the
+    /// result (every caller must still get the deterministic id for its digest).
+    #[test]
+    fn concurrent_carrier_derivations_serialize() {
+        let kdf = Arc::new(
+            CarrierKdf::new(
+                &argon2id_normal_phc("normal-pin"),
+                &argon2id_duress_phc("duress-pin"),
+                [3u8; 32],
+            )
+            .expect("kdf"),
+        );
+        let expected = *kdf.derive(&[9u8; 32]);
+
+        // Eight threads all deriving at once — well past what an unserialized
+        // implementation needs to overlap two matrices.
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let kdf = Arc::clone(&kdf);
+                std::thread::spawn(move || {
+                    for _ in 0..4 {
+                        assert_eq!(
+                            *kdf.derive(&[9u8; 32]),
+                            expected,
+                            "the carrier id must stay deterministic under contention"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("derive thread");
+        }
+        assert_eq!(
+            kdf.peak_derivations(),
+            1,
+            "carrier-KDF derivations must serialize so peak memory-hard allocation is \
+             one matrix regardless of /channel concurrency"
         );
     }
 }

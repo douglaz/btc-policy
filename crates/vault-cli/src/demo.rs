@@ -776,11 +776,16 @@ impl Manifest {
             .iter()
             .map(|actor| ceremony::channel_pubkey(&actor.seckey))
             .collect();
+        // The demo leaves every node's `max_msg_bytes` at the default, so the ceremony
+        // seals that same value into the manifest (V0-4b §0: the cap is a
+        // federation-uniform preimage field, and a node configured otherwise fails
+        // startup).
         let hash = ceremony::manifest_hash(
             wallet_id,
             coord_auth_pubkey,
             &ceremony_nodes,
             &channel_pubkeys,
+            vault_node::channel::DEFAULT_MAX_MSG_BYTES,
         );
         let entries = canonical
             .iter()

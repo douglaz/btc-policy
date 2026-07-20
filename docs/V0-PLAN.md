@@ -177,7 +177,8 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
   nodes **VALIDATE** it (destination = escape descriptor, value-coverage ≥
   threshold, feerate ≥ floor) — they do NOT build it, and there is NO stored
   standby (per ADR-0012 — this line previously described the superseded design).
-- Duress state machine: arm (+propagate to peers +record in RAMDISK state — reboot-death/tmpfs, 2026-07-16) → armed (silent,
+- Duress state machine: record intent + propagate to peers (RAMDISK state — reboot-death/tmpfs, 2026-07-16) → arm on
+  t-of-n confirmation (V0-4b §0; ingress itself never arms) → armed (silent,
   freezes hot-class completion) → **unconditional lockdown at T** (terminal,
   recovery-path exit), **THEN a best-effort sweep** (combine + re-broadcast; may
   fail → funds stay frozen → recovery). `duress_delay_secs` is the hostage-safety window.
@@ -199,11 +200,15 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
   DEAD and contributes no partial; the surviving armed set fires the sweep at `T` if ≥ t remain, else
   lockdown-only → recovery (ADR-0007); enter Lockdown at `T` even if fire/broadcast fails (not only after
   confirm); the pin is **never persisted in the envelope** (ADR-0012 duress state machine).
-- **Two-track duress state machine — arm is keyed on the valid DURESS PIN ALONE** (unconditional,
-  chain-view-independent): a valid coordinator-authenticated duress pin **freezes hot-class finalization +
-  schedules lockdown at T**, with **NO** coverage / feerate / `testmempoolaccept` / mempool judgment at arm
-  at all — so backend chain-view skew (tip lag, reorg, propagation) cannot split the armed set below `t`
-  (this is the arm-split conditional-theft fix). Escape admissibility (class-aware coverage, feerate floor,
+- **Two-track duress state machine — the arm VERDICT is keyed on the valid DURESS PIN ALONE**
+  (chain-view-independent), and the arm is **COMMITTED at t-of-n confirmation** (V0-4b §0): a valid
+  coordinator-authenticated duress pin decides the verdict with **NO** coverage / feerate /
+  `testmempoolaccept` / mempool judgment at arm at all — so backend chain-view skew (tip lag, reorg,
+  propagation) cannot split the armed set below `t` (this is the arm-split conditional-theft fix) — but the
+  **freeze of hot-class finalization + lockdown-at-T commit only once ≥ t nodes are confirmed to hold the
+  request**, on the `/channel` receipt path and off the `/sign` response path. Ingress records intent and
+  propagates; it never arms. That ordering is what makes arming un-splittable: a coordinator that keeps a
+  carrier from reaching `t` nodes achieves censorship (an accepted residual), never a one-armed split. Escape admissibility (class-aware coverage, feerate floor,
   package `testmempoolaccept`) is **ENTIRELY a fire-time check** that gates only whether the best-effort
   sweep fires; a sweep that fails still leaves the node frozen + locked down → recovery. See ADR-0012
   "Duress state machine (per node) — normative".

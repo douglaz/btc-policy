@@ -14,7 +14,7 @@
 //! here — those still trust each input's `witness_utxo`, exactly as in v0. Being a
 //! trait, unit tests use a mock and never need bitcoind.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::str::FromStr;
@@ -97,6 +97,17 @@ pub trait ChainBackend {
     /// spent). Confirmed-only would strand the common case: spend-change and
     /// refresh outputs are usually still unconfirmed (ADR-0012).
     fn prevout(&self, outpoint: &OutPoint) -> Result<Option<Prevout>, Error>;
+
+    /// Every currently-unspent output paying one of `scripts` in this node's
+    /// confirmed UTXO set, plus unconfirmed outputs whose parent txid is in the
+    /// node's validated-and-policy-accepted `authorized` set. This is the
+    /// fire-time whole-vault denominator for ADR-0012/0013 coverage. External
+    /// unconfirmed deposits are deliberately excluded (toxic-deposit safe).
+    fn vault_unspent(
+        &self,
+        scripts: &[ScriptBuf],
+        authorized: &HashSet<Txid>,
+    ) -> Result<Vec<(OutPoint, Prevout)>, Error>;
 
     /// Raw consensus bytes of `txid` iff it is in this node's mempool. This is the
     /// ancestor lookup used after the first package level: a mempool parent's own
@@ -268,6 +279,162 @@ impl BitcoindBackend {
         }
         Ok(reply["result"].clone())
     }
+
+    /// Fail startup unless Core's transaction index is present and caught up AND
+    /// the node has left initial block download. Escape-class union coverage must
+    /// distinguish a paired spend that confirmed from one absent from the mempool;
+    /// `getrawtransaction(txid, true)` cannot make that distinction reliably without
+    /// `-txindex=1`, and neither lookup is reliable against a stale IBD chain view.
+    pub fn verify_required_indexes(&self) -> Result<(), Error> {
+        // `getindexinfo`'s `synced` only means the txindex has caught up to THIS
+        // node's current tip. During initial block download that tip still lags the
+        // network, so the index can report `synced` over a stale chain view — the
+        // confirmed vault-UTXO scan would then miss outputs in not-yet-downloaded
+        // blocks (understating the coverage denominator) and `transaction_confirmed`
+        // would misread an already-mined paired spend as absent. `initialblockdownload`
+        // is the authoritative "chain view is current" signal, so require it cleared
+        // before this node consumes its key's one process generation.
+        let chain = self.call("getblockchaininfo", json!([]))?;
+        if chain.get("initialblockdownload").and_then(Value::as_bool) != Some(false) {
+            return Err(
+                "bitcoind is still in initial block download: refusing to start until the chain \
+                 view is current (escape coverage and confirmation lookup would be computed \
+                 against a stale tip)"
+                    .into(),
+            );
+        }
+        let indexes = self.call("getindexinfo", json!([]))?;
+        let txindex = indexes.get("txindex").and_then(Value::as_object).ok_or(
+            "bitcoind must run with -txindex=1: escape-class union coverage requires confirmed \
+             transaction lookup",
+        )?;
+        if txindex.get("synced").and_then(Value::as_bool) != Some(true) {
+            return Err(
+                "bitcoind txindex is not synced: refusing to start until escape-class \
+                 confirmation lookup is reliable"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Scan the confirmed vault UTXO set and return the block hash the scan was
+    /// evaluated against. `vault_unspent` uses that hash to detect a confirmation
+    /// racing the later authorized-mempool enumeration; without reconciliation, an
+    /// authorized output that confirms between those two reads appears in neither.
+    fn scan_confirmed_vault_unspent(
+        &self,
+        scripts: &[ScriptBuf],
+    ) -> Result<(String, HashMap<OutPoint, Prevout>), Error> {
+        let scan_objects: Vec<Value> = scripts
+            .iter()
+            .map(|script| {
+                json!({
+                    "desc": format!("raw({})", script.as_bytes().to_lower_hex_string())
+                })
+            })
+            .collect();
+        let scan = self.call("scantxoutset", json!(["start", scan_objects]))?;
+        if scan["success"].as_bool() != Some(true) {
+            return Err("scantxoutset: scan did not complete successfully".into());
+        }
+        let bestblock = scan["bestblock"]
+            .as_str()
+            .ok_or("scantxoutset: bestblock is not a hash")?
+            .to_string();
+        let unspents = scan["unspents"]
+            .as_array()
+            .ok_or("scantxoutset: unspents is not an array")?;
+        let watched: HashSet<&ScriptBuf> = scripts.iter().collect();
+        let mut found = HashMap::new();
+        for entry in unspents {
+            let txid = entry["txid"]
+                .as_str()
+                .ok_or("scantxoutset: unspent has no txid")?;
+            let vout = entry["vout"]
+                .as_u64()
+                .ok_or("scantxoutset: unspent has no vout")?;
+            let vout = u32::try_from(vout).map_err(|_| "scantxoutset: vout exceeds u32")?;
+            let outpoint = OutPoint::new(
+                Txid::from_str(txid).map_err(|e| format!("scantxoutset: bad txid: {e}"))?,
+                vout,
+            );
+            if let Some(prevout) = self.prevout(&outpoint)? {
+                if watched.contains(&prevout.txout.script_pubkey) && prevout.confirmed {
+                    found.insert(outpoint, prevout);
+                }
+            }
+        }
+        Ok((bestblock, found))
+    }
+
+    /// The node's current mempool txid set. Coverage snapshots compare the complete
+    /// set before and after enumeration: any membership change can alter whether
+    /// `gettxout(..., true)` exposes a confirmed vault output.
+    fn mempool_txids(&self) -> Result<HashSet<Txid>, Error> {
+        let mempool = self.call("getrawmempool", json!([]))?;
+        let entries = mempool
+            .as_array()
+            .ok_or("getrawmempool: expected an array")?;
+        entries
+            .iter()
+            .map(|entry| {
+                let txid = entry
+                    .as_str()
+                    .ok_or("getrawmempool: entry is not a txid string")?;
+                Txid::from_str(txid)
+                    .map_err(|e| format!("getrawmempool: bad txid {txid}: {e}").into())
+            })
+            .collect()
+    }
+
+    /// The node's current mempool txid set together with Core's monotonic
+    /// `mempool_sequence`. The sequence increments on EVERY mempool add and remove,
+    /// so an unchanged sequence across two reads proves nothing entered or left in
+    /// between — including a transient transaction that both enters and leaves
+    /// between the reads, which comparing the txid-set endpoints alone would miss.
+    fn mempool_snapshot(&self) -> Result<(HashSet<Txid>, u64), Error> {
+        // `getrawmempool false true`: the non-verbose txid list plus the sequence.
+        let reply = self.call("getrawmempool", json!([false, true]))?;
+        let sequence = reply
+            .get("mempool_sequence")
+            .and_then(Value::as_u64)
+            .ok_or("getrawmempool: missing mempool_sequence")?;
+        let entries = reply
+            .get("txids")
+            .and_then(Value::as_array)
+            .ok_or("getrawmempool: txids is not an array")?;
+        let txids = entries
+            .iter()
+            .map(|entry| {
+                let txid = entry
+                    .as_str()
+                    .ok_or("getrawmempool: txid entry is not a string")?;
+                Txid::from_str(txid)
+                    .map_err(|e| format!("getrawmempool: bad txid {txid}: {e}").into())
+            })
+            .collect::<Result<HashSet<Txid>, Error>>()?;
+        Ok((txids, sequence))
+    }
+
+    /// Fetch raw transaction bytes without taking another complete mempool
+    /// snapshot. Callers either already proved membership from their own snapshot
+    /// or tolerate a concurrent eviction/confirmation as `None` and reconcile it.
+    fn raw_transaction_if_available(&self, txid: &Txid) -> Result<Option<Vec<u8>>, Error> {
+        let reply = self.call_reply("getrawtransaction", json!([txid.to_string()]))?;
+        if !reply["error"].is_null() {
+            if reply["error"]["code"].as_i64() == Some(-5) {
+                return Ok(None);
+            }
+            return Err(format!("bitcoind getrawtransaction: {}", reply["error"]).into());
+        }
+        let hex = reply["result"]
+            .as_str()
+            .ok_or("getrawtransaction: expected a hex string")?;
+        Ok(Some(
+            Vec::<u8>::from_hex(hex).map_err(|e| format!("getrawtransaction: bad hex: {e}"))?,
+        ))
+    }
 }
 
 impl ChainBackend for BitcoindBackend {
@@ -399,33 +566,104 @@ impl ChainBackend for BitcoindBackend {
         }))
     }
 
+    fn vault_unspent(
+        &self,
+        scripts: &[ScriptBuf],
+        authorized: &HashSet<Txid>,
+    ) -> Result<Vec<(OutPoint, Prevout)>, Error> {
+        // Confirmed balance: scan the node's own UTXO set for the exact vault
+        // script(s), then re-read each result through `gettxout(..., true)` so an
+        // output already spent by a mempool transaction is not double-counted.
+        //
+        // SCALING (deferred to the V0-4b-harness bead): `scantxoutset` is a full
+        // UTXO-set scan — fast on regtest/small chains (the demo + tests), but minutes
+        // on a large mainnet chain. Because this runs synchronously inside the
+        // fire-time `escape_sweep_admissible` coverage check, a multi-minute scan can
+        // outlast the bounded `[T, T + combine_slack_secs]` combine window and stop the
+        // SWEEP from broadcasting. This does NOT weaken safety — Lockdown at `T` is
+        // unconditional and independent of the sweep, so funds still freeze → recovery,
+        // never theft — but near-term mainnet operation of the sweep needs a
+        // wallet/indexed vault-UTXO lookup here (a backend capability, out of this
+        // core bead's scope; see challenges-round-3).
+        let watched: HashSet<&ScriptBuf> = scripts.iter().collect();
+        // There is no atomic chain+mempool JSON-RPC snapshot. Take bounded full
+        // passes instead, bracketing each with Core's monotonic `mempool_sequence`
+        // (bumped on EVERY add and remove). An unchanged sequence AND an unchanged
+        // tip across the pass prove the scan/gettxout reads saw one consistent
+        // chain+mempool view — including that no transaction transiently entered and
+        // left between the two reads (an ABA that comparing the txid-set endpoints
+        // alone would miss). A changed sequence or tip retries once; a second
+        // unstable pass fails closed (no sweep; Lockdown already latched) rather than
+        // admit an escape against an understated coverage denominator.
+        for attempt in 0..2 {
+            // Snapshot the FULL mempool, not just its intersection with the
+            // authorized set. An unauthorized mempool transaction can temporarily
+            // suppress a confirmed vault output from `gettxout(..., true)`; any such
+            // membership motion during the pass bumps the sequence below and forces a
+            // retry, whether the suppressor stays or is evicted before the pass ends,
+            // so an understated confirmed denominator is never accepted.
+            let (mempool_before, sequence_before) = self.mempool_snapshot()?;
+            let (scan_tip, mut found) = self.scan_confirmed_vault_unspent(scripts)?;
+
+            // Authorized-unconfirmed balance: only transactions this node accepted may
+            // contribute. Reading just those txids avoids scanning unrelated mempool
+            // traffic and structurally excludes external unconfirmed deposits.
+            for txid in mempool_before.intersection(authorized) {
+                let Some(raw) = self.raw_transaction_if_available(txid)? else {
+                    continue;
+                };
+                let tx: Transaction = consensus::deserialize(&raw).map_err(|e| {
+                    format!("authorized mempool transaction {txid} is malformed: {e}")
+                })?;
+                for (vout, output) in tx.output.iter().enumerate() {
+                    if !watched.contains(&output.script_pubkey) {
+                        continue;
+                    }
+                    let vout = u32::try_from(vout).map_err(|_| {
+                        format!("authorized transaction {txid} has too many outputs")
+                    })?;
+                    let outpoint = OutPoint::new(*txid, vout);
+                    if let Some(prevout) = self.prevout(&outpoint)? {
+                        if !prevout.confirmed {
+                            found.insert(outpoint, prevout);
+                        }
+                    }
+                }
+            }
+            let tip_after = self
+                .call("getbestblockhash", json!([]))?
+                .as_str()
+                .ok_or("getbestblockhash: expected a block hash")?
+                .to_string();
+            let (_, sequence_after) = self.mempool_snapshot()?;
+            if scan_tip == tip_after && sequence_before == sequence_after {
+                let mut found: Vec<_> = found.into_iter().collect();
+                found.sort_by_key(|(outpoint, _)| *outpoint);
+                return Ok(found);
+            }
+
+            if attempt == 1 {
+                return Err("chain tip or mempool membership changed again while \
+                     reconciling the vault UTXO snapshot"
+                    .into());
+            }
+        }
+        unreachable!("the bounded snapshot loop always returns or errors")
+    }
+
     fn mempool_transaction(&self, txid: &Txid) -> Result<Option<Vec<u8>>, Error> {
         // Query membership explicitly instead of probing an English RPC error or
         // relying on `-txindex`. A confirmed parent is absent here; an unconfirmed
         // ancestor is present and getrawtransaction can always read mempool data.
-        let mempool = self.call("getrawmempool", json!([]))?;
-        let entries = mempool
-            .as_array()
-            .ok_or("getrawmempool: expected an array")?;
-        let txid_text = txid.to_string();
-        if !entries
-            .iter()
-            .any(|entry| entry.as_str() == Some(txid_text.as_str()))
-        {
+        if !self.mempool_txids()?.contains(txid) {
             return Ok(None);
         }
-        let result = self.call("getrawtransaction", json!([txid_text]))?;
-        let hex = result
-            .as_str()
-            .ok_or("getrawtransaction: expected a hex string")?;
-        Ok(Some(
-            Vec::<u8>::from_hex(hex).map_err(|e| format!("getrawtransaction: bad hex: {e}"))?,
-        ))
+        self.raw_transaction_if_available(txid)
     }
 
     fn transaction_confirmed(&self, txid: &Txid) -> Result<bool, Error> {
-        // The v0 bitcoind backend is launched with `-txindex=1` by the demo, so it
-        // can distinguish a mined transaction from one that is merely absent.
+        // Production startup verifies a fully-synced `-txindex=1`, so this can
+        // distinguish a mined transaction from one that is merely absent.
         // Preserve Core's structured -5 "not found" result as ordinary `false`;
         // every other RPC failure remains an error and leaves the candidate for a
         // later retry.
@@ -516,7 +754,7 @@ pub(crate) mod mock {
     //! A mock chain backend for the unit tests — no bitcoind, no sockets.
 
     use std::collections::{HashMap, HashSet};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Barrier, Mutex};
 
     use bitcoin::{consensus, OutPoint, ScriptBuf, Transaction, Txid};
 
@@ -555,7 +793,18 @@ pub(crate) mod mock {
         pub raw_txs: HashMap<Txid, Vec<u8>>,
         pub confirmed_txs: HashSet<Txid>,
         pub package_rejection: Option<String>,
+        /// Forces `broadcast` to fail AFTER package acceptance (the "quorum +
+        /// admissibility + package-accept all pass, but `sendrawtransaction` itself
+        /// errors" branch). Distinct from `package_rejection`, which fails earlier at
+        /// `test_package_accept`. Lets a test exercise the `broadcast_package` `Err`
+        /// arm and prove Lockdown at `T` is still unconditional there.
+        pub broadcast_error: Option<String>,
         pub packages_tested: Mutex<Vec<Vec<Vec<u8>>>>,
+        /// Optional deterministic pause around package acceptance. A concurrency
+        /// test uses this to land a duress arm after finalization but before the
+        /// final broadcast-authorization boundary.
+        pub package_test_entered: Option<Arc<Barrier>>,
+        pub package_test_continue: Option<Arc<Barrier>>,
     }
 
     impl ChainBackend for MockBackend {
@@ -564,6 +813,11 @@ pub(crate) mod mock {
             // (no panic) — and so the returned txid is the real one.
             let tx: Transaction = consensus::deserialize(raw_tx)
                 .map_err(|e| format!("malformed transaction: {e}"))?;
+            // A forced broadcast failure never records the transaction — mirroring a
+            // real backend whose `sendrawtransaction` rejected it.
+            if let Some(reason) = &self.broadcast_error {
+                return Err(reason.clone().into());
+            }
             self.broadcasts
                 .lock()
                 .expect("broadcasts lock")
@@ -598,6 +852,25 @@ pub(crate) mod mock {
             Ok(self.prevouts.get(outpoint).cloned())
         }
 
+        fn vault_unspent(
+            &self,
+            scripts: &[ScriptBuf],
+            authorized: &HashSet<Txid>,
+        ) -> Result<Vec<(OutPoint, Prevout)>, Error> {
+            let watched: HashSet<&ScriptBuf> = scripts.iter().collect();
+            let mut found: Vec<_> = self
+                .prevouts
+                .iter()
+                .filter(|(outpoint, prevout)| {
+                    watched.contains(&prevout.txout.script_pubkey)
+                        && (prevout.confirmed || authorized.contains(&outpoint.txid))
+                })
+                .map(|(outpoint, prevout)| (*outpoint, prevout.clone()))
+                .collect();
+            found.sort_by_key(|(outpoint, _)| *outpoint);
+            Ok(found)
+        }
+
         fn mempool_transaction(&self, txid: &Txid) -> Result<Option<Vec<u8>>, Error> {
             Ok(self.raw_txs.get(txid).cloned())
         }
@@ -611,6 +884,12 @@ pub(crate) mod mock {
                 .lock()
                 .expect("packages_tested lock")
                 .push(raw_txs.to_vec());
+            if let Some(entered) = &self.package_test_entered {
+                entered.wait();
+            }
+            if let Some(proceed) = &self.package_test_continue {
+                proceed.wait();
+            }
             Ok(match &self.package_rejection {
                 Some(reason) => PackageVerdict::Rejected(reason.clone()),
                 None => PackageVerdict::Accepted,
@@ -622,14 +901,77 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use super::mock::MockBackend;
-    use super::{assemble_package, ChainBackend, Prevout, MAX_PACKAGE_ANCESTORS};
+    use super::{assemble_package, BitcoindBackend, ChainBackend, Prevout, MAX_PACKAGE_ANCESTORS};
 
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash;
+    use bitcoin::hex::DisplayHex;
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
     use std::collections::HashSet;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A tiny scripted JSON-RPC peer for exercising the real bitcoind backend's
+    /// cross-call snapshot ordering without launching bitcoind.
+    fn scripted_rpc(
+        replies: Vec<(&'static str, serde_json::Value)>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted RPC");
+        let addr = listener.local_addr().expect("scripted RPC address");
+        let handle = std::thread::spawn(move || {
+            for (expected_method, result) in replies {
+                let (mut stream, _) = listener.accept().expect("accept RPC call");
+                let mut request = Vec::new();
+                let (header_end, content_len) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let read = stream.read(&mut chunk).expect("read RPC request");
+                    assert!(read > 0, "RPC request ended before its headers");
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let header_end = header_end + 4;
+                    let headers =
+                        std::str::from_utf8(&request[..header_end]).expect("HTTP headers");
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("content length"))
+                        })
+                        .expect("Content-Length");
+                    break (header_end, content_len);
+                };
+                while request.len() < header_end + content_len {
+                    let mut chunk = [0u8; 4096];
+                    let read = stream.read(&mut chunk).expect("read RPC body");
+                    assert!(read > 0, "RPC request ended before its body");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_len])
+                        .expect("JSON-RPC request");
+                assert_eq!(body["method"], expected_method);
+                let response = serde_json::json!({
+                    "result": result,
+                    "error": serde_json::Value::Null,
+                    "id": "vault-node",
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .expect("write RPC response");
+            }
+        });
+        (addr, handle)
+    }
 
     /// A minimal but well-formed 1-in/1-out transaction to broadcast.
     fn sample_tx() -> Transaction {
@@ -681,6 +1023,406 @@ mod tests {
             },
             confirmed,
         }
+    }
+
+    #[test]
+    fn required_index_check_accepts_a_synced_txindex() {
+        let (addr, server) = scripted_rpc(vec![
+            (
+                "getblockchaininfo",
+                serde_json::json!({ "initialblockdownload": false }),
+            ),
+            (
+                "getindexinfo",
+                serde_json::json!({
+                    "txindex": { "synced": true, "best_block_height": 321 }
+                }),
+            ),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        backend
+            .verify_required_indexes()
+            .expect("a current, synced txindex satisfies the production backend contract");
+        server.join().expect("scripted RPC completed");
+    }
+
+    #[test]
+    fn required_index_check_rejects_a_missing_or_unsynced_txindex() {
+        for (result, expected) in [
+            (serde_json::json!({}), "-txindex=1"),
+            (
+                serde_json::json!({ "txindex": { "synced": false } }),
+                "not synced",
+            ),
+        ] {
+            let (addr, server) = scripted_rpc(vec![
+                (
+                    "getblockchaininfo",
+                    serde_json::json!({ "initialblockdownload": false }),
+                ),
+                ("getindexinfo", result),
+            ]);
+            let backend = BitcoindBackend::new(addr, String::new());
+            let error = backend
+                .verify_required_indexes()
+                .expect_err("an unavailable confirmation index must fail startup")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "unexpected index failure for {expected}: {error}"
+            );
+            server.join().expect("scripted RPC completed");
+        }
+    }
+
+    /// A `synced` txindex over a chain view that is still in initial block download
+    /// must NOT pass: the tip lags the network, so the confirmed vault-UTXO scan and
+    /// `transaction_confirmed` would both read a stale view. The check must reject
+    /// BEFORE consulting `getindexinfo` (only `getblockchaininfo` is scripted).
+    #[test]
+    fn required_index_check_rejects_a_backend_in_initial_block_download() {
+        let (addr, server) = scripted_rpc(vec![(
+            "getblockchaininfo",
+            serde_json::json!({ "initialblockdownload": true }),
+        )]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let error = backend
+            .verify_required_indexes()
+            .expect_err("an IBD chain view must fail startup")
+            .to_string();
+        assert!(
+            error.contains("initial block download"),
+            "the IBD failure must name its reason: {error}"
+        );
+        server.join().expect("scripted RPC completed");
+    }
+
+    /// An authorized transaction can confirm after `scantxoutset` snapshots the UTXO
+    /// set but before the authorized-mempool pass reaches it. It is then absent from
+    /// both reads unless the changed tip triggers a confirmed-set reconciliation.
+    #[test]
+    fn vault_unspent_reconciles_an_authorized_confirmation_racing_the_scan() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let txid = Txid::from_byte_array([0xA5; 32]);
+        let old_tip = "11".repeat(32);
+        let new_tip = "22".repeat(32);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let mut authorized_tx = sample_tx();
+        authorized_tx.output[0].script_pubkey = script.clone();
+        let authorized_tx_hex = serialize(&authorized_tx).to_lower_hex_string();
+        let confirmed_output = serde_json::json!({
+            "scriptPubKey": {"hex": script_hex},
+            "value": 0.001,
+            "confirmations": 1,
+        });
+        let (addr, server) = scripted_rpc(vec![
+            // Snapshot 1 starts while the authorized transaction is in the mempool.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [txid.to_string()], "mempool_sequence": 1}),
+            ),
+            (
+                "scantxoutset",
+                serde_json::json!({"success": true, "bestblock": old_tip, "unspents": []}),
+            ),
+            // It confirms while the authorized pass reads its output.
+            ("getrawtransaction", serde_json::json!(authorized_tx_hex)),
+            ("gettxout", confirmed_output.clone()),
+            ("getbestblockhash", serde_json::json!(new_tip)),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 2}),
+            ),
+            // Snapshot 2 retries the complete view at the new stable tip.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 2}),
+            ),
+            (
+                "scantxoutset",
+                serde_json::json!({
+                    "success": true,
+                    "bestblock": "22".repeat(32),
+                    "unspents": [{"txid": txid.to_string(), "vout": 0}],
+                }),
+            ),
+            ("gettxout", confirmed_output),
+            ("getbestblockhash", serde_json::json!("22".repeat(32))),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 2}),
+            ),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let authorized: HashSet<Txid> = [txid].into_iter().collect();
+
+        let unspent = backend
+            .vault_unspent(std::slice::from_ref(&script), &authorized)
+            .expect("reconciled vault balance");
+        server.join().expect("scripted RPC completed");
+        assert_eq!(unspent.len(), 1);
+        assert_eq!(unspent[0].0, OutPoint::new(txid, 0));
+        assert_eq!(unspent[0].1.txout.value, Amount::from_sat(100_000));
+        assert!(unspent[0].1.confirmed);
+    }
+
+    /// An authorized mempool transaction can be evicted after `gettxout(..., true)`
+    /// suppresses its confirmed input but before the authorized pass enumerates its
+    /// unconfirmed output. With a stable tip, tip-only reconciliation misses that
+    /// transition and undercounts both sides. Authorized-mempool membership snapshots
+    /// must force a complete retry, which restores the now-unspent confirmed input.
+    #[test]
+    fn vault_unspent_reconciles_authorized_mempool_eviction_without_a_tip_change() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let parent_txid = Txid::from_byte_array([0xB4; 32]);
+        let authorized_txid = Txid::from_byte_array([0xC5; 32]);
+        let tip = "33".repeat(32);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let mut authorized_tx = sample_tx();
+        authorized_tx.output[0].script_pubkey = script.clone();
+        let authorized_tx_hex = serialize(&authorized_tx).to_lower_hex_string();
+        let scan = serde_json::json!({
+            "success": true,
+            "bestblock": tip,
+            "unspents": [{"txid": parent_txid.to_string(), "vout": 0}],
+        });
+        let confirmed_parent = serde_json::json!({
+            "scriptPubKey": {"hex": script_hex},
+            "value": 0.001,
+            "confirmations": 1,
+        });
+        let (addr, server) = scripted_rpc(vec![
+            // Snapshot 1: the authorized child initially spends the confirmed parent.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [authorized_txid.to_string()], "mempool_sequence": 10}),
+            ),
+            ("scantxoutset", scan.clone()),
+            ("gettxout", serde_json::Value::Null),
+            // Evicted while its outputs are enumerated; the tip does not change, but
+            // the eviction bumps the sequence, so the pass is not accepted.
+            ("getrawtransaction", serde_json::json!(authorized_tx_hex)),
+            ("gettxout", serde_json::Value::Null),
+            ("getbestblockhash", serde_json::json!("33".repeat(32))),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 11}),
+            ),
+            // Snapshot 2 is stable and sees the confirmed parent unspent again.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 11}),
+            ),
+            ("scantxoutset", scan),
+            ("gettxout", confirmed_parent),
+            ("getbestblockhash", serde_json::json!("33".repeat(32))),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 11}),
+            ),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let authorized: HashSet<Txid> = [authorized_txid].into_iter().collect();
+
+        let unspent = backend
+            .vault_unspent(std::slice::from_ref(&script), &authorized)
+            .expect("eviction-reconciled vault balance");
+        server.join().expect("scripted RPC completed");
+        assert_eq!(unspent.len(), 1);
+        assert_eq!(unspent[0].0, OutPoint::new(parent_txid, 0));
+        assert_eq!(unspent[0].1.txout.value, Amount::from_sat(100_000));
+        assert!(unspent[0].1.confirmed);
+    }
+
+    /// An unauthorized mempool spend suppresses its confirmed vault prevout from
+    /// `gettxout(..., true)` just like an authorized spend does. If it is evicted
+    /// during the snapshot, comparing only the authorized intersection sees no
+    /// change and accepts an understated balance. Full-mempool reconciliation must
+    /// retry and restore the now-unspent confirmed output.
+    #[test]
+    fn vault_unspent_reconciles_unauthorized_mempool_eviction() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let parent_txid = Txid::from_byte_array([0xD6; 32]);
+        let unauthorized_txid = Txid::from_byte_array([0xE7; 32]);
+        let tip = "44".repeat(32);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let scan = serde_json::json!({
+            "success": true,
+            "bestblock": tip,
+            "unspents": [{"txid": parent_txid.to_string(), "vout": 0}],
+        });
+        let confirmed_parent = serde_json::json!({
+            "scriptPubKey": {"hex": script_hex},
+            "value": 0.001,
+            "confirmations": 1,
+        });
+        let (addr, server) = scripted_rpc(vec![
+            // Snapshot 1: an UNAUTHORIZED mempool tx suppresses the confirmed
+            // parent. The authorized set is empty throughout this test.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [unauthorized_txid.to_string()], "mempool_sequence": 20}),
+            ),
+            ("scantxoutset", scan.clone()),
+            ("gettxout", serde_json::Value::Null),
+            ("getbestblockhash", serde_json::json!("44".repeat(32))),
+            // Eviction with no tip change bumps the sequence, so the complete pass
+            // is not accepted even though the authorized intersection never changed.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 21}),
+            ),
+            // Snapshot 2 is stable and sees the confirmed parent unspent again.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 21}),
+            ),
+            ("scantxoutset", scan),
+            ("gettxout", confirmed_parent),
+            ("getbestblockhash", serde_json::json!("44".repeat(32))),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 21}),
+            ),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        let unspent = backend
+            .vault_unspent(std::slice::from_ref(&script), &HashSet::new())
+            .expect("unauthorized-eviction-reconciled vault balance");
+        server.join().expect("scripted RPC completed");
+        assert_eq!(unspent.len(), 1);
+        assert_eq!(unspent[0].0, OutPoint::new(parent_txid, 0));
+        assert_eq!(unspent[0].1.txout.value, Amount::from_sat(100_000));
+        assert!(unspent[0].1.confirmed);
+    }
+
+    /// The ABA the txid-set endpoints alone cannot see: a transaction is absent at
+    /// the first snapshot, ENTERS and suppresses a confirmed vault output from
+    /// `gettxout(..., true)` while the scan runs, then LEAVES before the second
+    /// snapshot. Both endpoint sets are empty and the tip never moves, so a
+    /// set-only comparison would accept the understated (here, empty) balance.
+    /// Core's `mempool_sequence` still advances across the enter+leave, so the pass
+    /// is retried and the now-unspent confirmed output is restored.
+    #[test]
+    fn vault_unspent_retries_when_a_transient_mempool_tx_races_the_scan() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let parent_txid = Txid::from_byte_array([0xF8; 32]);
+        let tip = "88".repeat(32);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let scan = serde_json::json!({
+            "success": true,
+            "bestblock": tip,
+            "unspents": [{"txid": parent_txid.to_string(), "vout": 0}],
+        });
+        let confirmed_parent = serde_json::json!({
+            "scriptPubKey": {"hex": script_hex},
+            "value": 0.001,
+            "confirmations": 1,
+        });
+        let (addr, server) = scripted_rpc(vec![
+            // Snapshot 1: empty mempool. A transient tx then enters, suppresses the
+            // confirmed parent, and leaves — all before snapshot 2, so BOTH sets are
+            // empty. Only the sequence records the enter (+1) and leave (+1).
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 50}),
+            ),
+            ("scantxoutset", scan.clone()),
+            ("gettxout", serde_json::Value::Null),
+            ("getbestblockhash", serde_json::json!("88".repeat(32))),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 52}),
+            ),
+            // Snapshot 2 is stable and sees the confirmed parent unspent again.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 52}),
+            ),
+            ("scantxoutset", scan),
+            ("gettxout", confirmed_parent),
+            ("getbestblockhash", serde_json::json!("88".repeat(32))),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 52}),
+            ),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        let unspent = backend
+            .vault_unspent(std::slice::from_ref(&script), &HashSet::new())
+            .expect("transient-reconciled vault balance");
+        server.join().expect("scripted RPC completed");
+        assert_eq!(unspent.len(), 1);
+        assert_eq!(unspent[0].0, OutPoint::new(parent_txid, 0));
+        assert_eq!(unspent[0].1.txout.value, Amount::from_sat(100_000));
+        assert!(unspent[0].1.confirmed);
+    }
+
+    #[test]
+    fn vault_unspent_rejects_an_incomplete_confirmed_scan() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let (addr, server) = scripted_rpc(vec![
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 30}),
+            ),
+            (
+                "scantxoutset",
+                serde_json::json!({
+                    "success": false,
+                    "bestblock": "55".repeat(32),
+                    "unspents": [],
+                }),
+            ),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        let error = backend
+            .vault_unspent(std::slice::from_ref(&script), &HashSet::new())
+            .expect_err("an aborted scan must fail closed");
+        server.join().expect("scripted RPC completed");
+        assert!(
+            error.to_string().contains("scan did not complete"),
+            "the incomplete-scan reason must be preserved: {error}"
+        );
+    }
+
+    #[test]
+    fn vault_unspent_fetches_raw_transactions_only_for_the_mempool_intersection() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let current_txid = Txid::from_byte_array([0x66; 32]);
+        let current_raw = serialize(&sample_tx()).to_lower_hex_string();
+        let tip = "77".repeat(32);
+        let (addr, server) = scripted_rpc(vec![
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [current_txid.to_string()], "mempool_sequence": 40}),
+            ),
+            (
+                "scantxoutset",
+                serde_json::json!({"success": true, "bestblock": tip, "unspents": []}),
+            ),
+            ("getrawtransaction", serde_json::json!(current_raw)),
+            ("getbestblockhash", serde_json::json!("77".repeat(32))),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [current_txid.to_string()], "mempool_sequence": 40}),
+            ),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let mut authorized: HashSet<Txid> = (0..128)
+            .map(|tag| Txid::from_byte_array([tag; 32]))
+            .collect();
+        authorized.insert(current_txid);
+
+        let unspent = backend
+            .vault_unspent(std::slice::from_ref(&script), &authorized)
+            .expect("stable snapshot");
+        server.join().expect("scripted RPC completed");
+        assert!(unspent.is_empty());
     }
 
     #[test]

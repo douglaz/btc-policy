@@ -18,8 +18,8 @@ use bytes::BytesMut;
 use vault_proto::TaggedRequest;
 use zeroize::Zeroize;
 
-use crate::channel::{self, ChannelReply, RejectReason};
-use crate::{handle_channel_body, handle_refresh_now, handle_sign_now, propagate_outbox, Node};
+use crate::channel::{ChannelReply, RejectReason};
+use crate::{handle_channel_body_now, handle_refresh_now, handle_sign_now, propagate_outbox, Node};
 
 /// Unchanged 1 MiB cap applied while the zeroizing accumulator reads `/sign`.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -140,9 +140,18 @@ struct AppState {
 }
 
 /// Serve the one axum app (`/sign` + `/events`) over `listener`.
+///
+/// `listener` is already bound, so this is the last production startup boundary
+/// before any request can arm or register a candidate. Claim the config inode's
+/// one-shot process generation here rather than relying on a particular binary
+/// caller to remember it: every embedding that uses the public serving API then
+/// preserves ADR-0012 reboot-death, and path-less test construction cannot be
+/// exposed accidentally as a restartable signer.
 pub async fn serve(listener: tokio::net::TcpListener, node: Arc<Node>) -> std::io::Result<()> {
     node.require_channel_mode()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    node.claim_process_generation()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
     axum::serve(listener, app(node)).await
 }
 
@@ -366,10 +375,10 @@ async fn channel(State(state): State<AppState>, body: Body) -> Response {
             // guard and exhausting the blocking pool. Tying the permit to the job caps
             // in-flight work at the bound regardless of cancellation.
             let _permit = permit;
-            // `handle_channel_body`, not `channel.ingest`: a `request` envelope has to
+            // `handle_channel_body_now`, not `channel.ingest`: a `request` envelope has to
             // pass THIS node's own coordinator-auth + policy gates, which live on the
             // node, not the channel (§3).
-            handle_channel_body(&node, bytes.as_ref(), channel::unix_now())
+            handle_channel_body_now(&node, bytes.as_ref())
         })
         .await;
         // A `request` this node accepted now goes to every peer (§3), so delivery to
@@ -598,6 +607,13 @@ mod tests {
         // This backend exists to stall the watchtower scan; the fire path is not
         // under test here, so its three methods are unreachable stubs.
         fn prevout(&self, _outpoint: &OutPoint) -> Result<Option<Prevout>, Error> {
+            Err("SlowBackend has no chain view".into())
+        }
+        fn vault_unspent(
+            &self,
+            _scripts: &[ScriptBuf],
+            _authorized: &std::collections::HashSet<Txid>,
+        ) -> Result<Vec<(OutPoint, Prevout)>, Error> {
             Err("SlowBackend has no chain view".into())
         }
         fn mempool_transaction(&self, _txid: &Txid) -> Result<Option<Vec<u8>>, Error> {

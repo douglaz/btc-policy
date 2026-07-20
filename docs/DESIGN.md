@@ -130,7 +130,8 @@ pin_normal_hash = "argon2id$..." # authorizes the submitted spend
 pin_duress_hash = "argon2id$..." # triggers the duress mechanism; externally identical (ADR-0008)
 # NOTE: the `duress_response ∈ {lockdown, sweep_and_lockdown}` TOGGLE IS RETIRED
 # (ADR-0012, 2026-07-16). Duress is now a single mandatory two-track mechanism:
-# arm+freeze on the pin alone → unconditional lockdown at T → best-effort escape
+# arm+freeze (verdict from the pin alone, committed at t-of-n confirmation —
+# V0-4b §0) → unconditional lockdown at T → best-effort escape
 # sweep. There is no per-vault response choice. Occurrences of `duress_response`
 # below (lines ~150/187/224/262) are superseded by ADR-0012.
 
