@@ -25,33 +25,23 @@
 //!    could broadcast even if it wanted to.
 
 use std::fs::File;
-use std::io::Read;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use bitcoin::absolute::LockTime;
-use bitcoin::bip32::{Xpriv, Xpub};
 use bitcoin::consensus::encode::deserialize_hex;
-use bitcoin::hashes::{sha256, Hash};
-use bitcoin::hex::DisplayHex;
-use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
-use bitcoin::sighash::SighashCache;
-use bitcoin::transaction::Version;
-use bitcoin::{
-    Amount, CompressedPublicKey, EcdsaSighashType, Network, NetworkKind, OutPoint, Psbt, PublicKey,
-    ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-};
-use miniscript::{Descriptor, DescriptorPublicKey};
+use bitcoin::secp256k1::Secp256k1;
+use bitcoin::{Amount, Network, PublicKey, ScriptBuf, Transaction};
+use miniscript::Descriptor;
 use serde_json::json;
-use vault_node::channel::ceremony;
-use vault_proto::{RefusalCode, SignRequest, SignResponse, TaggedRequest, MAX_PIN_BYTES};
-use zeroize::Zeroizing;
+use vault_proto::{RefusalCode, SignRequest, SignResponse};
 
 use crate::bitcoind::Bitcoind;
-use crate::http::{self, Error};
+use crate::fed::{
+    build_spend, commitment_expiry, free_ports, locate_vault_node, p2wpkh_spk, sign_all_inputs,
+    summarize, utxo_paying, wallet_id, Actor, Coordinator, Manifest, NodeParams, NodeProcess,
+    NodeSpawn, TempDir, Utxo, Wallet,
+};
+use crate::http::Error;
 
 const NORMAL_PIN: &str = "246802";
 const DURESS_PIN: &str = "135791";
@@ -98,12 +88,32 @@ const HOT_MAX_PER_WINDOW: Amount = Amount::from_sat(900_000_000);
 /// node-authorized completion lifetime.
 const HOT_WINDOW_SECS: u64 = MAX_COMMITMENT_AGE_SECS;
 
-/// The demo's Hot budget in the shape the ceremony and the nodes both take.
-fn hot_budget() -> vault_node::HotBudget {
-    vault_node::HotBudget {
-        max_per_tx_sat: HOT_MAX_PER_TX.to_sat(),
-        max_per_window_sat: HOT_MAX_PER_WINDOW.to_sat(),
-        window_secs: HOT_WINDOW_SECS,
+/// The demo's per-vault policy numbers, in the one shape the ceremony and the
+/// generated node configs both read.
+fn node_params() -> NodeParams {
+    NodeParams {
+        hold_secs: HOLD_SECS,
+        // First light never enters duress, so the hostage window and its margin stay
+        // at the node's own defaults; `attack` is where they are tuned.
+        duress_delay_secs: 0,
+        epsilon_secs: 60,
+        combine_slack_secs: 60,
+        max_commitment_age_secs: MAX_COMMITMENT_AGE_SECS,
+        delivery_horizon_secs: 60,
+        max_derivation_index: MAX_DERIVATION_INDEX,
+        policy_version: POLICY_VERSION,
+        max_msg_bytes: vault_node::channel::DEFAULT_MAX_MSG_BYTES,
+        hot_budget: vault_node::HotBudget {
+            max_per_tx_sat: HOT_MAX_PER_TX.to_sat(),
+            max_per_window_sat: HOT_MAX_PER_WINDOW.to_sat(),
+            window_secs: HOT_WINDOW_SECS,
+        },
+        normal_pin: NORMAL_PIN.to_string(),
+        duress_pin: DURESS_PIN.to_string(),
+        // The demo measures nothing about pin latency, so it enrols at the fixture
+        // minimum and keeps first light fast.
+        pin_m_cost_kib: 8,
+        escape_feerate_floor: 1,
     }
 }
 
@@ -118,7 +128,7 @@ pub fn run_first_light() -> Result<(), Error> {
     // process births every throwaway regtest key and writes node seckeys into
     // temp-dir TOML. The v0 provisioning task (T1) removes this.
     println!("[1/4] generating throwaway keys (user, 5 nodes, destinations)");
-    let temp = TempDir::new()?;
+    let temp = TempDir::new("first-light")?;
     let mut urandom = File::open("/dev/urandom")?;
     let user = Actor::random(&secp, &mut urandom)?;
     let node_actors: Vec<Actor> = (0..NODE_COUNT)
@@ -209,14 +219,13 @@ pub fn run_first_light() -> Result<(), Error> {
     // signing key. Every byte is computed by the node's own code (see
     // `vault_node::channel::ceremony`), so the federation this provisions agrees
     // with itself by construction rather than by luck.
+    let params = node_params();
     let manifest = Manifest::assemble(
         &wallet_id(&descriptor),
         &coordinator.pubkey,
         &node_actors,
         &node_ports,
-        &ceremony_hot_allowlist,
-        &escape_wallet.descriptor,
-        MAX_DERIVATION_INDEX,
+        &params.ceremony(&ceremony_hot_allowlist, &escape_wallet.descriptor),
     )?;
     let mut nodes = Vec::new();
     for (index, actor) in node_actors.iter().enumerate() {
@@ -238,6 +247,7 @@ pub fn run_first_light() -> Result<(), Error> {
                 bitcoind_rpc_addr: bitcoind.rpc_addr(),
                 bitcoind_auth: bitcoind.auth(),
                 manifest: &manifest,
+                params: &params,
             },
         )?);
     }
@@ -296,13 +306,6 @@ pub fn run_first_light() -> Result<(), Error> {
     Ok(())
 }
 
-/// `wallet_id` — the hash of the canonical vault descriptor — computed exactly as
-/// the node computes it, so the manifest this ceremony hashes is the one every
-/// node re-derives.
-fn wallet_id(descriptor: &Descriptor<PublicKey>) -> [u8; 32] {
-    sha256::Hash::hash(descriptor.to_string().as_bytes()).to_byte_array()
-}
-
 /// Act one — honest spend: hot-wallet payment + escape variant, user-signed,
 /// normal PIN; all nodes sign; 3 signatures are combined and the spend
 /// confirms on-chain. Returns the confirmed transaction.
@@ -346,7 +349,7 @@ fn act_one(
         escape_psbt: escape.to_string(),
         pin: NORMAL_PIN.into(),
         nonce: String::new(),
-        expiry: commitment_expiry()?,
+        expiry: commitment_expiry(COMMITMENT_TTL_SECS)?,
         policy_version: POLICY_VERSION,
         coord_sig: String::new(),
     };
@@ -493,7 +496,7 @@ fn act_two(
             escape_psbt: escape.to_string(),
             pin: NORMAL_PIN.into(),
             nonce: String::new(),
-            expiry: commitment_expiry()?,
+            expiry: commitment_expiry(COMMITMENT_TTL_SECS)?,
             policy_version: POLICY_VERSION,
             coord_sig: String::new(),
         },
@@ -560,600 +563,4 @@ fn foreign_coordinator_is_refused(
          outside their configured trust root with COORD_AUTH_INVALID"
     );
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Keys and destinations
-
-pub(crate) struct Actor {
-    pub(crate) seckey: SecretKey,
-    pub(crate) pubkey: PublicKey,
-}
-
-impl Actor {
-    pub(crate) fn random(
-        secp: &Secp256k1<bitcoin::secp256k1::All>,
-        urandom: &mut File,
-    ) -> Result<Actor, Error> {
-        loop {
-            let mut bytes = [0u8; 32];
-            urandom.read_exact(&mut bytes)?;
-            if let Ok(seckey) = SecretKey::from_slice(&bytes) {
-                return Ok(Actor {
-                    seckey,
-                    pubkey: PublicKey::new(seckey.public_key(secp)),
-                });
-            }
-        }
-    }
-}
-
-fn p2wpkh_spk(actor: &Actor) -> ScriptBuf {
-    ScriptBuf::new_p2wpkh(&CompressedPublicKey(actor.pubkey.inner).wpubkey_hash())
-}
-
-/// The coordinator's authentication identity (ADR-0013 §2). Generated ONCE for
-/// the demo vault; its public half is provisioned into every node's per-vault
-/// config (`coordinator_auth_pubkey`) and is the channel-manifest input when that
-/// mode is enabled. Its secret half signs every request the coordinator relays,
-/// so each node authenticates a request before evaluating it. Rotation would be
-/// a new vault (ADR-0013 §7), so the demo never rotates it.
-struct Coordinator {
-    seckey: SecretKey,
-    pubkey: PublicKey,
-}
-
-impl Coordinator {
-    fn random(
-        secp: &Secp256k1<bitcoin::secp256k1::All>,
-        urandom: &mut File,
-    ) -> Result<Coordinator, Error> {
-        let actor = Actor::random(secp, urandom)?;
-        Ok(Coordinator {
-            seckey: actor.seckey,
-            pubkey: actor.pubkey,
-        })
-    }
-
-    /// Turn an unauthenticated spend body into a coordinator-authenticated request:
-    /// attach a fresh single-use nonce and the coordinator's signature over the
-    /// canonical request bytes (ADR-0013 §2). Every node admits it past its gate.
-    fn authorize(
-        &self,
-        secp: &Secp256k1<bitcoin::secp256k1::All>,
-        mut request: SignRequest,
-    ) -> Result<SignRequest, Error> {
-        request.nonce = fresh_nonce()?;
-        // `coord_request()` selects the signed fields; coord_sig is excluded from
-        // its own preimage, so it needs no clearing before the digest.
-        let digest = request.coord_request().auth_digest();
-        let sig = secp.sign_ecdsa(&Message::from_digest(digest), &self.seckey);
-        request.coord_sig = sig.serialize_der().to_lower_hex_string();
-        Ok(request)
-    }
-}
-
-/// A fresh 32-byte random nonce as lowercase hex — single-use per request so a
-/// node rejects any replay (ADR-0013 §2/§3).
-fn fresh_nonce() -> Result<String, Error> {
-    let mut bytes = [0u8; 32];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.to_lower_hex_string())
-}
-
-/// A ranged single-sig destination wallet: a `wpkh(<xpub>/*)` descriptor from a
-/// throwaway master key, from which the coordinator derives a fresh address per
-/// index. This is the shape of a hot/escape allowlist entry (DESIGN.md config
-/// schema); the node stores only the descriptor string and re-derives.
-struct Wallet {
-    /// The canonical descriptor string (with checksum) placed in the node config.
-    descriptor: String,
-    parsed: Descriptor<DescriptorPublicKey>,
-}
-
-impl Wallet {
-    fn random(
-        secp: &Secp256k1<bitcoin::secp256k1::All>,
-        urandom: &mut File,
-    ) -> Result<Wallet, Error> {
-        let mut seed = [0u8; 32];
-        urandom.read_exact(&mut seed)?;
-        let xpriv = Xpriv::new_master(NetworkKind::Test, &seed)?;
-        let xpub = Xpub::from_priv(secp, &xpriv);
-        let parsed = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({xpub}/*)"))?;
-        Ok(Wallet {
-            descriptor: parsed.to_string(),
-            parsed,
-        })
-    }
-
-    /// The scriptPubKey of this wallet's address at `index`.
-    fn address_spk(
-        &self,
-        secp: &Secp256k1<bitcoin::secp256k1::All>,
-        index: u32,
-    ) -> Result<ScriptBuf, Error> {
-        Ok(self.parsed.derived_descriptor(secp, index)?.script_pubkey())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PSBT plumbing
-
-struct Utxo {
-    outpoint: OutPoint,
-    txout: TxOut,
-}
-
-fn utxo_paying(tx: &Transaction, spk: &ScriptBuf) -> Result<Utxo, Error> {
-    let vout = tx
-        .output
-        .iter()
-        .position(|output| output.script_pubkey == *spk)
-        .ok_or("transaction has no output paying the vault")?;
-    Ok(Utxo {
-        outpoint: OutPoint::new(tx.compute_txid(), vout as u32),
-        txout: tx.output[vout].clone(),
-    })
-}
-
-fn build_spend(
-    utxo: &Utxo,
-    witness_script: &ScriptBuf,
-    outputs: &[(ScriptBuf, Amount)],
-) -> Result<Psbt, Error> {
-    let tx = Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: utxo.outpoint,
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: outputs
-            .iter()
-            .map(|(script_pubkey, value)| TxOut {
-                script_pubkey: script_pubkey.clone(),
-                value: *value,
-            })
-            .collect(),
-    };
-    let mut psbt = Psbt::from_unsigned_tx(tx)?;
-    psbt.inputs[0].witness_utxo = Some(utxo.txout.clone());
-    psbt.inputs[0].witness_script = Some(witness_script.clone());
-    Ok(psbt)
-}
-
-fn sign_all_inputs(
-    secp: &Secp256k1<bitcoin::secp256k1::All>,
-    psbt: &mut Psbt,
-    signer: &Actor,
-    witness_script: &ScriptBuf,
-) -> Result<(), Error> {
-    let unsigned_tx = psbt.unsigned_tx.clone();
-    let mut cache = SighashCache::new(&unsigned_tx);
-    for (index, input) in psbt.inputs.iter_mut().enumerate() {
-        let utxo = input
-            .witness_utxo
-            .as_ref()
-            .ok_or_else(|| format!("input {index} has no witness_utxo"))?;
-        let sighash =
-            cache.p2wsh_signature_hash(index, witness_script, utxo.value, EcdsaSighashType::All)?;
-        let signature = secp.sign_ecdsa(
-            &Message::from_digest(sighash.to_byte_array()),
-            &signer.seckey,
-        );
-        input.partial_sigs.insert(
-            signer.pubkey,
-            bitcoin::ecdsa::Signature {
-                signature,
-                sighash_type: EcdsaSighashType::All,
-            },
-        );
-    }
-    Ok(())
-}
-
-fn summarize(response: &SignResponse) -> String {
-    serde_json::to_string(response).unwrap_or_else(|_| format!("{response:?}"))
-}
-
-/// A coordinator-proposed commitment expiry: the current wall clock plus the
-/// TTL. Each node re-checks it against its own clock and cap.
-fn commitment_expiry() -> Result<u64, Error> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    Ok(now + COMMITMENT_TTL_SECS)
-}
-
-// ---------------------------------------------------------------------------
-// Node processes
-
-/// The assembled per-vault manifest (ADR-0013 §4): membership, the hash every
-/// node is sealed to, and each node's channel endorsement.
-///
-/// The demo IS the setup ceremony here, so this is the ceremony's output. It
-/// computes nothing itself — every byte comes from `vault_node::channel::ceremony`,
-/// the node's own definitions — because a manifest the ceremony and the nodes
-/// disagree about is a federation that cannot boot, and a second implementation is
-/// exactly how that disagreement would arise unnoticed.
-struct Manifest {
-    /// Per node, in `node_id` order: `(channel_pubkey, channel_endorsement, endpoints)`.
-    entries: Vec<ManifestEntry>,
-    manifest_hash: String,
-}
-
-struct ManifestEntry {
-    node_id: u16,
-    signing_pubkey: String,
-    channel_pubkey: String,
-    channel_endorsement: String,
-    endpoint: String,
-}
-
-impl Manifest {
-    fn assemble(
-        wallet_id: &[u8; 32],
-        coord_auth_pubkey: &PublicKey,
-        node_actors: &[Actor],
-        ports: &[u16],
-        hot_allowlist: &[String],
-        escape_descriptor: &str,
-        max_derivation_index: u32,
-    ) -> Result<Manifest, Error> {
-        // `node_id` is the node key's 0-based position in the descriptor's
-        // CANONICAL order — lexicographic over the full key expression (§1), which
-        // for these concrete keys is the compressed-pubkey hex. Every party derives
-        // it from the frozen descriptor alone, so the mapping is a total bijection
-        // and never a table anyone maintains.
-        let mut canonical: Vec<&Actor> = node_actors.iter().collect();
-        canonical.sort_by_key(|actor| actor.pubkey.to_string());
-        let ceremony_nodes: Vec<ceremony::CeremonyNode> = canonical
-            .iter()
-            .enumerate()
-            .map(|(node_id, actor)| ceremony::CeremonyNode {
-                node_id: node_id as u16,
-                signing_pubkey: actor.pubkey,
-                endpoints: vec![endpoint_of(actor, node_actors, ports)],
-            })
-            .collect();
-        let channel_pubkeys: Vec<PublicKey> = canonical
-            .iter()
-            .map(|actor| ceremony::channel_pubkey(&actor.seckey))
-            .collect();
-        // The demo leaves every node's `max_msg_bytes` at the default, so the ceremony
-        // seals that same value into the manifest (V0-4b §0: the cap is a
-        // federation-uniform preimage field, and a node configured otherwise fails
-        // startup). The Hot budget is sealed the same way (ADR-0014 §6) and from the
-        // same constants the generated configs emit, so the two cannot drift.
-        let hash = ceremony::manifest_hash(
-            wallet_id,
-            coord_auth_pubkey,
-            &ceremony_nodes,
-            &channel_pubkeys,
-            vault_node::channel::DEFAULT_MAX_MSG_BYTES,
-            hot_budget(),
-            hot_allowlist,
-            escape_descriptor,
-            max_derivation_index,
-        )?;
-        let entries = canonical
-            .iter()
-            .zip(&ceremony_nodes)
-            .zip(&channel_pubkeys)
-            .map(|((actor, node), channel_pubkey)| ManifestEntry {
-                node_id: node.node_id,
-                signing_pubkey: actor.pubkey.to_string(),
-                channel_pubkey: channel_pubkey.to_string(),
-                // Each node's channel key is endorsed by that node's OWN Bitcoin
-                // signing key: peers accept a channel identity only if a key
-                // already in the federation vouches for it, so the coordinator
-                // cannot mint or impersonate a node.
-                channel_endorsement: ceremony::endorse(
-                    &actor.seckey,
-                    wallet_id,
-                    &hash,
-                    node.node_id,
-                    &node.endpoints,
-                ),
-                endpoint: node.endpoints[0].clone(),
-            })
-            .collect();
-        Ok(Manifest {
-            entries,
-            manifest_hash: hash.to_lower_hex_string(),
-        })
-    }
-
-    /// This node's `node_id` — its position in the canonical order.
-    fn node_id_of(&self, actor: &Actor) -> u16 {
-        let pubkey = actor.pubkey.to_string();
-        self.entries
-            .iter()
-            .find(|entry| entry.signing_pubkey == pubkey)
-            .map(|entry| entry.node_id)
-            .expect("every node actor is in the manifest")
-    }
-
-    /// The `[channel]` config block: this node's id, the FULL membership including
-    /// itself (§5 — the manifest hash needs all `n`, and self-inclusion removes the
-    /// "does peers contain me?" ambiguity), and the sealed `manifest_hash`.
-    fn channel_toml(&self, actor: &Actor) -> String {
-        let mut toml = format!(
-            "\n[channel]\nnode_id = {}\nexpected_manifest_hash = \"{}\"\n",
-            self.node_id_of(actor),
-            self.manifest_hash
-        );
-        for entry in &self.entries {
-            toml.push_str(&format!(
-                "\n[[channel.nodes]]\nnode_id = {}\nsigning_pubkey = \"{}\"\n\
-                 channel_pubkey = \"{}\"\nchannel_endorsement = \"{}\"\n\
-                 endpoints = [\"{}\"]\n",
-                entry.node_id,
-                entry.signing_pubkey,
-                entry.channel_pubkey,
-                entry.channel_endorsement,
-                entry.endpoint,
-            ));
-        }
-        toml
-    }
-}
-
-/// The loopback endpoint a node listens on. Endpoints are deliberately PINNED in
-/// the manifest (§4, anti-redirection): nobody — not a compromised coordinator,
-/// not a later config writer — can repoint one node's view of a peer.
-fn endpoint_of(actor: &Actor, node_actors: &[Actor], ports: &[u16]) -> String {
-    let index = node_actors
-        .iter()
-        .position(|a| a.pubkey == actor.pubkey)
-        .expect("actor is one of the node actors");
-    format!("127.0.0.1:{}", ports[index])
-}
-
-struct NodeProcess {
-    index: usize,
-    port: u16,
-    child: Child,
-    log_path: PathBuf,
-}
-
-/// Everything one node's config needs. A struct because the list outgrew the point
-/// where positional arguments stay readable.
-struct NodeSpawn<'a> {
-    index: usize,
-    port: u16,
-    actor: &'a Actor,
-    descriptor: &'a str,
-    allowlist: &'a [&'a str],
-    escape_descriptor: &'a str,
-    coord_auth_pubkey: &'a str,
-    bitcoind_rpc_addr: SocketAddr,
-    bitcoind_auth: &'a str,
-    manifest: &'a Manifest,
-}
-
-impl NodeProcess {
-    fn spawn(node_bin: &Path, nodes_dir: &Path, spawn: NodeSpawn) -> Result<NodeProcess, Error> {
-        let NodeSpawn {
-            index,
-            port,
-            actor,
-            descriptor,
-            allowlist,
-            escape_descriptor,
-            coord_auth_pubkey,
-            bitcoind_rpc_addr,
-            bitcoind_auth,
-            manifest,
-        } = spawn;
-        let allowlist_toml: Vec<String> =
-            allowlist.iter().map(|desc| format!("\"{desc}\"")).collect();
-        // Table headers end the top-level section, so `[chain_backend]` and
-        // `[channel]` come last. `coordinator_auth_pubkey` is the trust root
-        // (ADR-0013 §2/§4): the same key in every node's config, turning on the
-        // coord-auth gate — and, in channel mode, hashed into `manifest_hash`, so
-        // a node sealed to this manifest will not boot under a swapped coordinator.
-        //
-        // `[chain_backend]` is MANDATORY here, not optional: with `[channel]` on,
-        // this node combines and broadcasts, and a node that could not broadcast
-        // would accept spends it can never complete.
-        let config = format!(
-            "listen_port = {port}\n\
-             node_seckey = \"{}\"\n\
-             descriptor = \"{descriptor}\"\n\
-             allowlist = [{}]\n\
-             escape_descriptor = \"{escape_descriptor}\"\n\
-             max_derivation_index = {MAX_DERIVATION_INDEX}\n\
-             hold_secs = {HOLD_SECS}\n\
-             hot_max_per_tx = {}\n\
-             hot_max_per_window = {}\n\
-             hot_window_secs = {HOT_WINDOW_SECS}\n\
-             max_commitment_age_secs = {MAX_COMMITMENT_AGE_SECS}\n\
-             policy_version = {POLICY_VERSION}\n\
-             pin_normal_hash = \"{}\"\n\
-             pin_duress_hash = \"{}\"\n\
-             coordinator_auth_pubkey = \"{coord_auth_pubkey}\"\n\
-             \n[chain_backend]\n\
-             rpc_addr = \"{bitcoind_rpc_addr}\"\n\
-             auth = \"{bitcoind_auth}\"\n\
-             {}",
-            actor.seckey.display_secret(),
-            allowlist_toml.join(", "),
-            HOT_MAX_PER_TX.to_sat(),
-            HOT_MAX_PER_WINDOW.to_sat(),
-            vault_node::argon2id_normal_phc(NORMAL_PIN),
-            vault_node::argon2id_duress_phc(DURESS_PIN),
-            manifest.channel_toml(actor),
-        );
-        let config_path = nodes_dir.join(format!("node{index}.toml"));
-        std::fs::write(&config_path, config)?;
-        let log_path = nodes_dir.join(format!("node{index}.log"));
-        let log = File::create(&log_path)?;
-        let child = Command::new(node_bin)
-            .arg("--config")
-            .arg(&config_path)
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .stdin(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("cannot spawn {}: {e}", node_bin.display()))?;
-        Ok(NodeProcess {
-            index,
-            port,
-            child,
-            log_path,
-        })
-    }
-
-    /// 1-based, for humans.
-    fn number(&self) -> usize {
-        self.index + 1
-    }
-
-    fn addr(&self) -> SocketAddr {
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port))
-    }
-
-    fn wait_ready(&mut self) -> Result<(), Error> {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if let Some(status) = self.child.try_wait()? {
-                return Err(format!(
-                    "node {} exited at startup ({status}): {}",
-                    self.number(),
-                    log_tail(&self.log_path)
-                )
-                .into());
-            }
-            if TcpStream::connect_timeout(&self.addr(), Duration::from_millis(250)).is_ok() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        Err(format!(
-            "node {} did not start listening: {}",
-            self.number(),
-            log_tail(&self.log_path)
-        )
-        .into())
-    }
-
-    fn sign(&self, request: &SignRequest) -> Result<SignResponse, Error> {
-        let tagged = TaggedRequest::Spend(request.clone());
-        let mut shape = tagged.clone();
-        let TaggedRequest::Spend(shape_request) = &mut shape else {
-            unreachable!("the demo sign client only sends Spend requests")
-        };
-        shape_request.pin.clear();
-        // Reserve from a PIN-free shape before writing the real request. This keeps
-        // serde from freeing a grown allocation that already held plaintext PIN
-        // bytes; the one final allocation is wiped on every HTTP/error path.
-        let serialize_capacity = serde_json::to_vec(&shape)?
-            .len()
-            .saturating_add(6 * MAX_PIN_BYTES);
-        let mut body = Zeroizing::new(Vec::with_capacity(serialize_capacity));
-        let allocation = body.as_ptr();
-        serde_json::to_writer(&mut *body, &tagged)?;
-        debug_assert_eq!(
-            body.as_ptr(),
-            allocation,
-            "secret demo request serialization must not reallocate"
-        );
-        let response = http::post_json(self.addr(), "/sign", &body, None, Duration::from_secs(30))?;
-        if response.status != 200 {
-            return Err(format!(
-                "node {} answered HTTP {}: {}",
-                self.number(),
-                response.status,
-                response.body
-            )
-            .into());
-        }
-        Ok(serde_json::from_str(&response.body)?)
-    }
-}
-
-impl Drop for NodeProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn log_tail(path: &Path) -> String {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let mut lines: Vec<&str> = content.lines().rev().take(3).collect();
-            lines.reverse();
-            lines.join(" | ")
-        }
-        Err(_) => "(no node log)".into(),
-    }
-}
-
-/// Find the compiled vault-node binary. `cargo run -p vault-cli` does not
-/// build sibling binaries, so build it ourselves before every demo run. Cargo
-/// no-ops when it is already fresh.
-fn locate_vault_node() -> Result<PathBuf, Error> {
-    let exe = std::env::current_exe()?;
-    let dir = exe.parent().ok_or("current executable has no parent dir")?;
-    let sibling = dir.join("vault-node");
-
-    println!("      building vault-node...");
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = Command::new(cargo)
-        .args(["build", "-p", "vault-node"])
-        .status()
-        .map_err(|e| format!("cannot run cargo to build vault-node: {e}"))?;
-    if !status.success() {
-        return Err("cargo build -p vault-node failed".into());
-    }
-
-    if sibling.exists() {
-        Ok(sibling)
-    } else {
-        Err("cannot locate the vault-node binary after cargo build".into())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Temp dir + port allocation
-
-pub(crate) struct TempDir {
-    pub(crate) path: PathBuf,
-}
-
-impl TempDir {
-    pub(crate) fn new() -> Result<TempDir, Error> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let path = std::env::temp_dir().join(format!(
-            "btc-vault-first-light-{}-{}{:09}",
-            std::process::id(),
-            now.as_secs(),
-            now.subsec_nanos()
-        ));
-        std::fs::create_dir_all(&path)?;
-        Ok(TempDir { path })
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// Reserve `count` distinct free loopback ports by binding them all at once,
-/// then releasing. A small race remains until the real processes bind; fine
-/// for a demo that fails loudly.
-pub(crate) fn free_ports(count: usize) -> Result<Vec<u16>, Error> {
-    let mut listeners = Vec::new();
-    let mut ports = Vec::new();
-    for _ in 0..count {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        ports.push(listener.local_addr()?.port());
-        listeners.push(listener);
-    }
-    Ok(ports)
 }

@@ -1,7 +1,9 @@
-//! The demo IS the e2e test. Opt in (needs bitcoind on PATH, e.g. the flake
-//! dev shell) with:
+//! The demo IS the e2e test. Every test here needs bitcoind on PATH, which a plain
+//! `cargo test --workspace` does not provide, so all of them are `#[ignore]`d and
+//! opted into together — this one command IS the launch gate, and it runs
+//! [`attack_harness_exits_zero`] along with the two demos:
 //!
-//!   nix develop -c cargo test -p vault-cli -- --ignored
+//!   nix develop -c cargo test -p vault-cli -- --ignored --test-threads=1
 
 #[test]
 #[ignore = "spawns bitcoind and 5 vault-node processes; run with --ignored"]
@@ -25,4 +27,24 @@ fn demo_recovery_drill_exits_zero() {
         .status()
         .expect("run btc-vault demo recovery-drill");
     assert!(status.success(), "recovery drill exited {status}");
+}
+
+/// The adversarial harness (ADR-0012 / ADR-0014): thirteen scenarios against live
+/// `n = 2t−1` federations with `t−1` compromised node identities, asserting the
+/// signer/partial coupling and release-gate rather than a receipt count, the Hot
+/// budget bound on the censorship residual, silence before `T`, ADR-0012's V0-4
+/// implementation-semantics checklist (the Armed overlay racing a Hold expiry,
+/// fail-closed lockout, idempotency ordering), reboot-death on both sides of the
+/// threshold, and the recovery exit. Exits 0 only when every safety assertion holds.
+///
+/// Slower than the demos — it stands up a fresh federation per scenario and waits
+/// out real Holds and hostage windows.
+#[test]
+#[ignore = "spawns bitcoind and a vault-node federation per scenario; run with --ignored"]
+fn attack_harness_exits_zero() {
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_btc-vault"))
+        .args(["attack", "all"])
+        .status()
+        .expect("run btc-vault attack all");
+    assert!(status.success(), "adversarial harness exited {status}");
 }
