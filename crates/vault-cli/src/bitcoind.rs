@@ -15,6 +15,25 @@ use crate::http::{self, Error};
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// bitcoind's `RPC_INVALID_ADDRESS_OR_KEY`: the code both `getmempoolentry` and
+/// `getrawtransaction` return for a txid they do not know. The one JSON-RPC error
+/// that means "absent" rather than "broken".
+const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
+
+/// bitcoind's `RPC_INVALID_PARAMETER`, the code it also returns for "Scan already
+/// in progress". Deliberately paired with a message match in
+/// [`Bitcoind::scan_txoutset`]: `-8` covers genuinely malformed descriptors too,
+/// and retrying those would spin until the deadline instead of failing fast.
+const RPC_INVALID_PARAMETER: i64 = -8;
+
+/// How long [`Bitcoind::scan_txoutset`] waits out another `scantxoutset`.
+///
+/// A UTXO-set scan on a regtest chain of a few hundred blocks is milliseconds, but
+/// up to five watchtower drivers plus this process can queue on the one scan slot,
+/// and a driver's scan spans several descriptors. Long enough to outlast that
+/// queue, short enough to still fail rather than hang if a scan wedges.
+const SCAN_CONTENTION_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Bitcoind {
     child: Child,
     datadir: PathBuf,
@@ -38,8 +57,19 @@ pub struct Bitcoind {
 impl Bitcoind {
     /// Spawn bitcoind on a private regtest chain and wait until RPC answers.
     pub fn start(datadir: PathBuf, rpc_port: u16) -> Result<Bitcoind, Error> {
+        Self::start_with_args(datadir, rpc_port, &[])
+    }
+
+    /// Spawn bitcoind with scenario-specific policy arguments in addition to the
+    /// shared regtest configuration.
+    pub fn start_with_args(
+        datadir: PathBuf,
+        rpc_port: u16,
+        extra_args: &[&str],
+    ) -> Result<Bitcoind, Error> {
         std::fs::create_dir_all(&datadir)?;
-        let child = Command::new("bitcoind")
+        let mut command = Command::new("bitcoind");
+        command
             .arg("-regtest")
             .arg(format!("-datadir={}", datadir.display()))
             .arg(format!("-rpcport={rpc_port}"))
@@ -47,8 +77,10 @@ impl Bitcoind {
             .arg("-server=1")
             .arg("-txindex=1")
             .arg("-fallbackfee=0.0001")
+            .args(extra_args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command
             .spawn()
             .map_err(|e| format!("cannot spawn bitcoind (is the dev shell active?): {e}"))?;
         let mut bitcoind = Bitcoind {
@@ -106,6 +138,75 @@ impl Bitcoind {
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
+        match self.call_inner(method, params)? {
+            Ok(result) => Ok(result),
+            Err(error) => Err(format!("bitcoind {method}: {error}").into()),
+        }
+    }
+
+    /// A `call` whose "no such transaction" answer is an ordinary ABSENCE rather
+    /// than a failure: `Ok(None)` for exactly [`RPC_INVALID_ADDRESS_OR_KEY`], `Err`
+    /// for everything else.
+    ///
+    /// bitcoind reports "this txid is not in the mempool" and "no such transaction"
+    /// as JSON-RPC *errors*, so a lookup written as `call(..).is_ok()` cannot tell
+    /// absent from broken — a dead daemon, an auth failure, or a timeout all read
+    /// as "the transaction is not there". That defaulting is exactly what the
+    /// callers must never do: they turn a `false` here into "nothing was stolen"
+    /// and "the coerced spend never broadcast". So the error code is inspected
+    /// before it is flattened into a string, and only the absence code is a `None`.
+    pub fn call_optional(&self, method: &str, params: Value) -> Result<Option<Value>, Error> {
+        match self.call_inner(method, params)? {
+            Ok(result) => Ok(Some(result)),
+            Err(error) => {
+                if error.get("code").and_then(Value::as_i64) == Some(RPC_INVALID_ADDRESS_OR_KEY) {
+                    Ok(None)
+                } else {
+                    Err(format!("bitcoind {method}: {error}").into())
+                }
+            }
+        }
+    }
+
+    /// `scantxoutset "start"`, retried while bitcoind answers "Scan already in
+    /// progress".
+    ///
+    /// Core serializes the UTXO-set scan PROCESS-WIDE, and every scenario here runs
+    /// against one regtest daemon that three to five live watchtower drivers are
+    /// also scanning (`vault-node/src/chain.rs`). Whichever caller loses the race
+    /// gets `-8`, which [`Bitcoind::call`] flattens into an ordinary `Err`. That
+    /// matters far more than a lost scan: the harness's callers are the no-theft
+    /// ground truth, so an RPC collision propagating out of `assert_no_theft` is
+    /// reported as *a duress safety assertion did not hold* — a red launch gate
+    /// naming the wrong cause. Contention is not an answer about where the funds
+    /// are, so it is waited out rather than surfaced.
+    ///
+    /// Only the contention error is retried. Every other error, including a `-8`
+    /// from a descriptor this harness built wrong, still fails immediately.
+    pub fn scan_txoutset(&self, descriptors: Value) -> Result<Value, Error> {
+        let deadline = Instant::now() + SCAN_CONTENTION_TIMEOUT;
+        loop {
+            let error = match self.call_inner("scantxoutset", json!(["start", descriptors]))? {
+                Ok(result) => return Ok(result),
+                Err(error) => error,
+            };
+            let contended = error.get("code").and_then(Value::as_i64)
+                == Some(RPC_INVALID_PARAMETER)
+                && error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| message.contains("Scan already in progress"));
+            if !contended || Instant::now() >= deadline {
+                return Err(format!("bitcoind scantxoutset: {error}").into());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// One JSON-RPC round trip. The outer `Result` is the TRANSPORT (a broken or
+    /// unparseable exchange); the inner one is bitcoind's own structured `error`
+    /// object, kept intact so [`Bitcoind::call_optional`] can read its code.
+    fn call_inner(&self, method: &str, params: Value) -> Result<Result<Value, Value>, Error> {
         if method == "sendrawtransaction" {
             self.sendrawtransaction_calls
                 .set(self.sendrawtransaction_calls.get() + 1);
@@ -132,9 +233,9 @@ impl Bitcoind {
         })?;
         let error = &reply["error"];
         if !error.is_null() {
-            return Err(format!("bitcoind {method}: {error}").into());
+            return Ok(Err(error.clone()));
         }
-        Ok(reply["result"].clone())
+        Ok(Ok(reply["result"].clone()))
     }
 
     /// A `call` result that must be a string (txid, address, hex...).

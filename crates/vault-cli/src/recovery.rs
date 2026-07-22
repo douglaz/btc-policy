@@ -45,7 +45,7 @@ use vault_node::chain::BitcoindBackend;
 use vault_node::watchtower::{scan, AlertKind};
 
 use crate::bitcoind::Bitcoind;
-use crate::demo::{free_ports, Actor, TempDir};
+use crate::fed::{free_ports, Actor, TempDir};
 use crate::http::Error;
 
 /// Coins funded into the vault for the drill.
@@ -60,7 +60,7 @@ pub fn run_recovery_drill() -> Result<(), Error> {
     println!(
         "[1/6] building the two-branch vault (normal 3-of-5 OR older(4224679)+2-of-3 recovery)"
     );
-    let temp = TempDir::new()?;
+    let temp = TempDir::new("recovery-drill")?;
     let mut urandom = File::open("/dev/urandom")?;
     let user = Actor::random(&secp, &mut urandom)?;
     let node_pubkeys: Vec<String> = (0..5)
@@ -229,7 +229,7 @@ pub fn run_recovery_drill() -> Result<(), Error> {
 /// rust-miniscript) selects the recovery branch and builds its witness; it returns
 /// `Err` when the supplied keys do not meet the 2-of-3 threshold, which is exactly
 /// how the "1-of-3 is insufficient" property is enforced.
-fn build_recovery_spend(
+pub(crate) fn build_recovery_spend(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
     outpoint: OutPoint,
     txout: &TxOut,
@@ -295,7 +295,10 @@ fn build_recovery_spend(
 /// bumps the node's clock (`setmocktime`) and mines a handful of blocks that carry
 /// that timestamp — NOT 30375 blocks. It mines > 11 blocks with strictly-advancing
 /// timestamps so the tip's MTP (the median of the last 11) clears the lock cleanly.
-fn advance_mtp_past_recovery_lock(bitcoind: &Bitcoind, miner: &str) -> Result<(), Error> {
+pub(crate) fn advance_mtp_past_recovery_lock(
+    bitcoind: &Bitcoind,
+    miner: &str,
+) -> Result<(), Error> {
     let mediantime = bitcoind.call("getblockchaininfo", json!([]))?["mediantime"]
         .as_u64()
         .ok_or("getblockchaininfo has no mediantime")?;

@@ -30,7 +30,9 @@ mod replay;
 pub mod server;
 pub mod watchtower;
 
-pub use pin::{argon2id_duress_phc, argon2id_normal_phc};
+pub use pin::{
+    argon2id_duress_phc, argon2id_duress_phc_at, argon2id_normal_phc, argon2id_normal_phc_at,
+};
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -1525,15 +1527,24 @@ impl Node {
     }
 
     /// The §0 confirmation receipt: a peer's propagation of `carrier` proves that peer
-    /// holds it. Counts the sender and commits the arm when the holder set reaches
-    /// `t` with this node's own verdict being duress. Returns whether the arm
-    /// committed on this call.
+    /// holds it. Counts the sender and commits the holder decision when the holder set
+    /// reaches `t`, arming the SAFETY track if this node's own verdict for the carrier
+    /// was duress.
+    ///
+    /// Returns both facts separately ([`channel::CarrierConfirmation`]): the commit is
+    /// pin-uniform, the arm is not, and a caller that treats "committed" as "armed"
+    /// builds a duress oracle out of the difference.
     ///
     /// Driven only from the `/channel` receipt path, deliberately: keeping the commit
     /// off `/sign` is what makes the coordinator's view pin-independent.
-    pub(crate) fn confirm_carrier(&self, sender: u16, carrier: &str, now: u64) -> bool {
+    pub(crate) fn confirm_carrier(
+        &self,
+        sender: u16,
+        carrier: &str,
+        now: u64,
+    ) -> channel::CarrierConfirmation {
         let Some(channel) = &self.channel else {
-            return false;
+            return channel::CarrierConfirmation::NONE;
         };
         // Serialize the rollback-guarded freshness lower bound with confirmation.
         // `verify_coord_auth` may have logically expired and forgotten this carrier's
@@ -2568,6 +2579,23 @@ pub(crate) fn handle_channel_body_now(node: &Node, body: &[u8]) -> ChannelReply 
     )
 }
 
+/// Whether the harness-only `/channel` holder-commit marker should be emitted.
+///
+/// `/channel` deliberately maps every decodable policy outcome to ACCEPTED, so the
+/// adversarial harness has no other way to observe that a holder decision committed.
+/// Emitting that marker unconditionally in production would be a standing local side
+/// channel, so it is gated on the `BTC_VAULT_CHANNEL_MARKER` environment variable,
+/// which the harness sets when it launches daemons (`vault-cli/src/fed.rs`);
+/// production is silent by default. Read once and cached — the value cannot change
+/// over a process's life — so the hot `/channel` path carries no per-request
+/// environment read. The gate is a single process-wide bool, independent of pin, so
+/// it stays PIN-UNIFORM: it never turns the marker into a duress oracle, and the
+/// `committed` crossing it guards still fires for NORMAL and DURESS alike.
+fn channel_marker_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BTC_VAULT_CHANNEL_MARKER").is_some())
+}
+
 #[cfg(test)]
 fn handle_channel_body_with_clock(
     node: &Node,
@@ -2714,7 +2742,34 @@ fn handle_channel_body_with_clocks(
                     // is read identically for every verdict, so this costs no pin
                     // observability; erring late only ever refuses (censorship), never
                     // arms.
-                    node.confirm_carrier(sender, &carrier, confirmation_clock());
+                    let confirmation = node.confirm_carrier(sender, &carrier, confirmation_clock());
+                    // Pin-uniform live-harness evidence. `/channel` intentionally maps
+                    // every decodable policy outcome to ACCEPTED, so that reply cannot
+                    // establish that the carrier memo resolved or its holder decision
+                    // committed. Emit the same local marker for NORMAL and DURESS only
+                    // after observing the production decision — and ONLY when the harness
+                    // has set `BTC_VAULT_CHANNEL_MARKER` (`channel_marker_enabled`), so a
+                    // production node is silent by default. It is not an API/event surface
+                    // and changes no state-machine behavior.
+                    //
+                    // Gated on `committed`, NEVER on `armed`. Those differ exactly on a
+                    // normal carrier's commit, so gating on the arm would print this line
+                    // for duress and withhold it for normal — turning the marker itself
+                    // into the local duress oracle it is written to avoid being.
+                    //
+                    // The nonce is hex-encoded, never interpolated raw. It is
+                    // coordinator-chosen and validated only for length
+                    // (`NonceDecision::InvalidLength`), so interpolating it verbatim would
+                    // let an authenticated hostile coordinator — which ADR-0010 puts
+                    // squarely in the threat model — embed newlines and forge whole log
+                    // records on an honest node, including this very marker for a nonce
+                    // whose holder decision never committed.
+                    if confirmation.committed && channel_marker_enabled() {
+                        eprintln!(
+                            "channel: holder decision committed for request nonce {}",
+                            spend.nonce.as_bytes().to_lower_hex_string()
+                        );
+                    }
                 }
             }
             match outcome {

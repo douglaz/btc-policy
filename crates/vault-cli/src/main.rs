@@ -1,7 +1,10 @@
 //! btc-vault coordinator CLI. See docs/DESIGN.md and docs/adr/.
 
+mod adversary;
+mod attack;
 mod bitcoind;
 mod demo;
+mod fed;
 mod http;
 mod recovery;
 
@@ -25,8 +28,16 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // The adversarial harness. `attack all` is the launch gate; a single
+        // scenario name runs just that one, for iterating on a failure.
+        ["attack"] | ["attack", "all"] => attack::run(None),
+        ["attack", scenario] => attack::run(Some(scenario)),
         _ => {
-            eprintln!("usage: btc-vault demo <first-light|recovery-drill>");
+            eprintln!(
+                "usage: btc-vault demo <first-light|recovery-drill>\n\
+                        btc-vault attack [all|{}]",
+                attack::SCENARIO_NAMES.join("|")
+            );
             ExitCode::from(2)
         }
     }

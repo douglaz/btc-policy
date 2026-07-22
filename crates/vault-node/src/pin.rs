@@ -752,7 +752,22 @@ impl AttemptBudget {
 /// with whatever params the PHC embeds, so this choice is not baked into
 /// verification and a production digest with real params verifies unchanged.
 fn enrol_params() -> Params {
-    Params::new(Params::MIN_M_COST, 1, 1, None).expect("valid v0 argon2 params")
+    enrol_params_at(Params::MIN_M_COST)
+}
+
+/// [`enrol_params`] at an explicit memory cost. `t`/`p` stay at 1 so memory is the
+/// single knob a caller scales.
+///
+/// The cost is clamped into the SAME `[MIN_M_COST, MAX_ARGON2_M_COST_KIB]` band
+/// [`validate_digests`] enforces on a loaded digest. Clamping the top matters as
+/// much as the bottom: hashing happens here, at enrolment, whereas the ceiling is
+/// checked at config load, so an unclamped over-large cost would allocate — and
+/// possibly OOM-kill the process — before anything could reject it. Clamping also
+/// keeps enrolment total: every value yields a digest the node will actually
+/// accept, rather than one that hashes successfully and then fails startup.
+fn enrol_params_at(m_cost_kib: u32) -> Params {
+    let m_cost_kib = m_cost_kib.clamp(Params::MIN_M_COST, MAX_ARGON2_M_COST_KIB);
+    Params::new(m_cost_kib, 1, 1, None).expect("valid v0 argon2 params")
 }
 
 /// The baked NORMAL-slot salt for demo/fixture enrolment — distinct from
@@ -774,6 +789,31 @@ pub fn argon2id_duress_phc(pin: &str) -> String {
     argon2id_phc(pin, DURESS_SALT)
 }
 
+/// [`argon2id_normal_phc`] at an explicit Argon2id memory cost (KiB).
+///
+/// The minimum-cost default above keeps the demo and the fixtures fast, but it also
+/// puts one evaluation at tens of MICROSECONDS. That is far below the jitter of any
+/// end-to-end measurement, so a harness asserting that the node evaluates BOTH pin
+/// slots unconditionally — the constant-time property whose failure mode is one
+/// extra Argon2 on the duress path — cannot observe the leak it exists to catch
+/// while enrolled at the minimum. Such a harness must enrol at a cost where one
+/// evaluation dominates the measurement noise.
+///
+/// `m_cost_kib` is CLAMPED into the same band `validate_digests` enforces on a
+/// loaded digest (see [`enrol_params_at`]), so no argument can make this allocate
+/// past the node's own ceiling, and every digest it returns is one the node loads.
+pub fn argon2id_normal_phc_at(pin: &str, m_cost_kib: u32) -> String {
+    require_enrollable_pin(pin);
+    argon2id_phc_at(pin, NORMAL_SALT, m_cost_kib)
+}
+
+/// [`argon2id_duress_phc`] at an explicit Argon2id memory cost (KiB). See
+/// [`argon2id_normal_phc_at`].
+pub fn argon2id_duress_phc_at(pin: &str, m_cost_kib: u32) -> String {
+    require_enrollable_pin(pin);
+    argon2id_phc_at(pin, DURESS_SALT, m_cost_kib)
+}
+
 fn require_enrollable_pin(pin: &str) {
     assert!(
         !pin.is_empty(),
@@ -787,9 +827,17 @@ fn require_enrollable_pin(pin: &str) {
 }
 
 fn argon2id_phc(pin: &str, salt: &[u8]) -> String {
+    argon2id_phc_with(pin, salt, enrol_params())
+}
+
+fn argon2id_phc_at(pin: &str, salt: &[u8], m_cost_kib: u32) -> String {
+    argon2id_phc_with(pin, salt, enrol_params_at(m_cost_kib))
+}
+
+fn argon2id_phc_with(pin: &str, salt: &[u8], params: Params) -> String {
     use argon2::password_hash::{PasswordHasher, SaltString};
     let salt = SaltString::encode_b64(salt).expect("valid salt bytes");
-    let argon2 = Argon2::new(Algorithm::Argon2id, argon2::Version::V0x13, enrol_params());
+    let argon2 = Argon2::new(Algorithm::Argon2id, argon2::Version::V0x13, params);
     argon2
         .hash_password(pin.as_bytes(), &salt)
         .expect("argon2 hash")
@@ -972,6 +1020,19 @@ mod tests {
         let err = validate_digests(&oversized_phc, &argon2id_duress_phc("duress"))
             .expect_err("an over-ceiling PHC must be a fatal startup config");
         assert!(err.contains("memory cost"), "unexpected error: {err}");
+    }
+
+    /// The explicit-cost enrolment helpers hash immediately, whereas the ceiling is
+    /// checked at config load — so an unclamped argument would allocate before
+    /// anything could reject it. Clamping makes enrolment total: the digest an
+    /// over-large request produces is one the node actually loads.
+    #[test]
+    fn explicit_cost_enrolment_clamps_into_the_validated_band() {
+        assert_eq!(enrol_params_at(u32::MAX).m_cost(), MAX_ARGON2_M_COST_KIB);
+        assert_eq!(enrol_params_at(0).m_cost(), Params::MIN_M_COST);
+        // The clamped ceiling is exactly what a loaded digest is allowed to carry,
+        // so a clamped enrolment always produces one the node accepts.
+        assert!(require_bounded_params(&enrol_params_at(u32::MAX), "pin_normal_hash").is_ok());
     }
 
     #[test]

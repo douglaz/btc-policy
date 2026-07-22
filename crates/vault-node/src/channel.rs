@@ -1061,6 +1061,47 @@ impl Armed {
     }
 }
 
+/// What one holder receipt did, split into the two facts that are NOT the same
+/// fact — and were previously conflated behind a single `bool`.
+///
+/// `committed` is PIN-UNIFORM: it is the `holders.len()` crossing of `threshold`
+/// that ran the holder-decision commit, and NORMAL and DURESS carriers reach it on
+/// exactly the same conditions (a live intent, `ready_to_propagate`, not already
+/// committed). `armed` is the DURESS-ONLY selector bit, true only where `committed`
+/// also is.
+///
+/// Keeping them apart is a correctness requirement, not tidiness. Anything derived
+/// from this value that is observable outside the state machine — a log line, a
+/// counter, a timing — must key off `committed`, because keying off `armed` makes
+/// that artifact present for duress and absent for normal, i.e. a duress oracle. The
+/// single `bool` this replaced returned `armed`, so [`crate::Node::confirm_carrier`]'s
+/// `/channel` marker fired only under duress.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CarrierConfirmation {
+    /// This call is the one that crossed `threshold` and committed the holder
+    /// decision for both candidates. Pin-uniform.
+    pub(crate) committed: bool,
+    /// The committed decision also activated the SAFETY track (the carrier's pin was
+    /// duress). Never true unless `committed` is.
+    ///
+    /// Production reads this nowhere, which is the point: the arm commits inside
+    /// `confirm_carrier` itself (`write_safety_overlay`), so the `/channel` caller has
+    /// no duress-dependent branch to take, and its one outward-visible action stays
+    /// pin-uniform. It is returned for the state-machine tests, which assert the arm
+    /// transition directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) armed: bool,
+}
+
+impl CarrierConfirmation {
+    /// This receipt changed no holder decision: no intent, lapsed, not yet
+    /// propagatable, already committed, or still short of `threshold`.
+    pub(crate) const NONE: CarrierConfirmation = CarrierConfirmation {
+        committed: false,
+        armed: false,
+    };
+}
+
 /// The three ADR-0013 §6 duress timing parameters. They are read from one config
 /// block, used together at every arm/schedule site, and never vary independently, so
 /// they travel as one value rather than as three positional `u64`s that are easy to
@@ -3310,14 +3351,14 @@ impl ChannelState {
         threshold: usize,
         now: u64,
         timing: DuressTiming,
-    ) -> bool {
+    ) -> CarrierConfirmation {
         let mut store = self.store.lock().expect("store lock poisoned");
         #[cfg(test)]
         self.schedule_work
             .safety_locks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(intent) = store.intents.get_mut(carrier) else {
-            return false;
+            return CarrierConfirmation::NONE;
         };
         // Expiry is enforced HERE, atomically with the count, not only by the
         // periodic prune. Both sites use the same strict `expiry > now` rule as
@@ -3334,14 +3375,14 @@ impl ChannelState {
             store.carriers_by_nonce.retain(|_, remembered| {
                 !matches!(&remembered.outcome, MemoOutcome::Derived { carrier: c, .. } if c == carrier)
             });
-            return false;
+            return CarrierConfirmation::NONE;
         }
         if !intent.ready_to_propagate {
-            return false;
+            return CarrierConfirmation::NONE;
         }
         intent.holders.insert(sender);
         if intent.committed || intent.holders.len() < threshold {
-            return false;
+            return CarrierConfirmation::NONE;
         }
         // Crossing `t` is processed ONCE under both verdicts. In particular, do not
         // early-return for NORMAL here: the coordinator can keep concurrent `/sign`
@@ -3422,7 +3463,10 @@ impl ChannelState {
             .selector_allocations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self::refresh_escape_window(&mut store, &selected);
-        commit_arm
+        CarrierConfirmation {
+            committed: true,
+            armed: commit_arm,
+        }
     }
 
     /// Fixed-work deadline poll for the always-running SAFETY timer. Both states take
@@ -3494,6 +3538,7 @@ impl ChannelState {
             }
         }
         self.confirm_carrier(final_confirmer, carrier, threshold, now, timing)
+            .armed
     }
 
     /// A test-only read view of the internal arm overlay. Production polling uses
@@ -7394,7 +7439,7 @@ mod partial {
             SignResponse::Accepted(_)
         ));
         let carrier = crate::arm_carrier_id(&node, request.coord_request());
-        assert!(!node.confirm_carrier(0, &carrier, NOW));
+        assert!(!node.confirm_carrier(0, &carrier, NOW).armed);
         let channel = node.channel.as_ref().expect("channel");
         let cid = crate::commitment_id_for(&node, &psbt, NOW + 3_600);
 
@@ -8615,9 +8660,9 @@ mod fire {
             SignResponse::Accepted(_)
         ));
         let carrier = crate::arm_carrier_id(&node, request.coord_request());
-        assert!(!node.confirm_carrier(1, &carrier, NOW));
+        assert!(!node.confirm_carrier(1, &carrier, NOW).armed);
         assert!(
-            !node.confirm_carrier(2, &carrier, NOW),
+            !node.confirm_carrier(2, &carrier, NOW).armed,
             "a normal holder decision opens the pair but never arms"
         );
         let cid = crate::commitment_id_for(&node, &psbt, EXPIRY);
@@ -8748,8 +8793,8 @@ mod fire {
             SignResponse::Accepted(_)
         ));
         let carrier = crate::arm_carrier_id(&node, request.coord_request());
-        assert!(!node.confirm_carrier(1, &carrier, NOW));
-        assert!(!node.confirm_carrier(2, &carrier, NOW));
+        assert!(!node.confirm_carrier(1, &carrier, NOW).armed);
+        assert!(!node.confirm_carrier(2, &carrier, NOW).armed);
         let cid = crate::commitment_id_for(&node, &psbt, expiry);
         deliver_peer_partials(&fx, node.channel.as_ref().expect("channel"), &psbt, &cid, 2);
 
@@ -8925,8 +8970,8 @@ mod fire {
             SignResponse::Accepted(_)
         ));
         let carrier = crate::arm_carrier_id(&node, request.coord_request());
-        assert!(!node.confirm_carrier(1, &carrier, NOW));
-        assert!(!node.confirm_carrier(2, &carrier, NOW));
+        assert!(!node.confirm_carrier(1, &carrier, NOW).armed);
+        assert!(!node.confirm_carrier(2, &carrier, NOW).armed);
         let cid = crate::commitment_id_for(&node, &psbt, EXPIRY);
         let channel = node.channel.as_ref().expect("channel");
         let mut backend = MockBackend::default();
@@ -9243,8 +9288,8 @@ mod fire {
             SignResponse::Accepted(_)
         ));
         let child_carrier = crate::arm_carrier_id(&node, child_request.coord_request());
-        assert!(!node.confirm_carrier(1, &child_carrier, NOW));
-        assert!(!node.confirm_carrier(2, &child_carrier, NOW));
+        assert!(!node.confirm_carrier(1, &child_carrier, NOW).armed);
+        assert!(!node.confirm_carrier(2, &child_carrier, NOW).armed);
         let child_cid = crate::commitment_id_for(&node, &child, EXPIRY);
         let channel = node.channel.as_ref().expect("channel");
         deliver_peer_partials(&fx, channel, &child, &child_cid, 2);
@@ -9367,8 +9412,8 @@ mod fire {
             SignResponse::Accepted(_)
         ));
         let carrier = crate::arm_carrier_id(&node, request.coord_request());
-        assert!(!node.confirm_carrier(1, &carrier, NOW));
-        assert!(!node.confirm_carrier(2, &carrier, NOW));
+        assert!(!node.confirm_carrier(1, &carrier, NOW).armed);
+        assert!(!node.confirm_carrier(2, &carrier, NOW).armed);
         deliver_peer_partials(&fx, channel, &psbt, &cid, 2);
         let backend = backend_for(&psbt);
         assert_eq!(
@@ -9761,7 +9806,7 @@ mod fire {
         assert!(node.outbox.lock().expect("outbox").is_empty());
         let carrier = crate::arm_carrier_id(&node, request.coord_request());
         for sender in 1..=4 {
-            assert!(!node.confirm_carrier(sender, &carrier, NOW));
+            assert!(!node.confirm_carrier(sender, &carrier, NOW).armed);
         }
         assert!(
             node.channel
@@ -9912,7 +9957,7 @@ mod duress {
         let carrier = crate::arm_carrier_id(node, request.coord_request());
         let mut armed = false;
         for sender in 1..=peers {
-            armed |= node.confirm_carrier(sender, &carrier, now);
+            armed |= node.confirm_carrier(sender, &carrier, now).armed;
         }
         armed
     }
@@ -12583,13 +12628,13 @@ mod duress {
         let carrier = crate::arm_carrier_id(&node, request.coord_request());
         for _ in 0..10 {
             assert!(
-                !node.confirm_carrier(1, &carrier, NOW),
+                !node.confirm_carrier(1, &carrier, NOW).armed,
                 "one peer repeating itself is still one holder"
             );
         }
         assert!(channel.armed_snapshot().is_none());
         // A genuinely distinct second peer completes the threshold.
-        assert!(node.confirm_carrier(2, &carrier, NOW));
+        assert!(node.confirm_carrier(2, &carrier, NOW).armed);
         assert!(channel.armed_snapshot().is_some());
     }
 
@@ -12658,7 +12703,11 @@ mod duress {
 
         // And a peer cannot conjure confirmation state for a carrier this node never
         // coordinator-authenticated at all.
-        assert!(!liar.confirm_carrier(1, "a-carrier-this-node-never-saw", NOW));
+        assert!(
+            !liar
+                .confirm_carrier(1, "a-carrier-this-node-never-saw", NOW)
+                .armed
+        );
     }
 
     /// Split vector (a): a corrupt user-signed escape. Local policy refuses the
@@ -14046,9 +14095,24 @@ mod hot_budget {
 
         // A normal carrier's t-holder decision opens the release gate at Hold fire.
         let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        let mut normal_commits = 0usize;
         for peer in 1..=2u16 {
-            node.confirm_carrier(peer, &carrier, NOW);
+            let confirmation = node.confirm_carrier(peer, &carrier, NOW);
+            assert!(
+                !confirmation.armed,
+                "a normal carrier must never arm the SAFETY track"
+            );
+            normal_commits += usize::from(confirmation.committed);
         }
+        // The holder decision is PIN-UNIFORM: a normal carrier crossing `t` commits
+        // exactly once, the same as a duress one. Only the `armed` bit above differs.
+        // Anything observable that keys off the commit — the `/channel` holder marker,
+        // and the harness's `confirm_with_compromised` evidence built on it — is a
+        // duress oracle the moment this stops holding for NORMAL.
+        assert_eq!(
+            normal_commits, 1,
+            "the normal carrier's t-th receipt must commit the holder decision"
+        );
         assert!(
             channel.release_partials(&cid, NOW + HOLD).is_some(),
             "the node's partial must actually leave before the expiry sweep"
@@ -14651,7 +14715,7 @@ mod hot_budget {
         let carrier = crate::arm_carrier_id(&node, duress.coord_request());
         let mut armed = false;
         for peer in 1..=2u16 {
-            armed |= node.confirm_carrier(peer, &carrier, NOW);
+            armed |= node.confirm_carrier(peer, &carrier, NOW).armed;
         }
         assert!(
             armed,
@@ -14717,7 +14781,7 @@ mod hot_budget {
         let carrier = crate::arm_carrier_id(&node, duress.coord_request());
         let mut armed = false;
         for peer in 1..=2u16 {
-            armed |= node.confirm_carrier(peer, &carrier, NOW);
+            armed |= node.confirm_carrier(peer, &carrier, NOW).armed;
         }
         assert!(
             armed,
@@ -14758,7 +14822,7 @@ mod hot_budget {
         let carrier = crate::arm_carrier_id(&node, duress.coord_request());
         let mut armed = false;
         for peer in 1..=2u16 {
-            armed |= node.confirm_carrier(peer, &carrier, NOW);
+            armed |= node.confirm_carrier(peer, &carrier, NOW).armed;
         }
         assert!(armed);
         assert!(channel.armed_snapshot().is_some());
@@ -14811,7 +14875,7 @@ mod hot_budget {
         let carrier = crate::arm_carrier_id(&node, duress.coord_request());
         let mut armed = false;
         for peer in 1..=2u16 {
-            armed |= node.confirm_carrier(peer, &carrier, NOW);
+            armed |= node.confirm_carrier(peer, &carrier, NOW).armed;
         }
         assert!(armed);
         assert!(
@@ -14847,7 +14911,7 @@ mod hot_budget {
         let carrier = crate::arm_carrier_id(&node, request.coord_request());
         let mut armed = false;
         for peer in 1..=2u16 {
-            armed |= node.confirm_carrier(peer, &carrier, NOW);
+            armed |= node.confirm_carrier(peer, &carrier, NOW).armed;
         }
         assert!(armed, "the duress carrier must arm at t-of-n");
         let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
