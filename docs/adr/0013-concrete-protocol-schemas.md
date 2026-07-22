@@ -62,6 +62,14 @@ BaseManifest {                     # everything EXCEPT endorsements and config_h
   hot_allowlist: [descriptor…], escape_descriptor, max_derivation_index,
 }
 manifest_hash = H(canonical_bytes(BaseManifest))
+# canonical_bytes preimage — v0 AUTHORITATIVE (vault-node `base_manifest_bytes`); reimplement from
+# THIS list + order, NOT a naive serialization of every field above:
+#   wallet_id ‖ protocol_version ‖ coordinator_auth_pubkey ‖ max_msg_bytes ‖ hot_max_per_tx
+#   ‖ hot_max_per_window ‖ hot_window_secs ‖ (hot_allowlist sorted+deduped) ‖ escape_descriptor
+#   ‖ max_derivation_index ‖ [ node_id, signing_pubkey, channel_pubkey, endpoints ]…
+# NOT serialized separately (bound TRANSITIVELY via wallet_id = H(canonical descriptor)):
+#   vault_descriptor, t, n, recovery_timelock. NOT manifest-pinned at all: policy_version — it is
+#   enforced per-request (commitment + request.policy_version), so it is absent from the preimage.
 # THEN: each node's channel_endorsement is computed OVER manifest_hash and
 # attached alongside (never inside BaseManifest). The distributed Manifest =
 # BaseManifest + { node_id → channel_endorsement }.
