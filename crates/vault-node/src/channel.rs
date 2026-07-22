@@ -5055,8 +5055,10 @@ mod fixture {
         /// coordinator nonce is single-use, so a repeat is a replay by definition.
         pub(crate) fn coord_sign(&self, request: &mut SignRequest, nonce_seed: &str) {
             request.nonce = nonce_seed.to_string();
-            // coord_sig is never part of its own preimage; no clearing needed.
-            let digest = request.coord_request().auth_digest();
+            // coord_sig is never part of its own preimage; no clearing needed. The
+            // digest is domain-separated by this vault's `wallet_id` (H2), which is
+            // exactly the id every node this fixture builds re-derives.
+            let digest = request.coord_request().auth_digest(&self.wallet_id);
             let sig =
                 Secp256k1::signing_only().sign_ecdsa(&Message::from_digest(digest), &self.coord_sk);
             request.coord_sig = sig.serialize_der().to_lower_hex_string();
@@ -5070,7 +5072,7 @@ mod fixture {
         /// this ability, which is what makes signature-keyed confirmation unsound: the
         /// body — not the signature — is the carrier identity.
         pub(crate) fn coord_resign(&self, request: &mut SignRequest, noncedata: u8) {
-            let digest = request.coord_request().auth_digest();
+            let digest = request.coord_request().auth_digest(&self.wallet_id);
             let sig = Secp256k1::signing_only().sign_ecdsa_with_noncedata(
                 &Message::from_digest(digest),
                 &self.coord_sk,
@@ -5128,7 +5130,7 @@ mod fixture {
                 policy_version: 1,
                 coord_sig: String::new(),
             };
-            let digest = request.coord_request().auth_digest();
+            let digest = request.coord_request().auth_digest(&self.wallet_id);
             let sig =
                 Secp256k1::signing_only().sign_ecdsa(&Message::from_digest(digest), &self.coord_sk);
             request.coord_sig = sig.serialize_der().to_lower_hex_string();
@@ -12431,8 +12433,8 @@ mod duress {
                 "the re-signed copy must actually differ"
             );
             assert_eq!(
-                copy.coord_request().auth_digest(),
-                duress.coord_request().auth_digest(),
+                copy.coord_request().auth_digest(&fx.wallet_id),
+                duress.coord_request().auth_digest(&fx.wallet_id),
                 "…while authenticating byte-identical content"
             );
             let payload = request_payload(&vault_proto::TaggedRequest::Spend(copy));
@@ -13238,7 +13240,10 @@ mod duress {
         let id = crate::arm_carrier_id(&node, duress.coord_request());
         assert_ne!(
             id,
-            duress.coord_request().auth_digest().to_lower_hex_string(),
+            duress
+                .coord_request()
+                .auth_digest(&fx.wallet_id)
+                .to_lower_hex_string(),
             "the carrier id must be memory-hard, not the PIN-committing auth digest itself"
         );
         // Stable within the process (the same request always keys the same intent)...

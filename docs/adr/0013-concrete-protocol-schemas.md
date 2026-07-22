@@ -18,7 +18,7 @@ or( and( pk(USER), thresh(t, NODE_1, …, NODE_n) ),          # normal branch
 
 ## 2. Tagged request schema (resolves "every request has an escape" vs pin-less refresh)
 
-Requests are a **tagged union**, all variants coordinator-authenticated. The coordinator signs `sig = sign(coord_key, canonical_bytes(request))`; nodes reject any request not validly coord-signed and fresh (`nonce` unseen, `expiry` in the future, capped by `max_commitment_age_secs`).
+Requests are a **tagged union**, all variants coordinator-authenticated. The coordinator signs `sig = sign(coord_key, tagged_hash(COORD_REQUEST_TAG, wallet_id ‖ canonical_bytes(request)))`; nodes reject any request not validly coord-signed and fresh (`nonce` unseen, `expiry` in the future, capped by `max_commitment_age_secs`). **`wallet_id` is a signing DOMAIN SEPARATOR bound into the digest but NEVER transmitted** (holistic v0 audit H2, 2026-07-22): the coordinator supplies its vault's `wallet_id = H(canonical descriptor)`, each node verifies against its own, so a coordinator signature is valid ONLY at nodes of the same vault — a coordinator-auth key reused across two vaults cannot authorize a request cross-vault (defense in depth; the per-node input-ownership check refuses it too).
 
 ```
 SpendRequest  { spend: Psbt, escape: Psbt, pin: Pin, nonce, expiry, policy_version }

@@ -96,12 +96,15 @@ impl Coordinator {
     pub(crate) fn authorize(
         &self,
         secp: &Secp256k1<All>,
+        wallet_id: &[u8; 32],
         mut request: SignRequest,
     ) -> Result<SignRequest, Error> {
         request.nonce = fresh_nonce()?;
         // `coord_request()` selects the signed fields; coord_sig is excluded from
-        // its own preimage, so it needs no clearing before the digest.
-        let digest = request.coord_request().auth_digest();
+        // its own preimage, so it needs no clearing before the digest. `wallet_id`
+        // is bound into the digest as a domain separator (H2): pass the id of the
+        // vault this coordinator is authorizing, which is the id its nodes verify.
+        let digest = request.coord_request().auth_digest(wallet_id);
         let sig = secp.sign_ecdsa(&Message::from_digest(digest), &self.seckey);
         request.coord_sig = sig.serialize_der().to_lower_hex_string();
         Ok(request)
@@ -939,6 +942,11 @@ fn spawn_child(node_bin: &Path, config_path: &Path, log_path: &Path) -> Result<C
         // (`confirm_with_compromised`). Set on every generation, including restarts,
         // since all daemon launches funnel through here.
         .env("BTC_VAULT_CHANNEL_MARKER", "1")
+        // Regtest federations deploy on ordinary temp dirs, and the demo/attack-all
+        // binary is `cfg!(test) = false`, so vault-node's startup tmpfs assertion
+        // (P3a) would fatal without this. INSECURE in production (it defeats the
+        // reboot-death model), which is exactly why it is confined to the harness.
+        .env("BTC_VAULT_ALLOW_DURABLE_STORAGE", "1")
         .stdout(log.try_clone()?)
         .stderr(log)
         .stdin(Stdio::null())

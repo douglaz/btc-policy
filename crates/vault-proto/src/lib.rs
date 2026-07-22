@@ -203,9 +203,12 @@ impl Commitment {
 }
 
 /// Domain-separation tag for the coordinator-request signature (ADR-0013 §2).
-/// The coordinator signs `tagged_hash(COORD_REQUEST_TAG, canonical_bytes(request))`
+/// The coordinator signs `tagged_hash(COORD_REQUEST_TAG, wallet_id ‖ canonical_bytes(request))`
 /// with its auth key; a node verifies against its pinned
-/// `coordinator_auth_pubkey`.
+/// `coordinator_auth_pubkey`. `wallet_id` (32 bytes) is prepended as a signing
+/// domain separator — it is NEVER transmitted; the signer and verifier each supply
+/// their own vault's `wallet_id`, so a signature is valid only within one vault
+/// (see [`CoordRequest::auth_digest`]).
 pub const COORD_REQUEST_TAG: &str = "btc-policy/coord-request/v0";
 
 /// BIP340-style tagged SHA-256, `SHA256(SHA256(tag) ‖ SHA256(tag) ‖ msg)` — the
@@ -414,10 +417,27 @@ impl<'a> CoordRequest<'a> {
     }
 
     /// The 32-byte digest the coordinator signs (`tagged_hash(COORD_REQUEST_TAG,
-    /// canonical_bytes)`). A node verifies `coord_sig` against it and its pinned
-    /// `coordinator_auth_pubkey`.
-    pub fn auth_digest(&self) -> [u8; 32] {
-        tagged_hash(COORD_REQUEST_TAG, &self.canonical_bytes())
+    /// wallet_id ‖ canonical_bytes)`). A node verifies `coord_sig` against it and
+    /// its pinned `coordinator_auth_pubkey`.
+    ///
+    /// `wallet_id` is a signing DOMAIN SEPARATOR bound into the digest — it is
+    /// NEVER a wire field and never transmitted; each side supplies its own (the
+    /// coordinator the vault it is authorizing, the verifying node its
+    /// `node.wallet_id`). Because that id is the vault descriptor hash, a request
+    /// coord-signed for one vault does not authenticate at another that happens to
+    /// reuse the coordinator auth key: the digests differ, so the signature fails
+    /// (holistic v0 audit H2, 2026-07-22).
+    pub fn auth_digest(&self, wallet_id: &[u8; 32]) -> [u8; 32] {
+        // The Spend preimage contains the plaintext PIN — `canonical_bytes` returns
+        // it `Zeroizing` for exactly that reason — so the wallet_id-prefixed buffer
+        // that embeds it must wipe itself on drop as well. Reserve the full length
+        // up front (32 + canonical) so the secret is copied once, never left behind
+        // by a Vec growth.
+        let canonical = self.canonical_bytes();
+        let mut preimage = Zeroizing::new(Vec::with_capacity(32 + canonical.len()));
+        preimage.extend_from_slice(wallet_id);
+        preimage.extend_from_slice(canonical.as_slice());
+        tagged_hash(COORD_REQUEST_TAG, &preimage)
     }
 }
 
@@ -465,8 +485,9 @@ pub struct SignRequest {
     #[serde(default)]
     pub policy_version: u32,
     /// The coordinator's ECDSA signature (DER, hex) over
-    /// `tagged_hash(COORD_REQUEST_TAG, canonical_bytes(SpendRequest))`, verified
-    /// against the node's pinned `coordinator_auth_pubkey` (see [`CoordRequest`]).
+    /// `tagged_hash(COORD_REQUEST_TAG, wallet_id ‖ canonical_bytes(SpendRequest))`
+    /// (the vault's `wallet_id` is a non-transmitted signing domain separator),
+    /// verified against the node's pinned `coordinator_auth_pubkey` (see [`CoordRequest`]).
     /// Every node is provisioned with a coordinator, so an empty or malformed
     /// `coord_sig` is simply an authentication failure (`COORD_AUTH_INVALID`) —
     /// there is no un-gated mode.
@@ -980,15 +1001,29 @@ mod tests {
         }
     }
 
-    /// The coordinator's role: sign the request digest with the auth key.
-    fn coord_sign(req: &CoordRequest, sk: &SecretKey) -> Signature {
-        Secp256k1::new().sign_ecdsa(&Message::from_digest(req.auth_digest()), sk)
+    /// A fixed vault id for these coord-auth unit tests. `auth_digest` binds
+    /// `wallet_id` as a domain separator (H2), so a signer and its verifier must
+    /// use the SAME id; every helper below threads this one constant, keeping the
+    /// bind transparent to the existing cases. (Matches the `[0x11; 32]` PartialSig
+    /// fixture elsewhere in this crate.)
+    const TEST_WALLET_ID: [u8; 32] = [0x11; 32];
+
+    /// The coordinator's role: sign the request digest (bound to `wallet_id`) with
+    /// the auth key.
+    fn coord_sign(req: &CoordRequest, sk: &SecretKey, wallet_id: &[u8; 32]) -> Signature {
+        Secp256k1::new().sign_ecdsa(&Message::from_digest(req.auth_digest(wallet_id)), sk)
     }
 
-    /// The node's role: verify a DER sig against a candidate coordinator pubkey.
-    fn coord_verify(req: &CoordRequest, sig: &Signature, pk: &SecpPublicKey) -> bool {
+    /// The node's role: verify a DER sig (bound to `wallet_id`) against a candidate
+    /// coordinator pubkey.
+    fn coord_verify(
+        req: &CoordRequest,
+        sig: &Signature,
+        pk: &SecpPublicKey,
+        wallet_id: &[u8; 32],
+    ) -> bool {
         Secp256k1::new()
-            .verify_ecdsa(&Message::from_digest(req.auth_digest()), sig, pk)
+            .verify_ecdsa(&Message::from_digest(req.auth_digest(wallet_id)), sig, pk)
             .is_ok()
     }
 
@@ -997,7 +1032,10 @@ mod tests {
         let a = sample_spend("aa");
         let b = sample_spend("aa");
         assert_eq!(a.canonical_bytes(), b.canonical_bytes());
-        assert_eq!(a.auth_digest(), b.auth_digest());
+        assert_eq!(
+            a.auth_digest(&TEST_WALLET_ID),
+            b.auth_digest(&TEST_WALLET_ID)
+        );
     }
 
     #[test]
@@ -1005,10 +1043,13 @@ mod tests {
         let (sk, pk) = coord_keypair(0xC0);
         let (_, wrong_pk) = coord_keypair(0xC1);
         let req = sample_spend("nonce-1");
-        let sig = coord_sign(&req, &sk);
-        assert!(coord_verify(&req, &sig, &pk), "the signing key must verify");
+        let sig = coord_sign(&req, &sk, &TEST_WALLET_ID);
         assert!(
-            !coord_verify(&req, &sig, &wrong_pk),
+            coord_verify(&req, &sig, &pk, &TEST_WALLET_ID),
+            "the signing key must verify"
+        );
+        assert!(
+            !coord_verify(&req, &sig, &wrong_pk, &TEST_WALLET_ID),
             "a coordinator key that did not sign must never verify"
         );
     }
@@ -1017,8 +1058,8 @@ mod tests {
     fn tampering_any_signed_field_breaks_the_signature() {
         let (sk, pk) = coord_keypair(0xC0);
         let base = sample_spend("nonce-1");
-        let sig = coord_sign(&base, &sk);
-        assert!(coord_verify(&base, &sig, &pk));
+        let sig = coord_sign(&base, &sk, &TEST_WALLET_ID);
+        assert!(coord_verify(&base, &sig, &pk, &TEST_WALLET_ID));
 
         // Each entry mutates exactly ONE signed field of the baseline; every one
         // must fail verification under the original signature (spend, escape, pin,
@@ -1075,7 +1116,7 @@ mod tests {
         ];
         for t in &tampered {
             assert!(
-                !coord_verify(t, &sig, &pk),
+                !coord_verify(t, &sig, &pk, &TEST_WALLET_ID),
                 "a tampered field must break verification: {t:?}"
             );
         }
@@ -1099,7 +1140,37 @@ mod tests {
             expiry: 7,
             policy_version: 1,
         };
-        assert_ne!(spend.auth_digest(), refresh.auth_digest());
+        assert_ne!(
+            spend.auth_digest(&TEST_WALLET_ID),
+            refresh.auth_digest(&TEST_WALLET_ID)
+        );
+    }
+
+    #[test]
+    fn the_wallet_id_domain_separates_the_digest() {
+        // H2: two vaults that reuse the coordinator auth key still get disjoint
+        // digests, because `wallet_id` (the descriptor hash) is bound into the
+        // preimage. A byte-identical request yields a different digest under a
+        // different id, and a signature made under one id does not verify under the
+        // other — the whole point of the domain separator.
+        let (sk, pk) = coord_keypair(0xC0);
+        let req = sample_spend("nonce-1");
+        let vault_x = [0x11u8; 32];
+        let vault_y = [0x22u8; 32];
+        assert_ne!(
+            req.auth_digest(&vault_x),
+            req.auth_digest(&vault_y),
+            "the same request must digest differently under different wallet_ids"
+        );
+        let sig_x = coord_sign(&req, &sk, &vault_x);
+        assert!(
+            coord_verify(&req, &sig_x, &pk, &vault_x),
+            "same id must verify"
+        );
+        assert!(
+            !coord_verify(&req, &sig_x, &pk, &vault_y),
+            "a signature bound to vault X must not verify at vault Y"
+        );
     }
 
     #[test]
@@ -1112,8 +1183,8 @@ mod tests {
             expiry: 1_752_500_000,
             policy_version: 1,
         };
-        let sig = coord_sign(&req, &sk);
-        assert!(coord_verify(&req, &sig, &pk));
-        assert!(!coord_verify(&req, &sig, &wrong_pk));
+        let sig = coord_sign(&req, &sk, &TEST_WALLET_ID);
+        assert!(coord_verify(&req, &sig, &pk, &TEST_WALLET_ID));
+        assert!(!coord_verify(&req, &sig, &wrong_pk, &TEST_WALLET_ID));
     }
 }

@@ -268,6 +268,7 @@ pub fn run_first_light() -> Result<(), Error> {
         &nodes,
         &user,
         &coordinator,
+        &wallet_id(&descriptor),
         &witness_script,
         &vault_utxo,
         &vault_spk,
@@ -279,6 +280,7 @@ pub fn run_first_light() -> Result<(), Error> {
         &nodes,
         &user,
         &coordinator,
+        &wallet_id(&descriptor),
         &witness_script,
         &spend_tx,
         &vault_spk,
@@ -317,6 +319,7 @@ fn act_one(
     nodes: &[NodeProcess],
     user: &Actor,
     coordinator: &Coordinator,
+    wallet_id: &[u8; 32],
     witness_script: &ScriptBuf,
     vault_utxo: &Utxo,
     vault_spk: &ScriptBuf,
@@ -360,7 +363,7 @@ fn act_one(
     // refused by every node (ADR-0013 §2). Nothing but the coordinator identity
     // differs, so COORD_AUTH_INVALID (never DEST_NOT_ALLOWED or BAD_PIN) is proof
     // the configured root is what refused it.
-    foreign_coordinator_is_refused(secp, nodes, &body)?;
+    foreign_coordinator_is_refused(secp, nodes, wallet_id, &body)?;
 
     // The real coordinator authenticates the request it relays (fresh nonce +
     // signature over the canonical bytes) so the node admits it past the gate.
@@ -374,7 +377,7 @@ fn act_one(
     // rest. A node that has already learned the request from a peer answers the
     // coordinator's own copy as a replayed nonce, which is the dup suppression
     // working; relaying to one node keeps that off the demo's happy path.
-    let request = coordinator.authorize(secp, body)?;
+    let request = coordinator.authorize(secp, wallet_id, body)?;
     let entry = &nodes[0];
     match entry.sign(&request)? {
         SignResponse::Accepted(accepted) => {
@@ -461,6 +464,7 @@ fn act_two(
     nodes: &[NodeProcess],
     user: &Actor,
     coordinator: &Coordinator,
+    wallet_id: &[u8; 32],
     witness_script: &ScriptBuf,
     spend_tx: &Transaction,
     vault_spk: &ScriptBuf,
@@ -491,6 +495,7 @@ fn act_two(
     // must first pass the coord-auth gate to reach that policy refusal.
     let request = coordinator.authorize(
         secp,
+        wallet_id,
         SignRequest {
             psbt: theft.to_string(),
             escape_psbt: escape.to_string(),
@@ -536,12 +541,15 @@ fn act_two(
 fn foreign_coordinator_is_refused(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
     nodes: &[NodeProcess],
+    wallet_id: &[u8; 32],
     body: &SignRequest,
 ) -> Result<(), Error> {
     // A coordinator the vault was never sealed to: a different key, but one that
     // signs the canonical bytes just as correctly as the real one.
     let foreign = Coordinator::random(secp, &mut File::open("/dev/urandom")?)?;
-    let request = foreign.authorize(secp, body.clone())?;
+    // Sign under the REAL vault id but a foreign KEY: the node rejects on the key,
+    // isolating coordinator authentication (not the wallet_id bind) as the cause.
+    let request = foreign.authorize(secp, wallet_id, body.clone())?;
     let mut refusals = 0;
     for node in nodes {
         match node.sign(&request)? {

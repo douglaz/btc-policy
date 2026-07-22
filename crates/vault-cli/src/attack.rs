@@ -1130,6 +1130,7 @@ impl Vault {
     ) -> Result<SignRequest, Error> {
         self.coordinator.authorize(
             &self.secp,
+            &wallet_id(&self.descriptor),
             SignRequest {
                 pin: pin.to_string().into(),
                 psbt: spend.to_string(),
@@ -1153,7 +1154,9 @@ impl Vault {
             coord_sig: String::new(),
         };
         request.nonce = crate::fed::fresh_nonce()?;
-        let digest = request.coord_request().auth_digest();
+        let digest = request
+            .coord_request()
+            .auth_digest(&wallet_id(&self.descriptor));
         let sig = self.secp.sign_ecdsa(
             &bitcoin::secp256k1::Message::from_digest(digest),
             &self.coordinator.seckey,
@@ -1279,7 +1282,11 @@ impl Vault {
     fn relay_all_fresh(&self, request: &SignRequest) -> Result<Vec<SignResponse>, Error> {
         let mut responses = Vec::new();
         for node in &self.honest {
-            let fresh = self.coordinator.authorize(&self.secp, request.clone())?;
+            let fresh = self.coordinator.authorize(
+                &self.secp,
+                &wallet_id(&self.descriptor),
+                request.clone(),
+            )?;
             responses.push(node.sign(&fresh)?);
         }
         Ok(responses)
@@ -1294,7 +1301,9 @@ impl Vault {
         for node in &self.honest {
             let mut fresh = request.clone();
             fresh.nonce = crate::fed::fresh_nonce()?;
-            let digest = fresh.coord_request().auth_digest();
+            let digest = fresh
+                .coord_request()
+                .auth_digest(&wallet_id(&self.descriptor));
             let sig = self.secp.sign_ecdsa(
                 &bitcoin::secp256k1::Message::from_digest(digest),
                 &self.coordinator.seckey,
@@ -2317,7 +2326,10 @@ fn arm_split_closed() -> Result<String, Error> {
     let bloat = "0".repeat(800 * 1024);
     let mut oversize = corrupt.clone();
     oversize.psbt = bloat;
-    let oversize = vault.coordinator.authorize(&vault.secp, oversize)?;
+    let oversize =
+        vault
+            .coordinator
+            .authorize(&vault.secp, &wallet_id(&vault.descriptor), oversize)?;
     let sign_body = encode_request(&TaggedRequest::Spend(oversize.clone()))?;
     if sign_body.len() >= 1024 * 1024 {
         return Err(format!(
@@ -2952,9 +2964,11 @@ fn censorship_residual_bounded() -> Result<String, Error> {
         if other == residual_target {
             continue;
         }
-        let fresh = censored
-            .coordinator
-            .authorize(&censored.secp, residual_request.clone())?;
+        let fresh = censored.coordinator.authorize(
+            &censored.secp,
+            &wallet_id(&censored.descriptor),
+            residual_request.clone(),
+        )?;
         let response = censored.relay_to(other, &fresh)?;
         if node.node_id < residual_target_id {
             expect_code(
@@ -3298,9 +3312,11 @@ fn censorship_residual_bounded() -> Result<String, Error> {
             if other == target {
                 continue;
             }
-            let fresh = routed
-                .coordinator
-                .authorize(&routed.secp, request.clone())?;
+            let fresh = routed.coordinator.authorize(
+                &routed.secp,
+                &wallet_id(&routed.descriptor),
+                request.clone(),
+            )?;
             let response = routed.relay_to(other, &fresh)?;
             if node.node_id < target_id {
                 expect_code(
@@ -5568,7 +5584,11 @@ fn lockout_then_duress() -> Result<String, Error> {
         let mut locked_refusal_body = None;
         let mut locked_at = None;
         for attempt in 0..WRONG_PIN_FLOOD {
-            let fresh = vault.coordinator.authorize(&vault.secp, guess.clone())?;
+            let fresh = vault.coordinator.authorize(
+                &vault.secp,
+                &wallet_id(&vault.descriptor),
+                guess.clone(),
+            )?;
             let probe = vault.honest[index].sign_timed(&fresh)?;
             let refusal = expect_refusal(
                 &probe.response,
@@ -5611,9 +5631,11 @@ fn lockout_then_duress() -> Result<String, Error> {
         duress_request.expiry,
     );
     for (index, wrong_pin_body) in locked_refusal_bodies.iter().enumerate() {
-        let fresh = vault
-            .coordinator
-            .authorize(&vault.secp, duress_request.clone())?;
+        let fresh = vault.coordinator.authorize(
+            &vault.secp,
+            &wallet_id(&vault.descriptor),
+            duress_request.clone(),
+        )?;
         let probe = vault.honest[index].sign_timed(&fresh)?;
         expect_code(
             &probe.response,

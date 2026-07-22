@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::bip32::{DerivationPath, Fingerprint};
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
@@ -62,8 +62,10 @@ fn coord_key() -> (SecretKey, PublicKey) {
 fn coord_sign_as(req: &mut SignRequest, sk: &SecretKey, nonce: &str) {
     req.nonce = nonce.to_string();
     // coord_sig is never part of its own preimage; no clearing needed. Re-signing
-    // a request that already carries a sig therefore just overwrites it.
-    let digest = req.coord_request().auth_digest();
+    // a request that already carries a sig therefore just overwrites it. The digest
+    // is domain-separated by the fixture vault's `wallet_id` (H2) — the id every
+    // fixture node re-derives; the negative tests vary the KEY (`sk`), not this.
+    let digest = req.coord_request().auth_digest(&fixture_wallet_id());
     let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), sk);
     req.coord_sig = sig.serialize_der().to_lower_hex_string();
 }
@@ -83,7 +85,7 @@ fn coord_sign_refresh(req: &mut RefreshRequest) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     req.nonce = format!("refresh-nonce-{n}");
-    let digest = req.coord_request().auth_digest();
+    let digest = req.coord_request().auth_digest(&fixture_wallet_id());
     let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &coord_key().0);
     req.coord_sig = sig.serialize_der().to_lower_hex_string();
 }
@@ -99,6 +101,18 @@ fn descriptor_str() -> String {
         .map(|i| pubkey(&secp, i).to_string())
         .collect();
     policy_core::vault_descriptor_string(&user, 3, &nodes, &recovery)
+}
+
+/// The `wallet_id` (sha256 of the canonical descriptor) every fixture node here
+/// loads. `auth_digest` binds `wallet_id` as a domain separator (H2), so the
+/// coordinator helpers must sign under the SAME id the node re-derives in
+/// `Node::load`. This test crate cannot read the node's private field, so it
+/// recomputes it exactly as the node does — parse the descriptor, hash its
+/// canonical string.
+fn fixture_wallet_id() -> [u8; 32] {
+    let descriptor =
+        Descriptor::<PublicKey>::from_str(&descriptor_str()).expect("valid descriptor");
+    sha256::Hash::hash(descriptor.to_string().as_bytes()).to_byte_array()
 }
 
 struct Fixture {
@@ -1180,7 +1194,7 @@ mod coord_auth {
     #[test]
     fn a_refresh_from_a_coordinator_outside_the_configured_root_is_rejected() {
         let (fixture, mut req) = honest_refresh();
-        let digest = req.coord_request().auth_digest();
+        let digest = req.coord_request().auth_digest(&fixture_wallet_id());
         let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &seckey(0xC1));
         req.coord_sig = sig.serialize_der().to_lower_hex_string();
         let refusal =
@@ -1221,6 +1235,48 @@ mod coord_auth {
         coord_sign_as(&mut req, &seckey(0xC1), "nonce-wrong-key");
         let refusal = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable"));
         assert_eq!(refusal.code, RefusalCode::CoordAuthInvalid);
+    }
+
+    /// H2 (holistic v0 audit, 2026-07-22): `wallet_id` is bound into the coord-auth
+    /// digest as a domain separator. A request the node's OWN pinned coordinator KEY
+    /// signed — but under a DIFFERENT vault's `wallet_id` — is rejected here, even
+    /// though the signing key is the one this node trusts. Only a signature computed
+    /// over THIS node's `wallet_id` verifies, so a coord-signed request minted for
+    /// one vault does not authenticate at another that reuses the coordinator key.
+    /// The control below re-signs the same body under this node's real `wallet_id`
+    /// and is accepted, isolating the id — not the key — as the sole cause.
+    #[test]
+    fn a_request_coord_signed_under_a_foreign_wallet_id_is_rejected() {
+        let foreign_wallet_id = [0x77u8; 32];
+        assert_ne!(
+            foreign_wallet_id,
+            fixture_wallet_id(),
+            "the foreign id must actually differ from this node's"
+        );
+
+        // Real coordinator key, FOREIGN wallet_id → the signature does not verify.
+        let (fixture, mut bad) = honest_request();
+        bad.nonce = "nonce-foreign-wallet-id".to_string();
+        let digest = bad.coord_request().auth_digest(&foreign_wallet_id);
+        let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &coord_key().0);
+        bad.coord_sig = sig.serialize_der().to_lower_hex_string();
+        let refusal = expect_refusal(handle_sign(&fixture.node, &bad, NOW).expect("decodable"));
+        assert_eq!(refusal.code, RefusalCode::CoordAuthInvalid);
+
+        // Same key, same body, THIS node's wallet_id → authenticates and reaches the
+        // signer. Only the bound domain separator changed between the two.
+        let (fixture, mut good) = honest_request();
+        good.nonce = "nonce-matching-wallet-id".to_string();
+        let digest = good.coord_request().auth_digest(&fixture_wallet_id());
+        let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &coord_key().0);
+        good.coord_sig = sig.serialize_der().to_lower_hex_string();
+        assert!(
+            matches!(
+                handle_sign(&fixture.node, &good, NOW).expect("decodable"),
+                SignResponse::Accepted(_)
+            ),
+            "a request coord-signed under this node's own wallet_id must authenticate"
+        );
     }
 
     #[test]

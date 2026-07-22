@@ -103,6 +103,178 @@ unsafe extern "C" {
         size: usize,
         flags: std::os::raw::c_int,
     ) -> std::os::raw::c_int;
+    fn fstatfs(fd: std::os::raw::c_int, buf: *mut Statfs) -> std::os::raw::c_int;
+}
+
+// --- P3a: fail-closed volatile-storage assertion (holistic v0 audit) -----------
+//
+// The whole "reboot = node death" model (ADR-0007) assumes the config/key inode
+// lives on tmpfs/ramfs, wiped on reboot: on a durable FS (ext4) the key, the
+// Lockdown xattr, and the generation xattr all survive a reboot, and operator
+// recovery (clearing the generation xattr) then resurrects an unlocked, unarmed
+// signer. Nothing else checks this, so `Node::load` asserts it at startup.
+
+/// Filesystem magic for the RAM-backed filesystems the reboot-death model relies
+/// on. `f_type` is the FIRST field of `struct statfs` (a signed `__fsword_t`, i.e.
+/// `long` on LP64).
+#[cfg(target_os = "linux")]
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+#[cfg(target_os = "linux")]
+const RAMFS_MAGIC: i64 = 0x8584_58f6;
+
+/// Setting this env var (to any value) disables the startup volatile-storage
+/// assertion. INSECURE: it defeats the reboot-death model (ADR-0007). It exists for
+/// the regtest harness (`vault-cli`'s `fed.rs`), which deploys nodes on ordinary
+/// temp dirs, and is documented as such in the fatal message below.
+#[cfg(target_os = "linux")]
+const ALLOW_DURABLE_STORAGE_ENV: &str = "BTC_VAULT_ALLOW_DURABLE_STORAGE";
+
+/// A deliberately oversized `#[repr(C)]` view of `struct statfs`: only `f_type`
+/// (offset 0) is read, and `fstatfs` writes exactly `sizeof(struct statfs)` (120 on
+/// x86-64), so the trailing slack makes the exact layout of everything after
+/// `f_type` irrelevant.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct Statfs {
+    f_type: i64,
+    _rest: [u8; 128],
+}
+
+/// The startup gate's verdict, factored out of the syscall so it is unit-testable
+/// on synthetic `f_type` values. `override_on` is true when enforcement is disabled
+/// (`cfg!(test)` or [`ALLOW_DURABLE_STORAGE_ENV`]).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// A confirmed RAM-backed filesystem (tmpfs/ramfs): the reboot-death model
+    /// holds — proceed silently.
+    Volatile,
+    /// Not confirmed volatile, but enforcement is disabled — proceed after ONE loud
+    /// warning.
+    OverrideDurable,
+    /// Not confirmed volatile and enforcement is active — fatal startup.
+    RejectDurable,
+}
+
+/// Pure gate decision: tmpfs/ramfs pass unconditionally; anything else is fatal
+/// unless `override_on`. The `fstatfs`-failed (indeterminate) case is handled by
+/// the caller and treated identically to a non-volatile `f_type` — an unidentified
+/// filesystem is never silently trusted.
+#[cfg(target_os = "linux")]
+fn classify_fs(f_type: i64, override_on: bool) -> Decision {
+    if f_type == TMPFS_MAGIC || f_type == RAMFS_MAGIC {
+        Decision::Volatile
+    } else if override_on {
+        Decision::OverrideDurable
+    } else {
+        Decision::RejectDurable
+    }
+}
+
+/// Fail closed at startup unless the config/key inode lives on tmpfs/ramfs. Called
+/// from [`Node::load`] on the real config inode. Enforcement is SKIPPED under
+/// `cfg!(test)` — vault-node unit tests path-load configs from ordinary, non-tmpfs
+/// temp dirs — or when [`ALLOW_DURABLE_STORAGE_ENV`] is set (the regtest harness).
+/// When skipped but the FS is not confirmed volatile, warn once and proceed; a
+/// durable or indeterminate FS is otherwise a fatal startup error naming the fix.
+#[cfg(target_os = "linux")]
+fn assert_volatile_storage(file: &File) -> Result<(), Error> {
+    use std::os::fd::AsRawFd;
+
+    let override_on = std::env::var_os(ALLOW_DURABLE_STORAGE_ENV).is_some();
+    let enforcement_off = cfg!(test) || override_on;
+
+    let mut buf = Statfs {
+        f_type: 0,
+        _rest: [0u8; 128],
+    };
+    // SAFETY: `file` owns a valid fd; `buf` is a #[repr(C)] region at least as large
+    // as `struct statfs`, which `fstatfs` initializes (it writes only sizeof(statfs);
+    // the remaining bytes are slack we never read).
+    let rc = unsafe { fstatfs(file.as_raw_fd(), &mut buf) };
+    if rc == -1 {
+        // INDETERMINATE: no `f_type` to classify. Treat exactly as not-confirmed-
+        // volatile — an unidentified filesystem must not be silently trusted.
+        let error = std::io::Error::last_os_error();
+        if enforcement_off {
+            eprintln!(
+                "WARNING: vault-node could not determine the config/key filesystem type \
+                 (fstatfs failed: {error}); the reboot-death model (ADR-0007) assumes tmpfs/ramfs. \
+                 Proceeding only because storage enforcement is disabled."
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "cannot determine the config/key filesystem type (fstatfs failed: {error}); \
+             vault-node's reboot-death model (ADR-0007) requires the config/key inode to live on \
+             tmpfs or ramfs. Deploy on tmpfs, or set {ALLOW_DURABLE_STORAGE_ENV}=1 (INSECURE — \
+             defeats reboot-death) to override."
+        )
+        .into());
+    }
+
+    match classify_fs(buf.f_type, enforcement_off) {
+        Decision::Volatile => Ok(()),
+        Decision::OverrideDurable => {
+            eprintln!(
+                "WARNING: vault-node's config/key inode is on a non-volatile filesystem \
+                 (statfs f_type {:#x}); the reboot-death model (ADR-0007) assumes tmpfs/ramfs so the \
+                 signing key, Lockdown latch, and process-generation xattr are wiped on reboot. \
+                 Proceeding only because storage enforcement is disabled (INSECURE).",
+                buf.f_type
+            );
+            Ok(())
+        }
+        Decision::RejectDurable => Err(format!(
+            "the config/key inode is on a non-volatile filesystem (statfs f_type {:#x}); \
+             vault-node's reboot-death model (ADR-0007) requires tmpfs or ramfs so the signing key, \
+             Lockdown latch, and process-generation xattr do NOT survive a reboot — otherwise \
+             operator recovery could resurrect an unlocked signer. Deploy on tmpfs, or set \
+             {ALLOW_DURABLE_STORAGE_ENV}=1 (INSECURE — defeats reboot-death) to override.",
+            buf.f_type
+        )
+        .into()),
+    }
+}
+
+/// Non-Linux targets have no `fstatfs`/tmpfs notion here, so the check is a no-op —
+/// `Node::load` compiles everywhere (the vault's deployment target is Linux).
+#[cfg(not(target_os = "linux"))]
+fn assert_volatile_storage(_file: &File) -> Result<(), Error> {
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod storage_gate_tests {
+    use super::{classify_fs, Decision, RAMFS_MAGIC, TMPFS_MAGIC};
+
+    /// EXT4_SUPER_MAGIC — a stand-in for any durable, non-RAM filesystem.
+    const EXT4_MAGIC: i64 = 0xEF53;
+
+    #[test]
+    fn classify_fs_passes_only_confirmed_volatile_filesystems() {
+        // tmpfs/ramfs are volatile regardless of the override — the reboot-death
+        // model holds, so no warning and no fatal.
+        assert_eq!(classify_fs(TMPFS_MAGIC, false), Decision::Volatile);
+        assert_eq!(classify_fs(RAMFS_MAGIC, false), Decision::Volatile);
+        assert_eq!(classify_fs(TMPFS_MAGIC, true), Decision::Volatile);
+        assert_eq!(classify_fs(RAMFS_MAGIC, true), Decision::Volatile);
+
+        // A durable filesystem is FATAL when enforcement is on, and only downgraded
+        // to a proceed-with-warning when explicitly overridden.
+        assert_eq!(classify_fs(EXT4_MAGIC, false), Decision::RejectDurable);
+        assert_eq!(classify_fs(EXT4_MAGIC, true), Decision::OverrideDurable);
+        // An arbitrary/unknown magic (and the indeterminate f_type == 0 sentinel)
+        // is treated the same as durable: never silently trusted.
+        assert_eq!(classify_fs(0, false), Decision::RejectDurable);
+        assert_eq!(classify_fs(0, true), Decision::OverrideDurable);
+    }
+
+    #[test]
+    fn the_volatile_magics_are_the_documented_kernel_constants() {
+        assert_eq!(TMPFS_MAGIC, 0x0102_1994);
+        assert_eq!(RAMFS_MAGIC, 0x8584_58f6);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -708,6 +880,11 @@ impl Node {
         // file than the signing key that was loaded.
         let mut lifecycle_file =
             File::open(path).map_err(|e| format!("cannot read config {path}: {e}"))?;
+        // P3a (holistic v0 audit): the reboot-death model (ADR-0007) assumes this
+        // inode is on tmpfs/ramfs (wiped on reboot). Fail closed here if it is not,
+        // unless explicitly overridden. `load` is the production entry with a real
+        // inode; the unit-test `from_toml_str` path has none and never reaches here.
+        assert_volatile_storage(&lifecycle_file)?;
         let mut raw = String::new();
         lifecycle_file
             .read_to_string(&mut raw)
@@ -1634,7 +1811,7 @@ fn arm_signature_tag(coord_sig: &str) -> [u8; 32] {
 /// when the two slots are enrolled at different costs. RefreshRequest carries no PIN
 /// and therefore needs only the domain-separated digest.
 fn arm_carrier_id(node: &Node, request: CoordRequest<'_>) -> String {
-    let digest = Zeroizing::new(request.auth_digest());
+    let digest = Zeroizing::new(request.auth_digest(&node.wallet_id));
     match request {
         CoordRequest::Spend { .. } => {
             let stretched = node.carrier_kdf.derive(&digest);
@@ -2718,7 +2895,9 @@ fn handle_channel_body_with_clocks(
                             ) {
                                 None
                             } else {
-                                let digest = Zeroizing::new(spend.coord_request().auth_digest());
+                                let digest = Zeroizing::new(
+                                    spend.coord_request().auth_digest(&node.wallet_id),
+                                );
                                 let stretched = reservation.derive(&digest);
                                 Some(
                                     vault_proto::tagged_hash(ARM_CARRIER_TAG, stretched.as_slice())
@@ -4272,7 +4451,7 @@ fn verify_coord_signature(
     // Authentication: coord_sig must ECDSA-verify over the canonical request bytes
     // against the configured coordinator_auth_pubkey. An absent, non-hex, or
     // non-DER signature is an authentication failure like any other.
-    let digest = request.auth_digest();
+    let digest = request.auth_digest(&node.wallet_id);
     let der = Vec::<u8>::from_hex(coord_sig).map_err(|_| {
         refusal(
             RefusalCode::CoordAuthInvalid,
@@ -4950,22 +5129,42 @@ pub(crate) mod test_support {
     /// nonce: the nonce is single-use per transmission, while idempotency lives on
     /// the commitment, so the same spend re-sent this way still returns the one
     /// recorded verdict from the anti-replay log.
-    pub(crate) fn coord_sign(request: &mut SignRequest, nonce: &str) {
+    pub(crate) fn coord_sign(request: &mut SignRequest, wallet_id: &[u8; 32], nonce: &str) {
         request.nonce = nonce.to_string();
         // `coord_request()` selects the signed fields; coord_sig is never part of
-        // its own preimage, so it needs no clearing before the digest.
-        let digest = request.coord_request().auth_digest();
+        // its own preimage, so it needs no clearing before the digest. `wallet_id`
+        // is bound into the digest as a domain separator (H2), so it MUST be the id
+        // the receiving node re-derives — pass `node.wallet_id`.
+        let digest = request.coord_request().auth_digest(wallet_id);
         let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &coord_key().0);
         request.coord_sig = sig.serialize_der().to_lower_hex_string();
     }
 
     /// Refresh counterpart to [`coord_sign`]: the same coordinator key and
-    /// freshness contract, over the Refresh variant's canonical bytes.
-    pub(crate) fn coord_sign_refresh(request: &mut RefreshRequest, nonce: &str) {
+    /// freshness contract, over the Refresh variant's canonical bytes (bound to the
+    /// receiving node's `wallet_id`, H2).
+    pub(crate) fn coord_sign_refresh(
+        request: &mut RefreshRequest,
+        wallet_id: &[u8; 32],
+        nonce: &str,
+    ) {
         request.nonce = nonce.to_string();
-        let digest = request.coord_request().auth_digest();
+        let digest = request.coord_request().auth_digest(wallet_id);
         let sig = Secp256k1::new().sign_ecdsa(&Message::from_digest(digest), &coord_key().0);
         request.coord_sig = sig.serialize_der().to_lower_hex_string();
+    }
+
+    /// The `wallet_id` (sha256 of the canonical descriptor) of the standard
+    /// single-node test vault `node_and_valid_request`/`config_with_bounds` build.
+    /// Coordinator signatures are domain-separated by `wallet_id` (H2), so a fixture
+    /// that signs WITHOUT a `node` in scope must bind the SAME id `Node::load`
+    /// re-derives from this exact descriptor. Callers that DO hold the node pass
+    /// `&node.wallet_id` directly.
+    pub(crate) fn test_wallet_id() -> [u8; 32] {
+        let descriptor =
+            Descriptor::<PublicKey>::from_str(&test_vault_descriptor(&key(1).1, &[key(2).1]))
+                .expect("standard test descriptor parses");
+        sha256::Hash::hash(descriptor.to_string().as_bytes()).to_byte_array()
     }
 
     fn user_sign(node: &Node, psbt: &mut Psbt) {
@@ -5011,7 +5210,7 @@ pub(crate) mod test_support {
             policy_version: spend.policy_version,
             coord_sig: String::new(),
         };
-        coord_sign_refresh(&mut request, nonce);
+        coord_sign_refresh(&mut request, &node.wallet_id, nonce);
         request
     }
 
@@ -5080,7 +5279,7 @@ pub(crate) mod test_support {
             policy_version: 1,
             coord_sig: String::new(),
         };
-        coord_sign(&mut request, "test-support-first-send");
+        coord_sign(&mut request, &node.wallet_id, "test-support-first-send");
         (node, request)
     }
 
@@ -5098,7 +5297,7 @@ pub(crate) mod test_support {
             psbt: psbt.to_string(),
             ..spend.clone()
         };
-        coord_sign(&mut request, "test-support-theft");
+        coord_sign(&mut request, &node.wallet_id, "test-support-theft");
         request
     }
 
@@ -5405,7 +5604,7 @@ mod sign_clock_tests {
 mod pin_substrate_tests {
     use super::pin::{PinEvaluator, PinSlot};
     use super::test_support::{
-        coord_sign, node_and_valid_request, node_and_valid_request_with_budget,
+        coord_sign, node_and_valid_request, node_and_valid_request_with_budget, test_wallet_id,
         valid_refresh_request,
     };
     use super::{handle_refresh, handle_sign, Node};
@@ -5430,7 +5629,9 @@ mod pin_substrate_tests {
     fn with_pin(base: &SignRequest, pin: &str, nonce: &str) -> SignRequest {
         let mut request = base.clone();
         request.pin = pin.into();
-        coord_sign(&mut request, nonce);
+        // `with_pin` holds no `node`; every fixture here feeds the standard test
+        // vault, whose id is `test_wallet_id()` (== that node's `wallet_id`).
+        coord_sign(&mut request, &test_wallet_id(), nonce);
         request
     }
 

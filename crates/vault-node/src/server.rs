@@ -768,7 +768,7 @@ mod tests {
         // definition (ADR-0013 §2) and would be refused at ingress instead of
         // exercising the anti-replay log this test is about.
         let mut second = request.clone();
-        crate::test_support::coord_sign(&mut second, "concurrent-retry");
+        crate::test_support::coord_sign(&mut second, &node.wallet_id, "concurrent-retry");
         let b1 = spend_body(&request);
         let b2 = spend_body(&second);
         let one = spawn_blocking(move || post(addr, "/sign", &b1));
@@ -923,7 +923,7 @@ mod tests {
         // the commitment, not the transmission, so this still returns the ONE
         // recorded verdict rather than signing twice.
         let mut retry = request.clone();
-        crate::test_support::coord_sign(&mut retry, "resubmit-after-408");
+        crate::test_support::coord_sign(&mut retry, &node.wallet_id, "resubmit-after-408");
         let retry_body = spend_body(&retry);
 
         // Blocking inside handle_sign makes the 408 deterministic.
