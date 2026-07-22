@@ -2051,6 +2051,20 @@ async fn fire_tick_with_clock(
         // THE GATE. `release_partials` returns `None` unless this candidate's
         // fire event has arrived — so a Hold-bound spend, and every unscheduled
         // escape, silently produce nothing here.
+        //
+        // SAFETY-CRITICAL ORDERING (v0-exit audit 2026-07-22, bead btc-policy-9y5.2):
+        // this release loop is fail-CLOSED under a poisoned `sign_state` ONLY because
+        // the fire pass acquires `sign_state` above (the `pending` poll) BEFORE reaching
+        // here — a panic that poisoned that lock also killed arming (`confirm_carrier`)
+        // and Lockdown, and the `.expect("sign_state lock poisoned")` aborts this pass
+        // before any partial is released. Do NOT reorder the release loop above that
+        // acquisition, remove it, or make it conditional: doing so leaves
+        // `release_partials` reachable while the freeze/arm path is dead — a FAIL-OPEN
+        // release of an unfrozen, coerced hot partial. The guarantee also rests on
+        // `confirm_carrier` setting `holder_quorum_reached` (opens the gate) and
+        // `armed.active` (freezes) atomically under one store lock, so a duress
+        // candidate is never due-here-but-unfrozen. Both legs are load-bearing and must
+        // stay asserted by test (btc-policy-9y5.2 adds the poisoned-sign_state test).
         if let Some(release) = channel.release_partials(commitment_id, release_now) {
             spawn_fan_out(&node, release.outbound());
         }
