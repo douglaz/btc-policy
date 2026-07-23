@@ -9,5 +9,9 @@ license.workspace = true
 bitcoin = { workspace = true }
 miniscript = { workspace = true }
 
+[dev-dependencies]
+# V0-7 property suite only (DESIGN.md T3); never in the shipped tree.
+proptest = { workspace = true }
+
 [lints]
 workspace = true

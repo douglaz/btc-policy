@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b7aa8cfe45cab41d007f6f59d7ab68ae8d0c87dbbe1f25acdbc95df5ecd16f89 # shrinks to request = Refresh(RefreshRequest { refresh_psbt: "\\\0𐀀\\\0𐀀a𐀀¡aAaA0ࠀ𐀀a𐀀#A\0 a𐀀ࠀA", nonce: "", expiry: 1000000000000000000, policy_version: 1000000000, coord_sig: "¡ 0Aࠀ¡ a𐀀Aaa𐀀¡\\𐀀𐀀A𐀀𐀀𐀀aa¡\\𐀀0𐀀ࠀ#0a 𐀀¡\0\u{c}0ࠀ𐀀¡ " }), position = 2792, xor = 1, truncate = false
+cc 9898569ec9a2fb8fd86e9761e4357a378b4ed1c7933f86c50fed2fed42724090 # shrinks to request = Spend(SignRequest { psbt: "0𐀀", escape_psbt: "0\0aa\0\"a¡\0𐀀𐀀𐀀a#\0 0𐀀 \0000a\u{8}\"\u{80}", pin: Pin(<redacted>), nonce: "0 \u{e}\u{e}a¡ \\\" a𐀀a𐀀a𐀀0 \\ࠀ0\u{e}𐀀𐀀𐀀*:D¥/?$", expiry: 4173912987163413049, policy_version: 1549702686, coord_sig: "\u{415ac}\u{72748}𦵾\u{c644e}=%:%<\u{dfa8f}¥🕴¥Ⱥ\t\u{6afa7}\u{b}\u{1b}\u{57533}s{`=𝈌:B&\0\u{e5faf}\u{7f}\u{feff}\u{b}Ⱥ\t\u{87b14}|({\u{dd202}\u{b}*RT\u{5}<\u{98c3c}\u{cef3b}\u{39ac4}'/%.7" }), position = 2187, xor = 84, truncate = false, wallet_id = [5, 196, 64, 168, 191, 203, 70, 22, 139, 219, 114, 41, 213, 24, 55, 188, 73, 205, 180, 43, 23, 165, 70, 214, 77, 79, 40, 166, 234, 221, 78, 59]

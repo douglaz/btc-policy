@@ -19,6 +19,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# V0-7 property suite only (DESIGN.md T3); never in the shipped tree.
+proptest = { workspace = true }
 
 [lints]
 workspace = true

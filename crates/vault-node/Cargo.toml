@@ -26,6 +26,8 @@ vault-proto = { path = "../vault-proto" }
 # `test-util` powers the paused-time retry-loop tests (deterministic backoff);
 # dev-only, so it never lands in the daemon build.
 tokio = { workspace = true, features = ["test-util"] }
+# V0-7 property suite only (DESIGN.md T3); never in the shipped tree.
+proptest = { workspace = true }
 
 [lints]
 workspace = true
