@@ -4707,7 +4707,7 @@ pub(crate) async fn retry_message_until(
 }
 
 #[cfg(test)]
-mod fixture {
+pub(crate) mod fixture {
     //! A reusable channel test fixture: `n` federation keys over one first-light
     //! vault, the derived channel keys, a computed manifest_hash, and per-node
     //! endorsements — everything the `[channel]` config and a real `Node` need.

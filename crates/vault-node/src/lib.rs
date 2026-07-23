@@ -30,6 +30,13 @@ mod replay;
 pub mod server;
 pub mod watchtower;
 
+/// V0-7: arbitrary-byte robustness for every untrusted-input parser.
+#[cfg(test)]
+mod prop_decoder;
+/// V0-7 (DESIGN.md T3): the PSBT-mutation property over the real ingress.
+#[cfg(test)]
+mod prop_mutation;
+
 pub use pin::{
     argon2id_duress_phc, argon2id_duress_phc_at, argon2id_normal_phc, argon2id_normal_phc_at,
 };
@@ -5181,25 +5188,25 @@ pub(crate) mod test_support {
         sha256::Hash::hash(descriptor.to_string().as_bytes()).to_byte_array()
     }
 
-    fn user_sign(node: &Node, psbt: &mut Psbt) {
-        let value = psbt.inputs[0]
-            .witness_utxo
-            .as_ref()
-            .expect("witness utxo")
-            .value;
-        let sighash = SighashCache::new(&psbt.unsigned_tx)
-            .p2wsh_signature_hash(0, &node.witness_script, value, EcdsaSighashType::All)
-            .expect("sighash");
-        let signature =
-            Secp256k1::new().sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &key(1).0);
-        psbt.inputs[0].partial_sigs.clear();
-        psbt.inputs[0].partial_sigs.insert(
-            node.user_pubkey,
-            bitcoin::ecdsa::Signature {
-                signature,
-                sighash_type: EcdsaSighashType::All,
-            },
-        );
+    fn user_sign_all(node: &Node, psbt: &mut Psbt) {
+        let unsigned = psbt.unsigned_tx.clone();
+        let mut cache = SighashCache::new(&unsigned);
+        for (index, input) in psbt.inputs.iter_mut().enumerate() {
+            let value = input.witness_utxo.as_ref().expect("witness utxo").value;
+            let sighash = cache
+                .p2wsh_signature_hash(index, &node.witness_script, value, EcdsaSighashType::All)
+                .expect("sighash");
+            let signature = Secp256k1::new()
+                .sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &key(1).0);
+            input.partial_sigs.clear();
+            input.partial_sigs.insert(
+                node.user_pubkey,
+                bitcoin::ecdsa::Signature {
+                    signature,
+                    sighash_type: EcdsaSighashType::All,
+                },
+            );
+        }
     }
 
     /// Derive a valid pin-less refresh from the fixture spend: only the output is
@@ -5216,7 +5223,7 @@ pub(crate) mod test_support {
         // read as ~106 sat/vB over this tiny transaction and trip the refresh fee
         // cap (ADR-0013 §6) — correctly: a real refresh pays a normal feerate.
         psbt.unsigned_tx.output[0].value = Amount::from_sat(99_999_000);
-        user_sign(node, &mut psbt);
+        user_sign_all(node, &mut psbt);
         let mut request = RefreshRequest {
             refresh_psbt: psbt.to_string(),
             nonce: String::new(),
@@ -5235,6 +5242,37 @@ pub(crate) mod test_support {
     /// enrolled normal pin is `1234`, the duress pin `9999`.
     pub(crate) fn node_and_valid_request() -> (Node, SignRequest) {
         node_and_valid_request_with_budget("")
+    }
+
+    /// The same accepted fixture expanded to two distinct inputs and two distinct
+    /// output amounts in BOTH the spend and escape. Mutation properties use this so
+    /// index selection, dropping, and reordering exercise nonzero positions through
+    /// the real ingress instead of collapsing every index onto a 1×1 transaction.
+    pub(crate) fn node_and_valid_multi_request() -> (Node, SignRequest) {
+        fn expand(node: &Node, psbt_text: &str) -> Psbt {
+            let mut psbt = Psbt::from_str(psbt_text).expect("fixture psbt");
+            let mut txin = psbt.unsigned_tx.input[0].clone();
+            txin.previous_output = OutPoint::new(Txid::from_byte_array([8; 32]), 0);
+            psbt.unsigned_tx.input.push(txin);
+            psbt.inputs.push(psbt.inputs[0].clone());
+
+            let mut txout = psbt.unsigned_tx.output[0].clone();
+            txout.value = Amount::from_sat(100_000_000);
+            psbt.unsigned_tx.output.push(txout);
+            psbt.outputs.push(bitcoin::psbt::Output::default());
+            user_sign_all(node, &mut psbt);
+            psbt
+        }
+
+        let (node, mut request) = node_and_valid_request();
+        request.psbt = expand(&node, &request.psbt).to_string();
+        request.escape_psbt = expand(&node, &request.escape_psbt).to_string();
+        coord_sign(
+            &mut request,
+            &node.wallet_id,
+            "test-support-multi-first-send",
+        );
+        (node, request)
     }
 
     /// [`node_and_valid_request`] with an explicit `[pin_attempt_budget]` TOML block
@@ -5306,7 +5344,7 @@ pub(crate) mod test_support {
         // A P2WSH of a hash no descriptor in this vault can derive.
         psbt.unsigned_tx.output[0].script_pubkey =
             ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([0xEE; 32]));
-        user_sign(node, &mut psbt);
+        user_sign_all(node, &mut psbt);
         let mut request = SignRequest {
             psbt: psbt.to_string(),
             ..spend.clone()
@@ -5338,7 +5376,7 @@ pub(crate) mod test_support {
             value,
         });
         psbt.inputs[0].witness_script = Some(node.witness_script.clone());
-        user_sign(node, &mut psbt);
+        user_sign_all(node, &mut psbt);
         psbt
     }
 }

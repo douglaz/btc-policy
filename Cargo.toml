@@ -40,6 +40,13 @@ zeroize = { version = "1", features = ["serde"] }
 # `Bytes::from_owner` lets reqwest carry a zeroizing channel-body owner all the
 # way through the transport; the allocation is wiped when the last body clone drops.
 bytes = "1"
+# DEV-ONLY (V0-7). DESIGN.md T3 makes property-based mutation testing part of the
+# core-proven gate, and a generator/shrinker framework is not something to
+# hand-roll: shrinking a 30-output PSBT mutation down to the minimal
+# counterexample is the whole value, and it ships in no binary. `default-features
+# = false` drops the `fork`/`timeout` features (subprocess isolation, which these
+# suites do not need) so the dev tree gains only proptest's core.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
