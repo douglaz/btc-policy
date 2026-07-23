@@ -43,7 +43,7 @@ pub use pin::{
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
@@ -400,6 +400,15 @@ fn write_xattr(
         std::io::ErrorKind::Unsupported,
         "vault-node lifecycle attributes require Linux",
     ))
+}
+
+/// Write one diagnostic line without letting a broken stderr sink panic through a
+/// safety boundary. Diagnostics are subordinate to the fail-closed transition: callers
+/// must latch any required state before calling this helper.
+fn best_effort_stderr(args: std::fmt::Arguments<'_>) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_fmt(args);
+    let _ = stderr.write_all(b"\n");
 }
 
 /// Input the node cannot decode: answered with HTTP 400, never a refusal.
@@ -1616,11 +1625,31 @@ impl Node {
     /// began pre-Lockdown) or observes the flag and refuses — none registers a new
     /// candidate AFTER Lockdown. Because it acquires `sign_state`, it MUST NOT be
     /// called while that lock is already held.
+    ///
+    /// This linearization is the NORMAL path only. The poison-FORCED sibling
+    /// [`Node::force_lockdown_fail_closed`] latches the SAME flag WITHOUT any lock, so it
+    /// does NOT linearize — a handler inside its `sign_state` critical section can still
+    /// read `is_locked_down() == false` after that latch. That is safe because the forced
+    /// path fires ONLY when a critical lock is already poisoned: the racing handler then
+    /// either cannot exist (a poisoned `sign_state` has no live holder) or panics
+    /// fail-closed at its own store op (e.g. `register_pair`) before anything egresses
+    /// (see that fn's doc). Reason about post-Lockdown registration as "impossible OR
+    /// fail-closed-panics on the poisoned store", never just "impossible".
     pub fn enter_lockdown(&self) {
         let _guard = self.sign_state.lock().expect("sign_state lock poisoned");
         // The dedicated deadline driver and the fire pass can observe T together.
-        // Re-check after taking their shared signing-state lock so only the winner
-        // performs the tmpfs latch write; terminal state remains monotonic.
+        // Re-check (in `latch_lockdown`) after taking their shared signing-state lock
+        // so only the winner performs the tmpfs latch write; terminal state remains
+        // monotonic.
+        self.latch_lockdown();
+    }
+
+    /// Persist the RAMDISK lockdown latch and flip the in-RAM flag. Takes NO lock: it
+    /// is the shared body of [`Self::enter_lockdown`] (which holds `sign_state` around
+    /// it, to linearize the transition with in-flight `/sign`) and of
+    /// [`Self::force_lockdown_fail_closed`] (the panic-boundary path, which must NOT
+    /// touch `sign_state` because the panic it is recovering from may have poisoned it).
+    fn latch_lockdown(&self) {
         if self.is_locked_down() {
             return;
         }
@@ -1632,22 +1661,61 @@ impl Node {
         // pre-opened at startup (see `lifecycle_file`), so it allocates NO new fd and
         // cannot be blocked by fd-table exhaustion (EMFILE). Durability = key
         // durability, and pathname aliases cannot select another latch.
-        if let Some(file) = &self.lifecycle_file {
-            if let Err(e) =
-                write_xattr(file, LOCKDOWN_XATTR, b"locked\n", false).and_then(|()| file.sync_all())
-            {
-                // Only ENOSPC-class failure remains (the RAM is full); irreducible
-                // (you cannot write to full storage) and self-limiting — such a node
-                // is failing and a reboot is node death = safe. This process still
-                // locks via the store below; logged loudly, never panicked (a panic
-                // would exit into an unlocked respawn, strictly worse).
-                eprintln!(
-                    "enter_lockdown: WARNING could not persist RAMDISK lockdown latch: {e} \
-                     (this process stays locked; the one-shot generation gate forbids restart)"
-                );
-            }
-        }
+        let persistence_error = self.lifecycle_file.as_ref().and_then(|file| {
+            write_xattr(file, LOCKDOWN_XATTR, b"locked\n", false)
+                .and_then(|()| file.sync_all())
+                .err()
+        });
         self.lockdown.store(true, Ordering::Release);
+        if let Some(e) = persistence_error {
+            // Only ENOSPC-class failure remains (the RAM is full); irreducible
+            // (you cannot write to full storage) and self-limiting — such a node
+            // is failing and a reboot is node death = safe. The in-RAM latch is
+            // already set above, BEFORE this best-effort diagnostic, so even a
+            // broken stderr sink cannot prevent this process from locking down.
+            best_effort_stderr(format_args!(
+                "enter_lockdown: WARNING could not persist RAMDISK lockdown latch: {e} \
+                 (this process stays locked; the one-shot generation gate forbids restart)"
+            ));
+        }
+    }
+
+    /// Force terminal **Lockdown** from a panic-recovery boundary WITHOUT taking any
+    /// lock the panicking critical section could have poisoned (bead btc-policy-9y5.2).
+    ///
+    /// The uniform `.expect("… lock poisoned")` convention means a panic while holding
+    /// `sign_state` or the channel `store` lock poisons it, and every later `.lock()`
+    /// on it re-panics. [`Self::enter_lockdown`] itself acquires `sign_state`, so on
+    /// that path it would re-panic instead of locking down — leaving a poisoned node
+    /// that can neither Lockdown-at-T nor serve, an ambiguous zombie. This path instead
+    /// reaches the SAME terminal latch through poison-independent state only: the
+    /// pre-opened `lifecycle_file` descriptor (no lock, no fresh fd) and the atomic
+    /// `lockdown` flag. It is the deterministic fail-closed destination the tick/handler
+    /// safety nets ([`fire_tick_with_lockdown_net`], [`lockdown_tick_with_lockdown_net`],
+    /// and the `/sign` + `/channel` handler panic arms) steer a panicked node into.
+    ///
+    /// Safe to run without `sign_state`'s linearization: this is only ever called after
+    /// a caught panic in a critical section, and that panic poisoned the very lock a
+    /// concurrent handler would need to register a candidate — so poison propagation,
+    /// not this lock, is what blocks any post-Lockdown signing. Monotonic and
+    /// idempotent, exactly like [`Self::enter_lockdown`].
+    pub(crate) fn force_lockdown_fail_closed(&self) {
+        self.latch_lockdown();
+    }
+
+    /// Whether a production critical-section lock is poisoned — i.e. some thread
+    /// panicked while holding `sign_state` or the channel `store` lock, unwinding
+    /// through its guard. The tick/handler safety nets read this after catching a panic
+    /// to decide whether to force fail-closed Lockdown: a poisoned lock means a critical
+    /// section tore mid-mutation, so the node must not keep serving as if intact. A
+    /// benign panic that held neither lock leaves both un-poisoned and does not lock the
+    /// node down.
+    pub(crate) fn critical_lock_poisoned(&self) -> bool {
+        self.sign_state.is_poisoned()
+            || self
+                .channel
+                .as_ref()
+                .is_some_and(channel::ChannelState::store_poisoned)
     }
 
     /// Whether this node is in Lockdown. Read at the top of every spend/refresh (a
@@ -1874,7 +1942,7 @@ pub fn spawn_drivers(node: &Arc<Node>) {
         let mut ticker = tokio::time::interval(FIRE_INTERVAL);
         loop {
             ticker.tick().await;
-            lockdown_tick(&lockdown_node, unix_now());
+            lockdown_tick_with_lockdown_net(&lockdown_node, unix_now());
         }
     });
     let node = Arc::clone(node);
@@ -1882,7 +1950,7 @@ pub fn spawn_drivers(node: &Arc<Node>) {
         let mut ticker = tokio::time::interval(FIRE_INTERVAL);
         loop {
             ticker.tick().await;
-            fire_tick_with_clock(
+            fire_tick_with_lockdown_net(
                 Arc::clone(&node),
                 Arc::clone(&backend),
                 unix_now(),
@@ -1922,6 +1990,67 @@ fn lockdown_tick(node: &Node, now: u64) -> bool {
         return true;
     }
     false
+}
+
+/// One SAFETY Lockdown-deadline tick under the §2b panic safety net (bead
+/// btc-policy-9y5.2), the always-running-driver analogue of
+/// [`fire_tick_with_lockdown_net`].
+///
+/// [`lockdown_tick`] calls [`Node::enter_lockdown`], which acquires `sign_state`; if a
+/// prior panic poisoned that lock, `enter_lockdown` re-panics on the `.expect`. Without
+/// this net that panic would kill the deadline driver loop permanently — the node could
+/// then never Lockdown-at-T, the worst failure. Catch the panic so the loop survives,
+/// then force the poison-independent terminal Lockdown when a critical lock is poisoned
+/// (so a torn critical section still reaches the known-safe fail-closed state rather
+/// than an ambiguous zombie). The tick is synchronous, so a plain `catch_unwind`
+/// suffices; `AssertUnwindSafe` is sound because a caught panic never resumes use of the
+/// possibly-torn state — it forces Lockdown and returns.
+fn lockdown_tick_with_lockdown_net(node: &Node, now: u64) {
+    // A critical-lock panic has already reached the only safe terminal state. Do not
+    // re-enter the poisoned store/sign-state path: `catch_unwind` would contain it, but
+    // the default panic hook would still print at 1 Hz and grow RAMDISK logs forever.
+    if node.is_locked_down() && node.critical_lock_poisoned() {
+        return;
+    }
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lockdown_tick(node, now)));
+    // Log on the poison→terminal transition, gated on ACTUAL poison rather than
+    // `!is_locked_down()`: a node that locked down normally at T and is THEN poisoned
+    // (e.g. a panic during post-Lockdown escape combining) still deserves the one
+    // diagnostic. Flooding is prevented by the poison early-return above — once
+    // locked-down AND poisoned, the tick returns before reaching here — so this fires
+    // exactly once, on the transition.
+    let should_log = outcome.is_err() && node.critical_lock_poisoned();
+    // Lockdown is the safety action; diagnostics are best-effort and happen only after
+    // the poison-independent latch. This ordering must survive a broken stderr sink.
+    if node.critical_lock_poisoned() {
+        node.force_lockdown_fail_closed();
+    }
+    // Log once, on the transition into Lockdown, not every 1 Hz tick a poisoned lock
+    // keeps re-panicking on.
+    if should_log {
+        best_effort_stderr(format_args!(
+            "lockdown: deadline tick panicked; forcing fail-closed Lockdown if a critical \
+             section was torn (bead btc-policy-9y5.2)"
+        ));
+    }
+}
+
+/// Compile-checked marker at the partial-release gate (bead btc-policy-9y5.2).
+///
+/// Requiring a live `MutexGuard<SignState>` at the loop makes the exclusion structural:
+/// the release call cannot be moved outside the guard's scope without a compile error.
+/// The debug assertion documents the corresponding runtime invariant — while this
+/// guard is held, no concurrent handler can poison `sign_state` or enter the
+/// `sign_state -> store` confirmation path between the health check and release.
+fn require_sign_state_guard_before_release(
+    node: &Node,
+    _guard: &std::sync::MutexGuard<'_, SignState>,
+) {
+    debug_assert!(
+        !node.sign_state.is_poisoned(),
+        "partial release requires a live, unpoisoned sign_state guard"
+    );
 }
 
 /// One fire pass (§1) — the Model-B spend path's engine.
@@ -1979,12 +2108,13 @@ async fn fire_tick_with_clock(
     // quorum-ready candidate's window on the same serial pass. Past the grace no
     // peer's combine window is still open, so the pending Hold instead lifts on its
     // commitment-expiry prune backstop.
-    let pending = node
-        .sign_state
-        .lock()
-        .expect("sign_state lock poisoned")
-        .pending
-        .ids(due_now);
+    // A lock poisoned before this pass still aborts at the pending poll, before any
+    // backend work or partial release. The release loop takes a second guard below:
+    // that guard closes the concurrent-poison window after this short poll.
+    let pending = {
+        let state = node.sign_state.lock().expect("sign_state lock poisoned");
+        state.pending.ids(due_now)
+    };
     due.extend(
         pending
             .into_iter()
@@ -2050,30 +2180,57 @@ async fn fire_tick_with_clock(
             HashSet::new()
         }
     };
-    let release_now = clock();
-    for commitment_id in &due {
-        if channel.is_armed_escape(commitment_id) && !release_eligible.contains(commitment_id) {
-            continue;
-        }
-        // THE GATE. `release_partials` returns `None` unless this candidate's
-        // fire event has arrived — so a Hold-bound spend, and every unscheduled
-        // escape, silently produce nothing here.
-        //
-        // SAFETY-CRITICAL ORDERING (v0-exit audit 2026-07-22, bead btc-policy-9y5.2):
-        // this release loop is fail-CLOSED under a poisoned `sign_state` ONLY because
-        // the fire pass acquires `sign_state` above (the `pending` poll) BEFORE reaching
-        // here — a panic that poisoned that lock also killed arming (`confirm_carrier`)
-        // and Lockdown, and the `.expect("sign_state lock poisoned")` aborts this pass
-        // before any partial is released. Do NOT reorder the release loop above that
-        // acquisition, remove it, or make it conditional: doing so leaves
-        // `release_partials` reachable while the freeze/arm path is dead — a FAIL-OPEN
-        // release of an unfrozen, coerced hot partial. The guarantee also rests on
-        // `confirm_carrier` setting `holder_quorum_reached` (opens the gate) and
-        // `armed.active` (freezes) atomically under one store lock, so a duress
-        // candidate is never due-here-but-unfrozen. Both legs are load-bearing and must
-        // stay asserted by test (btc-policy-9y5.2 adds the poisoned-sign_state test).
-        if let Some(release) = channel.release_partials(commitment_id, release_now) {
-            spawn_fan_out(&node, release.outbound());
+    // TEST-ONLY poison-injection rendezvous, at the pending-poll -> guard seam where
+    // `sign_state` is momentarily free (the pending poll dropped it; the release guard has
+    // not yet taken it). The after-poll poison test's clock poisons `sign_state` on its
+    // first call and must fire it HERE, while the lock is still free, so its poisoning
+    // thread can acquire the lock (no deadlock) and the guard acquisition below then aborts
+    // fail-closed on the poisoned lock. Gated to test builds so production never carries a
+    // discarded read; the AUTHORITATIVE release timestamp is always sampled AFTER the guard
+    // (below), so the timing invariant is identical either way.
+    #[cfg(test)]
+    let _ = clock();
+    // Re-acquire AFTER the potentially-blocking preflight and hold the guard through
+    // every release + fan-out. A critical-section panic that races this pass therefore
+    // linearizes on one side of the release gate: poison before this acquisition aborts
+    // here; poison after it cannot occur until every selected partial has been handed to
+    // the fan-out tasks. This preserves the existing `sign_state -> store` lock order
+    // used by `confirm_carrier`.
+    {
+        let release_guard = node.sign_state.lock().expect("sign_state lock poisoned");
+        // Sample the release clock AFTER acquiring the guard. The acquisition can BLOCK (a
+        // `/sign` or relayed request holds `sign_state` through the ~100ms Argon2), so a
+        // `release_now` sampled BEFORE it would be STALE: `release_partials` would then
+        // authorize a share against an in-window timestamp the real send time has already
+        // passed, emitting a finalizable share AFTER the true `FireWindow::deadline`
+        // (v0-exit multi-reviewer-loop pass 4, codex P1). Sampling here — under the guard,
+        // just before the gate — makes release authorization reflect the actual send time.
+        let release_now = clock();
+        for commitment_id in &due {
+            require_sign_state_guard_before_release(&node, &release_guard);
+            if channel.is_armed_escape(commitment_id) && !release_eligible.contains(commitment_id) {
+                continue;
+            }
+            // THE GATE. `release_partials` returns `None` unless this candidate's
+            // fire event has arrived — so a Hold-bound spend, and every unscheduled
+            // escape, silently produce nothing here.
+            //
+            // SAFETY-CRITICAL ORDERING (v0-exit audit 2026-07-22, bead btc-policy-9y5.2):
+            // this release loop is fail-CLOSED under a poisoned `sign_state` because the
+            // fire pass holds `release_guard` across the gate and fan-out. A panic that
+            // poisoned the lock before this scope aborts at acquisition; a concurrent
+            // handler cannot acquire and poison it until this scope ends. Do NOT move the
+            // release loop outside this guard, remove it, or make it conditional: doing so
+            // leaves `release_partials` reachable while the freeze/arm path is dead — a
+            // FAIL-OPEN release of an unfrozen, coerced hot partial. The guarantee also
+            // rests on `confirm_carrier` setting `holder_quorum_reached` (opens the gate)
+            // and `armed.active` (freezes) atomically under one store lock, so a duress
+            // candidate is never due-here-but-unfrozen. Both legs are load-bearing and
+            // must stay asserted by test (btc-policy-9y5.2 adds the poisoned-sign_state
+            // test).
+            if let Some(release) = channel.release_partials(commitment_id, release_now) {
+                spawn_fan_out(&node, release.outbound());
+            }
         }
     }
     // Combining calls the chain backend (blocking JSON-RPC), so it runs off the
@@ -2093,6 +2250,62 @@ async fn fire_tick_with_clock(
             0
         }
     }
+}
+
+/// One fire pass under the §2b panic safety net (bead btc-policy-9y5.2).
+///
+/// A panic inside the pass — in particular the deliberate `.expect("… lock poisoned")`
+/// fail-closed abort taken when a prior panic poisoned `sign_state` or the channel
+/// store lock — must neither kill the daemon's fire-driver loop (a permanent zombie
+/// that can no longer Lockdown-at-T) nor leave the node observable as still-releasing.
+/// Run the pass on a child task so tokio captures any panic as a `JoinError` (the
+/// default runtime does not abort the process on a task panic), keeping the driver loop
+/// alive; then, if a production critical lock is poisoned, steer the node into
+/// deterministic terminal Lockdown through the poison-independent path
+/// ([`Node::force_lockdown_fail_closed`]). This preserves fail-closed-for-THEFT — the
+/// pass still panics BEFORE the release loop under a poisoned `sign_state`, releasing
+/// nothing — while removing "one reachable panic permanently kills a member into an
+/// ambiguous state". Returns the pass's broadcast count (0 if it panicked).
+async fn fire_tick_with_lockdown_net(
+    node: Arc<Node>,
+    backend: Arc<dyn ChainBackend + Send + Sync>,
+    due_now: u64,
+    clock: impl Fn() -> u64 + Send + Sync + 'static,
+) -> usize {
+    // Preserve post-Lockdown escape combining on healthy nodes, but a node whose
+    // critical state is poisoned can do no safe store/sign-state work. It already
+    // reached the fail-closed terminal latch, so do not spawn another task whose
+    // inevitable panic would invoke the default hook and flood RAMDISK logs at 1 Hz.
+    if node.is_locked_down() && node.critical_lock_poisoned() {
+        return 0;
+    }
+    let pass_node = Arc::clone(&node);
+    let (broadcast, panic_error) =
+        match tokio::spawn(fire_tick_with_clock(pass_node, backend, due_now, clock)).await {
+            Ok(broadcast) => (broadcast, None),
+            Err(join_error) => (0, Some(join_error)),
+        };
+    // Poison→terminal transition, gated on ACTUAL poison (not `!is_locked_down()`), so a
+    // node poisoned AFTER a normal Lockdown at T still logs once; the poison early-return
+    // above prevents any repeat.
+    let should_log = panic_error.is_some() && node.critical_lock_poisoned();
+    // Force the terminal state before attempting diagnostics: stderr failure must not
+    // punch through the panic net and leave a poisoned node unlocked.
+    if node.critical_lock_poisoned() {
+        node.force_lockdown_fail_closed();
+    }
+    // Log once — on the transition into fail-closed Lockdown — not every 1 Hz tick a
+    // persistently poisoned lock keeps re-panicking on (a terminal node must not flood
+    // its RAMDISK logs).
+    if should_log {
+        if let Some(join_error) = panic_error {
+            best_effort_stderr(format_args!(
+                "fire: pass panicked ({join_error}); forcing fail-closed Lockdown if a \
+                 critical section was torn (bead btc-policy-9y5.2)"
+            ));
+        }
+    }
+    broadcast
 }
 
 /// Combine + broadcast every due candidate that has reached quorum. Synchronous
@@ -3154,7 +3367,10 @@ fn handle_sign_after_lock(
     // terminal transition that races an in-flight request linearizes here — this
     // request either saw `false` and now holds the lock (and commits before Lockdown
     // could store) or sees `true` and refuses. Either way nothing is signed or
-    // registered after Lockdown is entered.
+    // registered after Lockdown is entered — via the NORMAL `enter_lockdown`. The
+    // poison-FORCED latch sets the flag without this lock and does not linearize, but it
+    // fires only on a poisoned critical lock, so a request that raced past this check
+    // then panics fail-closed at its store op before any egress (see `enter_lockdown`).
     if node.is_locked_down() {
         return Ok(fraud_suspected());
     }
@@ -3621,7 +3837,18 @@ fn handle_sign_after_lock(
         // the user's own escape wallet either way, so there is nothing to defer and
         // therefore no timing oracle (ADR-0012).
         policy_core::TxClass::Escape => now,
-        policy_core::TxClass::Refresh => unreachable!("refresh-class was refused above"),
+        policy_core::TxClass::Refresh => {
+            // Vacuous here — the reserve lives in the `class == Hot` block below, so no
+            // reservation exists yet — but kept for the "every return between reserve and
+            // admission unwinds" uniformity this function maintains (cf. the Escape-branch
+            // vacuous unwind above).
+            unwind_hot_reservation();
+            return Ok(refusal(
+                RefusalCode::PsbtInconsistent,
+                "transaction_class",
+                "a RefreshRequest must use the pin-less refresh request variant".into(),
+            ));
+        }
     };
     if class == policy_core::TxClass::Hot {
         let floor = fire_at.saturating_add(node.combine_slack_secs);
@@ -3761,7 +3988,10 @@ fn handle_refresh_after_lock(
     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
     // Authoritative Lockdown re-check under the lock: `enter_lockdown` sets the flag
     // while holding `sign_state`, so a transition racing this refresh linearizes here
-    // and no refresh registers after Lockdown is entered (mirrors `/sign`).
+    // and no refresh registers after Lockdown is entered (mirrors `/sign`). The
+    // poison-FORCED latch does not linearize (it holds no lock) but fires only on a
+    // poisoned critical lock, where a raced-past refresh panics fail-closed at its store
+    // op before egress (see `enter_lockdown`).
     if node.is_locked_down() {
         return Ok(fraud_suspected());
     }
@@ -4152,10 +4382,17 @@ fn register_pair(node: &Node, pair: RegisterPair) -> Result<(), SignResponse> {
             pair.hot_reserve,
         )
         .map_err(|refused| {
-            let reserve = pair
-                .hot_reserve
-                .expect("only a hot candidate admission revalidates a reservation");
-            hot_velocity_refusal(node, reserve.outflow_sat, refused)
+            pair.hot_reserve.map_or_else(
+                || {
+                    refusal(
+                        RefusalCode::PsbtInconsistent,
+                        "candidate_registration",
+                        "a non-hot candidate unexpectedly reached the hot-budget refusal path"
+                            .into(),
+                    )
+                },
+                |reserve| hot_velocity_refusal(node, reserve.outflow_sat, refused),
+            )
         })?;
     if outcomes
         .iter()

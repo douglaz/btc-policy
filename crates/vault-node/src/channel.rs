@@ -2146,22 +2146,36 @@ impl PartialStore {
             self.reserved_bytes = self.reserved_bytes.saturating_sub(bytes);
             return ChannelReply::UnknownCandidate;
         }
-        let c = self.candidates.get_mut(p.commitment_id).expect("present");
+        let Some(c) = self.candidates.get_mut(p.commitment_id) else {
+            return ChannelReply::UnknownCandidate;
+        };
         if p.txid != c.unsigned_txid {
             return ChannelReply::Rejected(RejectReason::WrongTxid);
         }
         if p.user_sig_hash != c.user_sig_hash {
             return ChannelReply::Rejected(RejectReason::WrongUserSigHash);
         }
-        if (p.input as usize) >= c.sighashes.len() {
+        let input = p.input as usize;
+        if input >= c.sighashes.len() || input >= c.psbt.inputs.len() {
             return ChannelReply::Rejected(RejectReason::WrongInput);
+        }
+        // Fail-closed bounds check (bead btc-policy-9y5.2): `p.signer` is a raw
+        // peer-supplied index and this runs under the STORE lock, so an out-of-range
+        // value must REFUSE — never panic-index `nodes` and poison the lock (one
+        // reachable panic under this lock bricks the whole node). `handle_partial`
+        // already forces `signer == sender` and `ingest` bounds `sender < nodes.len()`,
+        // so this cannot fire today; keeping the guard LOCAL means the store-lock safety
+        // no longer rests on a precondition proven in another function. An out-of-manifest
+        // signer is exactly a SignerMismatch.
+        if (p.signer as usize) >= nodes.len() {
+            return ChannelReply::Rejected(RejectReason::SignerMismatch);
         }
         let expected = nodes[p.signer as usize].signing_pubkey;
         let sig = match Signature::from_der(p.der) {
             Ok(s) => s,
             Err(_) => return ChannelReply::Rejected(RejectReason::BadPartialSig),
         };
-        let sighash = c.sighashes[p.input as usize];
+        let sighash = c.sighashes[input];
         if Secp256k1::verification_only()
             .verify_ecdsa(&Message::from_digest(sighash), &sig, &expected.inner)
             .is_err()
@@ -2176,8 +2190,11 @@ impl PartialStore {
         }
         let canonical_der = sig.serialize_der();
         let old_psbt_bytes = c.psbt.serialize().len();
+        let Some(psbt_input) = c.psbt.inputs.get_mut(input) else {
+            return ChannelReply::Rejected(RejectReason::WrongInput);
+        };
         c.partials.insert(key, canonical_der.to_vec());
-        c.psbt.inputs[p.input as usize].partial_sigs.insert(
+        psbt_input.partial_sigs.insert(
             expected,
             ecdsa::Signature {
                 signature: sig,
@@ -2344,6 +2361,11 @@ pub struct ChannelState {
     hot_clock: HotClock,
     #[cfg(test)]
     schedule_work: ScheduleWorkCounters,
+    /// Test-only rendezvous between the arm-overlay write and release-gate write in
+    /// `confirm_carrier`. A regression test pauses there and proves the store lock is
+    /// still held, so no reader can observe either half of the coupled commit.
+    #[cfg(test)]
+    confirm_commit_midpoint: std::sync::OnceLock<Arc<std::sync::Barrier>>,
 }
 
 /// The clock the **Hot budget**'s rolling window ages against: MONOTONIC elapsed
@@ -2688,6 +2710,8 @@ impl ChannelState {
             hot_clock: HotClock::new(),
             #[cfg(test)]
             schedule_work: ScheduleWorkCounters::default(),
+            #[cfg(test)]
+            confirm_commit_midpoint: std::sync::OnceLock::new(),
         })
     }
 
@@ -2737,7 +2761,7 @@ impl ChannelState {
         // Keep HotClock -> store as the one lock order, matching
         // `reserve_hot_budget`. In production this is the second, registration-time
         // reading; absent a test pin, monotonic time cannot move backwards.
-        let hot_now = hot_reserve.map(|_| self.hot_clock.now());
+        let hot_reserve_with_now = hot_reserve.map(|spec| (spec, self.hot_clock.now()));
         let mut store = self.store.lock().expect("store lock poisoned");
         #[cfg(test)]
         self.schedule_work
@@ -2751,16 +2775,15 @@ impl ChannelState {
         // unmetered. Remember only a reservation created here: on an admission
         // refusal it belongs to this attempt and must be unwound here, whereas an
         // idempotent hit still belongs to the resident candidate.
-        let registration_reserve = match (hot_reserve, hot_now) {
-            (Some(spec), Some(now)) => store.hot_budget.reserve(
+        let registration_reserve = match hot_reserve_with_now {
+            Some((spec, now)) => store.hot_budget.reserve(
                 spec.commitment_id,
                 spec.outflow_sat,
                 now,
                 spec.wall_now,
                 spec.expiry,
             )?,
-            (None, None) => false,
-            _ => unreachable!("Hot reserve spec and clock reading are paired"),
+            None => false,
         };
         if candidates.iter().any(|candidate| {
             store
@@ -2769,9 +2792,9 @@ impl ChannelState {
                 .is_some_and(|resident| !resident.matches_registration(candidate))
         }) {
             if registration_reserve {
-                store
-                    .hot_budget
-                    .release(hot_reserve.expect("reserve was inserted").commitment_id);
+                if let Some(spec) = hot_reserve {
+                    store.hot_budget.release(spec.commitment_id);
+                }
             }
             return Ok(vec![RegisterOutcome::Conflict; candidates.len()]);
         }
@@ -2797,9 +2820,9 @@ impl ChannelState {
                 })
                 .collect();
             if registration_reserve {
-                store
-                    .hot_budget
-                    .release(hot_reserve.expect("reserve was inserted").commitment_id);
+                if let Some(spec) = hot_reserve {
+                    store.hot_budget.release(spec.commitment_id);
+                }
             }
             return Ok(outcomes);
         }
@@ -3400,6 +3423,13 @@ impl ChannelState {
             .safety_candidate_visits
             .fetch_add(store.candidates.len(), std::sync::atomic::Ordering::Relaxed);
         Self::write_safety_overlay(&mut store, commit_arm, first_seen, now, timing);
+        #[cfg(test)]
+        if let Some(barrier) = self.confirm_commit_midpoint.get() {
+            // Pause while the production `store` guard is live. The test checks that
+            // `try_lock` cannot observe this midpoint, then releases the commit.
+            barrier.wait();
+            barrier.wait();
+        }
         // The holder decision is release authority for BOTH candidates, under BOTH
         // verdicts. NORMAL opens the pair. DURESS performs the same writes while the
         // overlay above atomically activates the hot freeze, so no zero-Hold release or
@@ -3473,7 +3503,6 @@ impl ChannelState {
     /// one lock and one deadline comparison; the internal Armed bit selects only the
     /// result. No request installs a timer and no Armed-only snapshot is allocated.
     pub(crate) fn lockdown_due(&self, now: u64) -> bool {
-        let store = self.store.lock().expect("store lock poisoned");
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering::Relaxed;
@@ -3482,6 +3511,7 @@ impl ChannelState {
                 .deadline_comparisons
                 .fetch_add(1, Relaxed);
         }
+        let store = self.store.lock().expect("store lock poisoned");
         store.armed.active & (now >= store.armed.fire_at)
     }
 
@@ -3554,6 +3584,26 @@ impl ChannelState {
             escape_commitment_id,
         };
         store.armed.active.then_some(snapshot)
+    }
+
+    /// Whether this channel's `store` lock is poisoned — a thread panicked while
+    /// holding it, unwinding through the guard. Read by the node's tick/handler panic
+    /// safety nets ([`crate::Node::critical_lock_poisoned`]) to decide whether a caught
+    /// panic tore a critical section and must force fail-closed Lockdown. Poison-
+    /// independent: reads the lock's flag, never acquires it, so it cannot itself
+    /// re-panic on the poisoned lock.
+    pub(crate) fn store_poisoned(&self) -> bool {
+        self.store.is_poisoned()
+    }
+
+    /// Test-only panic injection at the production candidate-store lock boundary.
+    #[cfg(test)]
+    pub(crate) fn panic_while_holding_store(&self) {
+        let _guard = self
+            .store
+            .lock()
+            .expect("acquire store for panic injection");
+        panic!("injected panic while holding the channel store");
     }
 
     /// Prune expired candidates — driven from the same `/sign` sweep the replay
@@ -3721,6 +3771,10 @@ impl ChannelState {
     /// fires at T and the frozen spend never settles" enforceable, and it is the
     /// hook V0-4b's arm uses to suppress release entirely.
     pub(crate) fn release_partials(&self, commitment_id: &str, now: u64) -> Option<Release> {
+        let signer = self
+            .nodes
+            .get(self.node_id as usize)
+            .map(|node| node.signing_pubkey)?;
         let mut store = self.store.lock().expect("store lock poisoned");
         // The FREEZE (ADR-0012 invariant vii), read atomically with the release
         // under this one lock: while the store is armed, a hot-class spend releases
@@ -3746,7 +3800,6 @@ impl ChannelState {
             return None;
         }
         candidate.released = true;
-        let signer = self.nodes[self.node_id as usize].signing_pubkey;
         let payloads = (0..candidate.psbt.inputs.len())
             .filter_map(|input| {
                 let sig = candidate.psbt.inputs[input].partial_sigs.get(&signer)?;
@@ -10097,6 +10150,125 @@ mod duress {
         assert!(channel.release_partials(&escape_cid, NOW + DELAY).is_some());
     }
 
+    /// Fail-closed release-gate atomicity (bead btc-policy-9y5.2): [`confirm_carrier`]
+    /// opens the release gate (`holder_quorum_reached`) and — for a DURESS carrier —
+    /// activates the hot freeze (`armed.active`) under ONE store-lock scope, so the two
+    /// facts commit together. A barrier pauses between those writes and proves the
+    /// production store guard still excludes readers at that midpoint. A duress spend
+    /// is therefore never observable quorum-reached-but-unfrozen: the very state that,
+    /// at the fire-tick gate, would be a fail-open release of a coerced hot partial.
+    /// The post-commit assertions also pin that a normal carrier is quorum-reached and
+    /// NOT armed, while a duress carrier is quorum-reached AND armed.
+    #[test]
+    fn confirm_carrier_couples_quorum_and_freeze_atomically() {
+        let fx = Fixture::new(3, 5);
+
+        // A NORMAL carrier: reaching `t` holders opens the gate but arms nothing.
+        let normal_node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let normal_channel = normal_node.channel.as_ref().expect("channel");
+        let normal_spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let normal_request = fx.spend_request(&normal_spend, EXPIRY, "normal-couple");
+        assert!(matches!(
+            crate::handle_sign(&normal_node, &normal_request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let normal_cid = crate::commitment_id_for(&normal_node, &normal_spend, EXPIRY);
+        // Pre-confirmation: the gate is CLOSED (born holder-unconfirmed, §0) and nothing
+        // is armed. Ingress alone must never open the release slot.
+        assert!(
+            !normal_channel.slot_is_active(&normal_cid),
+            "a spend is born holder-unconfirmed; its release slot must be closed at ingress"
+        );
+        assert!(normal_channel.armed_snapshot().is_none());
+        assert!(
+            !confirm_to_quorum(&normal_node, &normal_request),
+            "a NORMAL carrier crossing t commits the holder decision but never arms"
+        );
+        // Post-commit: quorum-reached (gate open) AND not armed.
+        assert!(
+            normal_channel.slot_is_active(&normal_cid),
+            "crossing t must open the release gate for a normal spend"
+        );
+        assert!(
+            normal_channel.armed_snapshot().is_none(),
+            "a normal carrier must never activate the SAFETY freeze"
+        );
+
+        // A DURESS carrier: the SAME holder-decision commit also freezes, atomically.
+        let duress_node_ = Arc::new(duress_node(
+            &fx,
+            HOLD,
+            &format!("duress_delay_secs = {DELAY}"),
+        ));
+        let duress_channel = duress_node_.channel.as_ref().expect("channel");
+        let duress_spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let escape = default_escape(&fx);
+        let request = duress_request(&fx, &duress_spend, &escape, "duress-couple");
+        assert!(matches!(
+            crate::handle_sign(&duress_node_, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let duress_cid = crate::commitment_id_for(&duress_node_, &duress_spend, EXPIRY);
+        assert!(
+            !duress_channel.slot_is_active(&duress_cid),
+            "the duress spend is also born holder-unconfirmed"
+        );
+        assert!(
+            duress_channel.armed_snapshot().is_none(),
+            "ingress alone never arms"
+        );
+        let carrier = crate::arm_carrier_id(&duress_node_, request.coord_request());
+        assert!(
+            !duress_node_.confirm_carrier(1, &carrier, NOW).armed,
+            "one peer remains below the 3-of-5 holder quorum"
+        );
+        let midpoint = Arc::new(std::sync::Barrier::new(2));
+        assert!(
+            duress_channel
+                .confirm_commit_midpoint
+                .set(Arc::clone(&midpoint))
+                .is_ok(),
+            "the midpoint seam is installed once"
+        );
+        let confirming_node = Arc::clone(&duress_node_);
+        let confirmation =
+            std::thread::spawn(move || confirming_node.confirm_carrier(2, &carrier, NOW));
+        midpoint.wait();
+        let store_guard_still_held = matches!(
+            duress_channel.store.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        // Always release the confirmation thread before asserting, so a failing
+        // regression cannot strand the test process at the barrier.
+        midpoint.wait();
+        assert!(
+            confirmation.join().expect("confirmation thread").armed,
+            "a DURESS carrier crossing t commits the arm"
+        );
+        assert!(
+            store_guard_still_held,
+            "the store lock must cover both the freeze and release-gate writes"
+        );
+        // Post-commit: BOTH quorum-reached AND armed — committed together, so the spend
+        // is never observable due-but-unfrozen.
+        assert!(
+            duress_channel.slot_is_active(&duress_cid),
+            "crossing t opens the holder gate for the duress spend too"
+        );
+        assert!(
+            duress_channel.armed_snapshot().is_some(),
+            "the duress carrier's holder-decision commit must also arm"
+        );
+        // The coupling made observable: the quorum-reached hot spend is FROZEN, so its
+        // partial never releases — not at its Hold-expiry, not at expiry.
+        for now in [NOW, NOW + DELAY, NOW + HOLD, EXPIRY - 1] {
+            assert!(
+                duress_channel.release_partials(&duress_cid, now).is_none(),
+                "a quorum-reached duress hot spend must stay frozen at {now}"
+            );
+        }
+    }
+
     /// Initial `T` (codex D4): a hot spend whose public Hold-expiry precedes
     /// `now + duress_delay` shrinks `T` to `Hold-expiry − ε`, so the escape fires
     /// before the coerced spend would visibly settle.
@@ -11157,6 +11329,339 @@ mod duress {
             channel.store_len(),
             0,
             "fire-complete removes the armed pair and releases candidate capacity"
+        );
+    }
+
+    // -- Fail-closed lock-poison posture (bead btc-policy-9y5.2) -------------
+
+    /// Poison `sign_state` the way a real in-critical-section panic would: a thread
+    /// panics while holding the lock, unwinding through its guard.
+    fn poison_sign_state(node: &Arc<crate::Node>) {
+        let poison_node = Arc::clone(node);
+        let panicked = std::thread::spawn(move || {
+            let _guard = poison_node
+                .sign_state
+                .lock()
+                .expect("acquire sign_state to poison it");
+            panic!("intentionally poison sign_state (btc-policy-9y5.2 test)");
+        })
+        .join();
+        assert!(panicked.is_err(), "the poisoning thread must have panicked");
+        assert!(
+            node.sign_state.is_poisoned(),
+            "sign_state must be poisoned after the panic"
+        );
+    }
+
+    /// D1 fail-closed ordering: a poisoned `sign_state` makes a fire pass release
+    /// NOTHING. The pass acquires `sign_state` (the `pending` poll) BEFORE the release
+    /// loop, so it panics there and aborts before any partial can fan out — not even an
+    /// admissible, due escape a HEALTHY pass would have swept. This FAILS if a refactor
+    /// moves the release loop above that acquisition (the escape would release before
+    /// the panic → `was_released` would flip true).
+    #[tokio::test]
+    async fn a_poisoned_sign_state_makes_a_fire_pass_release_nothing() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let (node, escape, escape_cid) = arm_hot(node, &fx);
+        // The escape's peer partials are present, so a healthy pass at T WOULD release +
+        // sweep it. That is the sentinel: under poison it must stay unreleased.
+        deliver_partials(
+            &fx,
+            node.channel.as_ref().expect("channel"),
+            &escape,
+            &escape_cid,
+            2,
+        );
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let spend_cid = crate::commitment_id_for(&node, &spend, EXPIRY);
+        // Lock down BEFORE poisoning, so the deadline tick at T early-returns on the
+        // already-set latch instead of re-acquiring `sign_state` in `enter_lockdown`.
+        // That isolates the fire pass's `pending` poll as THE `sign_state` acquisition
+        // guarding the release loop — exactly the ordering the SAFETY comment pins.
+        node.enter_lockdown();
+        let node = Arc::new(node);
+        poison_sign_state(&node);
+
+        // Drive the raw pass on a child task so the expected panic is captured (the async
+        // analogue of `catch_unwind`) rather than aborting the test.
+        let outcome = tokio::spawn(crate::fire_tick(
+            node.clone(),
+            Arc::new(backend_for(&escape)),
+            NOW + DELAY,
+        ))
+        .await;
+        assert!(
+            matches!(&outcome, Err(join_error) if join_error.is_panic()),
+            "a poisoned sign_state must panic the fire pass before the release loop"
+        );
+
+        // The load-bearing assertion: NOTHING left the node.
+        let channel = node.channel.as_ref().expect("channel");
+        assert!(
+            !channel.was_released(&escape_cid),
+            "the admissible escape must not release when the pass aborts before the gate"
+        );
+        assert!(
+            !channel.was_released(&spend_cid),
+            "the coerced hot spend's partial must never leave the node"
+        );
+    }
+
+    /// A pass must stay fail-closed when `sign_state` becomes poisoned AFTER its
+    /// pending poll but BEFORE partial release. The injected clock runs at exactly that
+    /// production seam. Without the release-loop guard, this pass continues, marks the
+    /// due escape released, and fans out its signature despite the torn critical state.
+    #[tokio::test]
+    async fn sign_state_poisoned_after_the_pending_poll_still_blocks_release() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let (node, escape, escape_cid) = arm_hot(node, &fx);
+        deliver_partials(
+            &fx,
+            node.channel.as_ref().expect("channel"),
+            &escape,
+            &escape_cid,
+            2,
+        );
+        let spend_cid = crate::commitment_id_for(&node, &fx.spend_psbt(&fx.hot_spk, 7), EXPIRY);
+        let node = Arc::new(node);
+        let clock_node = Arc::clone(&node);
+        let injected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clock_injected = Arc::clone(&injected);
+
+        // `fire_tick_with_clock` invokes this only after the pending poll and escape
+        // preflight, immediately before acquiring the release-loop guard.
+        let outcome = tokio::spawn(crate::fire_tick_with_clock(
+            Arc::clone(&node),
+            Arc::new(backend_for(&escape)),
+            NOW + DELAY,
+            move || {
+                if !clock_injected.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    poison_sign_state(&clock_node);
+                    clock_node.force_lockdown_fail_closed();
+                }
+                NOW + DELAY
+            },
+        ))
+        .await;
+
+        assert!(
+            injected.load(std::sync::atomic::Ordering::SeqCst),
+            "the after-poll panic injection must run"
+        );
+        assert!(
+            matches!(&outcome, Err(join_error) if join_error.is_panic()),
+            "the release-loop guard must observe the newly poisoned sign_state"
+        );
+        assert!(
+            node.is_locked_down(),
+            "the injected critical panic must leave the node in terminal Lockdown"
+        );
+        let channel = node.channel.as_ref().expect("channel");
+        assert!(
+            !channel.was_released(&escape_cid),
+            "no due partial may leave after sign_state is poisoned"
+        );
+        assert!(
+            !channel.was_released(&spend_cid),
+            "the coerced hot partial must remain unreleased"
+        );
+    }
+
+    /// D2 panic net: a panic that poisons `sign_state` (despite the panic-site
+    /// hardening) must steer the node into deterministic terminal Lockdown through the
+    /// poison-independent path — not a still-releasing zombie. Driving the pass through
+    /// the driver's guarded wrapper, the inner pass panics fail-closed, the net catches
+    /// it, and the node ends LOCKED DOWN having released and broadcast nothing. FAILS if
+    /// the Lockdown-on-panic net is removed (the node would stay unlocked).
+    #[tokio::test]
+    async fn the_panic_net_forces_lockdown_when_sign_state_is_poisoned() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let (node, escape, escape_cid) = arm_hot(node, &fx);
+        deliver_partials(
+            &fx,
+            node.channel.as_ref().expect("channel"),
+            &escape,
+            &escape_cid,
+            2,
+        );
+        let spend_cid = crate::commitment_id_for(&node, &fx.spend_psbt(&fx.hot_spk, 7), EXPIRY);
+        let node = Arc::new(node);
+        assert!(!node.is_locked_down(), "not locked before the panic");
+        poison_sign_state(&node);
+
+        let broadcasts = crate::fire_tick_with_lockdown_net(
+            node.clone(),
+            Arc::new(backend_for(&escape)),
+            NOW + DELAY,
+            move || NOW + DELAY,
+        )
+        .await;
+        assert_eq!(broadcasts, 0, "a poisoned pass broadcasts nothing");
+        assert!(
+            node.is_locked_down(),
+            "the panic net must force terminal Lockdown on a poisoned critical section"
+        );
+        let channel = node.channel.as_ref().expect("channel");
+        let prune_locks = channel.schedule_work_trace().prune_locks;
+        let repeated = crate::fire_tick_with_lockdown_net(
+            node.clone(),
+            Arc::new(backend_for(&escape)),
+            NOW + DELAY,
+            move || NOW + DELAY,
+        )
+        .await;
+        assert_eq!(repeated, 0, "a terminal poisoned node stays inert");
+        assert_eq!(
+            channel.schedule_work_trace().prune_locks,
+            prune_locks,
+            "the fire net must not start another panic-producing pass once terminal poison is latched"
+        );
+        assert!(
+            !channel.was_released(&escape_cid),
+            "no escape partial released"
+        );
+        assert!(
+            !channel.was_released(&spend_cid),
+            "no coerced hot partial released"
+        );
+
+        // A different federation member has independent locks and remains able to
+        // execute the sweep at T. One member's terminal poison cannot consume the
+        // surviving federation's fire path.
+        let survivor = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let (survivor, survivor_escape, survivor_escape_cid) = arm_hot(survivor, &fx);
+        deliver_partials(
+            &fx,
+            survivor.channel.as_ref().expect("survivor channel"),
+            &survivor_escape,
+            &survivor_escape_cid,
+            2,
+        );
+        let survivor = Arc::new(survivor);
+        assert_eq!(
+            crate::fire_tick(
+                survivor.clone(),
+                Arc::new(backend_for(&survivor_escape)),
+                NOW + DELAY,
+            )
+            .await,
+            1,
+            "a surviving federation member must still sweep at T"
+        );
+        assert!(
+            survivor.is_locked_down(),
+            "the surviving member still enters unconditional Lockdown at T"
+        );
+    }
+
+    /// D2 panic net: the same posture for the channel STORE lock. A panic under the
+    /// store lock poisons it; the fire pass then panics fail-closed at its first store
+    /// operation (`prune_store`'s `.expect`), the net forces Lockdown, and the
+    /// release/finalize paths are proven CLOSED — they re-panic on any further attempt,
+    /// so a poisoned node is never observable as still-releasing.
+    #[tokio::test]
+    async fn the_panic_net_forces_lockdown_when_the_store_is_poisoned() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let (node, escape, escape_cid) = arm_hot(node, &fx);
+        deliver_partials(
+            &fx,
+            node.channel.as_ref().expect("channel"),
+            &escape,
+            &escape_cid,
+            2,
+        );
+        let node = Arc::new(node);
+        assert!(!node.is_locked_down(), "not locked before the panic");
+
+        // Poison the channel store lock mid-critical-section.
+        let poison_node = Arc::clone(&node);
+        let panicked = std::thread::spawn(move || {
+            let channel = poison_node.channel.as_ref().expect("channel");
+            let _guard = channel.store.lock().expect("acquire store to poison it");
+            panic!("intentionally poison the store lock (btc-policy-9y5.2 test)");
+        })
+        .join();
+        assert!(panicked.is_err(), "the poisoning thread must have panicked");
+        let channel = node.channel.as_ref().expect("channel");
+        assert!(channel.store_poisoned(), "the store lock must be poisoned");
+
+        let broadcasts = crate::fire_tick_with_lockdown_net(
+            node.clone(),
+            Arc::new(backend_for(&escape)),
+            NOW + DELAY,
+            move || NOW + DELAY,
+        )
+        .await;
+        assert_eq!(broadcasts, 0, "a poisoned pass broadcasts nothing");
+        assert!(
+            node.is_locked_down(),
+            "the panic net must force terminal Lockdown on a poisoned store"
+        );
+        let deadline_polls = channel.schedule_work_trace().deadline_poll_locks;
+        crate::lockdown_tick_with_lockdown_net(&node, NOW + DELAY);
+        assert_eq!(
+            channel.schedule_work_trace().deadline_poll_locks,
+            deadline_polls,
+            "the deadline net must not retry a poisoned store after terminal Lockdown"
+        );
+        // Release + finalize are CLOSED under a poisoned store: EVERY store op re-panics
+        // fail-closed (`.expect("store lock poisoned")`), so no partial can leave the node
+        // and the node is never observable as still-releasing. (This is why "nothing
+        // released" cannot be read back via `was_released` here — that too fails closed.)
+        let release_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            channel.release_partials(&escape_cid, NOW + DELAY)
+        }));
+        assert!(
+            release_attempt.is_err(),
+            "release_partials must fail closed (panic), never observe the node as still-releasing"
+        );
+        let finalize_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            channel.try_finalize(&escape_cid, 3, NOW + DELAY)
+        }));
+        assert!(
+            finalize_attempt.is_err(),
+            "try_finalize must fail closed (panic) under a poisoned store"
+        );
+        let broadcast_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            channel.with_broadcast_authorization(&escape_cid, || NOW + DELAY, || ())
+        }));
+        assert!(
+            broadcast_attempt.is_err(),
+            "broadcast authorization must fail closed (panic) under a poisoned store"
+        );
+    }
+
+    /// The independent deadline driver has its own panic net: a poisoned store must
+    /// not kill that loop before terminal Lockdown is latched.
+    #[test]
+    fn the_deadline_panic_net_forces_lockdown_without_reentering_a_poisoned_store() {
+        let fx = Fixture::new(3, 5);
+        let node = Arc::new(duress_node(
+            &fx,
+            HOLD,
+            &format!("duress_delay_secs = {DELAY}"),
+        ));
+        let poison_node = Arc::clone(&node);
+        let panicked = std::thread::spawn(move || {
+            poison_node
+                .channel
+                .as_ref()
+                .expect("channel")
+                .panic_while_holding_store();
+        })
+        .join();
+        assert!(panicked.is_err(), "the injected store panic must unwind");
+        assert!(!node.is_locked_down(), "the deadline net has not run yet");
+
+        crate::lockdown_tick_with_lockdown_net(&node, NOW);
+
+        assert!(
+            node.is_locked_down(),
+            "the deadline net must force poison-independent terminal Lockdown"
         );
     }
 
