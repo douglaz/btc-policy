@@ -295,9 +295,10 @@ async fn sign(State(state): State<AppState>, body: Body) -> Response {
     }
     let node = Arc::clone(&state.node);
     let propagation_node = Arc::clone(&state.node);
-    // `/sign` is serialized BY DESIGN by one `Mutex<SignState>` across the whole
-    // call. Dropping a timed-out JoinHandle detaches rather than aborts the job,
-    // preventing half-mutated ghost state. The DETACHED JOB also owns propagation:
+    // `/sign` uses one `Mutex<SignState>` for an atomic ingress phase and an atomic
+    // replay/pending phase, with only the slow chain preflight between them. Dropping
+    // a timed-out JoinHandle detaches rather than aborts the job, preventing
+    // half-mutated ghost state. The DETACHED JOB also owns propagation:
     // if the policy work finishes after the client deadline, it drains the outbox
     // then, rather than letting the timeout path drain too early and strand the
     // request on one node. The clock is read after the sign lock.
@@ -819,10 +820,16 @@ mod tests {
             std::thread::sleep(self.delay);
             Ok(0)
         }
+        fn block_hash_at(&self, _height: u32) -> Result<Option<bitcoin::BlockHash>, Error> {
+            self.signal_entered();
+            std::thread::sleep(self.delay);
+            Ok(None)
+        }
         fn spends_of(
             &self,
             _scripts: &[ScriptBuf],
             _from_height: u32,
+            _through_height: u32,
         ) -> Result<Vec<SpendSeen>, Error> {
             self.signal_entered();
             std::thread::sleep(self.delay);
