@@ -139,6 +139,36 @@ struct AppState {
     sign_entered: Option<std::sync::mpsc::Sender<()>>,
 }
 
+/// Re-check for a poisoned critical lock on a handler's outer `JoinError` arm and, if
+/// poisoned, force the poison-independent terminal Lockdown. Covers a panic in the OUTER
+/// job body (e.g. `propagate_outbox`) that poisoned a lock AFTER the in-job net
+/// ([`blocking_with_lockdown_net`]) already returned. Idempotent and poison-independent,
+/// gated on ACTUAL poison, so a benign panic that held no critical lock leaves the node
+/// untouched (a plain 500).
+fn outer_job_lockdown_recheck(node: &Node) {
+    if node.critical_lock_poisoned() {
+        node.force_lockdown_fail_closed();
+    }
+}
+
+/// Run one blocking request job and force terminal Lockdown if it unwinds through a
+/// crown-jewel lock. The caller may be detached by an HTTP timeout/disconnect, so the
+/// poison check belongs here, inside the owned job, rather than only in the handler's
+/// `JoinError` arm.
+async fn blocking_with_lockdown_net<T>(
+    node: Arc<Node>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+{
+    let outcome = tokio::task::spawn_blocking(work).await;
+    if node.critical_lock_poisoned() {
+        node.force_lockdown_fail_closed();
+    }
+    outcome
+}
+
 /// Serve the one axum app (`/sign` + `/events`) over `listener`.
 ///
 /// `listener` is already bound, so this is the last production startup boundary
@@ -272,11 +302,12 @@ async fn sign(State(state): State<AppState>, body: Body) -> Response {
     // then, rather than letting the timeout path drain too early and strand the
     // request on one node. The clock is read after the sign lock.
     let job = tokio::spawn(async move {
-        let outcome = tokio::task::spawn_blocking(move || match request {
-            TaggedRequest::Spend(request) => handle_sign_now(&node, &request),
-            TaggedRequest::Refresh(request) => handle_refresh_now(&node, &request),
-        })
-        .await;
+        let outcome =
+            blocking_with_lockdown_net(Arc::clone(&propagation_node), move || match request {
+                TaggedRequest::Spend(request) => handle_sign_now(&node, &request),
+                TaggedRequest::Refresh(request) => handle_refresh_now(&node, &request),
+            })
+            .await;
         propagate_outbox(&propagation_node);
         outcome
     });
@@ -290,13 +321,26 @@ async fn sign(State(state): State<AppState>, body: Body) -> Response {
             ),
         },
         Ok(Ok(Ok(Err(bad_request)))) => error_response(StatusCode::BAD_REQUEST, &bad_request.0),
-        // The blocking task panicked (a bug, never an input): 500, not a hang.
-        Ok(Ok(Err(_join_error))) | Ok(Err(_join_error)) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "sign task failed unexpectedly",
-        ),
-        // Handler timeout: stop waiting and answer, but the detached job keeps
-        // running and commits its verdict for an idempotent resubmit.
+        // The job completed (no handler timeout) but reported a captured panic: 500, not
+        // a hang. The in-job §2b net above already forces fail-closed Lockdown when the
+        // BLOCKING sign work poisoned a critical lock; re-check here to also cover a panic
+        // in the outer job body (e.g. `propagate_outbox`) on this awaited path. Idempotent
+        // and poison-independent, gated on ACTUAL poison, so a benign panic that held no
+        // lock stays a plain 500.
+        Ok(Ok(Err(_join_error))) | Ok(Err(_join_error)) => {
+            outer_job_lockdown_recheck(&state.node);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sign task failed unexpectedly",
+            )
+        }
+        // Handler timeout: stop waiting and answer, but the detached job keeps running
+        // and commits its verdict for an idempotent resubmit. A panic past the deadline
+        // is no longer observed here, so this arm cannot be its fail-closed net. Coverage
+        // is elsewhere: a panic in the BLOCKING work is latched by that job's OWN in-job
+        // §2b net (above); a panic in the outer body (e.g. `propagate_outbox`) that
+        // poisons a critical lock is latched by the 1 Hz fire/lockdown driver nets on the
+        // next tick — which is exactly why poison recovery cannot live only on this handler.
         Err(_elapsed) => error_response(StatusCode::REQUEST_TIMEOUT, "sign timed out"),
     }
 }
@@ -326,6 +370,17 @@ async fn channel(State(state): State<AppState>, body: Body) -> Response {
         // Unreachable — the route is mounted only when `channel.is_some()`.
         return error_response(StatusCode::NOT_FOUND, "channel not configured");
     };
+    // Once a critical-lock panic has reached terminal Lockdown, no channel work is
+    // safe or useful: an authenticated partial would re-enter the poisoned store,
+    // panic at its fail-closed `.expect`, and invoke the panic hook on every peer retry.
+    // Return the same 500 this handler already exposes for that panic, before body
+    // parsing or authentication, so retries cannot fill the RAMDISK logs.
+    if state.node.is_locked_down() && state.node.critical_lock_poisoned() {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "channel task failed unexpectedly",
+        );
+    }
     // Pre-auth: bound concurrent `/channel` work so forged traffic cannot burn CPU
     // or a victim peer's quota unboundedly.
     let permit = match ch.concurrency().try_acquire_owned() {
@@ -364,7 +419,7 @@ async fn channel(State(state): State<AppState>, body: Body) -> Response {
     // disconnects after the body arrives, axum may cancel this handler, but an
     // accepted request must still fan out rather than remain stranded locally.
     let outcome = tokio::spawn(async move {
-        let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = blocking_with_lockdown_net(Arc::clone(&propagation_node), move || {
             // Hold the pre-auth permit until ingest actually finishes — move it INTO
             // the job, not just the handler future. `spawn_blocking` detaches: if the
             // connection task is cancelled while we await the JoinHandle (a peer that
@@ -389,11 +444,19 @@ async fn channel(State(state): State<AppState>, body: Body) -> Response {
     .await;
     match outcome {
         Ok(Ok(reply)) => channel_response(reply),
-        // Either detached layer panicked (a bug, never an input): 500, not a hang.
-        Ok(Err(_join_error)) | Err(_join_error) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "channel task failed unexpectedly",
-        ),
+        // The job was observed (handler not cancelled) but a layer panicked: 500, not a
+        // hang. The in-job §2b net above already forces Lockdown when the BLOCKING ingest
+        // poisoned the channel store lock; re-check here to also cover a panic in the
+        // outer job body (e.g. `propagate_outbox`) on this awaited path. Idempotent and
+        // poison-independent, gated on ACTUAL poison, so a benign panic that held no lock
+        // stays a plain 500.
+        Ok(Err(_join_error)) | Err(_join_error) => {
+            outer_job_lockdown_recheck(&state.node);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "channel task failed unexpectedly",
+            )
+        }
     }
 }
 
@@ -473,6 +536,167 @@ mod tests {
             production_handler_timeout(&node),
             Duration::from_secs(40),
             "a documented 30s terminal backoff must still reach its HTTP-200 refusal"
+        );
+    }
+
+    /// The handler's OUTER `JoinError` arm re-checks poison via
+    /// [`outer_job_lockdown_recheck`]: a panic in the outer job body (e.g.
+    /// `propagate_outbox`) that poisoned a critical lock AFTER the in-job net returned
+    /// must still force terminal Lockdown. Drives a real outer-job panic to a `JoinError`
+    /// and applies the arm's recheck, exactly as the `/sign` and `/channel` handlers do.
+    #[tokio::test]
+    async fn the_outer_job_join_error_arm_forces_lockdown_on_a_poisoned_critical_lock() {
+        let (node, _request) = node_and_valid_request();
+        let node = Arc::new(node);
+        let panic_node = Arc::clone(&node);
+        // The analogue of `propagate_outbox` panicking while a critical lock is poisoned,
+        // AFTER a successful in-job net: the outer job poisons sign_state and panics, and
+        // the handler's `tokio::spawn(...).await` surfaces the `JoinError` the arm handles.
+        let join = tokio::spawn(async move {
+            let _guard = panic_node
+                .sign_state
+                .lock()
+                .expect("acquire sign_state for outer-job panic injection");
+            panic!("injected outer-job-body panic while holding sign_state");
+        })
+        .await;
+        assert!(join.is_err(), "the outer job must surface a JoinError");
+        // The arm's exact behavior on that JoinError.
+        outer_job_lockdown_recheck(&node);
+        assert!(
+            node.is_locked_down(),
+            "an outer-job-body panic that poisoned a critical lock must force terminal Lockdown"
+        );
+    }
+
+    /// The shared `/sign` + `/channel` blocking boundary catches an unwind after a
+    /// crown-jewel lock is acquired and reaches Lockdown without re-locking it.
+    #[tokio::test]
+    async fn request_job_panic_net_forces_lockdown_after_critical_lock_panics() {
+        let (node, request) = node_and_valid_request();
+        let node = Arc::new(node);
+        let panic_node = Arc::clone(&node);
+        let sign_outcome = blocking_with_lockdown_net(Arc::clone(&node), move || {
+            let _guard = panic_node
+                .sign_state
+                .lock()
+                .expect("acquire sign_state for panic injection");
+            panic!("injected panic while holding sign_state");
+        })
+        .await;
+        assert!(
+            sign_outcome.is_err(),
+            "the blocking boundary must capture the sign-state panic"
+        );
+        assert!(
+            node.is_locked_down(),
+            "a request panic under sign_state must force terminal Lockdown"
+        );
+        assert!(matches!(
+            crate::handle_sign(&node, &request, 0).expect("Lockdown refusal"),
+            SignResponse::Refusal(refusal)
+                if refusal.code == vault_proto::RefusalCode::FraudSuspected
+        ));
+
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let node = Arc::new(
+            Node::from_toml_str(&fx.config(0, 0, "")).expect("valid channel fixture node"),
+        );
+        let panic_node = Arc::clone(&node);
+        let channel_outcome = blocking_with_lockdown_net(Arc::clone(&node), move || {
+            panic_node
+                .channel
+                .as_ref()
+                .expect("channel")
+                .panic_while_holding_store();
+        })
+        .await;
+        assert!(
+            channel_outcome.is_err(),
+            "the blocking boundary must capture the channel-store panic"
+        );
+        assert!(
+            node.is_locked_down(),
+            "a request panic under the channel store must force terminal Lockdown"
+        );
+    }
+
+    /// Once the panic net has latched Lockdown around a poisoned store, `/channel`
+    /// refuses before reading or authenticating another body. Without the handler's
+    /// terminal-poison guard, this malformed sentinel reaches normal parsing and
+    /// returns tagged 400 instead of the panic path's existing 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_short_circuits_after_critical_poison_reaches_lockdown() {
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let node = Arc::new(
+            Node::from_toml_str(&fx.config(0, 0, "")).expect("valid channel fixture node"),
+        );
+        let panic_node = Arc::clone(&node);
+        let outcome = blocking_with_lockdown_net(Arc::clone(&node), move || {
+            panic_node
+                .channel
+                .as_ref()
+                .expect("channel")
+                .panic_while_holding_store();
+        })
+        .await;
+        assert!(outcome.is_err(), "the injected store panic must unwind");
+        assert!(node.is_locked_down(), "the panic net must latch Lockdown");
+        assert!(
+            node.critical_lock_poisoned(),
+            "the store must remain poisoned"
+        );
+
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+        let (status, response) =
+            spawn_blocking(move || post(addr, "/channel", "definitely not json"))
+                .await
+                .expect("channel client");
+        assert_eq!(
+            status, 500,
+            "terminal poison must short-circuit before malformed-body parsing"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).expect("error json"),
+            serde_json::json!({ "error": "channel task failed unexpectedly" })
+        );
+    }
+
+    /// The negative twin: the `/channel` terminal-poison short-circuit is gated on
+    /// `is_locked_down() && critical_lock_poisoned()`. A node locked down NORMALLY at T
+    /// (not poisoned) must NOT hit the poison-500 — it still serves `/channel` so the
+    /// in-flight escape sweep can be combined (ADR-0012: Lockdown accepts the sweep
+    /// combine, it only blocks NEW signing). This pins the load-bearing
+    /// `&& critical_lock_poisoned()` conjunct: dropping it would 500 every locked-down
+    /// node and break sweep completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_serves_a_normally_locked_down_node_that_is_not_poisoned() {
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let node = Arc::new(
+            Node::from_toml_str(&fx.config(0, 0, "")).expect("valid channel fixture node"),
+        );
+        node.enter_lockdown();
+        assert!(node.is_locked_down(), "the node is locked down");
+        assert!(
+            !node.critical_lock_poisoned(),
+            "a normal Lockdown at T must NOT poison any critical lock"
+        );
+
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+        let (status, response) =
+            spawn_blocking(move || post(addr, "/channel", "definitely not json"))
+                .await
+                .expect("channel client");
+        // The short-circuit did NOT fire: the malformed body reaches normal parsing and
+        // returns the handler's tagged rejection, never the poison-500.
+        assert_ne!(
+            status, 500,
+            "a locked-down-but-not-poisoned node must not hit the terminal-poison short-circuit"
+        );
+        assert_ne!(
+            serde_json::from_str::<serde_json::Value>(&response).ok(),
+            Some(serde_json::json!({ "error": "channel task failed unexpectedly" })),
+            "must not return the poison-500 body"
         );
     }
 
