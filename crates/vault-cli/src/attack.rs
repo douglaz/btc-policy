@@ -382,7 +382,10 @@ impl Default for Setup {
             hold_secs: 0,
             duress_delay_secs: 0,
             epsilon_secs: 1,
-            combine_slack_secs: 10,
+            // At least 2x the vault-cache refresh interval (SCAN_INTERVAL = 10s), the
+            // config floor: a shorter combine window can go cache-stale for its whole
+            // duration and silently reduce duress to recovery (9y5.3 review).
+            combine_slack_secs: 20,
             hot_max_per_tx: Amount::from_sat(600_000_000),
             hot_max_per_window: Amount::from_sat(900_000_000),
             delivery_horizon_secs: 30,
@@ -6721,6 +6724,13 @@ fn with_restarted_bitcoind_without_mempool<T>(
 
     let result = action();
     let stop_result = vault.bitcoind.call("stop", json!([]));
+    // If the `stop` RPC failed (e.g. connection reset while Core reindexes the invalidated
+    // chain), the replacement is still running, so an unconditional `child.wait()` would
+    // wedge this scenario forever. Kill it on that path so the harness REPORTS the failure
+    // instead of hanging (Fable pass-6 P3, harness-only).
+    if stop_result.is_err() {
+        let _ = child.kill();
+    }
     let wait_result = child.wait();
     match result {
         Err(error) => Err(error),

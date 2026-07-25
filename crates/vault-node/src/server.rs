@@ -506,7 +506,7 @@ mod parse_since_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::{ChainBackend, PackageVerdict, Prevout, SpendSeen};
+    use crate::chain::{ChainBackend, PackageVerdict, Prevout};
     use crate::test_support::{node_and_valid_request, valid_refresh_request};
     use crate::watchtower::{self, Alert, AlertKind};
     use crate::Error;
@@ -830,10 +830,14 @@ mod tests {
             _scripts: &[ScriptBuf],
             _from_height: u32,
             _through_height: u32,
-        ) -> Result<Vec<SpendSeen>, Error> {
+            _expected_parent: Option<bitcoin::BlockHash>,
+        ) -> Result<crate::chain::ScanTraversal, Error> {
             self.signal_entered();
             std::thread::sleep(self.delay);
-            Ok(Vec::new())
+            Ok(crate::chain::ScanTraversal {
+                spends: Vec::new(),
+                blocks: Vec::new(),
+            })
         }
         // This backend exists to stall the watchtower scan; the fire path is not
         // under test here, so its three methods are unreachable stubs.

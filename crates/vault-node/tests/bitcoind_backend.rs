@@ -96,8 +96,14 @@ fn run() -> Result<(), Error> {
     );
 
     // --- spends_of ---
-    let spends = backend.spends_of(std::slice::from_ref(&watched_spk), 0, backend.tip_height()?)?;
-    let seen = spends
+    let traversal = backend.spends_of(
+        std::slice::from_ref(&watched_spk),
+        0,
+        backend.tip_height()?,
+        None,
+    )?;
+    let seen = traversal
+        .spends
         .iter()
         .find(|s| s.script == watched_spk)
         .expect("the watched script's spend must be seen");

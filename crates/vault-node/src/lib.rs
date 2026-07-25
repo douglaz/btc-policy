@@ -1234,20 +1234,46 @@ impl Node {
             )
             .into());
         }
-        // A zero-width combine window `[fire, fire]` is a silent broadcast trap: the
-        // fan-out never *initiates* a send once `now >= deadline` (see
-        // `try_endpoints`), so with `combine_slack_secs = 0` no partial ever leaves
-        // any node after its fire event, no candidate reaches quorum, and every
-        // accepted spend signs at ingress then silently never broadcasts — the exact
-        // invisible failure the `[chain_backend]` fatal below also guards. Reject it
-        // at load rather than at "the money never moved".
-        if config.combine_slack_secs == 0 {
-            return Err(
-                "combine_slack_secs must be greater than 0: a zero-width combine window \
-                 [fire, fire] lets no node transmit a partial after the fire event, so every \
-                 accepted spend would sign at ingress and then silently fail to broadcast"
-                    .into(),
-            );
+        // The combine window `[fire, fire + combine_slack_secs]` must be at least one
+        // confirmed-vault cache refresh interval (V0-6b's `SCAN_INTERVAL`) wide. Two
+        // silent-failure traps live below that floor:
+        //  - A zero-width window `[fire, fire]`: the fan-out never *initiates* a send once
+        //    `now >= deadline` (see `try_endpoints`), so no partial ever leaves any node
+        //    after its fire event, no candidate reaches quorum, and every accepted spend
+        //    signs at ingress then silently never broadcasts.
+        //  - A window shorter than the refresh cadence: the fire-time escape-coverage check
+        //    reads the background-maintained cache (never a synchronous `scantxoutset` on
+        //    the combine path, bead 9y5.3), and that cache refreshes only every
+        //    `SCAN_INTERVAL`. A block arriving just before the fire event leaves the cache
+        //    stale for the WHOLE window, so `confirmed_candidates` refuses coverage every
+        //    tick and `prune` deletes the armed escape before the next refresh — silently
+        //    reducing duress to recovery-only (v0-exit 9y5.3 review, codex P2).
+        // Floor at TWICE the refresh interval. The refresher (`spawn_drivers`) ticks
+        // `SCAN_INTERVAL` from each pass's COMPLETION (`ticker.reset()` after an awaited
+        // pass), so the worst-case gap between refreshes is `SCAN_INTERVAL + pass_duration`,
+        // not `SCAN_INTERVAL`; a floor of exactly one interval would leave the equality case
+        // marginal (codex/Fable pass 4). Two intervals gives a full interval of margin for a
+        // pass to complete inside the window. This is NOT a hard guarantee: a single refresh
+        // pass slower than the window (a post-reorg full `scantxoutset` on a large chain) can
+        // still leave the cache stale for the whole window, which — like a backend stall —
+        // degrades duress to frozen-funds → recovery, never theft (ADR-0012). The default
+        // (60s) is 6× the interval; only pathologically short windows are rejected. Reject at
+        // load, not at "money never moved" (same class as the `escape_coverage_pct = 100`
+        // fatal).
+        let min_combine_slack = 2 * watchtower::SCAN_INTERVAL.as_secs();
+        if config.combine_slack_secs < min_combine_slack {
+            return Err(format!(
+                "combine_slack_secs ({}) must be at least twice the vault cache refresh \
+                 interval ({min_combine_slack}s): a shorter combine window can go stale for its \
+                 whole duration when a block arrives near the fire event (the refresher ticks \
+                 from pass completion, so the worst-case gap exceeds one interval), so the \
+                 escape sweep's coverage check fails every tick and the armed escape is pruned \
+                 before the next refresh — silently reducing duress to recovery-only (a \
+                 zero-width window additionally lets no node transmit a partial after the fire \
+                 event)",
+                config.combine_slack_secs
+            )
+            .into());
         }
         // A zero refresh interval disables ADR-0013 §6's per-coin burn-rate
         // bound: every mark is pruned immediately and `elapsed < interval` can
@@ -3669,30 +3695,76 @@ fn handle_sign_after_lock(
     }
     let raw_now = clock();
     let now = state.coord_nonces.effective_now(raw_now);
-    if request.expiry <= now
-        || request.expiry > raw_now.saturating_add(node.max_commitment_age_secs)
-    {
+    if request.expiry <= now {
+        // NODE-LOCAL expiry: this node's own chain preflight (up to two RPC_TIMEOUT
+        // batches) outlived the commitment, so its `now` advanced past `expiry` while a
+        // faster peer's did not. Forward the carrier exactly like the two delivery-
+        // horizon refusals (phase-1 above, phase-2 just below) — the safety intent is
+        // already recorded, and a node that refuses to sign on its OWN clock must still
+        // fan the carrier out so every honest signer sees its receipt and can reach `t`
+        // (the theft vector the phase-1 horizon comment details). It still registers NO
+        // candidate against the stale window. `expiry <= now` also implies
+        // `expiry < now + delivery_horizon`, so this is exactly the expired subset of
+        // the horizon refusal below, split out only to keep the CommitmentExpired code
+        // (v0-exit 9y5.3 review, [P2] Fable: a slow/hung backend must not let this node
+        // silently swallow the duress signal). STAGE (not a bare outbox push): the pin
+        // hook already recorded this node's duress intent, so it must claim its holder
+        // slot too — otherwise the intent is hollow, `confirm_carrier` returns NONE
+        // forever, and this node can never arm/Lockdown off its OWN carrier even with all
+        // peer receipts. Matches the lockout and EXPIRY_TOO_SHORT node-local paths.
+        stage_spend_carrier(node, propagated_request, &carrier);
         return Ok(refusal(
             RefusalCode::CommitmentExpired,
             "commitment_expiry",
             format!(
-                "expiry {} is outside the acceptance window after chain preflight \
-                 (now {now}, max age {}s)",
+                "expiry {} is at or before this node's post-preflight clock (now {now}); \
+                 forwarded but not signed",
+                request.expiry
+            ),
+        ));
+    }
+    if request.expiry > raw_now.saturating_add(node.max_commitment_age_secs) {
+        // The future-expiry cap on the RAW clock (rollback protection deliberately does
+        // not widen it). For a monotonic clock this is defensively unreachable — the
+        // request already cleared `expiry <= now + max_age` at coordinator auth and
+        // `raw_now` only advanced. It can newly fire ONLY if system time stepped BACKWARD
+        // during the preflight, dropping `raw_now` below the phase-1 sample — a NODE-LOCAL
+        // clock fault this node's peers do not share. So STAGE it, like the expiry/horizon
+        // node-local refusals, rather than letting one node's backward clock step swallow
+        // a selectively-delivered duress carrier (v0-exit 9y5.3 review, codex P2).
+        stage_spend_carrier(node, propagated_request, &carrier);
+        return Ok(refusal(
+            RefusalCode::CommitmentExpired,
+            "commitment_expiry",
+            format!(
+                "expiry {} exceeds now + max age {}s (raw clock; a backward step forwarded \
+                 but did not sign)",
                 request.expiry, node.max_commitment_age_secs
             ),
         ));
     }
     if let Some(refused) = ensure_delivery_horizon(node, request.expiry, now) {
         // The carrier was fresh enough when received and its safety intent is already
-        // recorded, but slow chain I/O consumed the remaining relay margin. Forward it
-        // exactly like the phase-1 horizon refusal, while refusing to sign/register a
-        // candidate against a stale delivery window.
-        node.outbox
-            .lock()
-            .expect("outbox lock poisoned")
-            .push(propagated_request);
+        // recorded, but slow chain I/O consumed the remaining relay margin. STAGE (not a
+        // bare push): unlike the PHASE-1 horizon — which runs before the pin hook and
+        // deliberately claims no holder slot — the intent already exists here, so this
+        // node must also self-hold or its recorded intent is hollow and non-confirmable
+        // (Fable pass 3). It still refuses to sign/register a candidate against a stale
+        // delivery window.
+        stage_spend_carrier(node, propagated_request, &carrier);
         return Ok(refused);
     }
+    // A NODE-LOCAL prevout FETCH failure (this node's backend errored / hung) surfaces
+    // later in `verify_spend`/`verify_escape` via the pre-fetched `Err`, AFTER the
+    // accepted-replay lookup — so a retry of an already-accepted request honours its cached
+    // verdict instead of being overridden by a transient backend failure. Forwarding that
+    // node-local refusal so peers still process the carrier (Fable pass-1 "same shape")
+    // requires the SAME accepted-replay ordering + node-local-vs-federation-uniform split as
+    // the rest of the out-of-lock preflight; that is deferred to follow-up bead f91 (an
+    // earlier attempt to fan it out HERE, before the accepted-replay lookup, let a backend
+    // failure override an accepted verdict on retry — codex pass-5 P1). The hung-backend
+    // case is already covered above: a stall pushes `now` past expiry, hitting the
+    // node-local CommitmentExpired forward.
     // 2. Decode BOTH PSBTs; undecodable input is a 400, not a refusal. The escape
     //    is mandatory (ADR-0012: "a request missing the escape is invalid and
     //    rejected outright, so a hostile coordinator cannot strip the escape to
@@ -4966,9 +5038,10 @@ fn fetch_prevouts(psbt: &Psbt, backend: &dyn ChainBackend) -> PrevoutFetch {
 
 /// The pure scriptPubKey/value comparison of `psbt`'s inputs against pre-fetched
 /// chain `prevouts`. No chain I/O — safe under the sign lock, AFTER the arm hook.
-/// Refuses fail-closed only on a CONFIRMED input whose declared `witness_utxo`
-/// disagrees with the chain (the fee/ownership bypass); an absent or unconfirmed
-/// prevout stays the authorized-parent case the fire-time package check backstops.
+/// Refuses fail-closed on any input whose declared `witness_utxo` disagrees with the
+/// prevout `gettxout` RETURNED (confirmed OR unconfirmed-in-mempool — both fix the
+/// output at that outpoint); only an ABSENT (`None`) prevout stays the authorized-parent
+/// case the fire-time package check backstops.
 fn compare_prevouts_against_chain(
     psbt: &Psbt,
     prevouts: &[Option<Prevout>],
@@ -4988,15 +5061,18 @@ fn compare_prevouts_against_chain(
     }
     for (index, (input, prevout)) in psbt.unsigned_tx.input.iter().zip(prevouts).enumerate() {
         let Some(prevout) = prevout else {
-            // Null prevout: a legitimately-unconfirmed authorized parent (or unknown/
-            // already-spent). Allowed exactly as today — the fire-time package check
-            // is the double-spend backstop.
+            // Null prevout: a legitimately-unconfirmed authorized parent not yet visible,
+            // an unknown/already-spent output, or an RBF-replaced parent whose original
+            // txid is gone. Allowed exactly as today — the fire-time package check is the
+            // double-spend backstop.
             continue;
         };
-        if !prevout.confirmed {
-            // Unconfirmed prevout is the authorized-parent case, not a mismatch.
-            continue;
-        }
+        // NO `!prevout.confirmed` skip: if `gettxout(include_mempool)` RETURNED a prevout,
+        // the output at this exact outpoint is fixed (an RBF replacement carries a different
+        // txid and would have returned `None` above), so an unconfirmed mempool output is
+        // just as verifiable as a confirmed one. A coerced user signs whatever `witness_utxo`
+        // the coordinator supplies, so skipping the compare for unconfirmed-present prevouts
+        // let a forged one reach policy + registration as an unusable candidate (codex P2).
         let Some(witness_utxo) = psbt.inputs.get(index).and_then(|i| i.witness_utxo.as_ref())
         else {
             // A missing witness_utxo is policy-core's own PSBT_INCONSISTENT refusal.
@@ -5010,9 +5086,10 @@ fn compare_prevouts_against_chain(
                 RefusalCode::PsbtInconsistent,
                 "prevout_ground_truth",
                 format!(
-                    "input {index} witness_utxo disagrees with the confirmed on-chain prevout \
-                     {outpoint}: declared scriptPubKey/value do not match the chain's ground \
-                     truth (an attacker-supplied prevout the fee/ownership checks would trust)"
+                    "input {index} witness_utxo disagrees with the on-chain/mempool prevout \
+                     {outpoint} that gettxout returned: declared scriptPubKey/value do not \
+                     match the chain's ground truth (an attacker-supplied prevout the \
+                     fee/ownership checks would trust)"
                 ),
             ));
         }
@@ -5042,12 +5119,29 @@ fn run_prevout_check(
     backend: &dyn ChainBackend,
     prefetched: Option<&PrevoutFetch>,
 ) -> Result<(), SignResponse> {
+    let _ = backend; // retained for signature symmetry; the fallback no longer fetches.
     match prefetched {
         Some(Ok(prevouts)) => compare_prevouts_against_chain(psbt, prevouts),
         Some(Err(refused)) => Err(refused.clone()),
         None => {
-            let prevouts = fetch_prevouts(psbt, backend)?;
-            compare_prevouts_against_chain(psbt, &prevouts)
+            // The handlers ALWAYS pre-fetch the prevout batch OUT of the sign lock
+            // (round-2 P0: never chain RPC under `sign_state`, or a hung bitcoind pins the
+            // lock Lockdown-at-T needs). Reaching here means a caller with a live backend
+            // forgot to pre-fetch. Rather than silently reinstate that under-lock fetch,
+            // fail CLOSED — so the invariant is enforced structurally, not by convention
+            // (Fable pass-4 P3). Loud in debug so a test catches the mis-wiring at once.
+            debug_assert!(
+                false,
+                "run_prevout_check reached its no-prefetch fallback with a live backend; the \
+                 handler must pre-fetch prevouts out of the lock (round-2 P0)"
+            );
+            Err(refusal(
+                RefusalCode::PsbtInconsistent,
+                "prevout_ground_truth",
+                "internal: prevout preflight was not pre-fetched out of the sign lock; refusing \
+                 rather than running chain I/O under the lock"
+                    .into(),
+            ))
         }
     }
 }
@@ -5839,10 +5933,36 @@ mod prevout_preflight {
     }
 
     #[test]
-    fn an_unconfirmed_authorized_parent_is_allowed_even_if_values_differ() {
-        // `gettxout` returns the output but UNCONFIRMED — the vault-authorized-but-
-        // unconfirmed parent. Only a CONFIRMED prevout is immutable ground truth, so
-        // this is never a mismatch and must pass exactly as today.
+    fn an_unconfirmed_present_authorized_parent_with_matching_values_is_allowed() {
+        // `gettxout(include_mempool)` returns the output, UNCONFIRMED — the vault-
+        // authorized-but-unconfirmed parent, in this node's mempool. Its `witness_utxo`
+        // MATCHES the actual output, so it is the legitimate authorized-parent case and
+        // must pass.
+        let op = outpoint(4);
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let txout = TxOut {
+            script_pubkey: script,
+            value: Amount::from_sat(100_000),
+        };
+        let psbt = psbt_spending(op, txout.clone());
+        let backend = backend_with(
+            op,
+            Prevout {
+                txout,
+                confirmed: false,
+            },
+        );
+        verify_prevouts_against_chain(&psbt, &backend)
+            .expect("an unconfirmed authorized parent whose witness_utxo matches is allowed");
+    }
+
+    /// A txid commits to the whole tx, so the output at a fixed `(txid, vout)` is immutable
+    /// whether confirmed or in-mempool; an RBF replacement carries a DIFFERENT txid and
+    /// would make `gettxout` return null. So an unconfirmed prevout that `gettxout`
+    /// RETURNS is ground truth, and a `witness_utxo` disagreeing with it is a forgery a
+    /// coerced user would sign — refuse it, don't wave it through as "unconfirmed" (codex P2).
+    #[test]
+    fn an_unconfirmed_present_prevout_with_a_forged_witness_utxo_is_refused() {
         let op = outpoint(4);
         let script = ScriptBuf::from_bytes(vec![0x51]);
         let real = TxOut {
@@ -5861,8 +5981,11 @@ mod prevout_preflight {
                 confirmed: false,
             },
         );
-        verify_prevouts_against_chain(&psbt, &backend)
-            .expect("an unconfirmed authorized parent is allowed");
+        assert_eq!(
+            refusal_code(verify_prevouts_against_chain(&psbt, &backend)),
+            RefusalCode::PsbtInconsistent,
+            "a forged witness_utxo on an unconfirmed-present prevout must be refused",
+        );
     }
 
     #[test]
@@ -6061,6 +6184,27 @@ mod prevout_preflight {
             worker.join().expect("sign worker").expect("valid request"),
             SignResponse::Accepted(_)
         ));
+    }
+
+    /// A coordinator reaches one honest node whose bitcoind is down: its prevout preflight
+    /// fails and the node refuses fail-closed (registers no candidate). Forwarding that
+    /// node-local refusal so peers still arm is deferred to f91 (it needs the accepted-replay
+    /// ordering to avoid overriding an accepted verdict on retry — codex pass-5 P1); the
+    /// hung-backend case is covered by the node-local CommitmentExpired forward. Here we
+    /// only pin the fail-closed refusal.
+    #[test]
+    fn a_prevout_fetch_failure_refuses_fail_closed() {
+        let (mut node, request) = node_and_valid_request();
+        node.set_chain_backend(Arc::new(MockBackend {
+            prevout_error: Some("backend unavailable".into()),
+            ..Default::default()
+        }));
+        let now = request.expiry - 100;
+        let response = super::handle_sign(&node, &request, now).expect("valid request");
+        assert!(
+            matches!(&response, SignResponse::Refusal(r) if r.code == RefusalCode::PsbtInconsistent),
+            "a node whose backend is down refuses fail-closed: {response:?}"
+        );
     }
 
     #[test]
@@ -6517,6 +6661,29 @@ mod config_bounds_tests {
         let err = Node::from_toml_str(&config_with_bounds(0, 172_800, "combine_slack_secs = 0\n"))
             .err()
             .expect("zero combine slack must be rejected at load");
+        assert!(
+            err.to_string().contains("combine_slack_secs"),
+            "unexpected config error: {err}"
+        );
+    }
+
+    /// A combine window shorter than TWICE the vault cache refresh interval
+    /// (`SCAN_INTERVAL`) is a silent duress-to-recovery trap: a block near the fire event
+    /// leaves the cache stale for the whole window, so the escape coverage check fails
+    /// every tick and the armed escape is pruned before the next refresh. The floor is 2×
+    /// (not 1×) because the refresher ticks from pass completion, so the worst-case gap
+    /// exceeds one interval (v0-exit 9y5.3 review, codex/Fable pass 4). A value of exactly
+    /// one interval — accepted under the old 1× floor — must now be rejected.
+    #[test]
+    fn a_combine_slack_shorter_than_twice_the_cache_refresh_interval_is_a_fatal_config() {
+        let short = 2 * crate::watchtower::SCAN_INTERVAL.as_secs() - 1;
+        let err = Node::from_toml_str(&config_with_bounds(
+            0,
+            172_800,
+            &format!("combine_slack_secs = {short}\n"),
+        ))
+        .err()
+        .expect("a sub-refresh-interval combine window must be rejected at load");
         assert!(
             err.to_string().contains("combine_slack_secs"),
             "unexpected config error: {err}"

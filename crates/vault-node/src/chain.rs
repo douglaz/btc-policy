@@ -55,6 +55,24 @@ pub struct SpendSeen {
     pub witness: Witness,
 }
 
+/// The result of a [`ChainBackend::spends_of`] traversal: the watched spends seen,
+/// plus the `(height, hash)` chain the SAME traversal proved to be a contiguous
+/// prefix of the ACTIVE chain — every block chained onto its parent, the terminal
+/// block still active, and (when an `expected_parent` was supplied) the first block
+/// rooted on it. The watchtower binds its cursor anchors to `blocks` instead of
+/// re-reading the hashes independently, so an anchor can NEVER come from a fork the
+/// classifying scan did not actually traverse (v0-exit 9y5.3 review, [P1] BOTH): a
+/// second, unvalidated hash fetch is exactly where a racing reorg would otherwise
+/// slip a mixed-fork anchor past the terminal re-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanTraversal {
+    /// Spends of the queried scripts within the traversed range.
+    pub spends: Vec<SpendSeen>,
+    /// The `(height, hash)` of every block traversed, ascending and contiguous,
+    /// proven active by the same reads that produced `spends`.
+    pub blocks: Vec<(u32, BlockHash)>,
+}
+
 /// One prevout as this node sees it across its confirmed chain AND its own
 /// mempool (ADR-0012, "build over the mempool UTXO set, not confirmed-only").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,15 +118,26 @@ pub trait ChainBackend {
     fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, Error>;
 
     /// Spends of any of `scripts` observed in the inclusive block range
-    /// `from_height..=through_height`, against this node's own chain data. Fixing the
-    /// terminal height lets the watchtower bind alerts and cursor anchors to the same
-    /// captured chain prefix even if a new block arrives mid-pass.
+    /// `from_height..=through_height`, against this node's own chain data, together
+    /// with the validated `(height, hash)` chain of the blocks traversed (see
+    /// [`ScanTraversal`]). Fixing the terminal height lets the watchtower bind alerts
+    /// and cursor anchors to the same captured chain prefix even if a new block
+    /// arrives mid-pass.
+    ///
+    /// `expected_parent`, when `Some`, is the hash the block at `from_height` must
+    /// name as its `previousblockhash`: the newest cursor anchor the scan is
+    /// extending. Supplying it makes the traversal refuse a range that does not chain
+    /// ONTO the existing cursor — the reorg that forks below `from_height` and rebuilds
+    /// taller within the window between the caller's pre-scan anchor check and this
+    /// call (v0-exit 9y5.3 review, [P1] BOTH). `None` skips the root check: the first
+    /// scan (empty cursor) or a post-reset genesis re-scan has no anchor to root on.
     fn spends_of(
         &self,
         scripts: &[ScriptBuf],
         from_height: u32,
         through_height: u32,
-    ) -> Result<Vec<SpendSeen>, Error>;
+        expected_parent: Option<BlockHash>,
+    ) -> Result<ScanTraversal, Error>;
 
     /// The unspent output at `outpoint` as this node sees it, **including its own
     /// mempool**. `None` ⇒ this node cannot see the output (unknown or already
@@ -684,7 +713,8 @@ impl ChainBackend for BitcoindBackend {
         scripts: &[ScriptBuf],
         from_height: u32,
         through_height: u32,
-    ) -> Result<Vec<SpendSeen>, Error> {
+        expected_parent: Option<BlockHash>,
+    ) -> Result<ScanTraversal, Error> {
         // Scan blocks through the caller's captured terminal height; a watched script is spent
         // when some input's prevout carries it. `getblock` verbosity 3 (Core v25+)
         // inlines each input's `prevout`, so no per-input `getrawtransaction` is
@@ -695,9 +725,16 @@ impl ChainBackend for BitcoindBackend {
         // Mid-scan reorg guard (deliverable 9y5.3-a): the per-height reads below are
         // NOT an atomic chain snapshot, so a reorg that swaps the active block at some
         // height while this loop straddles it could read a fork this node no longer
-        // follows and silently miss the spends of the one it does. TWO checks together
-        // make the traversed range provably a prefix of the ACTIVE chain:
+        // follows and silently miss the spends of the one it does. THREE checks together
+        // make the traversed range provably a contiguous extension of the caller's
+        // cursor along the ACTIVE chain:
         //
+        //  0. the FIRST block must chain onto `expected_parent`, the newest cursor
+        //     anchor the caller is extending. Without it, a reorg that forks BELOW
+        //     `from_height` and rebuilds taller — landing between the caller's pre-scan
+        //     anchor check and this scan — leaves a new-fork `from_height` block whose
+        //     ancestors this scan never traversed; checks 1 and 2 both pass on the new
+        //     fork alone, and the anchor it is appended to no longer chains (9y5.3 [P1]);
         //  1. consecutive scanned blocks must CHAIN (`block[h].previousblockhash ==
         //     block[h-1].hash`), so a MIXED-fork straddle breaks the linkage; and
         //  2. after the loop, the LAST block actually traversed must STILL be the
@@ -708,12 +745,15 @@ impl ChainBackend for BitcoindBackend {
         // Check 2 is what closes the case check 1 cannot see: a loop that read a single
         // foreign fork END-TO-END is internally consistent, and an A→B→A that returns to
         // the original tip also slips past `scan_pass`'s post-scan tip-hash check, so
-        // without it a whole scan could be bound to a fork the node has abandoned.
+        // without it a whole scan could be bound to a fork the node has abandoned. The
+        // returned `blocks` carry the proven `(height, hash)` chain so the watchtower
+        // binds its anchors to exactly what this scan traversed, never a second re-read.
         //
-        // Either failure is an error, so the pass discards its results and retries from
+        // Any failure is an error, so the pass discards its results and retries from
         // an unadvanced cursor rather than binding one fork's spends and skipping the
         // active chain's.
         let mut last_scanned: Option<(u32, String)> = None;
+        let mut blocks: Vec<(u32, BlockHash)> = Vec::new();
         for height in from_height..=through_height {
             let hash = self
                 .call("getblockhash", json!([height]))?
@@ -721,20 +761,36 @@ impl ChainBackend for BitcoindBackend {
                 .ok_or("getblockhash: expected a hash string")?
                 .to_string();
             let block = self.call("getblock", json!([hash, 3]))?;
-            if let Some((_, prev)) = &last_scanned {
+            // The block at `from_height` must chain onto `expected_parent` (the cursor
+            // anchor being extended); every later block must chain onto the one just
+            // scanned. Together with the terminal re-check below, this proves the whole
+            // traversal is a contiguous extension of the caller's cursor along THIS
+            // active chain — closing BOTH the mixed-fork straddle (check 1) and the
+            // taller-fork reorg that races between the caller's pre-scan anchor read and
+            // this scan, whose new `from_height` block does not chain onto the anchor.
+            let required_parent = match &last_scanned {
+                Some((_, prev)) => Some(prev.clone()),
+                None => expected_parent.map(|parent| parent.to_string()),
+            };
+            if let Some(required) = required_parent {
                 let parent = block["previousblockhash"]
                     .as_str()
                     .ok_or("getblock: block has no previousblockhash (verbosity 3 required)")?;
-                if parent != prev {
+                if parent != required {
                     return Err(format!(
                         "getblock: block at height {height} does not chain onto the \
-                         previously scanned block (a reorg raced the scan); refusing to \
-                         bind a mixed-fork scan and re-scanning next pass"
+                         expected parent {required} (a reorg raced the scan); refusing to \
+                         bind a mixed-fork or unrooted scan and re-scanning next pass"
                     )
                     .into());
                 }
             }
-            last_scanned = Some((height, hash));
+            last_scanned = Some((height, hash.clone()));
+            blocks.push((
+                height,
+                BlockHash::from_str(&hash)
+                    .map_err(|e| format!("getblockhash: bad block hash at height {height}: {e}"))?,
+            ));
             let txs = block["tx"].as_array().ok_or("getblock: tx not an array")?;
             for tx in txs {
                 let spend_txid = tx["txid"].as_str().ok_or("getblock: tx has no txid")?;
@@ -813,7 +869,10 @@ impl ChainBackend for BitcoindBackend {
                 .into());
             }
         }
-        Ok(seen)
+        Ok(ScanTraversal {
+            spends: seen,
+            blocks,
+        })
     }
 
     fn prevout(&self, outpoint: &OutPoint) -> Result<Option<Prevout>, Error> {
@@ -1123,7 +1182,7 @@ pub(crate) mod mock {
     use bitcoin::hashes::Hash;
     use bitcoin::{consensus, BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 
-    use super::{ChainBackend, PackageVerdict, Prevout, SpendSeen};
+    use super::{ChainBackend, PackageVerdict, Prevout, ScanTraversal, SpendSeen};
     use crate::Error;
 
     /// A deterministic per-height block hash for the mock's chain view. `epoch`
@@ -1174,6 +1233,16 @@ pub(crate) mod mock {
         /// reorg race without mutating the mock through `&self`.
         pub scan_reorg_from: Option<u32>,
         pub scan_completed: AtomicBool,
+        /// If set, the first `tip_height` read of a pass commits a reorg forking at
+        /// `reorg_from_on_tip_read - 1` and rebuilding to `reorg_new_tip` (a distinct
+        /// epoch-3 history at and above the fork). This models the taller fork that
+        /// lands in the reconcile→scan GAP — AFTER reconcile matched the old anchor but
+        /// BEFORE the scan reads the new blocks — the case the root/boundary check
+        /// closes (v0-exit 9y5.3 [P1]). `tip_read_reorg_fired` records the trigger so
+        /// `block_hash_at`/`block_hash_of` return the new fork for the rest of the pass.
+        pub reorg_from_on_tip_read: Option<u32>,
+        pub reorg_new_tip: Option<u32>,
+        pub tip_read_reorg_fired: AtomicBool,
         pub scanned_from: Mutex<Vec<u32>>,
         pub prevouts: HashMap<OutPoint, Prevout>,
         /// Every `prevout` lookup, in order, so the preflight tests can prove a
@@ -1209,12 +1278,31 @@ pub(crate) mod mock {
         /// else the deterministic epoch-0 hash.
         fn block_hash_of(&self, height: u32) -> BlockHash {
             self.block_hashes.get(&height).copied().unwrap_or_else(|| {
+                // A taller-fork reorg committed in this pass's reconcile→scan gap:
+                // heights at and above the fork read the new fork (epoch 3).
+                if self.tip_read_reorg_fired.load(Ordering::Relaxed)
+                    && self
+                        .reorg_from_on_tip_read
+                        .is_some_and(|from_height| height >= from_height)
+                {
+                    return mock_block_hash(height, 3);
+                }
                 let raced = self.scan_completed.load(Ordering::Relaxed)
                     && self
                         .scan_reorg_from
                         .is_some_and(|from_height| height >= from_height);
                 mock_block_hash(height, if raced { 2 } else { 0 })
             })
+        }
+
+        /// The tip this mock reports now, accounting for a committed tip-read reorg
+        /// that rebuilt the chain taller.
+        fn effective_tip(&self) -> u32 {
+            if self.tip_read_reorg_fired.load(Ordering::Relaxed) {
+                self.reorg_new_tip.unwrap_or(self.tip)
+            } else {
+                self.tip
+            }
         }
 
         /// Rewrite the active chain from `from_height` up to the current `tip` to a
@@ -1248,13 +1336,19 @@ pub(crate) mod mock {
         }
 
         fn tip_height(&self) -> Result<u32, Error> {
-            Ok(self.tip)
+            // A pass reads the tip once, right after reconcile: that read commits the
+            // armed tip-read reorg, so the subsequent tip-hash capture and scan see the
+            // new (taller) fork while reconcile already matched the pre-reorg anchor.
+            if self.reorg_from_on_tip_read.is_some() {
+                self.tip_read_reorg_fired.store(true, Ordering::Relaxed);
+            }
+            Ok(self.effective_tip())
         }
 
         fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, Error> {
             // No block occupies a height above the tip — the reorg-shortened-chain
             // signal the cursor reads as a mismatch.
-            if height > self.tip {
+            if height > self.effective_tip() {
                 return Ok(None);
             }
             Ok(Some(self.block_hash_of(height)))
@@ -1265,11 +1359,27 @@ pub(crate) mod mock {
             _scripts: &[ScriptBuf],
             from_height: u32,
             through_height: u32,
-        ) -> Result<Vec<SpendSeen>, Error> {
+            expected_parent: Option<BlockHash>,
+        ) -> Result<ScanTraversal, Error> {
             self.scanned_from
                 .lock()
                 .expect("scanned_from lock")
                 .push(from_height);
+            // Model check 0 (the root/boundary linkage): the block at `from_height`
+            // must chain onto the caller's cursor anchor. In this linear mock, the
+            // parent of block[h] is `block_hash_of(h - 1)`. A reorg that lands in the
+            // reconcile→scan gap (e.g. via `reorg_from_on_tip_read`) makes this differ
+            // from the anchor the caller passed, so the scan refuses — exactly as the
+            // real backend's `previousblockhash` check does.
+            if let Some(parent) = expected_parent {
+                if from_height > 0 && self.block_hash_of(from_height - 1) != parent {
+                    return Err(format!(
+                        "mock spends_of: block at height {from_height} does not chain onto \
+                         expected parent {parent} (a reorg raced the scan)"
+                    )
+                    .into());
+                }
+            }
             // The canned spends live in `spend_block`; a scan whose cursor has
             // advanced past it sees nothing, so a re-alert can only come from a
             // cursor that failed to advance (never dedup).
@@ -1278,10 +1388,18 @@ pub(crate) mod mock {
             } else {
                 Vec::new()
             };
+            // The validated (height, hash) chain the watchtower binds its anchors to,
+            // captured from the SAME view that classified the spends.
+            let blocks: Vec<(u32, BlockHash)> = (from_height..=through_height)
+                .map(|height| (height, self.block_hash_of(height)))
+                .collect();
             if self.scan_reorg_from.is_some() {
                 self.scan_completed.store(true, Ordering::Relaxed);
             }
-            Ok(result)
+            Ok(ScanTraversal {
+                spends: result,
+                blocks,
+            })
         }
 
         fn prevout(&self, outpoint: &OutPoint) -> Result<Option<Prevout>, Error> {
@@ -1366,7 +1484,9 @@ mod tests {
     use bitcoin::hashes::Hash;
     use bitcoin::hex::DisplayHex;
     use bitcoin::transaction::Version;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+    use bitcoin::{
+        Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    };
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -2161,10 +2281,13 @@ mod tests {
         ]);
         let backend = BitcoindBackend::new(addr, String::new());
         let seen = backend
-            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 2)
+            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 2, None)
             .expect("a stable scan");
         server.join().expect("scripted RPC completed");
-        assert!(seen.is_empty(), "the scripted blocks carry no spends");
+        assert!(
+            seen.spends.is_empty(),
+            "the scripted blocks carry no spends"
+        );
     }
 
     /// A reorg that swaps the active block PART-WAY through the scan: block 2 comes
@@ -2181,7 +2304,7 @@ mod tests {
         ]);
         let backend = BitcoindBackend::new(addr, String::new());
         let error = backend
-            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 2)
+            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 2, None)
             .expect_err("a mixed-fork scan must not be bound")
             .to_string();
         server.join().expect("scripted RPC completed");
@@ -2207,13 +2330,41 @@ mod tests {
         ]);
         let backend = BitcoindBackend::new(addr, String::new());
         let error = backend
-            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 2)
+            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 2, None)
             .expect_err("an abandoned fork's spends must not be bound")
             .to_string();
         server.join().expect("scripted RPC completed");
         assert!(
             error.contains("no longer the active block"),
             "the refusal must name the abandoned fork: {error}"
+        );
+    }
+
+    /// Check 0 (v0-exit 9y5.3 [P1], BOTH reviewers): the FIRST scanned block must chain
+    /// onto `expected_parent` — the cursor anchor the caller is extending. A reorg that
+    /// forks below `from_height` and rebuilds taller in the reconcile→scan gap leaves a
+    /// new-fork `from_height` block whose parent is NOT the anchor; without this check,
+    /// binding it appends an anchor that no longer chains, and a later flip back to that
+    /// fork resumes above a block this node never scanned there — silently skipping its
+    /// spends forever.
+    #[test]
+    fn a_scan_that_does_not_root_on_the_cursor_anchor_is_refused() {
+        let (addr, server) = scripted_rpc(vec![
+            ("getblockhash", serde_json::json!("b1".repeat(32))),
+            // Block at `from_height` names a DIFFERENT parent than the cursor anchor.
+            ("getblock", scanned_block(Some(&"b0".repeat(32)))),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        // A cursor anchor on a DIFFERENT fork than the scanned block's parent (`b0…`).
+        let anchor = BlockHash::from_byte_array([0xa0; 32]);
+        let error = backend
+            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 1, Some(anchor))
+            .expect_err("a scan not rooted on the cursor anchor must be refused")
+            .to_string();
+        server.join().expect("scripted RPC completed");
+        assert!(
+            error.contains("does not chain onto the expected parent"),
+            "the refusal must name the broken root linkage: {error}"
         );
     }
 
