@@ -55,7 +55,7 @@ use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
-use bitcoin::{Amount, EcdsaSighashType, Psbt, PublicKey, ScriptBuf, Txid};
+use bitcoin::{Amount, EcdsaSighashType, OutPoint, Psbt, PublicKey, ScriptBuf, Txid};
 use miniscript::{Descriptor, DescriptorPublicKey};
 use replay::{NonceDecision, NonceLog, ReplayLog, SignState, MAX_COORD_NONCE_BYTES};
 use serde::Deserialize;
@@ -66,7 +66,7 @@ use vault_proto::{
 };
 use zeroize::Zeroizing;
 
-use crate::chain::{BitcoindBackend, ChainBackend};
+use crate::chain::{BitcoindBackend, ChainBackend, Prevout};
 use crate::channel::ChannelReply;
 use crate::watchtower::{AlertQueue, Event};
 
@@ -820,15 +820,13 @@ pub struct Node {
     escape_coverage_pct: u8,
     escape_feerate_floor: u64,
     /// The `/sign` handler's replay log AND Hold-timer pending log under ONE
-    /// lock (see [`replay::SignState`]). `/sign` is serialized BY DESIGN: the
-    /// axum migration buys ISOLATION of `/sign` from `/events` (and, in V0-8a,
-    /// `/channel`) — those keep their own locks below — NOT sign-vs-sign
-    /// throughput. Two `/sign` requests still run one-at-a-time: the whole
-    /// `handle_sign` call runs under this lock, so the check-then-update
-    /// sequences over the two logs never interleave, exactly as the old
-    /// sequential serve loop guaranteed. Splitting these into two locks is
-    /// FORBIDDEN — interleaved check/update between two concurrent identical
-    /// requests would corrupt replay semantics.
+    /// lock (see [`replay::SignState`]). `/sign` uses two guarded phases around
+    /// the slow chain preflight: phase 1 atomically consumes coordinator freshness
+    /// and records the safety intent, then phase 2 holds this same lock continuously
+    /// across every replay/pending check-and-update. Exact replays cannot enter the
+    /// gap because phase 1 already consumed their nonce. Splitting the state across
+    /// separate locks is FORBIDDEN — interleaved check/update over replay and pending
+    /// state would corrupt their shared semantics.
     sign_state: Mutex<SignState>,
     /// **The validated-AND-policy-ACCEPTED transaction set** (ADR-0012's
     /// watchtower recognition rule, and V0-8b's vault-authorized set). Holds the
@@ -866,6 +864,12 @@ pub struct Node {
     /// daemon can build the backend and spawn the driver after load
     /// ([`spawn_drivers`]).
     chain_backend: Option<(SocketAddr, String)>,
+    /// Unit tests build channel-valid nodes from configs that carry the required
+    /// production backend stanza but intentionally launch no bitcoind. Keep their
+    /// deterministic policy/state-machine tests off sockets; integration tests
+    /// compile the production path and exercise the real backend.
+    #[cfg(test)]
+    chain_backend_override: Option<Arc<dyn ChainBackend + Send + Sync>>,
     /// The node-to-node channel runtime (V0-8a), built from the sealed manifest
     /// when `[channel]` is present. `None` ⇒ absent-channel mode: `/channel` is
     /// not mounted and no channel invariant runs. Read by the `/channel` route and
@@ -1230,20 +1234,46 @@ impl Node {
             )
             .into());
         }
-        // A zero-width combine window `[fire, fire]` is a silent broadcast trap: the
-        // fan-out never *initiates* a send once `now >= deadline` (see
-        // `try_endpoints`), so with `combine_slack_secs = 0` no partial ever leaves
-        // any node after its fire event, no candidate reaches quorum, and every
-        // accepted spend signs at ingress then silently never broadcasts — the exact
-        // invisible failure the `[chain_backend]` fatal below also guards. Reject it
-        // at load rather than at "the money never moved".
-        if config.combine_slack_secs == 0 {
-            return Err(
-                "combine_slack_secs must be greater than 0: a zero-width combine window \
-                 [fire, fire] lets no node transmit a partial after the fire event, so every \
-                 accepted spend would sign at ingress and then silently fail to broadcast"
-                    .into(),
-            );
+        // The combine window `[fire, fire + combine_slack_secs]` must be at least one
+        // confirmed-vault cache refresh interval (V0-6b's `SCAN_INTERVAL`) wide. Two
+        // silent-failure traps live below that floor:
+        //  - A zero-width window `[fire, fire]`: the fan-out never *initiates* a send once
+        //    `now >= deadline` (see `try_endpoints`), so no partial ever leaves any node
+        //    after its fire event, no candidate reaches quorum, and every accepted spend
+        //    signs at ingress then silently never broadcasts.
+        //  - A window shorter than the refresh cadence: the fire-time escape-coverage check
+        //    reads the background-maintained cache (never a synchronous `scantxoutset` on
+        //    the combine path, bead 9y5.3), and that cache refreshes only every
+        //    `SCAN_INTERVAL`. A block arriving just before the fire event leaves the cache
+        //    stale for the WHOLE window, so `confirmed_candidates` refuses coverage every
+        //    tick and `prune` deletes the armed escape before the next refresh — silently
+        //    reducing duress to recovery-only (v0-exit 9y5.3 review, codex P2).
+        // Floor at TWICE the refresh interval. The refresher (`spawn_drivers`) ticks
+        // `SCAN_INTERVAL` from each pass's COMPLETION (`ticker.reset()` after an awaited
+        // pass), so the worst-case gap between refreshes is `SCAN_INTERVAL + pass_duration`,
+        // not `SCAN_INTERVAL`; a floor of exactly one interval would leave the equality case
+        // marginal (codex/Fable pass 4). Two intervals gives a full interval of margin for a
+        // pass to complete inside the window. This is NOT a hard guarantee: a single refresh
+        // pass slower than the window (a post-reorg full `scantxoutset` on a large chain) can
+        // still leave the cache stale for the whole window, which — like a backend stall —
+        // degrades duress to frozen-funds → recovery, never theft (ADR-0012). The default
+        // (60s) is 6× the interval; only pathologically short windows are rejected. Reject at
+        // load, not at "money never moved" (same class as the `escape_coverage_pct = 100`
+        // fatal).
+        let min_combine_slack = 2 * watchtower::SCAN_INTERVAL.as_secs();
+        if config.combine_slack_secs < min_combine_slack {
+            return Err(format!(
+                "combine_slack_secs ({}) must be at least twice the vault cache refresh \
+                 interval ({min_combine_slack}s): a shorter combine window can go stale for its \
+                 whole duration when a block arrives near the fire event (the refresher ticks \
+                 from pass completion, so the worst-case gap exceeds one interval), so the \
+                 escape sweep's coverage check fails every tick and the armed escape is pruned \
+                 before the next refresh — silently reducing duress to recovery-only (a \
+                 zero-width window additionally lets no node transmit a partial after the fire \
+                 event)",
+                config.combine_slack_secs
+            )
+            .into());
         }
         // A zero refresh interval disables ADR-0013 §6's per-coin burn-rate
         // bound: every mark is pruned immediately and `elapsed < interval` can
@@ -1531,6 +1561,8 @@ impl Node {
             authorized: Arc::new(Mutex::new(HashSet::new())),
             alerts,
             chain_backend,
+            #[cfg(test)]
+            chain_backend_override: Some(Arc::new(crate::chain::mock::MockBackend::default())),
             channel,
             outbox: Mutex::new(Vec::new()),
         })
@@ -1562,12 +1594,16 @@ impl Node {
         backend: &dyn ChainBackend,
         from_height: u32,
     ) -> Result<usize, Error> {
+        // A callable single pass builds a throwaway cursor at `from_height`; the
+        // reorg-rewind history lives in the daemon driver's persistent cursor
+        // ([`watchtower::spawn_driver`]). Both run the SAME `scan_pass`.
+        let mut cursor = watchtower::ScanCursor::starting_at(from_height);
         watchtower::scan_pass(
             backend,
             &self.vault_scripts(),
             &self.authorized,
             &self.alerts,
-            from_height,
+            &mut cursor,
         )
         .map(|outcome| outcome.new_alerts)
     }
@@ -1585,6 +1621,10 @@ impl Node {
 
     /// This node's own chain backend, when one is configured.
     fn backend(&self) -> Option<Arc<dyn ChainBackend + Send + Sync>> {
+        #[cfg(test)]
+        if let Some(backend) = &self.chain_backend_override {
+            return Some(Arc::clone(backend));
+        }
         let (addr, auth) = self.chain_backend.clone()?;
         Some(Arc::new(BitcoindBackend::new(addr, auth)))
     }
@@ -1839,6 +1879,14 @@ impl Node {
         self.pin_evaluator = evaluator;
     }
 
+    /// Inject a deterministic chain view into handler-level tests. Production never
+    /// compiles this field or setter; it exists so tests can prove the `/sign` wiring,
+    /// including the safety-hook ordering around a confirmed prevout mismatch.
+    #[cfg(test)]
+    pub(crate) fn set_chain_backend(&mut self, backend: Arc<dyn ChainBackend + Send + Sync>) {
+        self.chain_backend_override = Some(backend);
+    }
+
     /// The current pin evaluator, so a test can wrap it in a counting evaluator.
     #[cfg(test)]
     pub(crate) fn pin_evaluator(&self) -> Arc<dyn pin::PinEvaluator> {
@@ -1905,13 +1953,16 @@ fn arm_carrier_id(node: &Node, request: CoordRequest<'_>) -> String {
 ///    interval, alerting on any vault spend it never validated-and-accepted;
 ///  - the **Lockdown deadline driver** (ADR-0012 SAFETY): observes only the local
 ///    Armed deadline and enters terminal Lockdown at T, independent of backend work;
+///  - the **vault-scan cache refresher**: warms the cold full UTXO scan and advances
+///    it by bounded block deltas outside the fire path;
 ///  - the **fire driver** (§1): releases partials at each candidate's authorized
 ///    fire event, then combines + broadcasts once quorum arrives.
 ///
 /// The watchtower and fire driver need a chain backend; channel mode makes its
 /// absence a fatal config error, precisely so a node that must broadcast cannot
-/// boot unable to (see [`Node::from_toml_str`]). Unit tests build backend-less
-/// nodes and start no tasks.
+/// boot unable to (see [`Node::from_toml_str`]). Only `main.rs` calls this: unit
+/// tests carry a `#[cfg(test)]` mock backend but never spawn these background tasks,
+/// driving the passes directly instead (e.g. [`Node::watchtower_tick`]).
 pub fn spawn_drivers(node: &Arc<Node>) {
     let Some(backend) = node.backend() else {
         return;
@@ -1926,6 +1977,42 @@ pub fn spawn_drivers(node: &Arc<Node>) {
     if node.channel.is_none() {
         return;
     }
+    // Warm the cache before the daemon begins serving. `main` calls `spawn_drivers`
+    // before `server::serve`, and a fresh process cannot carry an armed schedule
+    // (reboot-death), so even a slow cold `scantxoutset` here is startup work rather
+    // than work inside a live fire/combine window. Starting service with an avoidably
+    // cold cache would make an early, otherwise-admissible sweep depend on a race with
+    // the refresher's first task tick.
+    if let Err(e) = backend.refresh_vault_unspent_cache(&node.vault_scripts()) {
+        eprintln!("initial vault scan cache warmup failed (will retry): {e}");
+    }
+    // Keep subsequent whole-UTXO scanning and delta catch-up completely outside the
+    // finite fire/combine window. The first task tick is immediate; each pass is
+    // awaited before scheduling the next, so a slow refresh never overlaps itself.
+    // Fire-time coverage consumes only a cache already at the active tip and otherwise
+    // fails fast (Lockdown remains unconditional).
+    let cache_backend = Arc::clone(&backend);
+    let cache_scripts = node.vault_scripts();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(watchtower::SCAN_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let backend = Arc::clone(&cache_backend);
+            let scripts = cache_scripts.clone();
+            match tokio::task::spawn_blocking(move || backend.refresh_vault_unspent_cache(&scripts))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    eprintln!("vault scan cache refresh failed (will retry): {e}");
+                }
+                Err(join_error) => {
+                    eprintln!("vault scan cache refresh task panicked: {join_error}");
+                }
+            }
+            ticker.reset();
+        }
+    });
     // SAFETY has its own always-running deadline driver. It never calls the chain
     // backend and reads only the local Armed deadline under the store lock, so no
     // Firing pass — however slow its `scantxoutset`, package check, or
@@ -2359,18 +2446,30 @@ fn combine_and_broadcast_with_clock(
         let armed_escape = channel.is_armed_escape(commitment_id);
         if armed_escape {
             match transaction_is_settled(backend, &candidate_txid) {
-                // On the network. A confirmation is terminal (settle + clear the paired
-                // hot spend's pending Hold). A copy merely resting in the mempool needs
-                // no action — re-running admissibility now would read the escape's own
-                // inputs as spent-by-mempool — so leave it resident and re-check next
-                // tick; only an EVICTED copy (the `Ok(false)` arm) is re-broadcast.
+                // On the network. A confirmation clears the paired hot spend's pending
+                // Hold, but the already-authorized escape candidate itself remains
+                // resident until the finite fire window closes. If a reorg removes that
+                // confirmation inside the window, the next tick therefore reaches the
+                // `Ok(false)` arm and re-broadcasts the exact same transaction. A copy
+                // merely resting in the mempool needs no action — re-running
+                // admissibility now would read the escape's own inputs as
+                // spent-by-mempool.
                 Ok(true) => {
                     if matches!(backend.transaction_confirmed(&candidate_txid), Ok(true)) {
-                        settle_candidate(node, channel, commitment_id);
-                        println!(
-                            "fire: armed escape {commitment_id} confirmed on-chain \
-                             ({candidate_txid})"
-                        );
+                        let paired = channel.pairing(commitment_id).map(|(_, sibling)| sibling);
+                        let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
+                        let mut first_confirmation = state.pending.remove(commitment_id);
+                        if let Some(paired) = paired {
+                            first_confirmation |= state.pending.remove(&paired);
+                        }
+                        drop(state);
+                        if first_confirmation {
+                            println!(
+                                "fire: armed escape {commitment_id} confirmed on-chain \
+                                 ({candidate_txid}); retaining it through the fire window for \
+                                 in-window reorg recovery"
+                            );
+                        }
                     }
                     continue;
                 }
@@ -2463,16 +2562,12 @@ fn combine_and_broadcast_with_clock(
     broadcast
 }
 
-/// Mark an exact candidate settled locally and release refresh subordination —
-/// for BOTH the settled candidate AND its paired sibling. The sibling removal is
-/// what actually makes a confirmed armed escape "clear the paired hot spend's
-/// pending Hold" (the claim above): the escape SUPERSEDES that hot spend, which is
-/// keyed in `pending` under its OWN id — never the escape's — so it will never
-/// settle at its public Hold-expiry and must stop subordinating refreshes now,
-/// not linger until commitment expiry. Read the pairing BEFORE `mark_broadcast`,
-/// which removes the armed pair from the store. Every removal is idempotent, so
-/// this is a no-op wherever the sibling was never a pending hot spend (a normal
-/// spend's escape, a self-paired refresh, an unknown/non-hot id).
+/// Mark an exact non-armed candidate settled locally and release refresh
+/// subordination for BOTH it and its paired sibling. Armed escapes use the
+/// confirmation branch above instead: it clears the same pending entries but
+/// deliberately retains the candidate through the fire window so an in-window
+/// reorg can re-broadcast it. Read the pairing BEFORE `mark_broadcast`, which may
+/// remove candidate context. Every pending removal is idempotent.
 fn settle_candidate(node: &Node, channel: &channel::ChannelState, commitment_id: &str) {
     let paired = channel.pairing(commitment_id).map(|(_, sibling)| sibling);
     channel.mark_broadcast(commitment_id);
@@ -2707,16 +2802,25 @@ fn escape_sweep_policy_admissible(
     // The swept value: Σ prevout value over the escape's inputs. A prevout this node
     // cannot see (spent or unknown) means the escape is not spendable now.
     let mut total_in: u64 = 0;
-    for input in &tx.input {
-        let prevout = backend
-            .prevout(&input.previous_output)
-            .map_err(|e| format!("cannot read escape prevout {}: {e}", input.previous_output))?
-            .ok_or_else(|| {
-                format!(
-                    "escape prevout {} is unknown to this node (spent or missing)",
-                    input.previous_output
-                )
-            })?;
+    let escape_outpoints: Vec<OutPoint> =
+        tx.input.iter().map(|input| input.previous_output).collect();
+    let escape_prevouts = backend
+        .prevouts(&escape_outpoints)
+        .map_err(|e| format!("cannot read escape prevouts: {e}"))?;
+    if escape_prevouts.len() != escape_outpoints.len() {
+        return Err(format!(
+            "chain backend returned {} escape prevouts for {} inputs",
+            escape_prevouts.len(),
+            escape_outpoints.len()
+        ));
+    }
+    for (outpoint, prevout) in escape_outpoints.iter().zip(escape_prevouts) {
+        let prevout = prevout.ok_or_else(|| {
+            format!(
+                "escape prevout {} is unknown to this node (spent or missing)",
+                outpoint
+            )
+        })?;
         total_in = total_in.saturating_add(prevout.txout.value.to_sat());
     }
     let total_out: u64 = tx
@@ -3021,7 +3125,7 @@ fn handle_channel_body_with_clocks(
     node: &Node,
     body: &[u8],
     received_at: u64,
-    processing_clock: impl FnOnce() -> u64,
+    processing_clock: impl Fn() -> u64,
     confirmation_clock: impl Fn() -> u64,
 ) -> ChannelReply {
     let Some(channel) = node.channel.as_ref() else {
@@ -3275,8 +3379,9 @@ pub fn handle_sign(
     handle_sign_after_lock(node, request, || now)
 }
 
-/// Handle an HTTP sign submission using the node's clock, read only after the
-/// sign-state lock so queued time cannot stale expiry or Hold checks.
+/// Handle an HTTP sign submission using the node's clock. The first read happens
+/// under the ingress sign-state guard; after the out-of-lock chain preflight a
+/// second guarded read prevents slow RPC from staling expiry or Hold checks.
 pub(crate) fn handle_sign_now(
     node: &Node,
     request: &SignRequest,
@@ -3334,7 +3439,7 @@ pub(crate) fn handle_refresh_now(
 fn handle_sign_after_lock(
     node: &Node,
     request: &SignRequest,
-    clock: impl FnOnce() -> u64,
+    clock: impl Fn() -> u64,
 ) -> Result<SignResponse, BadRequest> {
     // Terminal Lockdown (ADR-0008) short-circuits everything: a locked-down node
     // answers FRAUD_SUSPECTED to every spend for its lifetime and does no further
@@ -3343,18 +3448,21 @@ fn handle_sign_after_lock(
     if node.is_locked_down() {
         return Ok(fraud_suspected());
     }
-    // The whole call runs under ONE lock over the replay + pending logs
-    // (`Mutex<SignState>`), reproducing the atomicity the old sequential serve
-    // loop gave for free: two concurrent `/sign` requests execute one-at-a-time
-    // and their check-then-update sequences never interleave. This serializes
-    // `/sign` against `/sign` BY DESIGN — the async migration isolates `/sign`
-    // from `/events` (and, in V0-8a, `/channel`), which keep their own locks,
-    // not sign-vs-sign throughput.
+    // The handler has two short sign-state phases around one out-of-lock chain
+    // preflight. Phase 1 atomically consumes coordinator freshness, evaluates the PIN,
+    // and records the safety intent. Phase 2 holds the SAME lock continuously across
+    // every replay/pending check-and-update. Consuming the nonce before releasing phase
+    // 1 prevents an exact replay from entering the RPC gap, while keeping the slow
+    // backend call out of the lock lets Lockdown-at-T take it independently.
     //
     // Deliberate throughput tradeoff (V0-4a/V0-4b): the PIN compare's TWO Argon2id
     // evaluations and, in channel mode, one carrier derivation run under this lock,
     // so an authenticated request holds it for roughly three memory-hard evaluations
-    // instead of the old SHA-256 microseconds. Hoisting the work out would either
+    // instead of the old SHA-256 microseconds. The confirmed-prevout preflight's
+    // chain I/O is deliberately NOT part of that tradeoff: it runs between the two
+    // sign-state phases, after the safety intent exists, so no 60-second RPC timeout
+    // can delay the deadline driver's unconditional Lockdown-at-T. Hoisting the PIN
+    // work out would either
     // run Argon2 BEFORE coord-auth (an unauthenticated-Argon2 DoS vector) or
     // duplicate the atomic nonce consumption the lock exists to give. New carrier
     // work is coordinator-signature-gated; exact peer replays use the nonce/signature
@@ -3381,9 +3489,9 @@ fn handle_sign_after_lock(
     //    coordinator, carry a fresh (unseen) nonce, and fall inside the expiry
     //    window — BEFORE the PIN, so an unauthenticated caller never reaches the
     //    PIN compare (the trust root V0-8b builds on). Runs under the one sign
-    //    lock, so the nonce check-then-record is atomic. This gate also owns the
-    //    node-capped expiry check for the whole handler, so nothing below
-    //    re-checks the window. Its stale lower bound uses the nonce log's
+    //    lock, so the nonce check-then-record is atomic. The same expiry bounds are
+    //    re-checked after the out-of-lock chain preflight so slow RPC cannot stale
+    //    the candidate-registration timestamp. Its stale lower bound uses the nonce log's
     //    rollback-guarded clock (`max(high_water, now)`, [`NonceLog`]), so a clock
     //    rollback cannot revive a pruned nonce. Its future upper bound still uses
     //    raw `now`, preserving V0-2's exact `now + max_commitment_age_secs` cap.
@@ -3569,6 +3677,94 @@ fn handle_sign_after_lock(
         }
         return Ok(pin_refusal(charge.locked));
     }
+    // Prevout ground-truth FETCH, after the chain-INDEPENDENT safety intent exists
+    // and after coordinator freshness has been consumed, but OUTSIDE `sign_state`.
+    // This ordering closes both sides of the boundary:
+    //
+    //  - a slow/hung backend cannot delay the intent or Lockdown-at-T; and
+    //  - a captured nonce replay cannot repeatedly launch the two RPC batches.
+    //
+    // Re-acquire before any replay/pending mutation and re-sample time: an RPC that
+    // outlasts the request's expiry or delivery horizon must not register a stale
+    // candidate using the phase-1 timestamp.
+    drop(state);
+    let (spend_prevouts, escape_prevouts) = prefetch_spend_escape_prevouts(node, request);
+    let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
+    if node.is_locked_down() {
+        return Ok(fraud_suspected());
+    }
+    let raw_now = clock();
+    let now = state.coord_nonces.effective_now(raw_now);
+    if request.expiry <= now {
+        // NODE-LOCAL expiry: this node's own chain preflight (up to two RPC_TIMEOUT
+        // batches) outlived the commitment, so its `now` advanced past `expiry` while a
+        // faster peer's did not. Forward the carrier exactly like the two delivery-
+        // horizon refusals (phase-1 above, phase-2 just below) — the safety intent is
+        // already recorded, and a node that refuses to sign on its OWN clock must still
+        // fan the carrier out so every honest signer sees its receipt and can reach `t`
+        // (the theft vector the phase-1 horizon comment details). It still registers NO
+        // candidate against the stale window. `expiry <= now` also implies
+        // `expiry < now + delivery_horizon`, so this is exactly the expired subset of
+        // the horizon refusal below, split out only to keep the CommitmentExpired code
+        // (v0-exit 9y5.3 review, [P2] Fable: a slow/hung backend must not let this node
+        // silently swallow the duress signal). STAGE (not a bare outbox push): the pin
+        // hook already recorded this node's duress intent, so it must claim its holder
+        // slot too — otherwise the intent is hollow, `confirm_carrier` returns NONE
+        // forever, and this node can never arm/Lockdown off its OWN carrier even with all
+        // peer receipts. Matches the lockout and EXPIRY_TOO_SHORT node-local paths.
+        stage_spend_carrier(node, propagated_request, &carrier);
+        return Ok(refusal(
+            RefusalCode::CommitmentExpired,
+            "commitment_expiry",
+            format!(
+                "expiry {} is at or before this node's post-preflight clock (now {now}); \
+                 forwarded but not signed",
+                request.expiry
+            ),
+        ));
+    }
+    if request.expiry > raw_now.saturating_add(node.max_commitment_age_secs) {
+        // The future-expiry cap on the RAW clock (rollback protection deliberately does
+        // not widen it). For a monotonic clock this is defensively unreachable — the
+        // request already cleared `expiry <= now + max_age` at coordinator auth and
+        // `raw_now` only advanced. It can newly fire ONLY if system time stepped BACKWARD
+        // during the preflight, dropping `raw_now` below the phase-1 sample — a NODE-LOCAL
+        // clock fault this node's peers do not share. So STAGE it, like the expiry/horizon
+        // node-local refusals, rather than letting one node's backward clock step swallow
+        // a selectively-delivered duress carrier (v0-exit 9y5.3 review, codex P2).
+        stage_spend_carrier(node, propagated_request, &carrier);
+        return Ok(refusal(
+            RefusalCode::CommitmentExpired,
+            "commitment_expiry",
+            format!(
+                "expiry {} exceeds now + max age {}s (raw clock; a backward step forwarded \
+                 but did not sign)",
+                request.expiry, node.max_commitment_age_secs
+            ),
+        ));
+    }
+    if let Some(refused) = ensure_delivery_horizon(node, request.expiry, now) {
+        // The carrier was fresh enough when received and its safety intent is already
+        // recorded, but slow chain I/O consumed the remaining relay margin. STAGE (not a
+        // bare push): unlike the PHASE-1 horizon — which runs before the pin hook and
+        // deliberately claims no holder slot — the intent already exists here, so this
+        // node must also self-hold or its recorded intent is hollow and non-confirmable
+        // (Fable pass 3). It still refuses to sign/register a candidate against a stale
+        // delivery window.
+        stage_spend_carrier(node, propagated_request, &carrier);
+        return Ok(refused);
+    }
+    // A NODE-LOCAL prevout FETCH failure (this node's backend errored / hung) surfaces
+    // later in `verify_spend`/`verify_escape` via the pre-fetched `Err`, AFTER the
+    // accepted-replay lookup — so a retry of an already-accepted request honours its cached
+    // verdict instead of being overridden by a transient backend failure. Forwarding that
+    // node-local refusal so peers still process the carrier (Fable pass-1 "same shape")
+    // requires the SAME accepted-replay ordering + node-local-vs-federation-uniform split as
+    // the rest of the out-of-lock preflight; that is deferred to follow-up bead f91 (an
+    // earlier attempt to fan it out HERE, before the accepted-replay lookup, let a backend
+    // failure override an accepted verdict on retry — codex pass-5 P1). The hung-backend
+    // case is already covered above: a stall pushes `now` past expiry, hitting the
+    // node-local CommitmentExpired forward.
     // 2. Decode BOTH PSBTs; undecodable input is a 400, not a refusal. The escape
     //    is mandatory (ADR-0012: "a request missing the escape is invalid and
     //    rejected outright, so a hostile coordinator cannot strip the escape to
@@ -3665,7 +3861,7 @@ fn handle_sign_after_lock(
     //    semantics. A valid duress PIN still recorded THIS node's intent above,
     //    independent of chain view and policy outcome; the safety arm commits only
     //    if the carrier later reaches t-confirmation.
-    if let Err(refused) = verify_spend(node, &spend) {
+    if let Err(refused) = verify_spend(node, &spend, spend_prevouts.as_ref()) {
         // ONE exception to "an invalid submission is never propagated": the
         // per-transaction Hot budget (ADR-0014 §1).
         //
@@ -3800,7 +3996,7 @@ fn handle_sign_after_lock(
     //    node-built — every input a vault UTXO, every destination output paying
     //    the escape descriptor, and the user's signature verifying over the exact
     //    bytes.
-    if let Err(refused) = verify_escape(node, &escape) {
+    if let Err(refused) = verify_escape(node, &escape, escape_prevouts.as_ref()) {
         // The replay key binds only the spend. An escape-derived refusal is not a
         // property of that commitment: the same exact spend may be paired with a
         // corrected escape on a fresh request. Caching it under the spend id would
@@ -3974,7 +4170,7 @@ fn handle_sign_after_lock(
 fn handle_refresh_after_lock(
     node: &Node,
     request: &RefreshRequest,
-    clock: impl FnOnce() -> u64,
+    clock: impl Fn() -> u64,
 ) -> Result<SignResponse, BadRequest> {
     // Lockdown (ADR-0008) refuses refreshes too: every spend AND refresh answers
     // FRAUD_SUSPECTED for the node's lifetime. (The refresh path is pin-less, so it
@@ -3997,7 +4193,7 @@ fn handle_refresh_after_lock(
     }
     let raw_now = clock();
 
-    let now = match verify_coord_auth(
+    let _ingress_now = match verify_coord_auth(
         node,
         request.coord_request(),
         &request.coord_sig,
@@ -4008,6 +4204,31 @@ fn handle_refresh_after_lock(
         Err(rejected) => return Ok(rejected),
     };
     ensure_request_propagatable(node, &vault_proto::TaggedRequest::Refresh(request.clone()))?;
+    // Consume freshness before external work so a captured signed request cannot
+    // repeatedly launch backend RPC. As on `/sign`, the slow fetch runs without
+    // `sign_state`; phase 2 re-checks Lockdown and expiry before any policy/state
+    // mutation.
+    drop(state);
+    let refresh_prevouts = prefetch_refresh_prevouts(node, request);
+    let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
+    if node.is_locked_down() {
+        return Ok(fraud_suspected());
+    }
+    let raw_now = clock();
+    let now = state.coord_nonces.effective_now(raw_now);
+    if request.expiry <= now
+        || request.expiry > raw_now.saturating_add(node.max_commitment_age_secs)
+    {
+        return Ok(refusal(
+            RefusalCode::CommitmentExpired,
+            "commitment_expiry",
+            format!(
+                "expiry {} is outside the acceptance window after chain preflight \
+                 (now {now}, max age {}s)",
+                request.expiry, node.max_commitment_age_secs
+            ),
+        ));
+    }
 
     // Preserve the transport boundary: a signed but undecodable PSBT is still a
     // bad request (HTTP 400), not a policy outcome.
@@ -4030,7 +4251,7 @@ fn handle_refresh_after_lock(
 
     // The same validation a spend gets: the user's signature over the exact bytes,
     // then input ownership + allowlist + fee cap.
-    if let Err(refused) = verify_spend(node, &refresh) {
+    if let Err(refused) = verify_spend(node, &refresh, refresh_prevouts.as_ref()) {
         record_verdict(&mut state.replay, &commitment_id, request.expiry, &refused);
         return Ok(refused);
     }
@@ -4739,10 +4960,238 @@ fn verify_coord_signature(
         })
 }
 
-/// The V0-1 validation: verify the user's signatures, then run policy-core.
-/// Does NOT sign — signing is deferred (handler step 8) so a hot-class spend
-/// can be held first (ADR-0004). `Err` carries the wire refusal to return.
-fn verify_spend(node: &Node, psbt: &Psbt) -> Result<(), SignResponse> {
+/// The V0-6 prevout ground-truth PREFLIGHT (deliverable 9y5.3-d), run in the
+/// `/sign` path BEFORE policy-core. `policy-core` reads each input's PSBT
+/// `witness_utxo` for ownership (scriptPubKey) and fee (value) and trusts it as-is —
+/// its "No I/O, no clock, no chain access — same verdict every run" purity is
+/// load-bearing and stays untouched. So a lying coordinator can inflate a
+/// `witness_utxo` value to slip a fee-cap bypass, or forge its scriptPubKey, past
+/// those pure checks. This is the vault-node side finally doing the prevout check
+/// policy-core defers to V0-6.
+///
+/// For each input it fetches the real prevout from THIS node's own chain view and,
+/// for a CONFIRMED prevout, requires the `witness_utxo` scriptPubKey AND value to
+/// match the chain's ground truth; a mismatch is a fail-closed refusal — nothing is
+/// signed, so no partial is released. It deliberately does NOT refuse when:
+///
+///  - the prevout is absent (`gettxout` null): the input may legitimately spend a
+///    vault-AUTHORIZED-but-unconfirmed parent this node has not yet seen in its own
+///    mempool — the exact case [`chain::assemble_package`] allows for spend-change
+///    and refresh chaining. Absence is left to the fire-time package check, the
+///    authoritative double-spend gate; refusing here would break that rule.
+///  - the prevout is present but UNCONFIRMED: only a confirmed output is immutable
+///    ground truth. An unconfirmed one is the authorized-parent case above.
+///
+/// A backend RPC error refuses fail-closed on the first failed batch: policy-core
+/// must never evaluate attacker-supplied prevout data after chain ground truth became
+/// unavailable. The batch RPC — the only slow step — is hoisted OUT of the sign lock
+/// ([`prefetch_spend_escape_prevouts`], round-2 review) so a slow/hung bitcoind cannot
+/// delay the deadline driver's unconditional Lockdown-at-T; only the pure comparison
+/// ([`compare_prevouts_against_chain`]) runs under the lock. PIN-UNIFORM and
+/// duress-safe: the check is a pure function of the PSBT + chain (never the pin), runs
+/// identically for both pin classes, and its refusal sits AFTER the arm hook, so it
+/// opens no duress observable and does not suppress a duress arm the coordinator's own
+/// lie earned. The caller guards it behind `node.backend()`, so a backend-less
+/// deterministic policy test simply never runs it.
+///
+/// A prevout preflight FETCH result: `Ok` holds one entry per PSBT input (in order),
+/// `Err` a fail-closed refusal (backend RPC failure or a length mismatch). Produced
+/// OUTSIDE the sign lock and consumed by the pure comparison under it, so the
+/// under-lock check re-raises the `Err` verbatim rather than re-running the slow RPC.
+type PrevoutFetch = Result<Vec<Option<Prevout>>, SignResponse>;
+
+/// Fetch the chain's view of `psbt`'s input prevouts in ONE batch — the only
+/// chain-I/O step of the prevout preflight (deliverable 9y5.3-d). The request-body
+/// limit is already the protocol's input bound; adding a lower arbitrary input-count
+/// refusal would reject valid consolidations and large refreshes. The pure comparison
+/// is [`compare_prevouts_against_chain`].
+fn fetch_prevouts(psbt: &Psbt, backend: &dyn ChainBackend) -> PrevoutFetch {
+    let outpoints: Vec<OutPoint> = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect();
+    let prevouts = backend.prevouts(&outpoints).map_err(|e| {
+        refusal(
+            RefusalCode::PsbtInconsistent,
+            "prevout_ground_truth",
+            format!(
+                "cannot verify PSBT prevouts against this node's chain view; refusing \
+                 fail-closed before policy evaluation: {e}"
+            ),
+        )
+    })?;
+    if prevouts.len() != outpoints.len() {
+        return Err(refusal(
+            RefusalCode::PsbtInconsistent,
+            "prevout_ground_truth",
+            format!(
+                "chain backend returned {} prevout results for {} PSBT inputs",
+                prevouts.len(),
+                outpoints.len()
+            ),
+        ));
+    }
+    Ok(prevouts)
+}
+
+/// The pure scriptPubKey/value comparison of `psbt`'s inputs against pre-fetched
+/// chain `prevouts`. No chain I/O — safe under the sign lock, AFTER the arm hook.
+/// Refuses fail-closed on any input whose declared `witness_utxo` disagrees with the
+/// prevout `gettxout` RETURNED (confirmed OR unconfirmed-in-mempool — both fix the
+/// output at that outpoint); only an ABSENT (`None`) prevout stays the authorized-parent
+/// case the fire-time package check backstops.
+fn compare_prevouts_against_chain(
+    psbt: &Psbt,
+    prevouts: &[Option<Prevout>],
+) -> Result<(), SignResponse> {
+    if prevouts.len() != psbt.unsigned_tx.input.len() {
+        // Defensive: the fetch was over these exact inputs, so this cannot happen
+        // unless the PSBT changed between fetch and compare. Refuse fail-closed.
+        return Err(refusal(
+            RefusalCode::PsbtInconsistent,
+            "prevout_ground_truth",
+            format!(
+                "pre-fetched {} prevouts for {} PSBT inputs",
+                prevouts.len(),
+                psbt.unsigned_tx.input.len()
+            ),
+        ));
+    }
+    for (index, (input, prevout)) in psbt.unsigned_tx.input.iter().zip(prevouts).enumerate() {
+        let Some(prevout) = prevout else {
+            // Null prevout: a legitimately-unconfirmed authorized parent not yet visible,
+            // an unknown/already-spent output, or an RBF-replaced parent whose original
+            // txid is gone. Allowed exactly as today — the fire-time package check is the
+            // double-spend backstop.
+            continue;
+        };
+        // NO `!prevout.confirmed` skip: if `gettxout(include_mempool)` RETURNED a prevout,
+        // the output at this exact outpoint is fixed (an RBF replacement carries a different
+        // txid and would have returned `None` above), so an unconfirmed mempool output is
+        // just as verifiable as a confirmed one. A coerced user signs whatever `witness_utxo`
+        // the coordinator supplies, so skipping the compare for unconfirmed-present prevouts
+        // let a forged one reach policy + registration as an unusable candidate (codex P2).
+        let Some(witness_utxo) = psbt.inputs.get(index).and_then(|i| i.witness_utxo.as_ref())
+        else {
+            // A missing witness_utxo is policy-core's own PSBT_INCONSISTENT refusal.
+            continue;
+        };
+        if witness_utxo.script_pubkey != prevout.txout.script_pubkey
+            || witness_utxo.value != prevout.txout.value
+        {
+            let outpoint = input.previous_output;
+            return Err(refusal(
+                RefusalCode::PsbtInconsistent,
+                "prevout_ground_truth",
+                format!(
+                    "input {index} witness_utxo disagrees with the on-chain/mempool prevout \
+                     {outpoint} that gettxout returned: declared scriptPubKey/value do not \
+                     match the chain's ground truth (an attacker-supplied prevout the \
+                     fee/ownership checks would trust)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fetch + compare in one call — the standalone form kept for the unit tests that
+/// exercise the whole preflight against a mock backend. The `/sign` and `/refresh`
+/// handlers instead pre-fetch out of the lock and call [`compare_prevouts_against_chain`]
+/// via [`run_prevout_check`], so production never takes this fused path.
+#[cfg(test)]
+fn verify_prevouts_against_chain(
+    psbt: &Psbt,
+    backend: &dyn ChainBackend,
+) -> Result<(), SignResponse> {
+    let prevouts = fetch_prevouts(psbt, backend)?;
+    compare_prevouts_against_chain(psbt, &prevouts)
+}
+
+/// Run the prevout preflight for `psbt`: use the pre-fetched result when the handler
+/// hoisted the batch RPC out of the lock (the normal path), else fetch it here as a
+/// fallback for callers that did not pre-fetch. Either way the comparison is pure and
+/// identical.
+fn run_prevout_check(
+    psbt: &Psbt,
+    backend: &dyn ChainBackend,
+    prefetched: Option<&PrevoutFetch>,
+) -> Result<(), SignResponse> {
+    let _ = backend; // retained for signature symmetry; the fallback no longer fetches.
+    match prefetched {
+        Some(Ok(prevouts)) => compare_prevouts_against_chain(psbt, prevouts),
+        Some(Err(refused)) => Err(refused.clone()),
+        None => {
+            // The handlers ALWAYS pre-fetch the prevout batch OUT of the sign lock
+            // (round-2 P0: never chain RPC under `sign_state`, or a hung bitcoind pins the
+            // lock Lockdown-at-T needs). Reaching here means a caller with a live backend
+            // forgot to pre-fetch. Rather than silently reinstate that under-lock fetch,
+            // fail CLOSED — so the invariant is enforced structurally, not by convention
+            // (Fable pass-4 P3). Loud in debug so a test catches the mis-wiring at once.
+            debug_assert!(
+                false,
+                "run_prevout_check reached its no-prefetch fallback with a live backend; the \
+                 handler must pre-fetch prevouts out of the lock (round-2 P0)"
+            );
+            Err(refusal(
+                RefusalCode::PsbtInconsistent,
+                "prevout_ground_truth",
+                "internal: prevout preflight was not pre-fetched out of the sign lock; refusing \
+                 rather than running chain I/O under the lock"
+                    .into(),
+            ))
+        }
+    }
+}
+
+/// Fetch the prevout ground truth for a `SpendRequest`'s spend + mandatory escape
+/// OUTSIDE the sign lock (round-2 review, deliverable 9y5.3-d). The batch `gettxout`
+/// RPC is the ONLY slow step of the preflight. The handler calls this only after
+/// coordinator signature/freshness, PIN evaluation, and the safety-intent hook, then
+/// with `sign_state` released. A slow or hung bitcoind therefore cannot delay either
+/// the intent or the deadline driver's unconditional Lockdown-at-T (which acquires
+/// that lock). The pure comparison runs after the lock is re-acquired.
+///
+/// Returns `(spend, escape)` fetch results, each `None` when there is no backend or
+/// that PSBT does not decode. A decode failure becomes HTTP 400 before validation;
+/// the `None` fallback is otherwise only for backend-less deterministic tests.
+fn prefetch_spend_escape_prevouts(
+    node: &Node,
+    request: &SignRequest,
+) -> (Option<PrevoutFetch>, Option<PrevoutFetch>) {
+    let Some(backend) = node.backend() else {
+        return (None, None);
+    };
+    let spend = decode_psbt(&request.psbt, "spend")
+        .ok()
+        .map(|psbt| fetch_prevouts(&psbt, backend.as_ref()));
+    let escape = decode_psbt(&request.escape_psbt, "escape")
+        .ok()
+        .map(|psbt| fetch_prevouts(&psbt, backend.as_ref()));
+    (spend, escape)
+}
+
+/// The refresh analogue of [`prefetch_spend_escape_prevouts`]: pre-fetch the single
+/// refresh PSBT's prevouts out of the sign lock. The caller has already consumed
+/// coordinator freshness before entering this helper.
+fn prefetch_refresh_prevouts(node: &Node, request: &RefreshRequest) -> Option<PrevoutFetch> {
+    let backend = node.backend()?;
+    decode_psbt(&request.refresh_psbt, "refresh")
+        .ok()
+        .map(|psbt| fetch_prevouts(&psbt, backend.as_ref()))
+}
+
+/// The V0-1 validation: verify the user's signatures, verify each input's prevout
+/// against the chain (V0-6), then run policy-core. Does NOT sign — signing is
+/// deferred (handler step 8) so a hot-class spend can be held first (ADR-0004).
+/// `Err` carries the wire refusal to return.
+fn verify_spend(
+    node: &Node,
+    psbt: &Psbt,
+    prefetched: Option<&PrevoutFetch>,
+) -> Result<(), SignResponse> {
     // The user's partial signature must cryptographically verify on every
     // input against the node's own recomputed sighash — presence of a
     // partial_sig is never enough (DESIGN.md, "Sighash enforcement"). This
@@ -4750,6 +5199,17 @@ fn verify_spend(node: &Node, psbt: &Psbt) -> Result<(), SignResponse> {
     // mutation after signing changes the sighash and invalidates the very
     // signature the node verifies.
     verify_user_signatures(node, psbt)?;
+    // V0-6 prevout ground truth, BEFORE policy-core — so the pure ownership/fee
+    // checks below never trust an attacker-supplied `witness_utxo` for a confirmed
+    // input. The batch RPC was hoisted out of the sign lock (`prefetched`); the pure
+    // comparison runs here. Guarded by `node.backend()`: a backend-less deterministic
+    // policy test skips it. Not recorded in the replay log: `PSBT_INCONSISTENT` is
+    // excluded by [`is_recordable_verdict`], so a coordinator that corrects the
+    // prevout on a resubmission is re-evaluated, not answered from a stale refusal
+    // keyed by the unchanged commitment.
+    if let Some(backend) = node.backend() {
+        run_prevout_check(psbt, backend.as_ref(), prefetched)?;
+    }
     // The policy-core checks: input ownership, destination allowlist +
     // verified change, and the fee cap — all descriptor-derived. `evaluate`
     // also keeps its own consistency precondition for direct policy-core
@@ -4788,7 +5248,11 @@ fn record_verdict(replay: &mut ReplayLog, key: &str, expiry: u64, verdict: &Sign
 /// package acceptance) are deliberately NOT here: ADR-0012 makes them fire-time
 /// checks on the sweep track, never gates at ingress, and the sweep itself is
 /// V0-4b.
-fn verify_escape(node: &Node, psbt: &Psbt) -> Result<(), SignResponse> {
+fn verify_escape(
+    node: &Node,
+    psbt: &Psbt,
+    prefetched: Option<&PrevoutFetch>,
+) -> Result<(), SignResponse> {
     let escape_refusal = |code, check: &str, detail| {
         // Name the escape explicitly: a refusal an operator cannot attribute to
         // one of the request's two transactions is a refusal they cannot act on.
@@ -4796,6 +5260,14 @@ fn verify_escape(node: &Node, psbt: &Psbt) -> Result<(), SignResponse> {
     };
     if let Err(SignResponse::Refusal(r)) = verify_user_signatures(node, psbt) {
         return Err(escape_refusal(r.code, &r.check, r.detail));
+    }
+    // V0-6 prevout ground truth for the escape's inputs too, before policy-core. The
+    // batch RPC was hoisted out of the sign lock; only the pure comparison runs here.
+    if let Some(backend) = node.backend() {
+        if let Err(SignResponse::Refusal(r)) = run_prevout_check(psbt, backend.as_ref(), prefetched)
+        {
+            return Err(escape_refusal(r.code, &r.check, r.detail));
+        }
     }
     if let Err(v) = policy_core::evaluate(psbt, &node.check_params) {
         return Err(escape_refusal(map_policy_code(v.code), v.check, v.detail));
@@ -5308,6 +5780,486 @@ mod watchtower_wiring {
     }
 }
 
+#[cfg(test)]
+mod prevout_preflight {
+    //! Deliverable 9y5.3-d: the `/sign`-path preflight that verifies each CONFIRMED
+    //! input's `witness_utxo` against the chain's ground truth (keeping policy-core
+    //! pure). It refuses a confirmed mismatch fail-closed, yet leaves the
+    //! unconfirmed-authorized-parent rule (null / unconfirmed prevout) untouched.
+
+    use std::collections::HashMap;
+    use std::str::FromStr;
+    use std::sync::{Arc, Barrier};
+
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
+    use bitcoin::transaction::Version;
+    use bitcoin::{
+        Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    };
+
+    use super::{
+        compare_prevouts_against_chain, fetch_prevouts, run_prevout_check,
+        verify_prevouts_against_chain,
+    };
+    use crate::chain::mock::MockBackend;
+    use crate::chain::Prevout;
+    use crate::test_support::{coord_sign, node_and_valid_request};
+    use vault_proto::{RefusalCode, SignResponse};
+
+    fn outpoint(byte: u8) -> OutPoint {
+        OutPoint::new(Txid::from_byte_array([byte; 32]), 0)
+    }
+
+    /// A one-input PSBT declaring `witness_utxo` for `op`.
+    fn psbt_spending(op: OutPoint, witness_utxo: TxOut) -> Psbt {
+        psbt_spending_many(vec![(op, witness_utxo)])
+    }
+
+    fn psbt_spending_many(inputs: Vec<(OutPoint, TxOut)>) -> Psbt {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|(op, _)| TxIn {
+                    previous_output: *op,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                value: Amount::from_sat(500),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("unsigned tx");
+        for (input, (_, witness_utxo)) in psbt.inputs.iter_mut().zip(inputs) {
+            input.witness_utxo = Some(witness_utxo);
+        }
+        psbt
+    }
+
+    fn backend_with(op: OutPoint, prevout: Prevout) -> MockBackend {
+        let mut prevouts = HashMap::new();
+        prevouts.insert(op, prevout);
+        MockBackend {
+            prevouts,
+            ..Default::default()
+        }
+    }
+
+    fn refusal_code(result: Result<(), SignResponse>) -> RefusalCode {
+        match result {
+            Err(SignResponse::Refusal(r)) => {
+                assert_eq!(r.check, "prevout_ground_truth", "unexpected check: {r:?}");
+                r.code
+            }
+            other => panic!("expected a fail-closed refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_confirmed_value_mismatch_is_refused_fail_closed() {
+        // The coordinator inflates the declared value — the fee-cap bypass policy-core
+        // would otherwise trust.
+        let op = outpoint(1);
+        let script = ScriptBuf::from_bytes(vec![0x51, 0x52]);
+        let real = TxOut {
+            script_pubkey: script.clone(),
+            value: Amount::from_sat(100_000),
+        };
+        let lied = TxOut {
+            script_pubkey: script,
+            value: Amount::from_sat(50_000_000),
+        };
+        let psbt = psbt_spending(op, lied);
+        let backend = backend_with(
+            op,
+            Prevout {
+                txout: real,
+                confirmed: true,
+            },
+        );
+        assert_eq!(
+            refusal_code(verify_prevouts_against_chain(&psbt, &backend)),
+            RefusalCode::PsbtInconsistent
+        );
+    }
+
+    #[test]
+    fn a_confirmed_script_mismatch_is_refused_fail_closed() {
+        // The coordinator forges the prevout scriptPubKey (a forged-ownership attempt).
+        let op = outpoint(2);
+        let real = TxOut {
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            value: Amount::from_sat(100_000),
+        };
+        let lied = TxOut {
+            script_pubkey: ScriptBuf::from_bytes(vec![0x99]),
+            value: Amount::from_sat(100_000),
+        };
+        let psbt = psbt_spending(op, lied);
+        let backend = backend_with(
+            op,
+            Prevout {
+                txout: real,
+                confirmed: true,
+            },
+        );
+        assert_eq!(
+            refusal_code(verify_prevouts_against_chain(&psbt, &backend)),
+            RefusalCode::PsbtInconsistent
+        );
+    }
+
+    #[test]
+    fn a_confirmed_truthful_prevout_passes() {
+        let op = outpoint(3);
+        let txout = TxOut {
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            value: Amount::from_sat(100_000),
+        };
+        let psbt = psbt_spending(op, txout.clone());
+        let backend = backend_with(
+            op,
+            Prevout {
+                txout,
+                confirmed: true,
+            },
+        );
+        verify_prevouts_against_chain(&psbt, &backend).expect("a truthful witness_utxo passes");
+    }
+
+    #[test]
+    fn an_unconfirmed_present_authorized_parent_with_matching_values_is_allowed() {
+        // `gettxout(include_mempool)` returns the output, UNCONFIRMED — the vault-
+        // authorized-but-unconfirmed parent, in this node's mempool. Its `witness_utxo`
+        // MATCHES the actual output, so it is the legitimate authorized-parent case and
+        // must pass.
+        let op = outpoint(4);
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let txout = TxOut {
+            script_pubkey: script,
+            value: Amount::from_sat(100_000),
+        };
+        let psbt = psbt_spending(op, txout.clone());
+        let backend = backend_with(
+            op,
+            Prevout {
+                txout,
+                confirmed: false,
+            },
+        );
+        verify_prevouts_against_chain(&psbt, &backend)
+            .expect("an unconfirmed authorized parent whose witness_utxo matches is allowed");
+    }
+
+    /// A txid commits to the whole tx, so the output at a fixed `(txid, vout)` is immutable
+    /// whether confirmed or in-mempool; an RBF replacement carries a DIFFERENT txid and
+    /// would make `gettxout` return null. So an unconfirmed prevout that `gettxout`
+    /// RETURNS is ground truth, and a `witness_utxo` disagreeing with it is a forgery a
+    /// coerced user would sign — refuse it, don't wave it through as "unconfirmed" (codex P2).
+    #[test]
+    fn an_unconfirmed_present_prevout_with_a_forged_witness_utxo_is_refused() {
+        let op = outpoint(4);
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let real = TxOut {
+            script_pubkey: script.clone(),
+            value: Amount::from_sat(100_000),
+        };
+        let declared = TxOut {
+            script_pubkey: script,
+            value: Amount::from_sat(90_000),
+        };
+        let psbt = psbt_spending(op, declared);
+        let backend = backend_with(
+            op,
+            Prevout {
+                txout: real,
+                confirmed: false,
+            },
+        );
+        assert_eq!(
+            refusal_code(verify_prevouts_against_chain(&psbt, &backend)),
+            RefusalCode::PsbtInconsistent,
+            "a forged witness_utxo on an unconfirmed-present prevout must be refused",
+        );
+    }
+
+    #[test]
+    fn a_null_prevout_is_allowed_the_authorized_parent_not_yet_in_mempool() {
+        // `gettxout` null: the authorized parent this node has not yet seen, or an
+        // unknown/spent output. Allowed as today — the fire-time package check is the
+        // double-spend backstop; refusing here would break spend-change chaining.
+        let op = outpoint(5);
+        let declared = TxOut {
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            value: Amount::from_sat(100_000),
+        };
+        let psbt = psbt_spending(op, declared);
+        let backend = MockBackend::default(); // no prevout for `op` ⇒ null
+        verify_prevouts_against_chain(&psbt, &backend).expect("a null prevout is allowed");
+    }
+
+    #[test]
+    fn a_backend_failure_refuses_and_aborts_after_the_first_lookup() {
+        let declared = TxOut {
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            value: Amount::from_sat(100_000),
+        };
+        let first = outpoint(6);
+        let second = outpoint(7);
+        let psbt = psbt_spending_many(vec![(first, declared.clone()), (second, declared)]);
+        let backend = MockBackend {
+            prevout_error: Some("backend unavailable".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            refusal_code(verify_prevouts_against_chain(&psbt, &backend)),
+            RefusalCode::PsbtInconsistent
+        );
+        assert_eq!(
+            *backend.prevout_lookups.lock().expect("prevout lookups"),
+            vec![first],
+            "the default backend batch aborts on its first error instead of multiplying timeouts"
+        );
+    }
+
+    #[test]
+    fn a_large_valid_consolidation_is_not_rejected_by_an_arbitrary_input_cap() {
+        let declared = TxOut {
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            value: Amount::from_sat(100_000),
+        };
+        let inputs = (0..=128)
+            .map(|index| {
+                (
+                    OutPoint::new(Txid::from_byte_array([index as u8; 32]), index as u32),
+                    declared.clone(),
+                )
+            })
+            .collect();
+        let psbt = psbt_spending_many(inputs);
+        let backend = MockBackend::default();
+
+        let fetched = fetch_prevouts(&psbt, &backend)
+            .expect("the request-body bound, not an arbitrary input cap, governs the batch");
+        compare_prevouts_against_chain(&psbt, &fetched)
+            .expect("null prevouts are allowed, so the large consolidation passes");
+        assert_eq!(
+            backend
+                .prevout_lookups
+                .lock()
+                .expect("prevout lookups")
+                .len(),
+            129,
+            "every input reaches the backend preflight"
+        );
+    }
+
+    #[test]
+    fn a_prefetched_backend_error_is_re_raised_by_the_comparison_path() {
+        // The batch RPC is hoisted out of the sign lock; if it failed (bitcoind down),
+        // the fail-closed refusal it produced must be re-raised verbatim when the
+        // under-lock check consumes the pre-fetched result — never quietly treated as
+        // "no prevouts to compare" (which would let policy-core trust witness_utxo).
+        let declared = TxOut {
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            value: Amount::from_sat(100_000),
+        };
+        let psbt = psbt_spending(outpoint(9), declared);
+        let backend = MockBackend {
+            prevout_error: Some("backend unavailable".into()),
+            ..Default::default()
+        };
+        let prefetched = fetch_prevouts(&psbt, &backend);
+        assert!(prefetched.is_err(), "the hoisted fetch must fail closed");
+        assert_eq!(
+            refusal_code(run_prevout_check(&psbt, &backend, Some(&prefetched))),
+            RefusalCode::PsbtInconsistent
+        );
+    }
+
+    #[test]
+    fn sign_handler_refuses_a_confirmed_mismatch_after_recording_duress_intent() {
+        let (mut node, mut request) = node_and_valid_request();
+        request.pin = "9999".into();
+        coord_sign(&mut request, &node.wallet_id, "handler-prevout-mismatch");
+        let psbt = Psbt::from_str(&request.psbt).expect("fixture spend");
+        let outpoint = psbt.unsigned_tx.input[0].previous_output;
+        let declared = psbt.inputs[0]
+            .witness_utxo
+            .clone()
+            .expect("fixture witness_utxo");
+        let mut mismatch = declared.clone();
+        mismatch.value = Amount::from_sat(declared.value.to_sat() - 1);
+        node.set_chain_backend(Arc::new(backend_with(
+            outpoint,
+            Prevout {
+                txout: mismatch,
+                confirmed: true,
+            },
+        )));
+        let now = request.expiry - 100;
+
+        let refused = super::handle_sign(&node, &request, now).expect("decodable request");
+        assert!(matches!(
+            refused,
+            SignResponse::Refusal(ref refusal)
+                if refusal.code == RefusalCode::PsbtInconsistent
+                    && refusal.check == "prevout_ground_truth"
+        ));
+        assert_eq!(
+            node.duress_arm_count(),
+            1,
+            "chain-dependent refusal must land after the chain-independent safety hook"
+        );
+        assert_eq!(
+            node.sign_state.lock().expect("sign state").replay.len(),
+            0,
+            "a corrected witness_utxo must be re-evaluated rather than replaying the mismatch"
+        );
+
+        node.set_chain_backend(Arc::new(backend_with(
+            outpoint,
+            Prevout {
+                txout: declared,
+                confirmed: true,
+            },
+        )));
+        coord_sign(&mut request, &node.wallet_id, "handler-prevout-corrected");
+        assert!(matches!(
+            super::handle_sign(&node, &request, now).expect("corrected request"),
+            SignResponse::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn duress_intent_precedes_blocked_chain_io_and_lockdown_lock_stays_free() {
+        let (mut node, mut request) = node_and_valid_request();
+        request.pin = "9999".into();
+        coord_sign(&mut request, &node.wallet_id, "blocked-prevout-preflight");
+        let psbt = Psbt::from_str(&request.psbt).expect("fixture spend");
+        let outpoint = psbt.unsigned_tx.input[0].previous_output;
+        let declared = psbt.inputs[0]
+            .witness_utxo
+            .clone()
+            .expect("fixture witness_utxo");
+        let entered = Arc::new(Barrier::new(2));
+        let proceed = Arc::new(Barrier::new(2));
+        node.set_chain_backend(Arc::new(MockBackend {
+            prevouts: [(
+                outpoint,
+                Prevout {
+                    txout: declared,
+                    confirmed: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            prevout_fetch_entered: Some(Arc::clone(&entered)),
+            prevout_fetch_continue: Some(Arc::clone(&proceed)),
+            ..Default::default()
+        }));
+        let now = request.expiry - 100;
+        let node = Arc::new(node);
+        let worker_node = Arc::clone(&node);
+        let worker = std::thread::spawn(move || super::handle_sign(&worker_node, &request, now));
+
+        entered.wait();
+        assert_eq!(
+            node.duress_arm_count(),
+            1,
+            "the safety hook must commit before the first backend lookup can block"
+        );
+        assert!(
+            node.sign_state.try_lock().is_ok(),
+            "the chain preflight must not hold the lock needed by Lockdown-at-T"
+        );
+        proceed.wait();
+        assert!(matches!(
+            worker.join().expect("sign worker").expect("valid request"),
+            SignResponse::Accepted(_)
+        ));
+    }
+
+    /// A coordinator reaches one honest node whose bitcoind is down: its prevout preflight
+    /// fails and the node refuses fail-closed (registers no candidate). Forwarding that
+    /// node-local refusal so peers still arm is deferred to f91 (it needs the accepted-replay
+    /// ordering to avoid overriding an accepted verdict on retry — codex pass-5 P1); the
+    /// hung-backend case is covered by the node-local CommitmentExpired forward. Here we
+    /// only pin the fail-closed refusal.
+    #[test]
+    fn a_prevout_fetch_failure_refuses_fail_closed() {
+        let (mut node, request) = node_and_valid_request();
+        node.set_chain_backend(Arc::new(MockBackend {
+            prevout_error: Some("backend unavailable".into()),
+            ..Default::default()
+        }));
+        let now = request.expiry - 100;
+        let response = super::handle_sign(&node, &request, now).expect("valid request");
+        assert!(
+            matches!(&response, SignResponse::Refusal(r) if r.code == RefusalCode::PsbtInconsistent),
+            "a node whose backend is down refuses fail-closed: {response:?}"
+        );
+    }
+
+    #[test]
+    fn captured_nonce_replay_is_rejected_before_any_additional_chain_rpc() {
+        let (mut node, request) = node_and_valid_request();
+        let psbt = Psbt::from_str(&request.psbt).expect("fixture spend");
+        let outpoint = psbt.unsigned_tx.input[0].previous_output;
+        let declared = psbt.inputs[0]
+            .witness_utxo
+            .clone()
+            .expect("fixture witness_utxo");
+        let backend = Arc::new(MockBackend {
+            prevouts: [(
+                outpoint,
+                Prevout {
+                    txout: declared,
+                    confirmed: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        node.set_chain_backend(backend.clone());
+        let now = request.expiry - 100;
+
+        assert!(matches!(
+            super::handle_sign(&node, &request, now).expect("first request"),
+            SignResponse::Accepted(_)
+        ));
+        let first_lookups = backend
+            .prevout_lookups
+            .lock()
+            .expect("prevout lookups")
+            .len();
+        assert_eq!(first_lookups, 2, "spend and escape each fetch once");
+
+        let replay = super::handle_sign(&node, &request, now).expect("replayed request");
+        assert!(matches!(
+            replay,
+            SignResponse::Refusal(ref refusal)
+                if refusal.code == RefusalCode::NonceReplayed
+        ));
+        assert_eq!(
+            backend
+                .prevout_lookups
+                .lock()
+                .expect("prevout lookups")
+                .len(),
+            first_lookups,
+            "freshness rejection must precede both prevout batches"
+        );
+    }
+}
+
 /// Shared test fixtures: a signable node and a valid `SignRequest`. Used by the
 /// `server` HTTP regression tests, which drive the real handler over a real
 /// socket (so the handler reads the system clock, unlike the direct-call unit
@@ -5709,6 +6661,29 @@ mod config_bounds_tests {
         let err = Node::from_toml_str(&config_with_bounds(0, 172_800, "combine_slack_secs = 0\n"))
             .err()
             .expect("zero combine slack must be rejected at load");
+        assert!(
+            err.to_string().contains("combine_slack_secs"),
+            "unexpected config error: {err}"
+        );
+    }
+
+    /// A combine window shorter than TWICE the vault cache refresh interval
+    /// (`SCAN_INTERVAL`) is a silent duress-to-recovery trap: a block near the fire event
+    /// leaves the cache stale for the whole window, so the escape coverage check fails
+    /// every tick and the armed escape is pruned before the next refresh. The floor is 2×
+    /// (not 1×) because the refresher ticks from pass completion, so the worst-case gap
+    /// exceeds one interval (v0-exit 9y5.3 review, codex/Fable pass 4). A value of exactly
+    /// one interval — accepted under the old 1× floor — must now be rejected.
+    #[test]
+    fn a_combine_slack_shorter_than_twice_the_cache_refresh_interval_is_a_fatal_config() {
+        let short = 2 * crate::watchtower::SCAN_INTERVAL.as_secs() - 1;
+        let err = Node::from_toml_str(&config_with_bounds(
+            0,
+            172_800,
+            &format!("combine_slack_secs = {short}\n"),
+        ))
+        .err()
+        .expect("a sub-refresh-interval combine window must be rejected at load");
         assert!(
             err.to_string().contains("combine_slack_secs"),
             "unexpected config error: {err}"

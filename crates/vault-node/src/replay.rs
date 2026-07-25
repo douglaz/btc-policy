@@ -28,11 +28,12 @@ struct Entry {
 /// pending log, bundled under ONE lock (`Mutex<SignState>` in [`crate::Node`]).
 ///
 /// The old sequential serve loop gave `handle_sign` end-to-end atomicity for
-/// free — its check-then-update sequences over these two logs could never
-/// interleave. Under axum requests are concurrent, so the two logs move under a
-/// single lock held across the whole `handle_sign` call. Two SEPARATE locks are
-/// forbidden: an interleaved check/update between two concurrent identical
-/// requests would corrupt replay semantics, so both logs must move together.
+/// free. Under axum requests are concurrent, so one lock protects two phases:
+/// coordinator freshness is consumed atomically before the out-of-lock chain
+/// preflight, then every replay/pending check-and-update runs under one continuous
+/// phase-2 guard. An exact replay cannot enter the gap because its nonce is already
+/// consumed. Two SEPARATE state locks remain forbidden: replay and pending updates
+/// must move together.
 #[derive(Default)]
 pub(crate) struct SignState {
     pub(crate) replay: ReplayLog,
@@ -118,8 +119,8 @@ impl PendingLog {
     /// A spend stops being pending once a node successfully submits the finalized
     /// transaction. Removing an unknown id is intentionally a no-op: escape and
     /// refresh candidates were never pending, but share the broadcast path.
-    pub(crate) fn remove(&mut self, commitment_id: &str) {
-        self.entries.remove(commitment_id);
+    pub(crate) fn remove(&mut self, commitment_id: &str) -> bool {
+        self.entries.remove(commitment_id).is_some()
     }
 
     /// Drop every entry strictly after its commitment's final authorized second.

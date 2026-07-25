@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bitcoin::{ScriptBuf, Txid, Witness};
+use bitcoin::{BlockHash, ScriptBuf, Txid, Witness};
 use serde::Serialize;
 
 use crate::chain::{ChainBackend, SpendSeen};
@@ -41,6 +41,11 @@ use crate::Error;
 
 /// Default bound on the in-memory alert queue.
 pub const DEFAULT_ALERT_CAP: usize = 1024;
+
+/// The `(height, hash)` blocks a scan pass traversed and proved active — ascending,
+/// contiguous, rooted on the cursor anchor. The watchtower binds its cursor anchors
+/// to exactly this chain (see [`ChainBackend::spends_of`] / [`scan_pass`]).
+type ScannedBlocks = Vec<(u32, BlockHash)>;
 
 /// The two watchtower events (DESIGN.md, "Watchtower"). Serialized
 /// SCREAMING_SNAKE for the pull wire, like the refusal codes.
@@ -170,8 +175,10 @@ fn is_recovery_branch(witness: &Witness) -> bool {
         .is_some_and(|selector| selector.is_empty())
 }
 
-/// One watchtower scan pass: ask `backend` for spends of the vault scripts at or
-/// after `from_height`, then classify them against the node's authorized set. The
+/// One callable watchtower scan: capture the current tip, then ask `backend` for
+/// spends of the vault scripts through that height and classify them against the
+/// node's authorized set. The daemon's cursor pass uses [`scan_through`] directly
+/// with its already-captured terminal height.
 /// two-branch `wsh(...)` shares one scriptPubKey across the normal and recovery
 /// branches (ADR-0013 §1), so `vault_scripts` alone covers a recovery spend too —
 /// the branch is read from each spend's witness ([`classify`] / [`is_recovery_branch`]).
@@ -181,8 +188,37 @@ pub fn scan(
     authorized_txids: &HashSet<Txid>,
     from_height: u32,
 ) -> Result<Vec<Alert>, Error> {
-    let spends = backend.spends_of(vault_scripts, from_height)?;
-    Ok(classify(&spends, authorized_txids))
+    let through_height = backend.tip_height()?;
+    // A one-shot scan carries no cursor, so it roots on nothing (`None`) and discards
+    // the traversed chain — only [`scan_pass`] retains anchors across passes.
+    let (alerts, _blocks) = scan_through(
+        backend,
+        vault_scripts,
+        authorized_txids,
+        from_height,
+        through_height,
+        None,
+    )?;
+    Ok(alerts)
+}
+
+/// Scan one fixed inclusive block range. Pinning the terminal height keeps the
+/// spend set on the same captured prefix whose hash [`scan_pass`] validates before
+/// publishing alerts or advancing its cursor.
+fn scan_through(
+    backend: &dyn ChainBackend,
+    vault_scripts: &[ScriptBuf],
+    authorized_txids: &HashSet<Txid>,
+    from_height: u32,
+    through_height: u32,
+    expected_parent: Option<BlockHash>,
+) -> Result<(Vec<Alert>, ScannedBlocks), Error> {
+    let traversal =
+        backend.spends_of(vault_scripts, from_height, through_height, expected_parent)?;
+    Ok((
+        classify(&traversal.spends, authorized_txids),
+        traversal.blocks,
+    ))
 }
 
 /// Interval between watchtower scan passes in the daemon driver. A `const`, not a
@@ -190,22 +226,217 @@ pub fn scan(
 /// v0 watchtower deliberately minimal).
 pub const SCAN_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Outcome of one [`scan_pass`]: how many new alerts it queued and the cursor to
-/// carry into the next pass.
+/// Outcome of one [`scan_pass`]: how many new alerts it queued. The next scan
+/// height now lives in the [`ScanCursor`] the caller carries, not here.
+#[derive(Debug)]
 pub(crate) struct ScanOutcome {
     pub(crate) new_alerts: usize,
-    pub(crate) next_from: u32,
 }
 
-/// One scan pass, shared by the daemon driver and the callable
-/// [`Node::watchtower_tick`](crate::Node::watchtower_tick) so tests and
-/// production run ONE code path: read the tip, snapshot the authorized set, run the
-/// [`scan`] classification over `vault_scripts` at or after `from_height`, and
-/// queue the new alerts. Returns the new-alert count and the next cursor —
-/// `tip + 1`, so the following pass skips the blocks this one covered (the height
-/// advance is the primary de-duplication; the queue guards the small overlap a
-/// racing block can leave). When the cursor is already caught up, the scan range
-/// is empty and the cursor remains caught up — never a re-scan from 0.
+/// Bound on how deep a reorg the watchtower cursor can rewind across (deliverable
+/// 9y5.3-a). Recovering a `D`-block reorg requires the `D` replaced blocks PLUS
+/// their still-active fork-point anchor, so the cursor retains at most
+/// `MAX_REORG_DEPTH + 1` hashes. A reorg no deeper than this rewinds to the fork
+/// point and re-scans, while a deeper reorg fails loud and resets to genesis
+/// (re-scanning the whole chain, alert-deduped) rather than silently advancing past
+/// blocks it never re-classified or wedging the cursor forever.
+///
+/// 100 blocks is far beyond any reorg a live network produces post-finality (a
+/// handful of blocks is already extraordinary), yet bounds the retained state to a
+/// few KiB and one `getblockhash` per new block. It is a `const`, not a config
+/// knob: it is a safety floor on how far back the watchtower can recover, not
+/// policy.
+pub const MAX_REORG_DEPTH: u32 = 100;
+
+/// The reorg-aware watchtower scan cursor (deliverable 9y5.3-a). It carries not
+/// just the next height to scan but a bounded trailing window of the block HASHES
+/// it last scanned, so each pass can confirm its scanned range still matches the
+/// chain before advancing. The bare monotonic height it replaces tracked no hash
+/// and never rewound, so a spend that a reorg moved to (or first surfaced at) a
+/// height at or below the cursor was silently missed.
+#[derive(Clone)]
+pub(crate) struct ScanCursor {
+    /// `(height, block_hash)` for a trailing window of already-scanned blocks,
+    /// oldest first, at most `MAX_REORG_DEPTH + 1` entries and CONTIGUOUS at the
+    /// top of the scanned range. `anchors.back()` is the newest block this cursor
+    /// has confirmed-scanned; `anchors.front()` is the deepest fork point it can
+    /// retain.
+    anchors: VecDeque<(u32, BlockHash)>,
+    /// The next height to scan from (one past the newest scanned block, or the
+    /// configured start floor before anything has been scanned).
+    next_from: u32,
+}
+
+impl ScanCursor {
+    /// A cursor that begins scanning at `from_height` with no recorded history.
+    /// The daemon driver starts at 0; [`Node::watchtower_tick`](crate::Node::watchtower_tick)
+    /// builds a throwaway one per call to keep its single-pass `from_height` API.
+    pub(crate) fn starting_at(from_height: u32) -> ScanCursor {
+        ScanCursor {
+            anchors: VecDeque::new(),
+            next_from: from_height,
+        }
+    }
+
+    /// A cursor that begins at genesis — the daemon driver's start state.
+    pub(crate) fn new() -> ScanCursor {
+        ScanCursor::starting_at(0)
+    }
+}
+
+/// Confirm the cursor's scanned range still matches the chain, rewinding to the
+/// fork point on a reorg, and return the height the pass should (re-)scan from.
+///
+/// Block headers chain — each commits to its parent — so if ANY block within the
+/// retained window was re-orged out, the NEWEST anchor's hash changes too. One
+/// `block_hash_at` at the newest anchor therefore detects any in-window reorg. On
+/// a mismatch it walks the window newest→oldest for the highest anchor whose hash
+/// still matches (the fork point / last common block), drops every anchor above
+/// it, and returns `fork + 1`. A reorg deeper than the whole retained window (no
+/// anchor matches) cannot locate its fork point, so — rather than WEDGE a sealed
+/// node's cursor forever — it resets to genesis and returns `0`, re-scanning the
+/// whole chain (the alert queue dedups already-surfaced spends, so the redundant
+/// re-scan is harmless and no re-orged spend is missed). This mirrors the driver's
+/// panic-recovery reset and still fails LOUD; it never silently advances, because a
+/// full re-scan re-classifies every block.
+fn reconcile_cursor(backend: &dyn ChainBackend, cursor: &mut ScanCursor) -> Result<u32, Error> {
+    let Some(&(anchor_height, anchor_hash)) = cursor.anchors.back() else {
+        // Nothing scanned yet — no reorg is possible; start at the configured floor.
+        return Ok(cursor.next_from);
+    };
+    if backend.block_hash_at(anchor_height)? == Some(anchor_hash) {
+        return Ok(cursor.next_from);
+    }
+    // Reorg detected at the newest anchor. Find the deepest still-matching anchor.
+    let mut fork = None;
+    for &(height, hash) in cursor.anchors.iter().rev() {
+        if backend.block_hash_at(height)? == Some(hash) {
+            fork = Some(height);
+            break;
+        }
+    }
+    match fork {
+        Some(fork_height) => {
+            while cursor.anchors.back().is_some_and(|&(h, _)| h > fork_height) {
+                cursor.anchors.pop_back();
+            }
+            cursor.next_from = fork_height + 1;
+            eprintln!(
+                "watchtower: reorg detected — rewinding scan cursor to fork point at height \
+                 {fork_height}; re-scanning from {} (spends re-classified, dedup guards \
+                 already-alerted ones)",
+                cursor.next_from
+            );
+            Ok(cursor.next_from)
+        }
+        None => {
+            // Reorg deeper than the retained window: the fork point is unknown, so
+            // advancing could silently skip re-orged blocks. Rather than WEDGE the
+            // cursor forever (a sealed node has no operator to repair it, and the
+            // reconcile would keep failing every pass), reset to genesis and re-scan
+            // the whole chain. The alert queue dedups already-surfaced spends, so the
+            // redundant re-scan is harmless and no re-orged spend is missed; this
+            // mirrors the driver's panic-recovery reset. Still LOUD.
+            let oldest = cursor
+                .anchors
+                .front()
+                .map(|&(h, _)| h)
+                .unwrap_or(anchor_height);
+            eprintln!(
+                "watchtower: reorg deeper than the {MAX_REORG_DEPTH}-block recovery bound \
+                 (no retained anchor from height {oldest} up to {anchor_height} still matches \
+                 the chain); resetting the scan cursor to genesis and re-scanning from 0 \
+                 (alert dedup guards already-surfaced spends) rather than wedging the cursor or \
+                 silently advancing past re-orged blocks"
+            );
+            cursor.anchors.clear();
+            cursor.next_from = 0;
+            Ok(0)
+        }
+    }
+}
+
+/// Record the block hashes of the heights this pass scanned into the cursor's
+/// trailing window, keeping it contiguous and bounded to `MAX_REORG_DEPTH + 1`.
+/// The extra anchor is the unchanged fork point needed to recover exactly
+/// `MAX_REORG_DEPTH` replaced blocks. Only the top window's worth of heights are
+/// retained (a deeper rewind is refused anyway).
+///
+/// The hashes come from `blocks` — the `(height, hash)` chain [`ChainBackend::spends_of`]
+/// PROVED active on this same pass (rooted on the cursor anchor, internally chained,
+/// ending on the still-active tip). Binding anchors to that traversal, rather than
+/// re-reading each height, closes the reorg that would otherwise race the second read
+/// and slip a mixed-fork anchor into the window (v0-exit 9y5.3 review, [P1] BOTH).
+fn extend_anchors(
+    cursor: &mut ScanCursor,
+    blocks: &[(u32, BlockHash)],
+    from: u32,
+    tip: u32,
+) -> Result<(), Error> {
+    if tip < from {
+        // The chain is shorter than the cursor (a reorg that also dropped height):
+        // reconcile already trimmed the window to the fork, and there are no new
+        // blocks to record.
+        return Ok(());
+    }
+    // Nothing below the deepest retained fork point is rewindable, so never retain it.
+    let lo = from.max(tip.saturating_sub(MAX_REORG_DEPTH));
+    // A jump of more than a window past the last anchor would leave a gap in the
+    // retained hashes; drop the now-unreachable older anchors so the window stays
+    // contiguous (a later deep reorg into the gap then fails loud, as it must).
+    if cursor.anchors.back().is_some_and(|&(h, _)| lo > h + 1) {
+        cursor.anchors.clear();
+    }
+    // Start strictly above the newest retained anchor, so this is idempotent: if a
+    // prior pass's `extend` half-completed and returned `Err` (a reorg raced the
+    // scan), re-running never re-pushes an already-retained height and so never
+    // duplicates an anchor.
+    let start = cursor.anchors.back().map_or(lo, |&(h, _)| (h + 1).max(lo));
+    for &(height, hash) in blocks.iter().filter(|&&(h, _)| h >= start) {
+        // Defence-in-depth: `blocks` is spends_of's contiguous [from, tip] chain and
+        // `start >= from`, so the retained suffix is contiguous with the window. Refuse
+        // rather than record a gapped cursor if that ever fails to hold.
+        if let Some(&(back, _)) = cursor.anchors.back() {
+            if height != back + 1 {
+                return Err(format!(
+                    "watchtower: validated block at height {height} is not contiguous with the \
+                     retained anchor at {back}; refusing to record a gapped cursor"
+                )
+                .into());
+            }
+        }
+        cursor.anchors.push_back((height, hash));
+    }
+    while cursor.anchors.len() > MAX_REORG_DEPTH as usize + 1 {
+        cursor.anchors.pop_front();
+    }
+    Ok(())
+}
+
+/// One watchtower scan pass, shared by the daemon driver and the callable
+/// [`Node::watchtower_tick`](crate::Node::watchtower_tick) so tests and production
+/// run ONE code path.
+///
+/// First [`reconcile_cursor`] confirms the cursor's scanned range still matches the
+/// chain (rewinding to the fork point on a reorg, or — for one deeper than the
+/// retained window — failing loud and resetting to genesis to re-scan). Then it
+/// captures the tip hash, snapshots the authorized
+/// set, and runs the [`scan`] classification over `vault_scripts` from the
+/// reconciled height, passing the newest anchor as the parent the range must chain
+/// onto. Before queuing alerts or advancing, it records the scan's OWN validated
+/// `(height, hash)` chain into a candidate cursor and re-checks the captured tip hash.
+/// A same-height reorg that raced the scan therefore discards the candidate cursor
+/// and retries from the old position; it can never bind old-fork scan results to
+/// new-fork anchors and silently skip the new fork. Only a stable pass queues the
+/// alerts and advances to `tip + 1`. The complementary half of that guarantee lives
+/// in [`ChainBackend::spends_of`]: the per-height reads are not an atomic snapshot,
+/// so the backend itself proves the blocks it traversed are ROOTED on the caller's
+/// anchor, chain together, AND end on the still-active block — closing both the
+/// A→B→A that returns to the captured tip hash and the taller fork that rebuilds in
+/// the reconcile→scan gap (v0-exit 9y5.3 [P1]). The anchors are that proven chain,
+/// so the pass never re-reads a hash a reorg could have swapped between the two reads.
+/// When the cursor is already caught up the scan range is empty and it stays caught
+/// up — never a re-scan from 0.
 ///
 /// The authorized set is snapshotted (and its lock released) before the
 /// possibly-slow backend fetch, so a concurrent `/sign` is never blocked on chain
@@ -216,11 +447,72 @@ pub(crate) fn scan_pass(
     vault_scripts: &[ScriptBuf],
     authorized: &Mutex<HashSet<Txid>>,
     alerts: &Mutex<AlertQueue>,
-    from_height: u32,
+    cursor: &mut ScanCursor,
 ) -> Result<ScanOutcome, Error> {
+    let from_height = reconcile_cursor(backend, cursor)?;
     let tip = backend.tip_height()?;
+    // A height-SHRINKING reorg can land between reconcile_cursor's anchor match and this
+    // tip read: reconcile matched the newest anchor (so it did NOT rewind), but the chain
+    // is now shorter than that anchor. Committing `next_from = tip + 1` below — while
+    // `extend_anchors` no-ops because `tip < from_height` — would drop `next_from` BELOW
+    // the retained anchor, breaking the cursor invariant `next_from == anchors.back() + 1`.
+    // The root-linkage check (check 0) would then refuse EVERY later pass forever once the
+    // taller fork reactivates: the scan would start below the newest anchor and its first
+    // block could never name that anchor as its parent (v0-exit 9y5.3 review, [P1] Fable).
+    // Do NOT advance — leave the cursor untouched so the NEXT pass's `reconcile_cursor`
+    // sees the now-shorter chain (its anchor read returns a mismatch or `None`) and rewinds
+    // to the real fork point. The caught-up case (`tip == anchor_height`) is unaffected.
+    if cursor
+        .anchors
+        .back()
+        .is_some_and(|&(anchor_height, _)| tip < anchor_height)
+    {
+        return Ok(ScanOutcome { new_alerts: 0 });
+    }
+    let tip_hash = backend.block_hash_at(tip)?.ok_or_else(|| {
+        format!(
+            "watchtower: active tip at height {tip} vanished before the scan; refusing to advance"
+        )
+    })?;
     let authorized = authorized.lock().expect("authorized lock poisoned").clone();
-    let new_alerts = scan(backend, vault_scripts, &authorized, from_height)?;
+    // The newest anchor (AFTER reconcile's rewind/reset) is the parent the scanned
+    // range must chain onto. Passing it makes the scan refuse a taller-fork reorg that
+    // lands between the pre-scan anchor check and this scan, whose new `from_height`
+    // block does not chain onto the anchor (v0-exit 9y5.3 [P1]). `None` on the first
+    // scan or a post-reset genesis re-scan, which have no anchor to root on.
+    let expected_parent = cursor.anchors.back().map(|&(_, hash)| hash);
+    let (new_alerts, scanned_blocks) = scan_through(
+        backend,
+        vault_scripts,
+        &authorized,
+        from_height,
+        tip,
+        expected_parent,
+    )?;
+    // Build the prospective anchors transactionally. If recording them fails, or
+    // the captured tip changed while the scan was in flight, the live cursor stays
+    // at its reconciled pre-scan position and the next pass re-scans the range. The
+    // anchors are the very `(height, hash)` chain `spends_of` just proved active — not
+    // a second, race-prone re-read.
+    let mut advanced = cursor.clone();
+    extend_anchors(&mut advanced, &scanned_blocks, from_height, tip)?;
+    if backend.block_hash_at(tip)? != Some(tip_hash) {
+        return Err(format!(
+            "watchtower: active block hash at captured tip height {tip} changed while scanning; \
+             refusing to bind scan results to a different fork or advance the cursor"
+        )
+        .into());
+    }
+    advanced.next_from = tip.saturating_add(1);
+    debug_assert_eq!(
+        advanced.next_from,
+        advanced
+            .anchors
+            .back()
+            .map_or(advanced.next_from, |&(h, _)| h + 1),
+        "cursor invariant: next_from must be exactly one past the newest anchor"
+    );
+
     let mut queue = alerts.lock().expect("alerts lock poisoned");
     let mut queued = 0;
     for alert in new_alerts {
@@ -228,18 +520,18 @@ pub(crate) fn scan_pass(
             queued += 1;
         }
     }
-    Ok(ScanOutcome {
-        new_alerts: queued,
-        next_from: tip + 1,
-    })
+    drop(queue);
+    *cursor = advanced;
+    Ok(ScanOutcome { new_alerts: queued })
 }
 
 /// Spawn the daemon watchtower driver (ADR-0001, V0-6b): ONE background tokio
-/// task that runs a [`scan_pass`] every [`SCAN_INTERVAL`], carrying a height
-/// cursor between passes so it advances instead of re-scanning from 0.
-/// `authorized` and `alerts` are the node's shared watchtower state — the same
-/// handles the `/sign` server writes/reads, so a spend the node ACCEPTS is
-/// recognized and alerts surface through `GET /events`.
+/// task that runs a [`scan_pass`] every [`SCAN_INTERVAL`], carrying a reorg-aware
+/// [`ScanCursor`] between passes so it advances instead of re-scanning from 0 —
+/// yet rewinds and re-classifies across a reorg instead of silently missing a
+/// re-orged spend. `authorized` and `alerts` are the node's shared watchtower
+/// state — the same handles the `/sign` server writes/reads, so a spend the node
+/// ACCEPTS is recognized and alerts surface through `GET /events`.
 ///
 /// Each pass's [`scan_pass`] calls blocking bitcoind JSON-RPC (`chain.rs`), so
 /// it runs on `spawn_blocking`: a slow RPC never stalls the async runtime and so
@@ -255,7 +547,7 @@ pub fn spawn_driver(
 ) {
     let vault_scripts = Arc::new(vault_scripts);
     tokio::spawn(async move {
-        let mut from_height = 0u32;
+        let mut cursor = ScanCursor::new();
         let mut ticker = tokio::time::interval(SCAN_INTERVAL);
         loop {
             ticker.tick().await; // the first tick completes immediately
@@ -263,21 +555,38 @@ pub fn spawn_driver(
             let vault_scripts = Arc::clone(&vault_scripts);
             let authorized = Arc::clone(&authorized);
             let alerts = Arc::clone(&alerts);
+            // The cursor is owned by the blocking pass and handed back, so its reorg
+            // history survives across passes exactly as the old bare height did.
             let pass = tokio::task::spawn_blocking(move || {
-                scan_pass(
+                let outcome = scan_pass(
                     backend.as_ref(),
                     &vault_scripts,
                     &authorized,
                     &alerts,
-                    from_height,
-                )
+                    &mut cursor,
+                );
+                (cursor, outcome)
             })
             .await;
             match pass {
-                Ok(Ok(outcome)) => from_height = outcome.next_from,
-                Ok(Err(e)) => eprintln!("watchtower scan pass failed (cursor {from_height}): {e}"),
+                Ok((returned, Ok(_outcome))) => cursor = returned,
+                Ok((returned, Err(e))) => {
+                    // Cursor left unadvanced (a transient backend error) so the next
+                    // pass retries the same range and skips nothing. A too-deep reorg
+                    // is NOT an error here — `reconcile_cursor` resets that cursor to
+                    // genesis and returns Ok, so the pass re-scans rather than sticking.
+                    cursor = returned;
+                    eprintln!(
+                        "watchtower scan pass failed (next from {}): {e}",
+                        cursor.next_from
+                    );
+                }
                 Err(join_error) => {
-                    eprintln!("watchtower scan task panicked (cursor {from_height}): {join_error}")
+                    // The panic consumed the cursor with the task. Reset to genesis:
+                    // the alert queue dedups, so the redundant re-scan is harmless and
+                    // no spend is missed. (A panic in the scan pass is not expected.)
+                    cursor = ScanCursor::new();
+                    eprintln!("watchtower scan task panicked (cursor reset to 0): {join_error}");
                 }
             }
             // Schedule from pass completion, preserving the old
@@ -509,6 +818,24 @@ mod tests {
         assert_eq!(alerts[0].kind, AlertKind::RecoveryPathSpend);
     }
 
+    #[test]
+    fn a_block_above_the_captured_terminal_height_is_not_published_early() {
+        let vault = script(0x01);
+        let backend = MockBackend {
+            tip: 2,
+            spend_block: 2,
+            spends: vec![spend(0xAA, 0x01)],
+            ..Default::default()
+        };
+
+        let (alerts, _blocks) = scan_through(&backend, &[vault], &HashSet::new(), 0, 1, None)
+            .expect("fixed-prefix scan");
+        assert!(
+            alerts.is_empty(),
+            "a spend above the captured tip belongs to the next pass, not this cursor advance"
+        );
+    }
+
     // -- cursor semantics (task test 2) -------------------------------------
 
     fn alert(n: u8) -> Alert {
@@ -713,18 +1040,22 @@ mod tests {
         let authorized = Mutex::new(HashSet::new());
         let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
         let scripts = std::slice::from_ref(&vault);
+        // One persistent cursor across both passes, exactly as the daemon driver
+        // carries it.
+        let mut cursor = ScanCursor::new();
 
         // First pass scans 0..=5, alerts the spend, advances the cursor to 6.
-        let outcome = scan_pass(&backend, scripts, &authorized, &alerts, 0).expect("first pass");
-        assert_eq!(outcome.next_from, 6);
+        let outcome =
+            scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("first pass");
+        assert_eq!(cursor.next_from, 6);
         assert_eq!(outcome.new_alerts, 1);
         assert_eq!(alerts.lock().expect("alerts lock").since(0).0.len(), 1);
 
         // A new empty block arrives; the second pass scans only the new range.
         backend.tip = 6;
-        let outcome = scan_pass(&backend, scripts, &authorized, &alerts, outcome.next_from)
-            .expect("second pass");
-        assert_eq!(outcome.next_from, 7);
+        let outcome =
+            scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("second pass");
+        assert_eq!(cursor.next_from, 7);
         assert_eq!(outcome.new_alerts, 0);
 
         // The cursor advanced (0 then 6, never a re-scan from 0), and the spend
@@ -735,6 +1066,310 @@ mod tests {
             vec![0, 6]
         );
         assert_eq!(alerts.lock().expect("alerts lock").since(0).0.len(), 1);
+    }
+
+    // -- reorg-aware cursor (deliverable 9y5.3-a) ---------------------------
+
+    #[test]
+    fn a_reorg_rewinds_the_cursor_and_reclassifies_a_spend_the_reorg_surfaced() {
+        let vault = script(0x01);
+        // Pass 1: a quiet chain to height 10. The cursor records the block hashes of
+        // 0..=10 and advances to 11.
+        let mut backend = MockBackend {
+            tip: 10,
+            ..Default::default()
+        };
+        let authorized = Mutex::new(HashSet::new());
+        let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
+        let scripts = std::slice::from_ref(&vault);
+        let mut cursor = ScanCursor::new();
+
+        let outcome =
+            scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("pass 1");
+        assert_eq!(cursor.next_from, 11);
+        assert_eq!(outcome.new_alerts, 0);
+
+        // A reorg replaces blocks 8..=10, and an unrecognized vault spend now sits at
+        // height 8 — at/below the old cursor. A bare monotonic height (11) would scan
+        // 11.. and MISS it; the reorg-aware cursor must rewind to the fork and catch it.
+        backend.reorg_at(8);
+        backend.spends = vec![spend(0xAA, 0x01)];
+        backend.spend_block = 8;
+
+        let outcome =
+            scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("pass 2");
+        assert_eq!(
+            outcome.new_alerts, 1,
+            "the reorg's spend must be classified once the cursor rewinds to the fork"
+        );
+        // Pass 2 re-scanned from the fork point (8), not the stale 11 — the rewind.
+        assert_eq!(
+            *backend.scanned_from.lock().expect("scanned_from lock"),
+            vec![0, 8],
+            "the second pass must re-scan from the fork point, proving the rewind"
+        );
+        let (queued, _) = alerts.lock().expect("alerts lock").since(0);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].watchtower().kind, AlertKind::UnrecognizedSpend);
+        assert_eq!(queued[0].watchtower().spend_txid, txid(0xAA).to_string());
+        // The cursor caught back up past the (unchanged-height) tip.
+        assert_eq!(cursor.next_from, 11);
+    }
+
+    #[test]
+    fn a_matching_anchor_never_triggers_a_spurious_rewind() {
+        // A steady chain that only grows: the newest anchor keeps matching, so no
+        // pass ever rewinds — the cursor advances monotonically and re-scans nothing.
+        let vault = script(0x01);
+        let mut backend = MockBackend {
+            tip: 3,
+            ..Default::default()
+        };
+        let authorized = Mutex::new(HashSet::new());
+        let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
+        let scripts = std::slice::from_ref(&vault);
+        let mut cursor = ScanCursor::new();
+
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("pass 1");
+        backend.tip = 4;
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("pass 2");
+        backend.tip = 5;
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("pass 3");
+
+        assert_eq!(
+            *backend.scanned_from.lock().expect("scanned_from lock"),
+            vec![0, 4, 5],
+            "each pass scans only the new range; a matching anchor never rewinds"
+        );
+    }
+
+    #[test]
+    fn a_reorg_racing_scan_and_anchor_collection_never_advances_the_cursor() {
+        let vault = script(0x01);
+        let backend = MockBackend {
+            tip: 10,
+            // `spends_of` completes against epoch 0, then this mock changes the
+            // active hashes from height 8 onward before anchor collection.
+            scan_reorg_from: Some(8),
+            ..Default::default()
+        };
+        let authorized = Mutex::new(HashSet::new());
+        let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
+        let scripts = std::slice::from_ref(&vault);
+        let mut cursor = ScanCursor::new();
+
+        let err = scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor)
+            .expect_err("a fork change during the scan must invalidate the pass");
+        assert!(
+            err.to_string().contains("changed while scanning"),
+            "the race must fail loud with its cause: {err}"
+        );
+        assert_eq!(
+            cursor.next_from, 0,
+            "old-fork scan results must never advance past new-fork blocks"
+        );
+        assert!(
+            cursor.anchors.is_empty(),
+            "new-fork hashes must not be committed for an old-fork scan"
+        );
+        assert!(
+            alerts.lock().expect("alerts lock").since(0).0.is_empty(),
+            "alerts from a scan whose fork changed are not published"
+        );
+
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor)
+            .expect("the next pass re-scans the now-stable fork");
+        assert_eq!(cursor.next_from, 11);
+        assert_eq!(
+            *backend.scanned_from.lock().expect("scanned_from lock"),
+            vec![0, 0],
+            "the failed pass retries from the old cursor rather than skipping the new fork"
+        );
+    }
+
+    /// The taller-fork variant of the race (v0-exit 9y5.3 [P1], BOTH reviewers): a reorg
+    /// forks BELOW the cursor and rebuilds TALLER, committing in the reconcile→scan gap —
+    /// after reconcile matched the old anchor but before the scan reads the new blocks.
+    /// The scan's own mid-scan guards (chain-together, terminal-active) both pass on the
+    /// new fork alone, and `scan_pass`'s post-scan tip re-check compares the new-fork hash
+    /// to itself and passes; pre-fix the pass bound the mixed window and advanced past the
+    /// reorged range, missing its spends forever. The root/boundary check now refuses it.
+    #[test]
+    fn a_taller_fork_reorg_in_the_reconcile_scan_gap_is_refused_not_silently_skipped() {
+        let vault = script(0x01);
+        // Pass 1: a quiet chain to height 10; the cursor records 0..=10 and advances to 11.
+        let mut backend = MockBackend {
+            tip: 10,
+            ..Default::default()
+        };
+        let authorized = Mutex::new(HashSet::new());
+        let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
+        let scripts = std::slice::from_ref(&vault);
+        let mut cursor = ScanCursor::new();
+
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("pass 1");
+        assert_eq!(cursor.next_from, 11);
+
+        // Arm a taller-fork reorg that commits the instant this pass reads the tip: it
+        // forks at 5 (blocks 6.. differ) and rebuilds to 11, with a vault spend now at
+        // height 7 on the new fork. Reconcile still matched the old anchor at 10 first.
+        backend.reorg_from_on_tip_read = Some(6);
+        backend.reorg_new_tip = Some(11);
+        backend.spends = vec![spend(0xAA, 0x01)];
+        backend.spend_block = 7;
+
+        // Pass 2 must REFUSE: the new-fork block at `from_height` (11) does not chain onto
+        // the old anchor at 10. Pre-fix this pass advanced to 12, skipping 6..=11 forever.
+        let err = scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor)
+            .expect_err("a taller-fork reorg in the reconcile->scan gap must be refused");
+        assert!(
+            err.to_string().contains("does not chain onto"),
+            "the refusal must name the broken root linkage: {err}"
+        );
+        assert_eq!(
+            cursor.next_from, 11,
+            "the cursor must NOT advance past the reorged range on a refused pass"
+        );
+
+        // The next pass reconciles: block 10 now reads the new fork, so it rewinds to the
+        // fork point (5), re-scans 6..=11, and classifies the spend the reorg surfaced.
+        let outcome =
+            scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("recovery pass");
+        assert_eq!(
+            outcome.new_alerts, 1,
+            "the new fork's spend must be classified once the cursor rewinds to the fork"
+        );
+        assert_eq!(
+            cursor.next_from, 12,
+            "the cursor caught up to the taller tip + 1"
+        );
+        let (queued, _) = alerts.lock().expect("alerts lock").since(0);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].watchtower().kind,
+            AlertKind::UnrecognizedSpend,
+            "the surfaced spend is an unrecognized-spend alert"
+        );
+    }
+
+    /// A height-SHRINKING reorg racing the reconcile→tip gap must NOT wedge the cursor
+    /// (v0-exit 9y5.3 review, [P1] Fable). Reconcile matches the newest anchor (chain
+    /// still tall), then the chain shrinks below it before the tip read. Committing
+    /// `next_from = tip + 1` there would drop `next_from` below the retained anchor and
+    /// the root-linkage check would then refuse every later pass forever. The pass must
+    /// instead leave the cursor untouched so the next reconcile rewinds.
+    #[test]
+    fn a_shrinking_reorg_in_the_reconcile_scan_gap_does_not_wedge_the_cursor() {
+        let vault = script(0x01);
+        let mut backend = MockBackend {
+            tip: 10,
+            ..Default::default()
+        };
+        let authorized = Mutex::new(HashSet::new());
+        let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
+        let scripts = std::slice::from_ref(&vault);
+        let mut cursor = ScanCursor::new();
+
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("pass 1");
+        assert_eq!(cursor.next_from, 11);
+
+        // A shorter fork (forks at 5, rebuilds only to height 8) commits the instant the
+        // pass reads the tip — after reconcile matched the old anchor at 10.
+        backend.reorg_from_on_tip_read = Some(6);
+        backend.reorg_new_tip = Some(8);
+
+        // Pass 2: the chain is now shorter than the newest anchor (8 < 10), so the pass
+        // does NOT advance. The cursor invariant `next_from == anchors.back() + 1` holds.
+        let outcome = scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor)
+            .expect("the shrinking-gap pass returns without advancing, never an error");
+        assert_eq!(outcome.new_alerts, 0);
+        assert_eq!(
+            cursor.next_from, 11,
+            "a shrink race must not drop next_from below the retained anchor"
+        );
+        assert_eq!(
+            cursor.next_from,
+            cursor.anchors.back().expect("anchors").0 + 1,
+            "the cursor invariant is preserved: next_from is one past the newest anchor"
+        );
+
+        // Pass 3: the shorter chain is stable, so reconcile now detects the reorg (block 10
+        // is gone), rewinds to the fork, and re-scans — the cursor recovers, never wedges.
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor)
+            .expect("the next pass reconciles the shorter chain rather than wedging");
+        assert_eq!(
+            cursor.next_from, 9,
+            "reconcile rewound to the fork and re-scanned up to the new (shorter) tip"
+        );
+    }
+
+    #[test]
+    fn exactly_max_reorg_depth_retains_the_fork_anchor_and_rewinds() {
+        let vault = script(0x01);
+        let mut backend = MockBackend {
+            tip: MAX_REORG_DEPTH,
+            ..Default::default()
+        };
+        let authorized = Mutex::new(HashSet::new());
+        let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
+        let scripts = std::slice::from_ref(&vault);
+        let mut cursor = ScanCursor::new();
+
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("initial pass");
+        assert_eq!(
+            cursor.anchors.len(),
+            MAX_REORG_DEPTH as usize + 1,
+            "the replaced blocks plus their fork point must all be retained"
+        );
+
+        // Replace heights 1..=MAX_REORG_DEPTH: exactly MAX_REORG_DEPTH blocks,
+        // with genesis (height 0) as the still-matching fork point.
+        backend.reorg_at(1);
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor)
+            .expect("the documented maximum-depth reorg must be recoverable");
+        assert_eq!(
+            *backend.scanned_from.lock().expect("scanned_from lock"),
+            vec![0, 1],
+            "the cursor rewinds to one past the retained fork point"
+        );
+    }
+
+    #[test]
+    fn a_reorg_deeper_than_the_retained_window_resets_to_genesis_and_rescans() {
+        let vault = script(0x01);
+        let mut backend = MockBackend {
+            tip: 5,
+            ..Default::default()
+        };
+        let authorized = Mutex::new(HashSet::new());
+        let alerts = Mutex::new(AlertQueue::new(DEFAULT_ALERT_CAP));
+        let scripts = std::slice::from_ref(&vault);
+        let mut cursor = ScanCursor::new();
+
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor).expect("pass 1");
+
+        // Every retained anchor is re-orged out — a reorg deeper than the whole
+        // trailing window, so no fork point is recoverable.
+        backend.reorg_at(0);
+
+        scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor)
+            .expect("a too-deep reorg resets to genesis and re-scans, never wedges or errors");
+        // The cursor reset to genesis and re-scanned the whole chain from 0 rather
+        // than wedging (which would permanently stall a sealed node) or silently
+        // advancing past the re-orged blocks: the second recorded scan starts at 0.
+        assert_eq!(
+            *backend.scanned_from.lock().expect("scanned_from lock"),
+            vec![0, 0],
+            "the too-deep reorg must re-scan the whole chain from genesis"
+        );
+        // Having re-scanned, it re-anchored on the NEW chain and advanced past the
+        // tip, so it self-heals in one pass instead of re-scanning from 0 forever.
+        assert_eq!(cursor.next_from, backend.tip + 1);
+        assert_eq!(
+            cursor.anchors.back().map(|&(h, _)| h),
+            Some(backend.tip),
+            "the newest anchor is the re-scanned tip on the recovered chain"
+        );
     }
 
     #[test]
@@ -766,7 +1401,11 @@ mod tests {
                 };
                 let scripts = std::slice::from_ref(&vault);
                 for _ in 0..8 {
-                    scan_pass(&backend, scripts, &authorized, &alerts, 0).expect("scan pass");
+                    // A fresh cursor each pass deliberately re-scans from 0, so the
+                    // queue's dedup — not the height advance — is what is under test.
+                    let mut cursor = ScanCursor::new();
+                    scan_pass(&backend, scripts, &authorized, &alerts, &mut cursor)
+                        .expect("scan pass");
                 }
             })
         };

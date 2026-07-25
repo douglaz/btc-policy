@@ -3934,10 +3934,17 @@ impl ChannelState {
             .map(|candidate| candidate.unsigned_txid)
     }
 
-    /// Mark `commitment_id` broadcast so later ticks skip it. A completed armed
-    /// escape has no future work: remove it and its paired context immediately so
-    /// the expiry exemption releases candidate-count and byte capacity at
-    /// fire-complete, not only at the original commitment expiry.
+    /// Mark `commitment_id` broadcast so later ticks skip it (the `else` branch —
+    /// the only path production reaches).
+    ///
+    /// The `armed_escape` branch below — removing the escape and its paired context
+    /// immediately to release candidate-count and byte capacity — is NOT reached in
+    /// production: since 9y5.3 the fire path keeps a completed armed escape RESIDENT so
+    /// an in-window reorg can re-broadcast it, and the two production `settle_candidate`
+    /// callers are `!armed_escape`-guarded. The armed escape's capacity is instead
+    /// released at fire-complete by [`Self::prune`], not here. The branch is retained
+    /// (and exercised by its direct test callers) as the defensive semantics for any
+    /// path that DOES settle an armed escape immediately.
     pub(crate) fn mark_broadcast(&self, commitment_id: &str) {
         let mut store = self.store.lock().expect("store lock poisoned");
         let armed_escape = store.armed.active

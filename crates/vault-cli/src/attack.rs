@@ -46,7 +46,7 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::panic::{catch_unwind, UnwindSafe};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -157,6 +157,9 @@ pub(crate) const SCENARIO_NAMES: &[&str] = &[
     "duress-resubmission",
     "reboot-death",
     "fire-time-failure",
+    "reorg-watchtower-cursor",
+    "reorg-duress-lockdown",
+    "reorg-escape-resettles",
     "recovery",
 ];
 
@@ -314,6 +317,15 @@ pub fn run(only: Option<&str>) -> ExitCode {
     if selected("fire-time-failure") {
         card.run("fire-time-failure", fire_time_failure);
     }
+    if selected("reorg-watchtower-cursor") {
+        card.run("reorg-watchtower-cursor", reorg_watchtower_cursor);
+    }
+    if selected("reorg-duress-lockdown") {
+        card.run("reorg-duress-lockdown", reorg_duress_lockdown);
+    }
+    if selected("reorg-escape-resettles") {
+        card.run("reorg-escape-resettles", reorg_escape_resettles);
+    }
     if selected("recovery") {
         card.run("recovery", recovery_exit);
     }
@@ -333,6 +345,8 @@ struct Setup {
     /// fire − ε).max(now)`.
     duress_delay_secs: u64,
     epsilon_secs: u64,
+    /// Inclusive combine/re-broadcast window after a candidate's fire time.
+    combine_slack_secs: u64,
     hot_max_per_tx: Amount,
     hot_max_per_window: Amount,
     /// Minimum authenticated lifetime a carrier must retain for peer fan-out.
@@ -368,6 +382,10 @@ impl Default for Setup {
             hold_secs: 0,
             duress_delay_secs: 0,
             epsilon_secs: 1,
+            // At least 2x the vault-cache refresh interval (SCAN_INTERVAL = 10s), the
+            // config floor: a shorter combine window can go cache-stale for its whole
+            // duration and silently reduce duress to recovery (9y5.3 review).
+            combine_slack_secs: 20,
             hot_max_per_tx: Amount::from_sat(600_000_000),
             hot_max_per_window: Amount::from_sat(900_000_000),
             delivery_horizon_secs: 30,
@@ -486,7 +504,7 @@ impl Vault {
             hold_secs: setup.hold_secs,
             duress_delay_secs: setup.duress_delay_secs,
             epsilon_secs: setup.epsilon_secs,
-            combine_slack_secs: 10,
+            combine_slack_secs: setup.combine_slack_secs,
             max_commitment_age_secs: MAX_COMMITMENT_AGE_SECS,
             delivery_horizon_secs: setup.delivery_horizon_secs,
             max_derivation_index: MAX_DERIVATION_INDEX,
@@ -1808,8 +1826,15 @@ impl Vault {
                 return Ok(signers);
             }
             if Instant::now() >= deadline {
+                let node_logs = self
+                    .honest
+                    .iter()
+                    .map(|node| format!("node_id {}: {}", node.node_id, node.log_tail()))
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 return Err(format!(
-                    "only {}/{} honest partials became observable for commitment {commitment_id}",
+                    "only {}/{} honest partials became observable for commitment {commitment_id}; \
+                     honest node logs: {node_logs}",
                     signers.len(),
                     expected
                 )
@@ -3799,6 +3824,27 @@ fn events_alert_count(projection: &Value) -> Result<usize, Error> {
         return Err(format!("/events answered without a cursor: {projection}").into());
     }
     Ok(alerts.len())
+}
+
+/// The `spend_txid` of every alert in an `/events` projection — used by the reorg
+/// watchtower scenario to prove the specific re-orged spend was re-classified, not
+/// merely that some alert count moved.
+fn alert_spend_txids(projection: &Value) -> Vec<String> {
+    projection
+        .get("alerts")
+        .and_then(Value::as_array)
+        .map(|alerts| {
+            alerts
+                .iter()
+                .filter_map(|alert| {
+                    alert
+                        .get("spend_txid")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Blank exactly [`REQUEST_DEPENDENT_PATHS`], and only where the value above
@@ -6548,6 +6594,578 @@ fn fire_time_gate_refuses(gate: FireTimeGate) -> Result<String, Error> {
         gate.label(),
         vault.honest.len()
     ))
+}
+
+// ---------------------------------------------------------------------------
+// 9b. reorg handling (bead btc-policy-9y5.3)
+
+/// Force a live reorg: invalidate the top `depth` blocks of the active chain and
+/// mine `depth + 1` fresh ones, so every block from the fork point up carries a NEW
+/// hash and the rebuilt chain strictly outweighs the old one. bitcoind's
+/// `invalidateblock` marks the named block and all its descendants invalid; the
+/// honest daemons' reorg-aware watchtower cursors (9y5.3-a) must rewind across it
+/// rather than silently advance past re-orged blocks.
+/// Mine `blocks` blocks one at a time, retrying a single block on bitcoind's
+/// transient post-reorg `ProcessNewBlock, block not accepted`. Immediately after
+/// `invalidateblock`, `generatetoaddress` can race the median-time-past rule when the
+/// just-invalidated blocks left the last-11 timestamps clustered at ~now: the fresh
+/// block's time is not yet strictly greater than MTP and Core rejects it. The rejected
+/// block was NOT added, so retrying after a short pause — long enough for the wall
+/// clock (and thus the block timestamp) to advance past MTP — mines an acceptable
+/// block. Mining ONE at a time keeps the count exact under retry (no over-mining), and
+/// the bound still surfaces a genuine, non-transient failure.
+fn mine_resilient(vault: &Vault, blocks: u32) -> Result<(), Error> {
+    for _ in 0..blocks {
+        let mut attempt = 0u32;
+        loop {
+            match vault.mine(1) {
+                Ok(()) => break,
+                Err(e) if attempt < 15 && e.to_string().contains("block not accepted") => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reorg_tip(vault: &Vault, depth: u64) -> Result<(), Error> {
+    let tip = vault
+        .bitcoind
+        .call("getblockcount", json!([]))?
+        .as_u64()
+        .ok_or("getblockcount is not a number")?;
+    if tip <= depth {
+        return Err(format!("chain height {tip} is too short to reorg {depth} block(s)").into());
+    }
+    // Invalidating the fork's child drops it and every descendant — `depth` blocks.
+    let fork_child = vault
+        .bitcoind
+        .call_str("getblockhash", json!([tip - depth + 1]))?;
+    vault
+        .bitcoind
+        .call("invalidateblock", json!([fork_child]))?;
+    // Rebuild one block longer than what was dropped, so the new chain wins outright.
+    // Resilient mine: `generatetoaddress` can transiently fail the MTP rule right after
+    // `invalidateblock` (see [`mine_resilient`]).
+    mine_resilient(
+        vault,
+        u32::try_from(depth + 1).map_err(|_| "reorg depth overflow")?,
+    )?;
+    Ok(())
+}
+
+/// Restart the scenario's Core against the SAME datadir and RPC credentials while
+/// deliberately not loading `mempool.dat`, run `action`, then stop the replacement
+/// cleanly. `invalidateblock` ordinarily re-admits disconnected transactions to the
+/// mempool; clearing that automatic copy is what lets the escape-reorg scenario
+/// prove the NODE re-broadcasts its retained candidate, rather than merely watching
+/// Core mine a transaction Core itself restored.
+fn with_restarted_bitcoind_without_mempool<T>(
+    vault: &Vault,
+    action: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let datadir = vault.temp.path.join("bitcoind");
+    let cookie = std::fs::read_to_string(datadir.join("regtest").join(".cookie"))?;
+    let (rpc_user, rpc_password) = cookie
+        .trim()
+        .split_once(':')
+        .ok_or("bitcoind cookie is not user:password")?;
+    let rpc_port = vault.bitcoind.rpc_addr().port();
+
+    vault.bitcoind.call("stop", json!([]))?;
+    let shutdown_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if vault.bitcoind.call("getblockchaininfo", json!([])).is_err() {
+            break;
+        }
+        if Instant::now() >= shutdown_deadline {
+            return Err("bitcoind did not stop for the empty-mempool reorg restart".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The RPC listener closes just before Core releases its datadir lock.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut child = Command::new("bitcoind")
+        .arg("-regtest")
+        .arg(format!("-datadir={}", datadir.display()))
+        .arg(format!("-rpcport={rpc_port}"))
+        .arg("-listen=0")
+        .arg("-server=1")
+        .arg("-txindex=1")
+        .arg("-fallbackfee=0.0001")
+        .arg("-persistmempool=0")
+        .arg("-wallet=attack")
+        .arg(format!("-rpcuser={rpc_user}"))
+        .arg(format!("-rpcpassword={rpc_password}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot restart bitcoind without its mempool: {e}"))?;
+
+    let startup_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(
+                format!("empty-mempool bitcoind restart exited during startup: {status}").into(),
+            );
+        }
+        if vault.bitcoind.call("getblockchaininfo", json!([])).is_ok() {
+            break;
+        }
+        if Instant::now() >= startup_deadline {
+            return Err("empty-mempool bitcoind restart did not become ready".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let result = action();
+    let stop_result = vault.bitcoind.call("stop", json!([]));
+    // If the `stop` RPC failed (e.g. connection reset while Core reindexes the invalidated
+    // chain), the replacement is still running, so an unconditional `child.wait()` would
+    // wedge this scenario forever. Kill it on that path so the harness REPORTS the failure
+    // instead of hanging (Fable pass-6 P3, harness-only).
+    if stop_result.is_err() {
+        let _ = child.kill();
+    }
+    let wait_result = child.wait();
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => {
+            stop_result?;
+            let status = wait_result?;
+            if !status.success() {
+                return Err(format!(
+                    "empty-mempool bitcoind replacement exited unsuccessfully: {status}"
+                )
+                .into());
+            }
+            Ok(value)
+        }
+    }
+}
+
+/// Deliverable 9y5.3-a, end to end: a watchtower-alertable spend that a REORG
+/// re-lands at a height AT/BELOW the scan cursor is still classified. The old cursor
+/// was a bare monotonic height that only ever advanced, so a spend re-orged below it
+/// was silently MISSED; the reorg-aware cursor detects the fork, rewinds, and
+/// re-scans.
+///
+/// The only on-chain vault spend a watchtower alerts on that this harness can build
+/// without the federation's own node keys is a RECOVERY-branch spend (recovery uses
+/// the recovery keys). So: mature the recovery lock, advance every honest cursor well
+/// past where the recovery spend will re-land, reorg the tip out from under the
+/// cursors, land the recovery spend BELOW the cursors' old anchor, and require every
+/// honest watchtower to surface the resulting alert.
+fn reorg_watchtower_cursor() -> Result<String, Error> {
+    let vault = Vault::build(&Setup::default())?;
+    const CONTROL: Amount = Amount::from_sat(20_000_000);
+    // Fund the recovery coin FIRST and bury it deep, so the shallow tip reorg below
+    // never un-confirms the input the recovery spend spends.
+    let coin = vault.fund_extra(CONTROL)?;
+    // Recovery's relative TIME lock matures on median-time-past; this pins the chain
+    // clock forward. The watchtower keys off height/hash, not block time, so the mock
+    // clock is inert for this scenario's assertion.
+    crate::recovery::advance_mtp_past_recovery_lock(&vault.bitcoind, &vault.mining_address)?;
+
+    // Build — but do NOT broadcast — the recovery-branch spend of the control coin.
+    let destination = vault.bitcoind.call_str("getnewaddress", json!([]))?;
+    let destination_spk = {
+        let hex = vault
+            .bitcoind
+            .call("getaddressinfo", json!([destination]))?["scriptPubKey"]
+            .as_str()
+            .ok_or("getaddressinfo has no scriptPubKey")?
+            .to_string();
+        ScriptBuf::from_hex(&hex)?
+    };
+    let value = coin
+        .txout
+        .value
+        .checked_sub(FEE)
+        .ok_or("the recovery control coin cannot cover its fee")?;
+    let recovery_tx = crate::recovery::build_recovery_spend(
+        &vault.secp,
+        coin.outpoint,
+        &coin.txout,
+        &vault.witness_script,
+        &destination_spk,
+        value,
+        &vault.recovery_keys[..policy_core::RECOVERY_THRESHOLD],
+    )?;
+    let recovery_txid = recovery_tx.compute_txid().to_string();
+
+    // Advance the chain — and, after a couple of scan intervals, every honest
+    // watchtower cursor — well past the height the recovery spend will re-land at.
+    vault.mine(4)?;
+    let anchor_tip = vault
+        .bitcoind
+        .call("getblockcount", json!([]))?
+        .as_u64()
+        .ok_or("getblockcount is not a number")?;
+    // The watchtower scan interval is 10s; wait past two passes so every honest cursor
+    // has scanned to `anchor_tip` and recorded it as an anchor before the reorg drops
+    // the blocks below it. (The cursor would catch the spend even without this wait —
+    // it rewinds on any detected fork — but the wait makes the "would-have-been-missed"
+    // property concrete: the spend re-lands strictly below where the cursor had reached.)
+    std::thread::sleep(Duration::from_secs(25));
+
+    // Reorg: roll back the top two blocks, then land the recovery spend at
+    // `anchor_tip - 1` — BELOW the cursor's recorded anchor, where a non-rewinding
+    // cursor (scanning `anchor_tip + 1 ..`) would never see it.
+    let fork_child = vault
+        .bitcoind
+        .call_str("getblockhash", json!([anchor_tip - 1]))?;
+    vault
+        .bitcoind
+        .call("invalidateblock", json!([fork_child]))?;
+    vault.bitcoind.call_str(
+        "sendrawtransaction",
+        json!([bitcoin::consensus::encode::serialize_hex(&recovery_tx)]),
+    )?;
+    // Resilient mines: `generatetoaddress` can transiently fail the MTP rule right after
+    // `invalidateblock` (see [`mine_resilient`]). One at a time keeps the height exact.
+    mine_resilient(&vault, 1)?; // the recovery spend confirms at height anchor_tip - 1
+                                // Rebuild above the old anchor so the fork is unambiguous and the tip clearly moved.
+    mine_resilient(&vault, 3)?;
+
+    // Every honest watchtower must now rewind across the reorg and surface the
+    // recovery-path alert — the miss the bare monotonic cursor produced.
+    let deadline = Instant::now() + EXPECT_TIMEOUT;
+    loop {
+        let observed = vault.events_snapshot()?;
+        let mut pending = Vec::new();
+        for (id, projection) in &observed {
+            // Require THIS node to have surfaced the SPECIFIC re-orged recovery spend
+            // in its OWN projection — not merely an alert-count bump (an unrelated
+            // alert could otherwise satisfy a node that actually missed the reorged
+            // spend), and not merely that SOME node saw the txid. Every honest
+            // watchtower must rewind and re-classify this exact spend.
+            let saw_recovery = alert_spend_txids(projection)
+                .iter()
+                .any(|t| t == &recovery_txid);
+            if !saw_recovery {
+                pending.push(*id);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(format!(
+                "a recovery-path spend re-orged to height {} (below the cursor's anchor at {}) was \
+                 re-classified by all {} honest watchtowers after the cursor rewound to the fork — \
+                 the miss the bare monotonic cursor would have produced",
+                anchor_tip - 1,
+                anchor_tip,
+                vault.honest.len()
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "after a reorg landed recovery spend {recovery_txid} below the scan cursor, honest \
+                 node_id(s) {pending:?} never surfaced THAT specific spend in their own projection; \
+                 the reorg-aware cursor must rewind and re-classify a spend re-orged below it"
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Deliverable 9y5.3 (iii): the duress SAFETY track is indifferent to the chain
+/// re-orging underneath it. A coerced hot spend is armed under the duress pin; while
+/// the arm confirms and `T` passes, the tip is re-orged twice. Lockdown at `T` is
+/// still UNCONDITIONAL, no honest node releases the coerced partial (the coupling +
+/// store-locked release gate hold), the coerced spend never completes, and no value
+/// reaches the attacker.
+fn reorg_duress_lockdown() -> Result<String, Error> {
+    // A crippling feerate floor keeps the escape from ever broadcasting, so no vault
+    // transaction sits in the mempool and the tip blocks the reorg rolls back carry
+    // only their coinbase — the reorg churns the chain without disturbing candidate
+    // settlement. Lockdown at T is independent of the sweep, so it still lands.
+    const CRIPPLING_FEERATE_FLOOR: u64 = 100_000;
+    let vault = Vault::build(&Setup {
+        hold_secs: 20,
+        duress_delay_secs: 8,
+        epsilon_secs: 1,
+        escape_feerate_floor: CRIPPLING_FEERATE_FLOOR,
+        ..Setup::default()
+    })?;
+
+    // Positive wiretap control so a later "0 coerced partials" is evidence rather than
+    // an artefact of a deaf listener. Runs while the federation is whole.
+    let control_coin = vault.fund_extra(Amount::from_sat(100_000_000))?;
+    let (control_id, control_signers) = vault.wiretap_positive_control(&control_coin)?;
+
+    // Arm a coerced hot spend under the DURESS pin, plus its mandatory escape.
+    let coerced = vault.hot_spend_fee(&vault.vault_utxo, Amount::from_sat(400_000_000), FEE)?;
+    let escape = vault.escape_for(&vault.vault_utxo)?;
+    let request = vault.request(&coerced, &escape, DURESS_PIN)?;
+    let accepted = expect_accepted(&vault.relay_to(0, &request)?, "duress carrier under reorg")?;
+
+    // Reorg the tip out from under the federation while the carrier propagates and the
+    // arm confirms, then again as `T` approaches.
+    reorg_tip(&vault, 2)?;
+    vault.wait_for_honest_relayers(&request.nonce, vault.honest.len(), EXPECT_TIMEOUT)?;
+    vault.confirm_with_compromised(&request)?;
+    reorg_tip(&vault, 2)?;
+
+    // (iii) Lockdown at T is unconditional — it lands on every honest node across the
+    // reorgs.
+    let all: Vec<usize> = (0..vault.honest.len()).collect();
+    vault.wait_for_lockdown(&all, EXPECT_TIMEOUT)?;
+    vault.wait_past_hot_release_window(accepted.first_seen)?;
+
+    // The coerced hot spend never completed.
+    let coerced_txid = coerced.unsigned_tx.compute_txid().to_string();
+    if vault.in_mempool_or_chain(&coerced_txid)? {
+        return Err("the coerced hot spend completed across the reorg".into());
+    }
+    // No honest node released the coerced partial — the coupling + store-locked release
+    // gate stayed closed for the frozen duress spend across the chain churn.
+    let signed_coerced = Psbt::from_str(&request.psbt)?;
+    let coerced_signers =
+        vault.validated_honest_partials_for(&accepted.commitment_id, &signed_coerced, "spend")?;
+    if !coerced_signers.is_empty() {
+        return Err(format!(
+            "honest node_id(s) {coerced_signers:?} released the coerced hot partial across the \
+             reorg; the release gate must stay closed for a frozen duress spend"
+        )
+        .into());
+    }
+    // The escape was crippled and never fired, so the ONLY honest partials anywhere are
+    // the control's — anything else would be an unexpected release.
+    vault.assert_no_unexpected_partials(
+        "reorg duress global partial backstop",
+        &[control_id.as_str()],
+    )?;
+    assert_no_theft(&vault)?;
+
+    Ok(format!(
+        "Lockdown at T held unconditionally across two tip reorgs; 0 coerced partials released \
+         (control saw {control_signers} honest partial(s)); the coerced hot spend never completed; \
+         no value reached the attacker"
+    ))
+}
+
+/// Deliverable 9y5.3 (ii): an armed escape that a REORG un-confirms is not stranded —
+/// it re-settles within its Firing job — and the coerced spend still never completes,
+/// even though the reorg briefly re-opens the swept `vault_utxo`.
+///
+/// The sibling [`reorg_duress_lockdown`] CRIPPLES the escape to isolate the safety
+/// track; this one lets an ADMISSIBLE escape actually sweep, confirm, get its
+/// confirming block re-orged out (so it is un-confirmed AGAIN, exactly the
+/// deliverable's wording), and settle a second time. That the escape wins the
+/// re-settlement — while the coerced hot spend, whose only input the reorg just
+/// re-opened, cannot — is the property no crippled-escape or unit test covers.
+///
+/// To distinguish the node's OWN retry from Core's automatic disconnected-
+/// transaction re-admission, the scenario invalidates the confirming block and
+/// restarts the same chain with mempool persistence disabled. It requires the escape
+/// to reappear in that explicitly empty mempool BEFORE mining the replacement block,
+/// then requires it to confirm again. The only writer capable of that reappearance
+/// is an honest node's retained Firing job.
+fn reorg_escape_resettles() -> Result<String, Error> {
+    // A working, admissible escape (default coverage + feerate) and a duress delay
+    // wide enough that the sweep reliably fires before the reorg — mirrors the
+    // reboot-death sweep recipe, minus the kill.
+    let vault = Vault::build(&Setup {
+        hold_secs: 90,
+        duress_delay_secs: 45,
+        epsilon_secs: 1,
+        // Restarting Core to erase its automatic disconnected-transaction
+        // re-admission takes real wall time. Keep the existing bounded semantics,
+        // but give this live proof enough room to observe the node retry.
+        combine_slack_secs: 30,
+        ..Setup::default()
+    })?;
+
+    // Positive wiretap control so the later "0 coerced partials" is evidence, not a
+    // deaf listener. Taken while the federation is whole.
+    let control_coin = vault.fund_extra(Amount::from_sat(20_000_000))?;
+    let (control_id, control_signers) = vault.wiretap_positive_control(&control_coin)?;
+
+    // Arm a coerced hot spend under the DURESS pin, plus its admissible escape.
+    let coerced = vault.hot_spend(&vault.vault_utxo, Amount::from_sat(400_000_000))?;
+    let escape = vault.escape_for(&vault.vault_utxo)?;
+    let request = vault.request(&coerced, &escape, DURESS_PIN)?;
+    let accepted = expect_accepted(
+        &vault.relay_to(0, &request)?,
+        "duress carrier (escape reorg)",
+    )?;
+    let (escape_id, _) = vault.signed_escape_candidate(&request)?;
+    let coerced_txid = coerced.unsigned_tx.compute_txid().to_string();
+    let escape_txid = escape.unsigned_tx.compute_txid().to_string();
+    vault.wait_for_honest_relayers(&request.nonce, vault.honest.len(), EXPECT_TIMEOUT)?;
+    vault.confirm_with_compromised(&request)?;
+
+    // The sweep fires at T (Lockdown is unconditional) and lands on the network.
+    let all: Vec<usize> = (0..vault.honest.len()).collect();
+    vault.wait_for_lockdown(&all, EXPECT_TIMEOUT + Duration::from_secs(45))?;
+    vault.wait_for_tx(
+        &escape_txid,
+        EXPECT_TIMEOUT + Duration::from_secs(vault.params.combine_slack_secs),
+    )?;
+    // Confirm the escape, then ensure the honest nodes actually OBSERVE that
+    // confirmation before the reorg pulls it back out — otherwise a node that had not
+    // yet observed it never exercised the retained-vs-cleared candidate path, and even
+    // the old remove-on-observation behavior would pass for the wrong reason.
+    vault.mine(1)?;
+    // First make the confirmation REAL on-chain (mining can lag), polling
+    // deterministically rather than assuming a fixed sleep sufficed.
+    let confirm_deadline = Instant::now() + EXPECT_TIMEOUT;
+    loop {
+        let confirmations = vault
+            .bitcoind
+            .call_optional("getrawtransaction", json!([escape_txid.clone(), true]))?
+            .and_then(|tx| tx.get("confirmations").and_then(Value::as_u64))
+            .unwrap_or(0);
+        if confirmations >= 1 {
+            break;
+        }
+        if Instant::now() >= confirm_deadline {
+            return Err(format!(
+                "escape {escape_txid} never reached 1 confirmation before the reorg step; the \
+                 scenario requires a genuinely-confirmed-then-reorged escape"
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Then wait for an honest fire tick (1 Hz) to actually OBSERVE that confirmation
+    // while still RETAINING the escape candidate, so the reorg genuinely models
+    // "confirmed AND observed, then re-orged" rather than "re-orged before anyone
+    // looked". The node logs exactly that state transition, so poll for the line
+    // instead of sleeping a fixed margin — the old blind sleep let the scenario pass
+    // for the wrong reason, since a node that never observed the confirmation would
+    // still hold (and re-broadcast) its candidate under the OLD remove-on-observation
+    // behavior too. This line is emitted ONLY by the retaining behavior; the old code
+    // logged the settle-and-clear path here instead.
+    //
+    // One honest node, not all three: only the node that finalized the sweep carries
+    // the escape in its fire path (the others released their escape share and never
+    // reached a local quorum, so the escape is never in their due set and they log
+    // nothing about it). That single node is also the one whose retained candidate the
+    // re-broadcast below must come from, so its observation is the assertion that
+    // matters. Bounded well inside the `combine_slack_secs` window (observation takes a
+    // tick or two), so a run where nobody observes is reported as such instead of
+    // silently eating the window the re-broadcast proof still needs.
+    let observed_marker =
+        format!("fire: armed escape {escape_id} confirmed on-chain ({escape_txid})");
+    let observe_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let observers: Vec<u16> = vault
+            .honest
+            .iter()
+            .filter(|node| node.log_contains(&observed_marker))
+            .map(|node| node.node_id)
+            .collect();
+        if !observers.is_empty() {
+            break;
+        }
+        if Instant::now() >= observe_deadline {
+            return Err(format!(
+                "escape {escape_txid} confirmed on-chain, but no honest node logged observing that \
+                 confirmation while retaining its escape candidate; re-orging it out now would prove \
+                 nothing about the retained-vs-cleared candidate path"
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // Reorg the escape's confirming block out. Core ordinarily puts every
+    // disconnected transaction straight back in its mempool, which would let a
+    // subsequent `generatetoaddress` mine it with ZERO node retry. Restart against
+    // the same invalidated chain with `-persistmempool=0`; the replacement chain and
+    // mempool then contain no escape until a retained Firing job re-broadcasts it.
+    let confirming_block = vault.bitcoind.call_str("getbestblockhash", json!([]))?;
+    vault
+        .bitcoind
+        .call("invalidateblock", json!([confirming_block]))?;
+
+    with_restarted_bitcoind_without_mempool(&vault, || {
+        // `getrawtransaction` also returns transactions known only from an INACTIVE
+        // block, so the generic `wait_for_tx` oracle is intentionally too broad here.
+        // Poll the active mempool specifically: mining stays forbidden until the
+        // node-originated copy exists.
+        let rebroadcast_deadline = Instant::now() + EXPECT_TIMEOUT;
+        loop {
+            if vault
+                .bitcoind
+                .call_optional("getmempoolentry", json!([escape_txid.clone()]))?
+                .is_some()
+            {
+                break;
+            }
+            if Instant::now() >= rebroadcast_deadline {
+                return Err(format!(
+                    "escape {escape_txid} did not reappear in the empty mempool after its \
+                     confirming block was invalidated; the scenario requires a node re-broadcast \
+                     before mining"
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        // Only now mine the competing replacement block. Its inclusion proves the
+        // node retry happened first; Core had no persisted/disconnected copy to mine.
+        // Resilient: `generatetoaddress` can transiently fail the MTP rule right after
+        // the `invalidateblock` above (see [`mine_resilient`]).
+        mine_resilient(&vault, 1)?;
+        let confirmations = vault
+            .bitcoind
+            .call_optional("getrawtransaction", json!([escape_txid.clone(), true]))?
+            .and_then(|tx| tx.get("confirmations").and_then(Value::as_u64))
+            .unwrap_or(0);
+        if confirmations == 0 {
+            return Err(format!(
+                "the node-rebroadcast escape {escape_txid} never re-settled after the reorg"
+            )
+            .into());
+        }
+
+        vault.wait_past_hot_release_window(accepted.first_seen)?;
+
+        // The coerced hot spend never completed — not even in the window where the reorg
+        // re-opened its input.
+        if vault.in_mempool_or_chain(&coerced_txid)? {
+            return Err(
+                "the coerced hot spend completed after the reorg re-opened the swept vault input"
+                    .into(),
+            );
+        }
+        // No honest node released the coerced partial across the reorg (coupling +
+        // store-locked release gate held).
+        let signed_coerced = Psbt::from_str(&request.psbt)?;
+        let coerced_signers = vault.validated_honest_partials_for(
+            &accepted.commitment_id,
+            &signed_coerced,
+            "spend",
+        )?;
+        if !coerced_signers.is_empty() {
+            return Err(format!(
+                "honest node_id(s) {coerced_signers:?} released the coerced hot partial across the \
+                 escape reorg; the release gate must stay closed for a frozen duress spend"
+            )
+            .into());
+        }
+        // The only honest partials anywhere are the control's and the escape the sweep was
+        // SUPPOSED to release — anything else is an unexpected release.
+        vault.assert_no_unexpected_partials(
+            "reorg escape re-settle global partial backstop",
+            &[control_id.as_str(), escape_id.as_str()],
+        )?;
+        assert_no_theft(&vault)?;
+
+        Ok(format!(
+            "an admissible escape swept, confirmed, was re-orged into an explicitly empty \
+             mempool, then was re-broadcast by the node before mining and re-settled \
+             ({confirmations} confirmation(s)); the coerced hot spend never completed and 0 \
+             coerced partials released (control saw {control_signers} honest partial(s))"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------

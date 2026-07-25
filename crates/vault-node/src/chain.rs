@@ -8,21 +8,24 @@
 //!  2. **spends_of** — the watchtower scan (ADR-0001): spends of the vault's
 //!     watched scriptPubKeys, as seen by THIS node's own chain view.
 //!
-//! v0 ships the trait seam plus one minimal `bitcoind`-RPC impl for regtest. The
-//! Core/Electrum/BIP158 choice and the lying-coordinator prevout enforcement stay
-//! v1 (T6): the backend is **not** wired into the policy fee/ownership checks
-//! here — those still trust each input's `witness_utxo`, exactly as in v0. Being a
-//! trait, unit tests use a mock and never need bitcoind.
+//! v0 ships the trait seam plus one minimal `bitcoind`-RPC impl for regtest.
+//! Vault-node's `/sign` preflight uses [`ChainBackend::prevouts`] to verify confirmed
+//! inputs before pure policy evaluation; unconfirmed authorized parents remain
+//! subject to the fire-time package checks. Being a trait, unit tests use a mock
+//! and never need bitcoind.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hex::{DisplayHex, FromHex};
-use bitcoin::{consensus, Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Witness};
+use bitcoin::{
+    consensus, Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Witness,
+};
 use serde_json::{json, Value};
 
 use crate::Error;
@@ -50,6 +53,24 @@ pub struct SpendSeen {
     /// second-from-last element is `01` for the normal branch and EMPTY for the
     /// recovery branch (see `watchtower::is_recovery_branch`).
     pub witness: Witness,
+}
+
+/// The result of a [`ChainBackend::spends_of`] traversal: the watched spends seen,
+/// plus the `(height, hash)` chain the SAME traversal proved to be a contiguous
+/// prefix of the ACTIVE chain — every block chained onto its parent, the terminal
+/// block still active, and (when an `expected_parent` was supplied) the first block
+/// rooted on it. The watchtower binds its cursor anchors to `blocks` instead of
+/// re-reading the hashes independently, so an anchor can NEVER come from a fork the
+/// classifying scan did not actually traverse (v0-exit 9y5.3 review, [P1] BOTH): a
+/// second, unvalidated hash fetch is exactly where a racing reorg would otherwise
+/// slip a mixed-fork anchor past the terminal re-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanTraversal {
+    /// Spends of the queried scripts within the traversed range.
+    pub spends: Vec<SpendSeen>,
+    /// The `(height, hash)` of every block traversed, ascending and contiguous,
+    /// proven active by the same reads that produced `spends`.
+    pub blocks: Vec<(u32, BlockHash)>,
 }
 
 /// One prevout as this node sees it across its confirmed chain AND its own
@@ -88,15 +109,51 @@ pub trait ChainBackend {
     /// re-scanning from height 0 every pass.
     fn tip_height(&self) -> Result<u32, Error>;
 
-    /// Spends of any of `scripts` observed in blocks at or after `from_height`,
-    /// against this node's own chain data.
-    fn spends_of(&self, scripts: &[ScriptBuf], from_height: u32) -> Result<Vec<SpendSeen>, Error>;
+    /// The block hash at `height` in this node's ACTIVE chain, or `None` if no
+    /// block occupies that height (beyond the tip, or pruned). The reorg-aware
+    /// watchtower cursor ([`watchtower::ScanCursor`](crate::watchtower::ScanCursor))
+    /// reads it to confirm the block it last scanned at a height still matches the
+    /// chain; a mismatch is a reorg, and the cursor rewinds to the fork point
+    /// rather than silently advancing past re-orged blocks it never re-classified.
+    fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, Error>;
+
+    /// Spends of any of `scripts` observed in the inclusive block range
+    /// `from_height..=through_height`, against this node's own chain data, together
+    /// with the validated `(height, hash)` chain of the blocks traversed (see
+    /// [`ScanTraversal`]). Fixing the terminal height lets the watchtower bind alerts
+    /// and cursor anchors to the same captured chain prefix even if a new block
+    /// arrives mid-pass.
+    ///
+    /// `expected_parent`, when `Some`, is the hash the block at `from_height` must
+    /// name as its `previousblockhash`: the newest cursor anchor the scan is
+    /// extending. Supplying it makes the traversal refuse a range that does not chain
+    /// ONTO the existing cursor — the reorg that forks below `from_height` and rebuilds
+    /// taller within the window between the caller's pre-scan anchor check and this
+    /// call (v0-exit 9y5.3 review, [P1] BOTH). `None` skips the root check: the first
+    /// scan (empty cursor) or a post-reset genesis re-scan has no anchor to root on.
+    fn spends_of(
+        &self,
+        scripts: &[ScriptBuf],
+        from_height: u32,
+        through_height: u32,
+        expected_parent: Option<BlockHash>,
+    ) -> Result<ScanTraversal, Error>;
 
     /// The unspent output at `outpoint` as this node sees it, **including its own
     /// mempool**. `None` ⇒ this node cannot see the output (unknown or already
     /// spent). Confirmed-only would strand the common case: spend-change and
     /// refresh outputs are usually still unconfirmed (ADR-0012).
     fn prevout(&self, outpoint: &OutPoint) -> Result<Option<Prevout>, Error>;
+
+    /// Resolve several prevouts as one logical preflight. Backends may override
+    /// this to batch transport; the default preserves the small trait seam for
+    /// mocks and alternate backends while aborting on the first error.
+    fn prevouts(&self, outpoints: &[OutPoint]) -> Result<Vec<Option<Prevout>>, Error> {
+        outpoints
+            .iter()
+            .map(|outpoint| self.prevout(outpoint))
+            .collect()
+    }
 
     /// Every currently-unspent output paying one of `scripts` in this node's
     /// confirmed UTXO set, plus unconfirmed outputs whose parent txid is in the
@@ -108,6 +165,13 @@ pub trait ChainBackend {
         scripts: &[ScriptBuf],
         authorized: &HashSet<Txid>,
     ) -> Result<Vec<(OutPoint, Prevout)>, Error>;
+
+    /// Refresh any backend-side confirmed-vault cache outside the fire/combine path.
+    /// The default is a no-op for mocks and indexed backends; the Core backend warms
+    /// a cold `scantxoutset` snapshot and advances it by a bounded block delta.
+    fn refresh_vault_unspent_cache(&self, _scripts: &[ScriptBuf]) -> Result<(), Error> {
+        Ok(())
+    }
 
     /// Raw consensus bytes of `txid` iff it is in this node's mempool. This is the
     /// ancestor lookup used after the first package level: a mempool parent's own
@@ -248,13 +312,43 @@ pub struct BitcoindBackend {
     /// base64 of `<user>:<password>` (or `__cookie__:<pw>`), exactly as the
     /// `Authorization: Basic` header carries it.
     auth: String,
+    /// Confirmed vault-UTXO cache maintained only by
+    /// [`ChainBackend::refresh_vault_unspent_cache`], never by the fire/combine hot
+    /// path. A cold cache is warmed with `scantxoutset` in a dedicated blocking task;
+    /// after that, bounded block deltas advance it. `vault_unspent` either consumes a
+    /// cache at the current tip or fails fast, so no whole-set scan can consume the
+    /// escape's finite combine window.
+    scan_cache: Mutex<Option<VaultUnspentCache>>,
 }
+
+/// The cached confirmed vault-UTXO scan (deliverable 9y5.3-c). `candidates` is
+/// mempool-agnostic active-chain membership; each entry is re-checked through
+/// batched `gettxout(..., include_mempool)` on use, so a confirmed output a mempool
+/// tx has since spent is still dropped.
+#[derive(Clone)]
+struct VaultUnspentCache {
+    bestblock: BlockHash,
+    height: u32,
+    scripts: Vec<ScriptBuf>,
+    candidates: HashSet<OutPoint>,
+}
+
+/// Maximum active-chain blocks one background cache refresh parses. A node that
+/// starts far behind advances over successive passes; until it catches the tip the
+/// fire path fails fast rather than doing unbounded catch-up inside the combine
+/// window. The cold full scan and any reorg fallback also run only in that background
+/// task.
+const MAX_VAULT_SCAN_DELTA_BLOCKS: u32 = 32;
 
 impl BitcoindBackend {
     /// `auth` is the base64 of `<user>:<password>` (regtest cookie auth). The
     /// caller reads bitcoind's `.cookie` and base64-encodes it.
     pub fn new(rpc_addr: SocketAddr, auth: String) -> BitcoindBackend {
-        BitcoindBackend { rpc_addr, auth }
+        BitcoindBackend {
+            rpc_addr,
+            auth,
+            scan_cache: Mutex::new(None),
+        }
     }
 
     /// One JSON-RPC call with its structured `result`/`error` fields intact.
@@ -278,6 +372,28 @@ impl BitcoindBackend {
             return Err(format!("bitcoind {method}: {}", reply["error"]).into());
         }
         Ok(reply["result"].clone())
+    }
+
+    fn parse_prevout(result: &Value) -> Result<Option<Prevout>, Error> {
+        if result.is_null() {
+            return Ok(None);
+        }
+        let spk_hex = result["scriptPubKey"]["hex"]
+            .as_str()
+            .ok_or("gettxout: no scriptPubKey hex")?;
+        let btc = result["value"].as_f64().ok_or("gettxout: no value")?;
+        // `confirmations = 0` is exactly bitcoind's "in the mempool, not mined".
+        let confirmations = result["confirmations"]
+            .as_u64()
+            .ok_or("gettxout: no confirmations")?;
+        Ok(Some(Prevout {
+            txout: TxOut {
+                script_pubkey: ScriptBuf::from_hex(spk_hex)
+                    .map_err(|e| format!("gettxout: bad scriptPubKey: {e}"))?,
+                value: Amount::from_btc(btc).map_err(|e| format!("gettxout: bad value: {e}"))?,
+            },
+            confirmed: confirmations > 0,
+        }))
     }
 
     /// Fail startup unless Core's transaction index is present and caught up AND
@@ -318,14 +434,9 @@ impl BitcoindBackend {
         Ok(())
     }
 
-    /// Scan the confirmed vault UTXO set and return the block hash the scan was
-    /// evaluated against. `vault_unspent` uses that hash to detect a confirmation
-    /// racing the later authorized-mempool enumeration; without reconciliation, an
-    /// authorized output that confirms between those two reads appears in neither.
-    fn scan_confirmed_vault_unspent(
-        &self,
-        scripts: &[ScriptBuf],
-    ) -> Result<(String, HashMap<OutPoint, Prevout>), Error> {
+    /// Parse one successful whole-UTXO-set scan into a cache anchored to the block
+    /// hash Core says it observed. This is called only by the background refresher.
+    fn full_confirmed_scan(&self, scripts: &[ScriptBuf]) -> Result<VaultUnspentCache, Error> {
         let scan_objects: Vec<Value> = scripts
             .iter()
             .map(|script| {
@@ -338,15 +449,15 @@ impl BitcoindBackend {
         if scan["success"].as_bool() != Some(true) {
             return Err("scantxoutset: scan did not complete successfully".into());
         }
-        let bestblock = scan["bestblock"]
+        let bestblock_text = scan["bestblock"]
             .as_str()
-            .ok_or("scantxoutset: bestblock is not a hash")?
-            .to_string();
+            .ok_or("scantxoutset: bestblock is not a hash")?;
+        let bestblock = BlockHash::from_str(bestblock_text)
+            .map_err(|e| format!("scantxoutset: bad bestblock hash: {e}"))?;
         let unspents = scan["unspents"]
             .as_array()
             .ok_or("scantxoutset: unspents is not an array")?;
-        let watched: HashSet<&ScriptBuf> = scripts.iter().collect();
-        let mut found = HashMap::new();
+        let mut candidates = HashSet::with_capacity(unspents.len());
         for entry in unspents {
             let txid = entry["txid"]
                 .as_str()
@@ -355,17 +466,136 @@ impl BitcoindBackend {
                 .as_u64()
                 .ok_or("scantxoutset: unspent has no vout")?;
             let vout = u32::try_from(vout).map_err(|_| "scantxoutset: vout exceeds u32")?;
-            let outpoint = OutPoint::new(
+            candidates.insert(OutPoint::new(
                 Txid::from_str(txid).map_err(|e| format!("scantxoutset: bad txid: {e}"))?,
                 vout,
+            ));
+        }
+        let header = self.call("getblockheader", json!([bestblock.to_string(), true]))?;
+        let height = header["height"]
+            .as_u64()
+            .ok_or("getblockheader: no block height")?;
+        let height =
+            u32::try_from(height).map_err(|_| "getblockheader: block height exceeds u32")?;
+        if self.block_hash_at(height)? != Some(bestblock) {
+            return Err(
+                "scantxoutset: best block is no longer active; discarding the cold cache".into(),
             );
-            if let Some(prevout) = self.prevout(&outpoint)? {
-                if watched.contains(&prevout.txout.script_pubkey) && prevout.confirmed {
-                    found.insert(outpoint, prevout);
+        }
+        Ok(VaultUnspentCache {
+            bestblock,
+            height,
+            scripts: scripts.to_vec(),
+            candidates,
+        })
+    }
+
+    /// Advance a warm confirmed-vault cache through at most
+    /// [`MAX_VAULT_SCAN_DELTA_BLOCKS`] active blocks. Transactions add watched
+    /// outputs and remove every spent outpoint. Parent linkage plus a terminal
+    /// active-hash re-read makes the update transactional across a racing reorg.
+    fn advance_confirmed_scan(
+        &self,
+        mut cache: VaultUnspentCache,
+    ) -> Result<VaultUnspentCache, Error> {
+        let tip = self.tip_height()?;
+        if tip <= cache.height {
+            return Ok(cache);
+        }
+        let through = tip.min(cache.height.saturating_add(MAX_VAULT_SCAN_DELTA_BLOCKS));
+        let watched: HashSet<ScriptBuf> = cache.scripts.iter().cloned().collect();
+        let mut parent = cache.bestblock;
+        for height in cache.height + 1..=through {
+            let hash = self.block_hash_at(height)?.ok_or_else(|| {
+                format!("vault scan delta: active block at height {height} vanished")
+            })?;
+            let block = self.call("getblock", json!([hash.to_string(), 2]))?;
+            let expected_parent = parent.to_string();
+            if block["previousblockhash"].as_str() != Some(expected_parent.as_str()) {
+                return Err(format!(
+                    "vault scan delta: block {hash} at height {height} does not chain to \
+                     cached parent {parent}; discarding the raced update"
+                )
+                .into());
+            }
+            let txs = block["tx"]
+                .as_array()
+                .ok_or("vault scan delta: getblock tx is not an array")?;
+            for tx in txs {
+                for vin in tx["vin"].as_array().into_iter().flatten() {
+                    let (Some(txid), Some(vout)) = (vin["txid"].as_str(), vin["vout"].as_u64())
+                    else {
+                        // Coinbase has no previous outpoint.
+                        continue;
+                    };
+                    let vout = u32::try_from(vout)
+                        .map_err(|_| "vault scan delta: input vout exceeds u32")?;
+                    cache.candidates.remove(&OutPoint::new(
+                        Txid::from_str(txid)
+                            .map_err(|e| format!("vault scan delta: bad input txid: {e}"))?,
+                        vout,
+                    ));
+                }
+                let txid_text = tx["txid"]
+                    .as_str()
+                    .ok_or("vault scan delta: transaction has no txid")?;
+                let txid = Txid::from_str(txid_text)
+                    .map_err(|e| format!("vault scan delta: bad transaction txid: {e}"))?;
+                let outputs = tx["vout"]
+                    .as_array()
+                    .ok_or("vault scan delta: transaction vout is not an array")?;
+                for (vout, output) in outputs.iter().enumerate() {
+                    let script_hex = output["scriptPubKey"]["hex"]
+                        .as_str()
+                        .ok_or("vault scan delta: output has no scriptPubKey hex")?;
+                    let script = ScriptBuf::from_hex(script_hex)
+                        .map_err(|e| format!("vault scan delta: bad output scriptPubKey: {e}"))?;
+                    if watched.contains(&script) {
+                        let vout = u32::try_from(vout)
+                            .map_err(|_| "vault scan delta: output index exceeds u32")?;
+                        cache.candidates.insert(OutPoint::new(txid, vout));
+                    }
                 }
             }
+            parent = hash;
         }
-        Ok((bestblock, found))
+        if self.block_hash_at(through)? != Some(parent) {
+            return Err(format!(
+                "vault scan delta: terminal block {parent} at height {through} is no longer active"
+            )
+            .into());
+        }
+        cache.bestblock = parent;
+        cache.height = through;
+        Ok(cache)
+    }
+
+    /// The current confirmed-UTXO membership paying `scripts`, read only from the
+    /// background-maintained cache. Cold or stale is an immediate error — never a
+    /// synchronous `scantxoutset` on the fire/combine path.
+    fn confirmed_candidates(
+        &self,
+        scripts: &[ScriptBuf],
+    ) -> Result<(BlockHash, Vec<OutPoint>), Error> {
+        let tip_text = self
+            .call("getbestblockhash", json!([]))?
+            .as_str()
+            .ok_or("getbestblockhash: expected a block hash")?
+            .to_string();
+        let tip = BlockHash::from_str(&tip_text)
+            .map_err(|e| format!("getbestblockhash: bad hash: {e}"))?;
+        let cache = self.scan_cache.lock().expect("scan cache lock poisoned");
+        let cached = cache
+            .as_ref()
+            .filter(|cache| cache.scripts == scripts && cache.bestblock == tip)
+            .ok_or_else(|| {
+                "confirmed vault cache is cold or behind the active tip; refusing the fire-time \
+                 coverage check without running scantxoutset on the combine path"
+                    .to_string()
+            })?;
+        let mut candidates: Vec<_> = cached.candidates.iter().copied().collect();
+        candidates.sort();
+        Ok((tip, candidates))
     }
 
     /// The node's current mempool txid set. Coverage snapshots compare the complete
@@ -458,18 +688,109 @@ impl ChainBackend for BitcoindBackend {
             .ok_or("getblockcount: not a number")? as u32)
     }
 
-    fn spends_of(&self, scripts: &[ScriptBuf], from_height: u32) -> Result<Vec<SpendSeen>, Error> {
-        // Scan blocks from `from_height` to the tip; a watched script is spent
+    fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, Error> {
+        // `getblockhash` errors with code -8 ("Block height out of range") for a
+        // height above the active tip. That is the reorg-shortened-chain case the
+        // cursor must read as "no block here" (→ rewind), NOT a backend failure, so
+        // fold -8 to `None` and surface every other RPC error.
+        let reply = self.call_reply("getblockhash", json!([height]))?;
+        if !reply["error"].is_null() {
+            if reply["error"]["code"].as_i64() == Some(-8) {
+                return Ok(None);
+            }
+            return Err(format!("bitcoind getblockhash: {}", reply["error"]).into());
+        }
+        let hash = reply["result"]
+            .as_str()
+            .ok_or("getblockhash: expected a hash string")?;
+        Ok(Some(
+            BlockHash::from_str(hash).map_err(|e| format!("getblockhash: bad hash: {e}"))?,
+        ))
+    }
+
+    fn spends_of(
+        &self,
+        scripts: &[ScriptBuf],
+        from_height: u32,
+        through_height: u32,
+        expected_parent: Option<BlockHash>,
+    ) -> Result<ScanTraversal, Error> {
+        // Scan blocks through the caller's captured terminal height; a watched script is spent
         // when some input's prevout carries it. `getblock` verbosity 3 (Core v25+)
         // inlines each input's `prevout`, so no per-input `getrawtransaction` is
         // needed. Bounded work on regtest; the Core/Electrum/filter tradeoff for
         // real networks is v1 (T6).
         let watched: HashSet<&ScriptBuf> = scripts.iter().collect();
-        let tip = self.tip_height()?;
         let mut seen = Vec::new();
-        for height in from_height..=tip {
-            let hash = self.call("getblockhash", json!([height]))?;
+        // Mid-scan reorg guard (deliverable 9y5.3-a): the per-height reads below are
+        // NOT an atomic chain snapshot, so a reorg that swaps the active block at some
+        // height while this loop straddles it could read a fork this node no longer
+        // follows and silently miss the spends of the one it does. THREE checks together
+        // make the traversed range provably a contiguous extension of the caller's
+        // cursor along the ACTIVE chain:
+        //
+        //  0. the FIRST block must chain onto `expected_parent`, the newest cursor
+        //     anchor the caller is extending. Without it, a reorg that forks BELOW
+        //     `from_height` and rebuilds taller — landing between the caller's pre-scan
+        //     anchor check and this scan — leaves a new-fork `from_height` block whose
+        //     ancestors this scan never traversed; checks 1 and 2 both pass on the new
+        //     fork alone, and the anchor it is appended to no longer chains (9y5.3 [P1]);
+        //  1. consecutive scanned blocks must CHAIN (`block[h].previousblockhash ==
+        //     block[h-1].hash`), so a MIXED-fork straddle breaks the linkage; and
+        //  2. after the loop, the LAST block actually traversed must STILL be the
+        //     active block at its height (below). Headers chain backwards, so that one
+        //     re-read proves every earlier traversed block is its ancestor and so also
+        //     active.
+        //
+        // Check 2 is what closes the case check 1 cannot see: a loop that read a single
+        // foreign fork END-TO-END is internally consistent, and an A→B→A that returns to
+        // the original tip also slips past `scan_pass`'s post-scan tip-hash check, so
+        // without it a whole scan could be bound to a fork the node has abandoned. The
+        // returned `blocks` carry the proven `(height, hash)` chain so the watchtower
+        // binds its anchors to exactly what this scan traversed, never a second re-read.
+        //
+        // Any failure is an error, so the pass discards its results and retries from
+        // an unadvanced cursor rather than binding one fork's spends and skipping the
+        // active chain's.
+        let mut last_scanned: Option<(u32, String)> = None;
+        let mut blocks: Vec<(u32, BlockHash)> = Vec::new();
+        for height in from_height..=through_height {
+            let hash = self
+                .call("getblockhash", json!([height]))?
+                .as_str()
+                .ok_or("getblockhash: expected a hash string")?
+                .to_string();
             let block = self.call("getblock", json!([hash, 3]))?;
+            // The block at `from_height` must chain onto `expected_parent` (the cursor
+            // anchor being extended); every later block must chain onto the one just
+            // scanned. Together with the terminal re-check below, this proves the whole
+            // traversal is a contiguous extension of the caller's cursor along THIS
+            // active chain — closing BOTH the mixed-fork straddle (check 1) and the
+            // taller-fork reorg that races between the caller's pre-scan anchor read and
+            // this scan, whose new `from_height` block does not chain onto the anchor.
+            let required_parent = match &last_scanned {
+                Some((_, prev)) => Some(prev.clone()),
+                None => expected_parent.map(|parent| parent.to_string()),
+            };
+            if let Some(required) = required_parent {
+                let parent = block["previousblockhash"]
+                    .as_str()
+                    .ok_or("getblock: block has no previousblockhash (verbosity 3 required)")?;
+                if parent != required {
+                    return Err(format!(
+                        "getblock: block at height {height} does not chain onto the \
+                         expected parent {required} (a reorg raced the scan); refusing to \
+                         bind a mixed-fork or unrooted scan and re-scanning next pass"
+                    )
+                    .into());
+                }
+            }
+            last_scanned = Some((height, hash.clone()));
+            blocks.push((
+                height,
+                BlockHash::from_str(&hash)
+                    .map_err(|e| format!("getblockhash: bad block hash at height {height}: {e}"))?,
+            ));
             let txs = block["tx"].as_array().ok_or("getblock: tx not an array")?;
             for tx in txs {
                 let spend_txid = tx["txid"].as_str().ok_or("getblock: tx has no txid")?;
@@ -533,7 +854,25 @@ impl ChainBackend for BitcoindBackend {
                 }
             }
         }
-        Ok(seen)
+        // Check 2 (see above): the newest block this loop actually READ must still be
+        // the active block at its height. A scan that ran entirely on a fork the node
+        // has since abandoned fails here instead of returning that fork's spends as if
+        // they were the active chain's.
+        if let Some((height, hash)) = last_scanned {
+            let active = self.call("getblockhash", json!([height]))?;
+            if active.as_str() != Some(hash.as_str()) {
+                return Err(format!(
+                    "getblockhash: block {hash} scanned at height {height} is no longer the \
+                     active block there (a reorg raced the scan); refusing to bind an \
+                     abandoned fork's spends and re-scanning next pass"
+                )
+                .into());
+            }
+        }
+        Ok(ScanTraversal {
+            spends: seen,
+            blocks,
+        })
     }
 
     fn prevout(&self, outpoint: &OutPoint) -> Result<Option<Prevout>, Error> {
@@ -545,25 +884,69 @@ impl ChainBackend for BitcoindBackend {
             "gettxout",
             json!([outpoint.txid.to_string(), outpoint.vout, true]),
         )?;
-        if result.is_null() {
-            return Ok(None);
+        Self::parse_prevout(&result)
+    }
+
+    fn prevouts(&self, outpoints: &[OutPoint]) -> Result<Vec<Option<Prevout>>, Error> {
+        if outpoints.is_empty() {
+            return Ok(Vec::new());
         }
-        let spk_hex = result["scriptPubKey"]["hex"]
-            .as_str()
-            .ok_or("gettxout: no scriptPubKey hex")?;
-        let btc = result["value"].as_f64().ok_or("gettxout: no value")?;
-        // `confirmations = 0` is exactly bitcoind's "in the mempool, not mined".
-        let confirmations = result["confirmations"]
-            .as_u64()
-            .ok_or("gettxout: no confirmations")?;
-        Ok(Some(Prevout {
-            txout: TxOut {
-                script_pubkey: ScriptBuf::from_hex(spk_hex)
-                    .map_err(|e| format!("gettxout: bad scriptPubKey: {e}"))?,
-                value: Amount::from_btc(btc).map_err(|e| format!("gettxout: bad value: {e}"))?,
-            },
-            confirmed: confirmations > 0,
-        }))
+        // One HTTP request and one fixed RPC timeout for the complete PSBT
+        // preflight. The hostile coordinator therefore cannot
+        // multiply a slow/down backend's network timeout by the number of inputs
+        // while `/sign` holds its serialization lock.
+        let requests: Vec<Value> = outpoints
+            .iter()
+            .enumerate()
+            .map(|(id, outpoint)| {
+                json!({
+                    "jsonrpc": "1.0",
+                    "id": id,
+                    "method": "gettxout",
+                    "params": [outpoint.txid.to_string(), outpoint.vout, true],
+                })
+            })
+            .collect();
+        let body = post_json(
+            self.rpc_addr,
+            &Value::Array(requests).to_string(),
+            &self.auth,
+        )?;
+        let replies: Vec<Value> = serde_json::from_str(&body)
+            .map_err(|e| format!("bitcoind gettxout batch: unparseable reply: {e}"))?;
+        if replies.len() != outpoints.len() {
+            return Err(format!(
+                "bitcoind gettxout batch: expected {} replies, got {}",
+                outpoints.len(),
+                replies.len()
+            )
+            .into());
+        }
+        let mut ordered = vec![None; outpoints.len()];
+        for reply in replies {
+            let id = reply["id"]
+                .as_u64()
+                .and_then(|id| usize::try_from(id).ok())
+                .filter(|id| *id < outpoints.len())
+                .ok_or("bitcoind gettxout batch: missing or out-of-range reply id")?;
+            if ordered[id].is_some() {
+                return Err(format!("bitcoind gettxout batch: duplicate reply id {id}").into());
+            }
+            if !reply["error"].is_null() {
+                return Err(
+                    format!("bitcoind gettxout batch item {id}: {}", reply["error"]).into(),
+                );
+            }
+            ordered[id] = Some(Self::parse_prevout(&reply["result"])?);
+        }
+        ordered
+            .into_iter()
+            .enumerate()
+            .map(|(id, result)| {
+                result
+                    .ok_or_else(|| format!("bitcoind gettxout batch: missing reply id {id}").into())
+            })
+            .collect()
     }
 
     fn vault_unspent(
@@ -575,16 +958,12 @@ impl ChainBackend for BitcoindBackend {
         // script(s), then re-read each result through `gettxout(..., true)` so an
         // output already spent by a mempool transaction is not double-counted.
         //
-        // SCALING (deferred to the V0-4b-harness bead): `scantxoutset` is a full
-        // UTXO-set scan — fast on regtest/small chains (the demo + tests), but minutes
-        // on a large mainnet chain. Because this runs synchronously inside the
-        // fire-time `escape_sweep_admissible` coverage check, a multi-minute scan can
-        // outlast the bounded `[T, T + combine_slack_secs]` combine window and stop the
-        // SWEEP from broadcasting. This does NOT weaken safety — Lockdown at `T` is
-        // unconditional and independent of the sweep, so funds still freeze → recovery,
-        // never theft — but near-term mainnet operation of the sweep needs a
-        // wallet/indexed vault-UTXO lookup here (a backend capability, out of this
-        // core bead's scope; see challenges-round-3).
+        // SCALING (deliverable 9y5.3-c): the confirmed scan is absent from this hot
+        // path. A dedicated background task warms the cold `scantxoutset` snapshot
+        // and advances it by at most `MAX_VAULT_SCAN_DELTA_BLOCKS` blocks per pass.
+        // Here [`Self::confirmed_candidates`] accepts only a cache already at the
+        // active tip; cold/stale fails immediately (no sweep; Lockdown already
+        // latched) rather than consuming the finite combine window.
         let watched: HashSet<&ScriptBuf> = scripts.iter().collect();
         // There is no atomic chain+mempool JSON-RPC snapshot. Take bounded full
         // passes instead, bracketing each with Core's monotonic `mempool_sequence`
@@ -603,7 +982,28 @@ impl ChainBackend for BitcoindBackend {
             // retry, whether the suppressor stays or is evicted before the pass ends,
             // so an understated confirmed denominator is never accepted.
             let (mempool_before, sequence_before) = self.mempool_snapshot()?;
-            let (scan_tip, mut found) = self.scan_confirmed_vault_unspent(scripts)?;
+            // The confirmed-set candidates from the current-tip cache, then one
+            // batched `gettxout(..., include_mempool=true)` re-validation that drops any
+            // confirmed output a mempool transaction has since spent — exactly as
+            // before the cache existed; the cache only skips the whole-set scan.
+            let (scan_tip, candidates) = self.confirmed_candidates(scripts)?;
+            let mut found: HashMap<OutPoint, Prevout> = HashMap::new();
+            let confirmed_prevouts = self.prevouts(&candidates)?;
+            if confirmed_prevouts.len() != candidates.len() {
+                return Err(format!(
+                    "chain backend returned {} confirmed-candidate prevouts for {} outpoints",
+                    confirmed_prevouts.len(),
+                    candidates.len()
+                )
+                .into());
+            }
+            for (outpoint, prevout) in candidates.iter().zip(confirmed_prevouts) {
+                if let Some(prevout) = prevout {
+                    if watched.contains(&prevout.txout.script_pubkey) && prevout.confirmed {
+                        found.insert(*outpoint, prevout);
+                    }
+                }
+            }
 
             // Authorized-unconfirmed balance: only transactions this node accepted may
             // contribute. Reading just those txids avoids scanning unrelated mempool
@@ -630,11 +1030,13 @@ impl ChainBackend for BitcoindBackend {
                     }
                 }
             }
-            let tip_after = self
+            let tip_after_text = self
                 .call("getbestblockhash", json!([]))?
                 .as_str()
                 .ok_or("getbestblockhash: expected a block hash")?
                 .to_string();
+            let tip_after = BlockHash::from_str(&tip_after_text)
+                .map_err(|e| format!("getbestblockhash: bad hash: {e}"))?;
             let (_, sequence_after) = self.mempool_snapshot()?;
             if scan_tip == tip_after && sequence_before == sequence_after {
                 let mut found: Vec<_> = found.into_iter().collect();
@@ -649,6 +1051,26 @@ impl ChainBackend for BitcoindBackend {
             }
         }
         unreachable!("the bounded snapshot loop always returns or errors")
+    }
+
+    fn refresh_vault_unspent_cache(&self, scripts: &[ScriptBuf]) -> Result<(), Error> {
+        let cached = self
+            .scan_cache
+            .lock()
+            .expect("scan cache lock poisoned")
+            .as_ref()
+            .filter(|cache| cache.scripts == scripts)
+            .cloned();
+        let refreshed = match cached {
+            Some(cache) if self.block_hash_at(cache.height)? == Some(cache.bestblock) => {
+                self.advance_confirmed_scan(cache)?
+            }
+            // Cold start or a reorg below the cache anchor. A full scan is unavoidable,
+            // but this method is called only from the dedicated background task.
+            Some(_) | None => self.full_confirmed_scan(scripts)?,
+        };
+        *self.scan_cache.lock().expect("scan cache lock poisoned") = Some(refreshed);
+        Ok(())
     }
 
     fn mempool_transaction(&self, txid: &Txid) -> Result<Option<Vec<u8>>, Error> {
@@ -754,12 +1176,26 @@ pub(crate) mod mock {
     //! A mock chain backend for the unit tests — no bitcoind, no sockets.
 
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
 
-    use bitcoin::{consensus, OutPoint, ScriptBuf, Transaction, Txid};
+    use bitcoin::hashes::Hash;
+    use bitcoin::{consensus, BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 
-    use super::{ChainBackend, PackageVerdict, Prevout, SpendSeen};
+    use super::{ChainBackend, PackageVerdict, Prevout, ScanTraversal, SpendSeen};
     use crate::Error;
+
+    /// A deterministic per-height block hash for the mock's chain view. `epoch`
+    /// distinguishes chain histories: the default view is epoch 0, and
+    /// [`MockBackend::reorg_at`] rewrites a suffix to epoch 1 so a hash that was
+    /// recorded before the reorg no longer matches — exactly what the reorg-aware
+    /// cursor keys off. Encoding the height keeps every height's hash distinct.
+    pub(crate) fn mock_block_hash(height: u32, epoch: u8) -> BlockHash {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
+        bytes[4] = epoch;
+        BlockHash::from_byte_array(bytes)
+    }
 
     /// Records every broadcast and replays a canned spend set to the scan. Each
     /// spend's `script` is what the watchtower classifies against.
@@ -788,8 +1224,38 @@ pub(crate) mod mock {
         pub broadcasts: Mutex<Vec<Vec<u8>>>,
         pub tip: u32,
         pub spend_block: u32,
+        /// Per-height block-hash overrides for the reorg-cursor tests. A height
+        /// absent here reads its deterministic epoch-0 [`mock_block_hash`];
+        /// [`Self::reorg_at`] inserts epoch-1 hashes to model a reorg.
+        pub block_hashes: HashMap<u32, BlockHash>,
+        /// If set, the first completed `spends_of` switches every hash at and above
+        /// this height to a distinct epoch. This models the scan/hash-collection
+        /// reorg race without mutating the mock through `&self`.
+        pub scan_reorg_from: Option<u32>,
+        pub scan_completed: AtomicBool,
+        /// If set, the first `tip_height` read of a pass commits a reorg forking at
+        /// `reorg_from_on_tip_read - 1` and rebuilding to `reorg_new_tip` (a distinct
+        /// epoch-3 history at and above the fork). This models the taller fork that
+        /// lands in the reconcile→scan GAP — AFTER reconcile matched the old anchor but
+        /// BEFORE the scan reads the new blocks — the case the root/boundary check
+        /// closes (v0-exit 9y5.3 [P1]). `tip_read_reorg_fired` records the trigger so
+        /// `block_hash_at`/`block_hash_of` return the new fork for the rest of the pass.
+        pub reorg_from_on_tip_read: Option<u32>,
+        pub reorg_new_tip: Option<u32>,
+        pub tip_read_reorg_fired: AtomicBool,
         pub scanned_from: Mutex<Vec<u32>>,
         pub prevouts: HashMap<OutPoint, Prevout>,
+        /// Every `prevout` lookup, in order, so the preflight tests can prove a
+        /// backend failure aborts rather than multiplying one timeout per input.
+        pub prevout_lookups: Mutex<Vec<OutPoint>>,
+        /// Optional failure injected after recording a `prevout` lookup.
+        pub prevout_error: Option<String>,
+        /// Optional one-shot pause on the first prevout lookup. Handler-level tests
+        /// use it to prove the duress intent exists and `sign_state` is free while
+        /// chain preflight is blocked.
+        pub prevout_fetch_entered: Option<Arc<Barrier>>,
+        pub prevout_fetch_continue: Option<Arc<Barrier>>,
+        pub prevout_fetch_paused: AtomicBool,
         pub raw_txs: HashMap<Txid, Vec<u8>>,
         pub confirmed_txs: HashSet<Txid>,
         pub package_rejection: Option<String>,
@@ -805,6 +1271,50 @@ pub(crate) mod mock {
         /// final broadcast-authorization boundary.
         pub package_test_entered: Option<Arc<Barrier>>,
         pub package_test_continue: Option<Arc<Barrier>>,
+    }
+
+    impl MockBackend {
+        /// The block hash this mock reports at `height`: an override if present,
+        /// else the deterministic epoch-0 hash.
+        fn block_hash_of(&self, height: u32) -> BlockHash {
+            self.block_hashes.get(&height).copied().unwrap_or_else(|| {
+                // A taller-fork reorg committed in this pass's reconcile→scan gap:
+                // heights at and above the fork read the new fork (epoch 3).
+                if self.tip_read_reorg_fired.load(Ordering::Relaxed)
+                    && self
+                        .reorg_from_on_tip_read
+                        .is_some_and(|from_height| height >= from_height)
+                {
+                    return mock_block_hash(height, 3);
+                }
+                let raced = self.scan_completed.load(Ordering::Relaxed)
+                    && self
+                        .scan_reorg_from
+                        .is_some_and(|from_height| height >= from_height);
+                mock_block_hash(height, if raced { 2 } else { 0 })
+            })
+        }
+
+        /// The tip this mock reports now, accounting for a committed tip-read reorg
+        /// that rebuilt the chain taller.
+        fn effective_tip(&self) -> u32 {
+            if self.tip_read_reorg_fired.load(Ordering::Relaxed) {
+                self.reorg_new_tip.unwrap_or(self.tip)
+            } else {
+                self.tip
+            }
+        }
+
+        /// Rewrite the active chain from `from_height` up to the current `tip` to a
+        /// distinct (epoch-1) history, modelling a reorg whose fork point is
+        /// `from_height - 1`. Every block hash at or above `from_height` then
+        /// differs from what a pre-reorg scan recorded, so the cursor detects the
+        /// reorg and rewinds. Set `tip` first if the reorg also changes the height.
+        pub(crate) fn reorg_at(&mut self, from_height: u32) {
+            for height in from_height..=self.tip {
+                self.block_hashes.insert(height, mock_block_hash(height, 1));
+            }
+        }
     }
 
     impl ChainBackend for MockBackend {
@@ -826,29 +1336,92 @@ pub(crate) mod mock {
         }
 
         fn tip_height(&self) -> Result<u32, Error> {
-            Ok(self.tip)
+            // A pass reads the tip once, right after reconcile: that read commits the
+            // armed tip-read reorg, so the subsequent tip-hash capture and scan see the
+            // new (taller) fork while reconcile already matched the pre-reorg anchor.
+            if self.reorg_from_on_tip_read.is_some() {
+                self.tip_read_reorg_fired.store(true, Ordering::Relaxed);
+            }
+            Ok(self.effective_tip())
+        }
+
+        fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, Error> {
+            // No block occupies a height above the tip — the reorg-shortened-chain
+            // signal the cursor reads as a mismatch.
+            if height > self.effective_tip() {
+                return Ok(None);
+            }
+            Ok(Some(self.block_hash_of(height)))
         }
 
         fn spends_of(
             &self,
             _scripts: &[ScriptBuf],
             from_height: u32,
-        ) -> Result<Vec<SpendSeen>, Error> {
+            through_height: u32,
+            expected_parent: Option<BlockHash>,
+        ) -> Result<ScanTraversal, Error> {
             self.scanned_from
                 .lock()
                 .expect("scanned_from lock")
                 .push(from_height);
+            // Model check 0 (the root/boundary linkage): the block at `from_height`
+            // must chain onto the caller's cursor anchor. In this linear mock, the
+            // parent of block[h] is `block_hash_of(h - 1)`. A reorg that lands in the
+            // reconcile→scan gap (e.g. via `reorg_from_on_tip_read`) makes this differ
+            // from the anchor the caller passed, so the scan refuses — exactly as the
+            // real backend's `previousblockhash` check does.
+            if let Some(parent) = expected_parent {
+                if from_height > 0 && self.block_hash_of(from_height - 1) != parent {
+                    return Err(format!(
+                        "mock spends_of: block at height {from_height} does not chain onto \
+                         expected parent {parent} (a reorg raced the scan)"
+                    )
+                    .into());
+                }
+            }
             // The canned spends live in `spend_block`; a scan whose cursor has
             // advanced past it sees nothing, so a re-alert can only come from a
             // cursor that failed to advance (never dedup).
-            if from_height <= self.spend_block {
-                Ok(self.spends.clone())
+            let result = if from_height <= self.spend_block && self.spend_block <= through_height {
+                self.spends.clone()
             } else {
-                Ok(Vec::new())
+                Vec::new()
+            };
+            // The validated (height, hash) chain the watchtower binds its anchors to,
+            // captured from the SAME view that classified the spends.
+            let blocks: Vec<(u32, BlockHash)> = (from_height..=through_height)
+                .map(|height| (height, self.block_hash_of(height)))
+                .collect();
+            if self.scan_reorg_from.is_some() {
+                self.scan_completed.store(true, Ordering::Relaxed);
             }
+            Ok(ScanTraversal {
+                spends: result,
+                blocks,
+            })
         }
 
         fn prevout(&self, outpoint: &OutPoint) -> Result<Option<Prevout>, Error> {
+            self.prevout_lookups
+                .lock()
+                .expect("prevout_lookups lock")
+                .push(*outpoint);
+            if self
+                .prevout_fetch_paused
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                if let Some(entered) = &self.prevout_fetch_entered {
+                    entered.wait();
+                }
+                if let Some(proceed) = &self.prevout_fetch_continue {
+                    proceed.wait();
+                }
+            }
+            if let Some(reason) = &self.prevout_error {
+                return Err(reason.clone().into());
+            }
             Ok(self.prevouts.get(outpoint).cloned())
         }
 
@@ -901,14 +1474,19 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use super::mock::MockBackend;
-    use super::{assemble_package, BitcoindBackend, ChainBackend, Prevout, MAX_PACKAGE_ANCESTORS};
+    use super::{
+        assemble_package, BitcoindBackend, ChainBackend, Prevout, MAX_PACKAGE_ANCESTORS,
+        MAX_VAULT_SCAN_DELTA_BLOCKS,
+    };
 
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash;
     use bitcoin::hex::DisplayHex;
     use bitcoin::transaction::Version;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+    use bitcoin::{
+        Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    };
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -954,12 +1532,43 @@ mod tests {
                 let body: serde_json::Value =
                     serde_json::from_slice(&request[header_end..header_end + content_len])
                         .expect("JSON-RPC request");
-                assert_eq!(body["method"], expected_method);
-                let response = serde_json::json!({
-                    "result": result,
-                    "error": serde_json::Value::Null,
-                    "id": "vault-node",
-                })
+                let response = if let Some(batch) = body.as_array() {
+                    assert!(
+                        batch
+                            .iter()
+                            .all(|request| request["method"] == expected_method),
+                        "unexpected JSON-RPC batch: {body}"
+                    );
+                    if let Some(raw) = result.get("__raw_batch") {
+                        raw.clone()
+                    } else {
+                        let results = result.as_array().cloned().unwrap_or_else(|| vec![result]);
+                        assert_eq!(
+                            results.len(),
+                            batch.len(),
+                            "scripted batch needs one result per request"
+                        );
+                        results
+                            .into_iter()
+                            .enumerate()
+                            .map(|(id, result)| {
+                                serde_json::json!({
+                                    "result": result,
+                                    "error": serde_json::Value::Null,
+                                    "id": id,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .into()
+                    }
+                } else {
+                    assert_eq!(body["method"], expected_method);
+                    serde_json::json!({
+                        "result": result,
+                        "error": serde_json::Value::Null,
+                        "id": "vault-node",
+                    })
+                }
                 .to_string();
                 write!(
                     stream,
@@ -971,6 +1580,18 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    fn cold_cache_replies(
+        scan: serde_json::Value,
+        bestblock: &str,
+        height: u32,
+    ) -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("scantxoutset", scan),
+            ("getblockheader", serde_json::json!({"height": height})),
+            ("getblockhash", serde_json::json!(bestblock)),
+        ]
     }
 
     /// A minimal but well-formed 1-in/1-out transaction to broadcast.
@@ -1098,73 +1719,196 @@ mod tests {
         server.join().expect("scripted RPC completed");
     }
 
-    /// An authorized transaction can confirm after `scantxoutset` snapshots the UTXO
-    /// set but before the authorized-mempool pass reaches it. It is then absent from
-    /// both reads unless the changed tip triggers a confirmed-set reconciliation.
     #[test]
-    fn vault_unspent_reconciles_an_authorized_confirmation_racing_the_scan() {
+    fn production_prevout_batch_reorders_ids_and_preserves_null_entries() {
+        let first = OutPoint::new(Txid::from_byte_array([0x11; 32]), 0);
+        let second = OutPoint::new(Txid::from_byte_array([0x22; 32]), 1);
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let (addr, server) = scripted_rpc(vec![(
+            "gettxout",
+            serde_json::json!({
+                "__raw_batch": [
+                    {"result": null, "error": null, "id": 1},
+                    {
+                        "result": {
+                            "scriptPubKey": {"hex": script.as_bytes().to_lower_hex_string()},
+                            "value": 0.001,
+                            "confirmations": 3
+                        },
+                        "error": null,
+                        "id": 0
+                    }
+                ]
+            }),
+        )]);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        let prevouts = backend
+            .prevouts(&[first, second])
+            .expect("the production batch parser accepts out-of-order ids");
+        server.join().expect("scripted RPC completed");
+        assert_eq!(prevouts.len(), 2);
+        assert_eq!(
+            prevouts[0]
+                .as_ref()
+                .map(|prevout| &prevout.txout.script_pubkey),
+            Some(&script)
+        );
+        assert!(prevouts[0]
+            .as_ref()
+            .is_some_and(|prevout| prevout.confirmed));
+        assert_eq!(prevouts[1], None);
+    }
+
+    #[test]
+    fn production_prevout_batch_refuses_duplicate_reply_ids() {
+        let first = OutPoint::new(Txid::from_byte_array([0x33; 32]), 0);
+        let second = OutPoint::new(Txid::from_byte_array([0x44; 32]), 1);
+        let (addr, server) = scripted_rpc(vec![(
+            "gettxout",
+            serde_json::json!({
+                "__raw_batch": [
+                    {"result": null, "error": null, "id": 0},
+                    {"result": null, "error": null, "id": 0}
+                ]
+            }),
+        )]);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        let error = backend
+            .prevouts(&[first, second])
+            .expect_err("duplicate batch ids must fail closed")
+            .to_string();
+        server.join().expect("scripted RPC completed");
+        assert!(error.contains("duplicate reply id 0"), "{error}");
+    }
+
+    /// A fire-time read never chases a stale cache. The background refresher advances
+    /// the cold scan by block delta, after which the same hot-path read succeeds.
+    #[test]
+    fn vault_unspent_fails_fast_until_the_background_delta_reaches_the_tip() {
         let script = ScriptBuf::from_bytes(vec![0x51]);
         let txid = Txid::from_byte_array([0xA5; 32]);
         let old_tip = "11".repeat(32);
         let new_tip = "22".repeat(32);
         let script_hex = script.as_bytes().to_lower_hex_string();
-        let mut authorized_tx = sample_tx();
-        authorized_tx.output[0].script_pubkey = script.clone();
-        let authorized_tx_hex = serialize(&authorized_tx).to_lower_hex_string();
         let confirmed_output = serde_json::json!({
             "scriptPubKey": {"hex": script_hex},
             "value": 0.001,
             "confirmations": 1,
         });
-        let (addr, server) = scripted_rpc(vec![
-            // Snapshot 1 starts while the authorized transaction is in the mempool.
+        let scan = serde_json::json!({
+            "success": true,
+            "bestblock": old_tip,
+            "unspents": []
+        });
+        let mut replies = cold_cache_replies(scan, &old_tip, 0);
+        replies.extend([
+            // Fire-time: one mempool snapshot plus one best-tip read, then fail fast.
             (
                 "getrawmempool",
-                serde_json::json!({"txids": [txid.to_string()], "mempool_sequence": 1}),
+                serde_json::json!({"txids": [], "mempool_sequence": 1}),
             ),
+            ("getbestblockhash", serde_json::json!(new_tip)),
+            // Background delta: anchor is still active, then one new block adds the
+            // watched output and the terminal active-hash re-read commits it.
+            ("getblockhash", serde_json::json!(old_tip)),
+            ("getblockcount", serde_json::json!(1)),
+            ("getblockhash", serde_json::json!(new_tip)),
             (
-                "scantxoutset",
-                serde_json::json!({"success": true, "bestblock": old_tip, "unspents": []}),
+                "getblock",
+                serde_json::json!({
+                    "previousblockhash": old_tip,
+                    "tx": [{
+                        "txid": txid.to_string(),
+                        "vin": [{"coinbase": "00"}],
+                        "vout": [{"scriptPubKey": {"hex": script_hex}}]
+                    }]
+                }),
             ),
-            // It confirms while the authorized pass reads its output.
-            ("getrawtransaction", serde_json::json!(authorized_tx_hex)),
-            ("gettxout", confirmed_output.clone()),
+            ("getblockhash", serde_json::json!(new_tip)),
+            // Fire-time after refresh: current cache, one batched prevout lookup, and
+            // a stable chain+mempool bracket.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 2}),
+            ),
+            ("getbestblockhash", serde_json::json!(new_tip)),
+            ("gettxout", confirmed_output),
             ("getbestblockhash", serde_json::json!(new_tip)),
             (
                 "getrawmempool",
                 serde_json::json!({"txids": [], "mempool_sequence": 2}),
             ),
-            // Snapshot 2 retries the complete view at the new stable tip.
-            (
-                "getrawmempool",
-                serde_json::json!({"txids": [], "mempool_sequence": 2}),
-            ),
-            (
-                "scantxoutset",
-                serde_json::json!({
-                    "success": true,
-                    "bestblock": "22".repeat(32),
-                    "unspents": [{"txid": txid.to_string(), "vout": 0}],
-                }),
-            ),
-            ("gettxout", confirmed_output),
-            ("getbestblockhash", serde_json::json!("22".repeat(32))),
-            (
-                "getrawmempool",
-                serde_json::json!({"txids": [], "mempool_sequence": 2}),
-            ),
         ]);
+        let (addr, server) = scripted_rpc(replies);
         let backend = BitcoindBackend::new(addr, String::new());
-        let authorized: HashSet<Txid> = [txid].into_iter().collect();
+        let scripts = std::slice::from_ref(&script);
 
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("cold cache warm");
+        let stale = backend
+            .vault_unspent(scripts, &HashSet::new())
+            .expect_err("the hot path must not perform its own catch-up");
+        assert!(stale.to_string().contains("cold or behind"), "{stale}");
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("bounded one-block delta");
         let unspent = backend
-            .vault_unspent(std::slice::from_ref(&script), &authorized)
+            .vault_unspent(scripts, &HashSet::new())
             .expect("reconciled vault balance");
         server.join().expect("scripted RPC completed");
         assert_eq!(unspent.len(), 1);
         assert_eq!(unspent[0].0, OutPoint::new(txid, 0));
         assert_eq!(unspent[0].1.txout.value, Amount::from_sat(100_000));
         assert!(unspent[0].1.confirmed);
+    }
+
+    #[test]
+    fn one_cache_refresh_applies_at_most_the_bounded_block_delta() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let hash_at = |height: u32| format!("{height:064x}");
+        let genesis = hash_at(0);
+        let scan = serde_json::json!({"success": true, "bestblock": genesis, "unspents": []});
+        let mut replies = cold_cache_replies(scan, &genesis, 0);
+        replies.push(("getblockhash", serde_json::json!(genesis)));
+        replies.push(("getblockcount", serde_json::json!(33)));
+        for height in 1..=MAX_VAULT_SCAN_DELTA_BLOCKS {
+            let hash = hash_at(height);
+            let parent = hash_at(height - 1);
+            replies.push(("getblockhash", serde_json::json!(hash)));
+            replies.push((
+                "getblock",
+                serde_json::json!({"previousblockhash": parent, "tx": []}),
+            ));
+        }
+        replies.push((
+            "getblockhash",
+            serde_json::json!(hash_at(MAX_VAULT_SCAN_DELTA_BLOCKS)),
+        ));
+        // The active tip is still one block beyond the bounded update, so fire-time
+        // coverage refuses without fetching or parsing block 33.
+        replies.push((
+            "getrawmempool",
+            serde_json::json!({"txids": [], "mempool_sequence": 1}),
+        ));
+        replies.push(("getbestblockhash", serde_json::json!(hash_at(33))));
+        let (addr, server) = scripted_rpc(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&script);
+
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("cold cache warm");
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("bounded delta");
+        let stale = backend
+            .vault_unspent(scripts, &HashSet::new())
+            .expect_err("one pass must not exceed the delta bound");
+        server.join().expect("scripted RPC completed");
+        assert!(stale.to_string().contains("cold or behind"), "{stale}");
     }
 
     /// An authorized mempool transaction can be evicted after `gettxout(..., true)`
@@ -1192,13 +1936,14 @@ mod tests {
             "value": 0.001,
             "confirmations": 1,
         });
-        let (addr, server) = scripted_rpc(vec![
+        let mut replies = cold_cache_replies(scan, &tip, 0);
+        replies.extend([
             // Snapshot 1: the authorized child initially spends the confirmed parent.
             (
                 "getrawmempool",
                 serde_json::json!({"txids": [authorized_txid.to_string()], "mempool_sequence": 10}),
             ),
-            ("scantxoutset", scan.clone()),
+            ("getbestblockhash", serde_json::json!(tip)),
             ("gettxout", serde_json::Value::Null),
             // Evicted while its outputs are enumerated; the tip does not change, but
             // the eviction bumps the sequence, so the pass is not accepted.
@@ -1214,7 +1959,7 @@ mod tests {
                 "getrawmempool",
                 serde_json::json!({"txids": [], "mempool_sequence": 11}),
             ),
-            ("scantxoutset", scan),
+            ("getbestblockhash", serde_json::json!(tip)),
             ("gettxout", confirmed_parent),
             ("getbestblockhash", serde_json::json!("33".repeat(32))),
             (
@@ -1222,9 +1967,13 @@ mod tests {
                 serde_json::json!({"txids": [], "mempool_sequence": 11}),
             ),
         ]);
+        let (addr, server) = scripted_rpc(replies);
         let backend = BitcoindBackend::new(addr, String::new());
         let authorized: HashSet<Txid> = [authorized_txid].into_iter().collect();
 
+        backend
+            .refresh_vault_unspent_cache(std::slice::from_ref(&script))
+            .expect("cold cache warm");
         let unspent = backend
             .vault_unspent(std::slice::from_ref(&script), &authorized)
             .expect("eviction-reconciled vault balance");
@@ -1257,14 +2006,15 @@ mod tests {
             "value": 0.001,
             "confirmations": 1,
         });
-        let (addr, server) = scripted_rpc(vec![
+        let mut replies = cold_cache_replies(scan, &tip, 0);
+        replies.extend([
             // Snapshot 1: an UNAUTHORIZED mempool tx suppresses the confirmed
             // parent. The authorized set is empty throughout this test.
             (
                 "getrawmempool",
                 serde_json::json!({"txids": [unauthorized_txid.to_string()], "mempool_sequence": 20}),
             ),
-            ("scantxoutset", scan.clone()),
+            ("getbestblockhash", serde_json::json!(tip)),
             ("gettxout", serde_json::Value::Null),
             ("getbestblockhash", serde_json::json!("44".repeat(32))),
             // Eviction with no tip change bumps the sequence, so the complete pass
@@ -1278,7 +2028,7 @@ mod tests {
                 "getrawmempool",
                 serde_json::json!({"txids": [], "mempool_sequence": 21}),
             ),
-            ("scantxoutset", scan),
+            ("getbestblockhash", serde_json::json!(tip)),
             ("gettxout", confirmed_parent),
             ("getbestblockhash", serde_json::json!("44".repeat(32))),
             (
@@ -1286,8 +2036,12 @@ mod tests {
                 serde_json::json!({"txids": [], "mempool_sequence": 21}),
             ),
         ]);
+        let (addr, server) = scripted_rpc(replies);
         let backend = BitcoindBackend::new(addr, String::new());
 
+        backend
+            .refresh_vault_unspent_cache(std::slice::from_ref(&script))
+            .expect("cold cache warm");
         let unspent = backend
             .vault_unspent(std::slice::from_ref(&script), &HashSet::new())
             .expect("unauthorized-eviction-reconciled vault balance");
@@ -1321,7 +2075,8 @@ mod tests {
             "value": 0.001,
             "confirmations": 1,
         });
-        let (addr, server) = scripted_rpc(vec![
+        let mut replies = cold_cache_replies(scan, &tip, 0);
+        replies.extend([
             // Snapshot 1: empty mempool. A transient tx then enters, suppresses the
             // confirmed parent, and leaves — all before snapshot 2, so BOTH sets are
             // empty. Only the sequence records the enter (+1) and leave (+1).
@@ -1329,7 +2084,7 @@ mod tests {
                 "getrawmempool",
                 serde_json::json!({"txids": [], "mempool_sequence": 50}),
             ),
-            ("scantxoutset", scan.clone()),
+            ("getbestblockhash", serde_json::json!(tip)),
             ("gettxout", serde_json::Value::Null),
             ("getbestblockhash", serde_json::json!("88".repeat(32))),
             (
@@ -1341,7 +2096,7 @@ mod tests {
                 "getrawmempool",
                 serde_json::json!({"txids": [], "mempool_sequence": 52}),
             ),
-            ("scantxoutset", scan),
+            ("getbestblockhash", serde_json::json!(tip)),
             ("gettxout", confirmed_parent),
             ("getbestblockhash", serde_json::json!("88".repeat(32))),
             (
@@ -1349,8 +2104,12 @@ mod tests {
                 serde_json::json!({"txids": [], "mempool_sequence": 52}),
             ),
         ]);
+        let (addr, server) = scripted_rpc(replies);
         let backend = BitcoindBackend::new(addr, String::new());
 
+        backend
+            .refresh_vault_unspent_cache(std::slice::from_ref(&script))
+            .expect("cold cache warm");
         let unspent = backend
             .vault_unspent(std::slice::from_ref(&script), &HashSet::new())
             .expect("transient-reconciled vault balance");
@@ -1361,27 +2120,92 @@ mod tests {
         assert!(unspent[0].1.confirmed);
     }
 
+    /// Deliverable 9y5.3-c: a second `vault_unspent` call with an UNCHANGED tip
+    /// reuses the cached confirmed-set candidates and SKIPS `scantxoutset`. The
+    /// scripted peer offers no second `scantxoutset`, so the test passing at all is
+    /// the proof the whole-set scan was not re-run — the bound that keeps a
+    /// multi-minute mainnet scan from repeating on every combine-window tick.
+    #[test]
+    fn vault_unspent_reuses_the_confirmed_scan_while_the_tip_is_unchanged() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let parent_txid = Txid::from_byte_array([0x5A; 32]);
+        let tip = "aa".repeat(32);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let scan = serde_json::json!({
+            "success": true,
+            "bestblock": tip,
+            "unspents": [{"txid": parent_txid.to_string(), "vout": 0}],
+        });
+        let confirmed = serde_json::json!({
+            "scriptPubKey": {"hex": script_hex},
+            "value": 0.001,
+            "confirmations": 3,
+        });
+        let mut replies = cold_cache_replies(scan, &tip, 0);
+        replies.extend([
+            // Calls 1 and 2 both consume the already-warm cache. Neither can issue
+            // `scantxoutset`; only the stable chain+mempool bracket repeats.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 1}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("gettxout", confirmed.clone()),
+            ("getbestblockhash", serde_json::json!(tip)),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 1}),
+            ),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 1}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("gettxout", confirmed),
+            ("getbestblockhash", serde_json::json!(tip)),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 1}),
+            ),
+        ]);
+        let (addr, server) = scripted_rpc(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&script);
+
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("cold cache warm");
+        let first = backend
+            .vault_unspent(scripts, &HashSet::new())
+            .expect("first scan");
+        let second = backend
+            .vault_unspent(scripts, &HashSet::new())
+            .expect("cached scan (no scantxoutset)");
+        server.join().expect("scripted RPC completed");
+        assert_eq!(
+            first, second,
+            "the cached pass returns the identical balance"
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, OutPoint::new(parent_txid, 0));
+        assert!(first[0].1.confirmed);
+    }
+
     #[test]
     fn vault_unspent_rejects_an_incomplete_confirmed_scan() {
         let script = ScriptBuf::from_bytes(vec![0x51]);
-        let (addr, server) = scripted_rpc(vec![
-            (
-                "getrawmempool",
-                serde_json::json!({"txids": [], "mempool_sequence": 30}),
-            ),
-            (
-                "scantxoutset",
-                serde_json::json!({
-                    "success": false,
-                    "bestblock": "55".repeat(32),
-                    "unspents": [],
-                }),
-            ),
-        ]);
+        let (addr, server) = scripted_rpc(vec![(
+            "scantxoutset",
+            serde_json::json!({
+                "success": false,
+                "bestblock": "55".repeat(32),
+                "unspents": [],
+            }),
+        )]);
         let backend = BitcoindBackend::new(addr, String::new());
 
         let error = backend
-            .vault_unspent(std::slice::from_ref(&script), &HashSet::new())
+            .refresh_vault_unspent_cache(std::slice::from_ref(&script))
             .expect_err("an aborted scan must fail closed");
         server.join().expect("scripted RPC completed");
         assert!(
@@ -1396,33 +2220,152 @@ mod tests {
         let current_txid = Txid::from_byte_array([0x66; 32]);
         let current_raw = serialize(&sample_tx()).to_lower_hex_string();
         let tip = "77".repeat(32);
-        let (addr, server) = scripted_rpc(vec![
+        let scan = serde_json::json!({"success": true, "bestblock": tip, "unspents": []});
+        let mut replies = cold_cache_replies(scan, &tip, 0);
+        replies.extend([
             (
                 "getrawmempool",
                 serde_json::json!({"txids": [current_txid.to_string()], "mempool_sequence": 40}),
             ),
-            (
-                "scantxoutset",
-                serde_json::json!({"success": true, "bestblock": tip, "unspents": []}),
-            ),
+            ("getbestblockhash", serde_json::json!(tip)),
             ("getrawtransaction", serde_json::json!(current_raw)),
-            ("getbestblockhash", serde_json::json!("77".repeat(32))),
+            ("getbestblockhash", serde_json::json!(tip)),
             (
                 "getrawmempool",
                 serde_json::json!({"txids": [current_txid.to_string()], "mempool_sequence": 40}),
             ),
         ]);
+        let (addr, server) = scripted_rpc(replies);
         let backend = BitcoindBackend::new(addr, String::new());
         let mut authorized: HashSet<Txid> = (0..128)
             .map(|tag| Txid::from_byte_array([tag; 32]))
             .collect();
         authorized.insert(current_txid);
 
+        backend
+            .refresh_vault_unspent_cache(std::slice::from_ref(&script))
+            .expect("cold cache warm");
         let unspent = backend
             .vault_unspent(std::slice::from_ref(&script), &authorized)
             .expect("stable snapshot");
         server.join().expect("scripted RPC completed");
         assert!(unspent.is_empty());
+    }
+
+    // -- the watchtower scan's mid-scan reorg guard (9y5.3-a) ----------------
+
+    /// One empty block, verbosity-3 shaped, for the scripted scan below.
+    fn scanned_block(parent: Option<&str>) -> serde_json::Value {
+        match parent {
+            Some(parent) => {
+                serde_json::json!({"previousblockhash": parent, "tx": []})
+            }
+            None => serde_json::json!({"tx": []}),
+        }
+    }
+
+    /// The control: a scan whose blocks chain and whose newest block is still the
+    /// active one at its height returns its spends. Without this the two rejection
+    /// tests below could pass for the wrong reason (any error at all).
+    #[test]
+    fn a_stable_scan_returns_its_spends() {
+        let first = "a1".repeat(32);
+        let second = "a2".repeat(32);
+        let (addr, server) = scripted_rpc(vec![
+            ("getblockhash", serde_json::json!(first)),
+            ("getblock", scanned_block(None)),
+            ("getblockhash", serde_json::json!(second)),
+            ("getblock", scanned_block(Some(&"a1".repeat(32)))),
+            // The terminal re-read: block 2 is still the active block there.
+            ("getblockhash", serde_json::json!("a2".repeat(32))),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let seen = backend
+            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 2, None)
+            .expect("a stable scan");
+        server.join().expect("scripted RPC completed");
+        assert!(
+            seen.spends.is_empty(),
+            "the scripted blocks carry no spends"
+        );
+    }
+
+    /// A reorg that swaps the active block PART-WAY through the scan: block 2 comes
+    /// back from a different fork and so does not chain onto block 1. Binding that
+    /// mixed read would classify one fork's spends and silently skip the other's.
+    #[test]
+    fn a_mixed_fork_scan_is_refused_rather_than_bound() {
+        let (addr, server) = scripted_rpc(vec![
+            ("getblockhash", serde_json::json!("a1".repeat(32))),
+            ("getblock", scanned_block(None)),
+            ("getblockhash", serde_json::json!("b2".repeat(32))),
+            // B's block 2 chains onto B's block 1, not the A block just scanned.
+            ("getblock", scanned_block(Some(&"b1".repeat(32)))),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let error = backend
+            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 2, None)
+            .expect_err("a mixed-fork scan must not be bound")
+            .to_string();
+        server.join().expect("scripted RPC completed");
+        assert!(
+            error.contains("does not chain onto"),
+            "the refusal must name the broken linkage: {error}"
+        );
+    }
+
+    /// A scan that ran END-TO-END on a fork the node has since abandoned is
+    /// internally consistent — every block chains — so only the terminal re-read
+    /// catches it. This is the A→B→A case that also returns the original tip hash
+    /// and so slips past the watchtower's own post-scan tip check.
+    #[test]
+    fn a_scan_bound_to_an_abandoned_fork_is_refused() {
+        let (addr, server) = scripted_rpc(vec![
+            ("getblockhash", serde_json::json!("b1".repeat(32))),
+            ("getblock", scanned_block(None)),
+            ("getblockhash", serde_json::json!("b2".repeat(32))),
+            ("getblock", scanned_block(Some(&"b1".repeat(32)))),
+            // The chain returned to A before the terminal re-read.
+            ("getblockhash", serde_json::json!("a2".repeat(32))),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let error = backend
+            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 2, None)
+            .expect_err("an abandoned fork's spends must not be bound")
+            .to_string();
+        server.join().expect("scripted RPC completed");
+        assert!(
+            error.contains("no longer the active block"),
+            "the refusal must name the abandoned fork: {error}"
+        );
+    }
+
+    /// Check 0 (v0-exit 9y5.3 [P1], BOTH reviewers): the FIRST scanned block must chain
+    /// onto `expected_parent` — the cursor anchor the caller is extending. A reorg that
+    /// forks below `from_height` and rebuilds taller in the reconcile→scan gap leaves a
+    /// new-fork `from_height` block whose parent is NOT the anchor; without this check,
+    /// binding it appends an anchor that no longer chains, and a later flip back to that
+    /// fork resumes above a block this node never scanned there — silently skipping its
+    /// spends forever.
+    #[test]
+    fn a_scan_that_does_not_root_on_the_cursor_anchor_is_refused() {
+        let (addr, server) = scripted_rpc(vec![
+            ("getblockhash", serde_json::json!("b1".repeat(32))),
+            // Block at `from_height` names a DIFFERENT parent than the cursor anchor.
+            ("getblock", scanned_block(Some(&"b0".repeat(32)))),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        // A cursor anchor on a DIFFERENT fork than the scanned block's parent (`b0…`).
+        let anchor = BlockHash::from_byte_array([0xa0; 32]);
+        let error = backend
+            .spends_of(&[ScriptBuf::from_bytes(vec![0x51])], 1, 1, Some(anchor))
+            .expect_err("a scan not rooted on the cursor anchor must be refused")
+            .to_string();
+        server.join().expect("scripted RPC completed");
+        assert!(
+            error.contains("does not chain onto the expected parent"),
+            "the refusal must name the broken root linkage: {error}"
+        );
     }
 
     #[test]
