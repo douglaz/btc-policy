@@ -21,6 +21,10 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // The named v0 acceptance artifact (DESIGN.md, "The demo"). It reports its
+        // own per-act scorecard, so it owns its exit code rather than being mapped
+        // from a Result here.
+        ["demo", "theft-refused"] => demo::run_theft_refused(),
         ["demo", "recovery-drill"] => match recovery::run_recovery_drill() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -34,7 +38,7 @@ fn main() -> ExitCode {
         ["attack", scenario] => attack::run(Some(scenario)),
         _ => {
             eprintln!(
-                "usage: btc-vault demo <first-light|recovery-drill>\n\
+                "usage: btc-vault demo <first-light|theft-refused|recovery-drill>\n\
                         btc-vault attack [all|{}]",
                 attack::SCENARIO_NAMES.join("|")
             );

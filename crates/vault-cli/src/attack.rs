@@ -46,7 +46,7 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::panic::{catch_unwind, UnwindSafe};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -6686,38 +6686,95 @@ fn with_restarted_bitcoind_without_mempool<T>(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // The RPC listener closes just before Core releases its datadir lock.
+    // The retry loop below respawns on ANY startup exit, not only the datadir-lock race, so
+    // the replacement's stderr is CAPTURED (not discarded) and surfaced on the deadline
+    // errors — a genuinely broken invocation (e.g. a flag a future bitcoind rejects) must be
+    // diagnosable, not looped ~600x behind a hard-coded "lock" cause (Fable 9y5.4 P3).
+    let replacement_stderr_path = datadir.join("replacement-bitcoind.stderr");
+    let debug_log = datadir.join("regtest").join("debug.log");
+    let diag = |what: &str| -> Error {
+        let tail = std::fs::read_to_string(&replacement_stderr_path)
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().collect();
+                lines[lines.len().saturating_sub(12)..].join("\n")
+            })
+            .unwrap_or_else(|_| "(no replacement stderr captured)".to_string());
+        format!(
+            "empty-mempool bitcoind restart {what}. NB the loop retries on ANY startup exit, so a \
+             rejected flag or bad config looks identical to the outgoing Core's datadir-lock race \
+             — last replacement stderr:\n{tail}\n(full node log: {})",
+            debug_log.display()
+        )
+        .into()
+    };
+    let spawn_replacement = || -> Result<Child, Error> {
+        Command::new("bitcoind")
+            .arg("-regtest")
+            .arg(format!("-datadir={}", datadir.display()))
+            .arg(format!("-rpcport={rpc_port}"))
+            .arg("-listen=0")
+            .arg("-server=1")
+            .arg("-txindex=1")
+            .arg("-fallbackfee=0.0001")
+            .arg("-persistmempool=0")
+            .arg("-wallet=attack")
+            .arg(format!("-rpcuser={rpc_user}"))
+            .arg(format!("-rpcpassword={rpc_password}"))
+            .stdout(Stdio::null())
+            // Capture stderr so the deadline diagnostics can show WHY it kept exiting.
+            .stderr(
+                std::fs::File::create(&replacement_stderr_path)
+                    .map(Stdio::from)
+                    .unwrap_or_else(|_| Stdio::null()),
+            )
+            .spawn()
+            .map_err(|e| format!("cannot restart bitcoind without its mempool: {e}").into())
+    };
+
+    // Core closes its RPC listener EARLY in shutdown but releases the datadir lock
+    // only when the process finally exits, after flushing chainstate — so the loop
+    // above returning "unreachable" does NOT mean the datadir is free. Measured on an
+    // idle regtest node with a 200-block chain: RPC stopped answering 1ms after
+    // `stop`, the process lived to 193ms. A replacement spawned inside that gap dies
+    // with "Cannot obtain a lock on data directory", which surfaces here only as
+    // `exit status: 1`.
+    //
+    // 200ms is therefore a bet that was being won by ~7ms on an IDLE box, against a
+    // flush whose cost grows with the chain and the machine's load; this scenario
+    // lost it during a full `attack all` run. So the sleep stays as a head start for
+    // the common case, but readiness is now established by RETRYING the spawn until
+    // the lock is genuinely free instead of by trusting the guess. This is the launch
+    // gate, and it runs on every push: a gate that goes red for a lost race is one
+    // people learn to re-run rather than read.
     std::thread::sleep(Duration::from_millis(200));
-
-    let mut child = Command::new("bitcoind")
-        .arg("-regtest")
-        .arg(format!("-datadir={}", datadir.display()))
-        .arg(format!("-rpcport={rpc_port}"))
-        .arg("-listen=0")
-        .arg("-server=1")
-        .arg("-txindex=1")
-        .arg("-fallbackfee=0.0001")
-        .arg("-persistmempool=0")
-        .arg("-wallet=attack")
-        .arg(format!("-rpcuser={rpc_user}"))
-        .arg(format!("-rpcpassword={rpc_password}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("cannot restart bitcoind without its mempool: {e}"))?;
-
     let startup_deadline = Instant::now() + Duration::from_secs(60);
+    let mut child = spawn_replacement()?;
     loop {
+        // `Some` means it died on startup. Retry while the outgoing Core may still
+        // hold the lock; past the deadline, report the last status verbatim so a
+        // genuinely broken invocation stays diagnosable rather than retried silently.
         if let Some(status) = child.try_wait()? {
-            return Err(
-                format!("empty-mempool bitcoind restart exited during startup: {status}").into(),
-            );
+            if Instant::now() >= startup_deadline {
+                return Err(diag(&format!(
+                    "kept exiting during startup (last: {status})"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            child = spawn_replacement()?;
+            continue;
         }
         if vault.bitcoind.call("getblockchaininfo", json!([])).is_ok() {
             break;
         }
         if Instant::now() >= startup_deadline {
-            return Err("empty-mempool bitcoind restart did not become ready".into());
+            // The replacement is still RUNNING here (`try_wait` returned `None` above) but
+            // never became ready. Kill and reap it before bailing, or the live child leaks
+            // its datadir lock + RPC port into every later scenario of `attack all` — a
+            // single readiness timeout would cascade into port collisions and blocked
+            // TempDir cleanup (Fable 9y5.4 P3; the sibling error paths already reap).
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(diag("did not become ready within 60s"));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
