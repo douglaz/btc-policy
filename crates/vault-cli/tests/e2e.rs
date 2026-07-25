@@ -15,6 +15,24 @@ fn demo_first_light_exits_zero() {
     assert!(status.success(), "demo exited {status}");
 }
 
+/// The NAMED v0 acceptance artifact (DESIGN.md, "The demo"): act one is the
+/// structured `DEST_NOT_ALLOWED` refusal of a sweep to an unknown address by every
+/// node, act two is the attacker's ALLOWLISTED spend caught mid-Hold as a pending
+/// spend the user never authorized and clawed back by an instant escape sweep. The
+/// exit code IS the scorecard, so a plain `success()` assertion is the whole gate.
+///
+/// Slower than first light: act two waits out a real (regtest-compressed) Hold and
+/// the combine window that follows before it may call the attacker's spend absent.
+#[test]
+#[ignore = "spawns bitcoind and 5 vault-node processes; run with --ignored"]
+fn demo_theft_refused_exits_zero() {
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_btc-vault"))
+        .args(["demo", "theft-refused"])
+        .status()
+        .expect("run btc-vault demo theft-refused");
+    assert!(status.success(), "theft-refused demo exited {status}");
+}
+
 /// The V0-10 recovery exit end-to-end: the two-branch vault is funded, a recovery
 /// spend before the relative timelock matures is consensus-rejected, 1-of-3 cannot
 /// finalize, and after advancing median-time-past the 2-of-3 recovery spend

@@ -1,0 +1,223 @@
+# CI for btc-policy.
+#
+# Two jobs, and the split is the point:
+#
+#   `check`      — fmt, clippy -D warnings, and the whole test suite (including the
+#                  V0-7 property/fuzz suites, which live in the workspace). Fast,
+#                  and the thing every push should be able to wait for.
+#
+#   `launch-gate` — `attack all` (every adversarial scenario) plus BOTH demos. This
+#                  is the custody claim itself: "no theft path, safety track held".
+#                  It is slow, so it is a separate job — but it runs on EVERY push,
+#                  because a launch gate nobody runs is a launch gate that has
+#                  already rotted, and for custody code that rot is silent.
+#
+# Everything runs inside the repo's own Nix devShell (`flake.nix`), which is where
+# the pinned toolchain and bitcoind come from. There is no second source of truth
+# for the build environment, and CI must not become one.
+name: CI
+
+# Both triggers: `push` is what the launch gate must not miss, `pull_request` is
+# what covers branches pushed from forks. A same-repo PR branch therefore builds
+# twice; that duplication is cheaper than a fork PR that never ran the gate.
+on:
+  push:
+  pull_request:
+
+# One in-flight run per ref. The gate is long, and a superseded push should not
+# keep a runner busy proving something about a commit nobody will merge.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.check.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      # Report every failing check in one run rather than only the first.
+      fail-fast: false
+      matrix:
+        check:
+          - name: fmt
+            run: nix develop -c cargo fmt --all --check
+          - name: clippy
+            run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+          - name: test
+            run: nix develop -c cargo test --workspace
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      # A pure speedup, and deliberately non-blocking: this action caches Nix store
+      # paths through an UNDOCUMENTED GitHub Actions cache API, which has broken
+      # before (the free tier was end-of-lifed in Feb 2025 and later restored). A
+      # cache that stops working must never turn a green tree red, so its failure is
+      # tolerated; every derivation it would have served still resolves from
+      # cache.nixos.org.
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+      - run: ${{ matrix.check.run }}
+
+  launch-gate:
+    name: launch gate (attack all + both demos)
+    runs-on: ubuntu-latest
+    # `attack all` stands up a fresh 5-node federation per scenario and waits out
+    # real Holds, hostage windows, and combine windows; the two demos add a real
+    # regtest Hold each. Generous, so a slow runner reports a FAILURE rather than a
+    # cancellation nobody can attribute.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        continue-on-error: true
+
+      # ---------------------------------------------------------------------
+      # What ran: the resolved environment, recorded before anything uses it.
+      - name: Record the resolved toolchain and flake lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp flake.nix flake.lock Cargo.lock artifacts/
+          {
+            echo "commit:  $GITHUB_SHA"
+            echo "ref:     $GITHUB_REF"
+            echo "runner:  $(uname -srm)"
+            nix --version
+            nix develop -c rustc -Vv
+            nix develop -c cargo -Vv
+            # Unpiped, deliberately: `| head` would close bitcoind's stdout early
+            # and, under `pipefail`, turn its SIGPIPE into a failed step.
+            nix develop -c bitcoind -version
+          } | tee artifacts/toolchain.txt
+          nix flake metadata --json > artifacts/flake-metadata.json
+
+      - name: Build the launch-gate binaries
+        shell: bash
+        run: nix develop -c cargo build -p vault-cli -p vault-node
+
+      # The binaries the gate below actually executes. `demo`/`attack` run the
+      # `btc-vault` binary, which builds and spawns `vault-node` itself, so both
+      # hashes are part of "what was proven".
+      - name: Record the binary hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum target/debug/btc-vault target/debug/vault-node \
+            | tee artifacts/binaries.sha256
+
+      # ---------------------------------------------------------------------
+      # The gate. Each step records its exit code and its full log BEFORE failing, so
+      # a FAILED gate is still attributable from the artifact rather than only from a
+      # red X. Note what this does NOT do: these steps carry no `if: always()`, so the
+      # first one to fail skips the ones after it, and the scorecard says so per
+      # section instead of implying a clean sweep. That is deliberate — the artifact
+      # covers every step that RAN, and `attack all` scorecards all 16 scenarios
+      # internally, so nothing is lost by not burning ~40min of runner time proving a
+      # second thing about a commit whose gate has already gone red.
+      # `shell: bash` gives `-o pipefail`, without which `tee` would swallow a
+      # non-zero exit and the gate would pass by accident — restated explicitly
+      # because that failure mode is silent.
+      - name: demo first-light
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          nix develop -c cargo run -q -p vault-cli --bin btc-vault -- demo first-light \
+            2>&1 | tee artifacts/demo-first-light.log || status=$?
+          echo "demo first-light:  exit $status" >> artifacts/exit-codes.txt
+          exit $status
+
+      - name: demo theft-refused
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          nix develop -c cargo run -q -p vault-cli --bin btc-vault -- demo theft-refused \
+            2>&1 | tee artifacts/demo-theft-refused.log || status=$?
+          echo "demo theft-refused: exit $status" >> artifacts/exit-codes.txt
+          exit $status
+
+      - name: attack all
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          nix develop -c cargo run -q -p vault-cli --bin btc-vault -- attack all \
+            2>&1 | tee artifacts/attack-all.log || status=$?
+          echo "attack all:        exit $status" >> artifacts/exit-codes.txt
+          exit $status
+
+      # ---------------------------------------------------------------------
+      # The record. `always()`, because the artifacts of a FAILED gate are the ones
+      # anybody actually needs.
+      - name: Assemble the scorecard and the effective config
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          # Both harnesses print their scorecard LAST, so the tail from its header
+          # onward is the table plus its verdict, verbatim. Slicing by header rather
+          # than matching rows by indentation keeps this file from owning a print
+          # format it does not control. An empty slice means the run died before it
+          # got there, and each block below says so instead of going silent.
+          attack_card=$(sed -n '/ADVERSARIAL HARNESS SCORECARD/,$p' artifacts/attack-all.log 2>/dev/null)
+          demo_card=$(sed -n '/THEFT-REFUSED SCORECARD/,$p' artifacts/demo-theft-refused.log 2>/dev/null)
+          indent() { sed 's/^/    /'; }
+          {
+            echo "commit: $GITHUB_SHA"
+            echo
+            echo "# The federation each demo provisioned (printed by its own bring-up)"
+            grep -h '^ *config:' artifacts/demo-*.log || echo "(no demo reached bring-up)"
+            echo
+            echo "# The adversarial harness federation"
+            grep -h 'ADVERSARIAL HARNESS SCORECARD' artifacts/attack-all.log \
+              || echo "(attack all did not reach its scorecard)"
+            echo
+            echo "# Per-scenario knobs are compile-time constants (crates/vault-cli/src/attack.rs,"
+            echo "# struct Setup) and are therefore pinned by the commit above."
+          } > artifacts/effective-config.txt
+          {
+            echo "# Launch gate — $GITHUB_SHA"
+            echo
+            echo '## Exit codes (0 = held)'
+            echo
+            indent 2>/dev/null < artifacts/exit-codes.txt || echo '    (no gate step ran)'
+            echo
+            echo '## Adversarial scenarios'
+            echo
+            if [ -n "$attack_card" ]; then
+              printf '%s\n' "$attack_card" | indent
+            else
+              echo '    (attack all did not reach its scorecard)'
+            fi
+            echo
+            echo '## Demo: theft-refused'
+            echo
+            if [ -n "$demo_card" ]; then
+              printf '%s\n' "$demo_card" | indent
+            else
+              echo '    (theft-refused did not reach its scorecard)'
+            fi
+            echo
+            echo '## Demo: first-light'
+            echo
+            grep -E 'ACT (ONE|TWO) OK|FIRST LIGHT COMPLETE' artifacts/demo-first-light.log \
+              | indent || echo '    (first light produced no act lines)'
+          } > artifacts/scorecard.md
+          cat artifacts/scorecard.md
+
+      - name: Upload the launch-gate record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: launch-gate-${{ github.sha }}
+          path: artifacts/
+          retention-days: 30
+          if-no-files-found: error

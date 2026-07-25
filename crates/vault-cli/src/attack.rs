@@ -46,7 +46,7 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::panic::{catch_unwind, UnwindSafe};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -6686,32 +6686,58 @@ fn with_restarted_bitcoind_without_mempool<T>(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // The RPC listener closes just before Core releases its datadir lock.
+    let spawn_replacement = || -> Result<Child, Error> {
+        Command::new("bitcoind")
+            .arg("-regtest")
+            .arg(format!("-datadir={}", datadir.display()))
+            .arg(format!("-rpcport={rpc_port}"))
+            .arg("-listen=0")
+            .arg("-server=1")
+            .arg("-txindex=1")
+            .arg("-fallbackfee=0.0001")
+            .arg("-persistmempool=0")
+            .arg("-wallet=attack")
+            .arg(format!("-rpcuser={rpc_user}"))
+            .arg(format!("-rpcpassword={rpc_password}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot restart bitcoind without its mempool: {e}").into())
+    };
+
+    // Core closes its RPC listener EARLY in shutdown but releases the datadir lock
+    // only when the process finally exits, after flushing chainstate — so the loop
+    // above returning "unreachable" does NOT mean the datadir is free. Measured on an
+    // idle regtest node with a 200-block chain: RPC stopped answering 1ms after
+    // `stop`, the process lived to 193ms. A replacement spawned inside that gap dies
+    // with "Cannot obtain a lock on data directory", which surfaces here only as
+    // `exit status: 1`.
+    //
+    // 200ms is therefore a bet that was being won by ~7ms on an IDLE box, against a
+    // flush whose cost grows with the chain and the machine's load; this scenario
+    // lost it during a full `attack all` run. So the sleep stays as a head start for
+    // the common case, but readiness is now established by RETRYING the spawn until
+    // the lock is genuinely free instead of by trusting the guess. This is the launch
+    // gate, and it runs on every push: a gate that goes red for a lost race is one
+    // people learn to re-run rather than read.
     std::thread::sleep(Duration::from_millis(200));
-
-    let mut child = Command::new("bitcoind")
-        .arg("-regtest")
-        .arg(format!("-datadir={}", datadir.display()))
-        .arg(format!("-rpcport={rpc_port}"))
-        .arg("-listen=0")
-        .arg("-server=1")
-        .arg("-txindex=1")
-        .arg("-fallbackfee=0.0001")
-        .arg("-persistmempool=0")
-        .arg("-wallet=attack")
-        .arg(format!("-rpcuser={rpc_user}"))
-        .arg(format!("-rpcpassword={rpc_password}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("cannot restart bitcoind without its mempool: {e}"))?;
-
     let startup_deadline = Instant::now() + Duration::from_secs(60);
+    let mut child = spawn_replacement()?;
     loop {
+        // `Some` means it died on startup. Retry while the outgoing Core may still
+        // hold the lock; past the deadline, report the last status verbatim so a
+        // genuinely broken invocation stays diagnosable rather than retried silently.
         if let Some(status) = child.try_wait()? {
-            return Err(
-                format!("empty-mempool bitcoind restart exited during startup: {status}").into(),
-            );
+            if Instant::now() >= startup_deadline {
+                return Err(format!(
+                    "empty-mempool bitcoind restart kept exiting during startup (last: \
+                     {status}); the outgoing Core never released the datadir lock"
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            child = spawn_replacement()?;
+            continue;
         }
         if vault.bitcoind.call("getblockchaininfo", json!([])).is_ok() {
             break;
