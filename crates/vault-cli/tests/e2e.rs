@@ -47,8 +47,9 @@ fn demo_recovery_drill_exits_zero() {
     assert!(status.success(), "recovery drill exited {status}");
 }
 
-/// The adversarial harness (ADR-0012 / ADR-0014): thirteen scenarios against live
-/// `n = 2t−1` federations with `t−1` compromised node identities, asserting the
+/// The adversarial harness (ADR-0012 / ADR-0014): sixteen scenarios (the reorg trio
+/// added in bead 9y5.3) against live `n = 2t−1` federations with `t−1` compromised node
+/// identities, asserting the
 /// signer/partial coupling and release-gate rather than a receipt count, the Hot
 /// budget bound on the censorship residual, silence before `T`, ADR-0012's V0-4
 /// implementation-semantics checklist (the Armed overlay racing a Hold expiry,

@@ -1058,11 +1058,23 @@ fn theft_refused_act_two(fed: &Federation) -> Result<String, Error> {
     // it is still `u64::MAX` and every "before it could fire" claim below would be
     // vacuously true.
     let pending_id = pending_id.ok_or("no node acknowledged the attacker's spend")?;
+    // The user SEES this pending spend because the modeled attacker (stolen user key + PIN,
+    // but NOT the coordinator auth key) must relay through the user's OWN coordinator, which
+    // surfaces the acknowledgements. A strictly stronger attacker who also stole the
+    // coordinator auth key could feed a node directly and arm the federation via request
+    // propagation, and no surface the user watches today would show it (GET /events carries
+    // only on-chain watchtower alerts; there is no pending-candidate query). The Hold window
+    // and the clawback below are demonstrated GENUINELY either way; only this "user notices"
+    // step rests on the relay path. A node-side pending projection is future work (Fable review).
     println!(
         "  the coordinator now shows a PENDING spend the user never authorized: {} paying {} to \
          the hot wallet ({theft_txid})",
         &pending_id[..16],
         HOT_SPEND,
+    );
+    println!(
+        "  (the user sees it because this attacker relays through the user's own coordinator; a \
+         coordinator-auth-key thief would need a node-side pending projection — future work)"
     );
 
     // The claw-back, inside the Hold.

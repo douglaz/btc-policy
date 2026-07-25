@@ -24,15 +24,28 @@ on:
   push:
   pull_request:
 
-# One in-flight run per ref. The gate is long, and a superseded push should not
-# keep a runner busy proving something about a commit nobody will merge.
+# Coalesce runs so a superseded push on a feature branch/PR does not keep a runner busy
+# proving something about a commit nobody will merge. `main` is the exception on BOTH axes,
+# because every permanent commit must keep its own gate record (an unrun gate rots silently):
+#  - group is SHA-SPECIFIC on main, so main commits never share a group. Sharing one group
+#    would let GitHub keep only ONE pending run — a third rapid push would displace the second
+#    (a permanent commit) from the pending slot even with `cancel-in-progress: false`, leaving
+#    it with no gate run or artifact (codex/Fable 9y5.4 review). Feature branches keep the
+#    per-ref group so their superseded runs still coalesce.
+#  - cancel-in-progress is false on main so an in-flight gate is never killed by a follow-up.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
 
+# Action-pinning policy: THIRD-PARTY actions run from a mutable branch (`@main`) are the
+# supply-chain risk this custody gate must not carry, so `DeterminateSystems/*` are pinned to
+# audited commit SHAs. GitHub's OWN first-party `actions/*` are kept on the stable `@v4` major
+# tag — the standard GitHub maintains and moves only within v4 — rather than a commit SHA: a
+# mis-copied SHA there would silently break the very gate this workflow adds, on a runner we
+# cannot observe from the repo. (codex/Fable 9y5.4 review: SHA-pin the mutable-branch actions.)
 jobs:
   check:
     name: ${{ matrix.check.name }}
@@ -46,19 +59,19 @@ jobs:
           - name: fmt
             run: nix develop -c cargo fmt --all --check
           - name: clippy
-            run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+            run: nix develop -c cargo clippy --locked --workspace --all-targets -- -D warnings
           - name: test
-            run: nix develop -c cargo test --workspace
+            run: nix develop -c cargo test --locked --workspace
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       # A pure speedup, and deliberately non-blocking: this action caches Nix store
       # paths through an UNDOCUMENTED GitHub Actions cache API, which has broken
       # before (the free tier was end-of-lifed in Feb 2025 and later restored). A
       # cache that stops working must never turn a green tree red, so its failure is
       # tolerated; every derivation it would have served still resolves from
       # cache.nixos.org.
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         continue-on-error: true
       - run: ${{ matrix.check.run }}
 
@@ -72,9 +85,24 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         continue-on-error: true
+
+      # Fail on stale lockfiles BEFORE anything resolves or archives them, so the
+      # flake.lock/Cargo.lock copied into the artifacts below provably describe the very
+      # environment that builds and tests the binaries — no silent regeneration in the
+      # runner (codex 9y5.4 review). The flake check runs FIRST: `--no-update-lock-file`
+      # makes nix EXIT NON-ZERO rather than resolve unlocked inputs in memory when flake.nix
+      # drifted from flake.lock (verified on Nix 2.28.4 — `--no-write-lock-file` only WARNS
+      # and passes, Fable 9y5.4 review), so the `nix develop` on the next line can only ever
+      # run against an already-current lock.
+      - name: Assert the committed lockfiles are current
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix flake metadata --no-update-lock-file >/dev/null
+          nix develop -c cargo metadata --locked --format-version 1 >/dev/null
 
       # ---------------------------------------------------------------------
       # What ran: the resolved environment, recorded before anything uses it.
@@ -84,6 +112,13 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           cp flake.nix flake.lock Cargo.lock artifacts/
+          # The adversarial harness's EFFECTIVE per-scenario configuration is
+          # config-as-code: the `Setup` defaults + each scenario's overrides (Hold,
+          # duress delay, combine slack, budgets, Core args) live here. Copy the source so
+          # an auditor reads the exact knobs from the artifact WITHOUT checking out the
+          # repo at $GITHUB_SHA (codex 9y5.4 review).
+          cp crates/vault-cli/src/attack.rs artifacts/attack-harness-source.rs
+          cp crates/vault-cli/src/demo.rs artifacts/demo-source.rs
           {
             echo "commit:  $GITHUB_SHA"
             echo "ref:     $GITHUB_REF"
@@ -95,11 +130,11 @@ jobs:
             # and, under `pipefail`, turn its SIGPIPE into a failed step.
             nix develop -c bitcoind -version
           } | tee artifacts/toolchain.txt
-          nix flake metadata --json > artifacts/flake-metadata.json
+          nix flake metadata --no-update-lock-file --json > artifacts/flake-metadata.json
 
       - name: Build the launch-gate binaries
         shell: bash
-        run: nix develop -c cargo build -p vault-cli -p vault-node
+        run: nix develop -c cargo build --locked -p vault-cli -p vault-node
 
       # The binaries the gate below actually executes. `demo`/`attack` run the
       # `btc-vault` binary, which builds and spawns `vault-node` itself, so both
@@ -128,7 +163,7 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          nix develop -c cargo run -q -p vault-cli --bin btc-vault -- demo first-light \
+          nix develop -c cargo run --locked -q -p vault-cli --bin btc-vault -- demo first-light \
             2>&1 | tee artifacts/demo-first-light.log || status=$?
           echo "demo first-light:  exit $status" >> artifacts/exit-codes.txt
           exit $status
@@ -138,7 +173,7 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          nix develop -c cargo run -q -p vault-cli --bin btc-vault -- demo theft-refused \
+          nix develop -c cargo run --locked -q -p vault-cli --bin btc-vault -- demo theft-refused \
             2>&1 | tee artifacts/demo-theft-refused.log || status=$?
           echo "demo theft-refused: exit $status" >> artifacts/exit-codes.txt
           exit $status
@@ -148,7 +183,7 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          nix develop -c cargo run -q -p vault-cli --bin btc-vault -- attack all \
+          nix develop -c cargo run --locked -q -p vault-cli --bin btc-vault -- attack all \
             2>&1 | tee artifacts/attack-all.log || status=$?
           echo "attack all:        exit $status" >> artifacts/exit-codes.txt
           exit $status
@@ -167,8 +202,12 @@ jobs:
           # than matching rows by indentation keeps this file from owning a print
           # format it does not control. An empty slice means the run died before it
           # got there, and each block below says so instead of going silent.
-          attack_card=$(sed -n '/ADVERSARIAL HARNESS SCORECARD/,$p' artifacts/attack-all.log 2>/dev/null)
-          demo_card=$(sed -n '/THEFT-REFUSED SCORECARD/,$p' artifacts/demo-theft-refused.log 2>/dev/null)
+          # The `|| true` matters: GitHub runs `shell: bash` with `-e`, and a `var=$(...)`
+          # whose command fails (a MISSING log when an earlier gate step failed and later ones
+          # were skipped) would abort this `always()` step BEFORE writing the diagnostic
+          # artifacts — the exact records a FAILED run most needs (codex 9y5.4 review).
+          attack_card=$(sed -n '/ADVERSARIAL HARNESS SCORECARD/,$p' artifacts/attack-all.log 2>/dev/null || true)
+          demo_card=$(sed -n '/THEFT-REFUSED SCORECARD/,$p' artifacts/demo-theft-refused.log 2>/dev/null || true)
           indent() { sed 's/^/    /'; }
           {
             echo "commit: $GITHUB_SHA"
@@ -181,7 +220,8 @@ jobs:
               || echo "(attack all did not reach its scorecard)"
             echo
             echo "# Per-scenario knobs are compile-time constants (crates/vault-cli/src/attack.rs,"
-            echo "# struct Setup) and are therefore pinned by the commit above."
+            echo "# struct Setup); the exact source is captured in artifacts/attack-harness-source.rs"
+            echo "# (and demo-source.rs) above, pinned to commit $GITHUB_SHA."
           } > artifacts/effective-config.txt
           {
             echo "# Launch gate — $GITHUB_SHA"

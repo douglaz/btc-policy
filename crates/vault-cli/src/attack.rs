@@ -6686,6 +6686,27 @@ fn with_restarted_bitcoind_without_mempool<T>(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // The retry loop below respawns on ANY startup exit, not only the datadir-lock race, so
+    // the replacement's stderr is CAPTURED (not discarded) and surfaced on the deadline
+    // errors — a genuinely broken invocation (e.g. a flag a future bitcoind rejects) must be
+    // diagnosable, not looped ~600x behind a hard-coded "lock" cause (Fable 9y5.4 P3).
+    let replacement_stderr_path = datadir.join("replacement-bitcoind.stderr");
+    let debug_log = datadir.join("regtest").join("debug.log");
+    let diag = |what: &str| -> Error {
+        let tail = std::fs::read_to_string(&replacement_stderr_path)
+            .map(|s| {
+                let lines: Vec<&str> = s.lines().collect();
+                lines[lines.len().saturating_sub(12)..].join("\n")
+            })
+            .unwrap_or_else(|_| "(no replacement stderr captured)".to_string());
+        format!(
+            "empty-mempool bitcoind restart {what}. NB the loop retries on ANY startup exit, so a \
+             rejected flag or bad config looks identical to the outgoing Core's datadir-lock race \
+             — last replacement stderr:\n{tail}\n(full node log: {})",
+            debug_log.display()
+        )
+        .into()
+    };
     let spawn_replacement = || -> Result<Child, Error> {
         Command::new("bitcoind")
             .arg("-regtest")
@@ -6700,7 +6721,12 @@ fn with_restarted_bitcoind_without_mempool<T>(
             .arg(format!("-rpcuser={rpc_user}"))
             .arg(format!("-rpcpassword={rpc_password}"))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // Capture stderr so the deadline diagnostics can show WHY it kept exiting.
+            .stderr(
+                std::fs::File::create(&replacement_stderr_path)
+                    .map(Stdio::from)
+                    .unwrap_or_else(|_| Stdio::null()),
+            )
             .spawn()
             .map_err(|e| format!("cannot restart bitcoind without its mempool: {e}").into())
     };
@@ -6729,11 +6755,9 @@ fn with_restarted_bitcoind_without_mempool<T>(
         // genuinely broken invocation stays diagnosable rather than retried silently.
         if let Some(status) = child.try_wait()? {
             if Instant::now() >= startup_deadline {
-                return Err(format!(
-                    "empty-mempool bitcoind restart kept exiting during startup (last: \
-                     {status}); the outgoing Core never released the datadir lock"
-                )
-                .into());
+                return Err(diag(&format!(
+                    "kept exiting during startup (last: {status})"
+                )));
             }
             std::thread::sleep(Duration::from_millis(100));
             child = spawn_replacement()?;
@@ -6743,7 +6767,14 @@ fn with_restarted_bitcoind_without_mempool<T>(
             break;
         }
         if Instant::now() >= startup_deadline {
-            return Err("empty-mempool bitcoind restart did not become ready".into());
+            // The replacement is still RUNNING here (`try_wait` returned `None` above) but
+            // never became ready. Kill and reap it before bailing, or the live child leaks
+            // its datadir lock + RPC port into every later scenario of `attack all` — a
+            // single readiness timeout would cascade into port collisions and blocked
+            // TempDir cleanup (Fable 9y5.4 P3; the sibling error paths already reap).
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(diag("did not become ready within 60s"));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
