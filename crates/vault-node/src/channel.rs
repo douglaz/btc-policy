@@ -193,10 +193,21 @@ pub struct ChannelConfig {
     pub max_response_bytes: usize,
     #[serde(default = "default_per_send_deadline_secs")]
     pub per_send_deadline_secs: u64,
-    /// When present, the computed provisional `manifest_hash` MUST equal it — the
-    /// node is sealed to a specific manifest (ADR-0013 trust-root posture).
-    #[serde(default)]
-    pub expected_manifest_hash: Option<String>,
+    /// The `manifest_hash` this node is SEALED to (ADR-0013 §4). **MANDATORY**: the
+    /// computed provisional hash must equal it, or startup fails.
+    ///
+    /// It was `Option` until bead btc-policy-9y5.5, and an absent value meant "no
+    /// anchor" — a hand-written config could silently opt out of the one immutable
+    /// federation root every other trust decision chains to (the coordinator auth
+    /// key, every peer channel identity, `max_msg_bytes`, the whole Hot budget and
+    /// its classification inputs). A node with no anchor still could not talk to
+    /// correctly-sealed peers (they answer `WRONG_MANIFEST`), but "cannot talk to
+    /// anyone" is a liveness symptom discovered at run time by whoever is watching,
+    /// not a provisioning error caught at startup — and it says nothing at all in a
+    /// federation whose configs were ALL written without the anchor. Required means
+    /// the mismatch is a startup failure, which is the only form in which it is
+    /// guaranteed to be noticed.
+    pub expected_manifest_hash: String,
 }
 
 /// One membership entry. `endpoints` is PLURAL (a node may advertise clearnet +
@@ -838,6 +849,43 @@ pub mod ceremony {
             .sign_ecdsa(&Message::from_digest(digest), node_seckey)
             .serialize_der()
             .to_lower_hex_string()
+    }
+
+    /// Verify one node's endorsement, the way every peer will at startup.
+    ///
+    /// The setup ceremony calls this on each round-two answer before it seals the
+    /// manifest. A bad endorsement is otherwise found by every node at startup —
+    /// after the vault is frozen and the hosts are sealed (ADR-0005), when the only
+    /// remedy is re-provisioning the whole federation.
+    pub fn verify_endorsement(
+        signing_pubkey: &PublicKey,
+        channel_pubkey: &PublicKey,
+        wallet_id: &[u8; 32],
+        manifest_hash: &[u8; 32],
+        node_id: u16,
+        endpoints: &[String],
+        endorsement_hex: &str,
+    ) -> Result<(), Error> {
+        let bytes = <Vec<u8> as bitcoin::hex::FromHex>::from_hex(endorsement_hex.trim())
+            .map_err(|e| format!("endorsement is not hex: {e}"))?;
+        let signature = bitcoin::secp256k1::ecdsa::Signature::from_der(&bytes)
+            .map_err(|e| format!("endorsement is not a DER signature: {e}"))?;
+        let digest = super::endorsement_digest(
+            wallet_id,
+            manifest_hash,
+            node_id,
+            channel_pubkey,
+            PROTOCOL_VERSION_V0,
+            endpoints,
+        );
+        Secp256k1::verification_only()
+            .verify_ecdsa(
+                &Message::from_digest(digest),
+                &signature,
+                &signing_pubkey.inner,
+            )
+            .map_err(|e| format!("endorsement does not verify: {e}"))?;
+        Ok(())
     }
 
     fn manifest_nodes(nodes: &[CeremonyNode], channel_pubkeys: &[PublicKey]) -> Vec<ManifestNode> {
@@ -2580,11 +2628,11 @@ impl ChannelState {
         }
 
         // `max_msg_bytes` is part of the preimage (V0-4b §0), so a node configured
-        // with a cap the federation did not agree computes a DIFFERENT hash here. With
-        // a sealed `expected_manifest_hash` that is a fatal startup error; without one
-        // the node still cannot talk to anyone (peers answer `WRONG_MANIFEST`). Either
-        // way the run-time value is provably uniform, which is what lets "the carrier
-        // fits my cap" stand in for "it fits every peer's cap".
+        // with a cap the federation did not agree computes a DIFFERENT hash here, and
+        // the mandatory `expected_manifest_hash` below makes that a fatal STARTUP
+        // error rather than a run-time symptom. The run-time value is therefore
+        // provably uniform, which is what lets "the carrier fits my cap" stand in for
+        // "it fits every peer's cap".
         let manifest_hash = compute_manifest_hash(
             &wallet_id,
             PROTOCOL_VERSION_V0,
@@ -2596,12 +2644,10 @@ impl ChannelState {
             escape_descriptor,
             max_derivation_index,
         );
-        if let Some(expected) = &cfg.expected_manifest_hash {
-            let expected = from_hex_32(expected)
-                .map_err(|_| Error::from("[channel] expected_manifest_hash is not 32-byte hex"))?;
-            if expected != manifest_hash {
-                return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes, Hot budget, or Hot-budget classification input disagreeing with the federation-uniform manifest values is one cause)".into());
-            }
+        let expected = from_hex_32(&cfg.expected_manifest_hash)
+            .map_err(|_| Error::from("[channel] expected_manifest_hash is not 32-byte hex"))?;
+        if expected != manifest_hash {
+            return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes, Hot budget, or Hot-budget classification input disagreeing with the federation-uniform manifest values is one cause)".into());
         }
 
         // Verify every node's channel-key endorsement against its signing key
@@ -4799,6 +4845,10 @@ pub(crate) mod fixture {
     pub(crate) struct Entry {
         pub(crate) node_id: u16,
         pub(crate) fed_sk: SecretKey,
+        /// The PUBLIC derivation parameters this entry's `fed_sk` comes out of.
+        /// Written into the node's config in place of the retired `node_seckey`, so
+        /// a fixture config names a derivation the fixture preimage really performs.
+        pub(crate) kdf: crate::nodekey::KdfParams,
         pub(crate) fed_pk: PublicKey,
         pub(crate) channel_pk: PublicKey,
         pub(crate) endpoints: Vec<String>,
@@ -4861,9 +4911,14 @@ pub(crate) mod fixture {
             // The coordinator this fixture's vault is sealed to. Seeded off
             // `user_seed` so a distinct vault also has a distinct coordinator.
             let (coord_sk, coord_pk) = keypair(user_seed.wrapping_add(0x0C));
-            let feds: Vec<(SecretKey, PublicKey)> =
-                (0..n as u8).map(|i| keypair(fed_base + i)).collect();
-            let node_pubkeys: Vec<String> = feds.iter().map(|(_, pk)| pk.to_string()).collect();
+            // Federation signing keys are wskdf-DERIVED here, exactly as a real node
+            // derives its own at startup: `fed_base + i` is the salt seed, and the
+            // fixture preimage is the operator secret. A fixture that kept using raw
+            // `keypair` seeds would emit configs no node could load.
+            let feds: Vec<(crate::nodekey::KdfParams, SecretKey, PublicKey)> = (0..n as u8)
+                .map(|i| crate::test_support::fixture_node_key(fed_base + i))
+                .collect();
+            let node_pubkeys: Vec<String> = feds.iter().map(|(_, _, pk)| pk.to_string()).collect();
             // Throwaway 2-of-3 recovery keyset (seeds 0x30..=0x32), off the normal
             // path these channel tests drive. The node validates the two-branch
             // template (ADR-0013 §1) at startup; the recovery keys never sign here.
@@ -4899,12 +4954,12 @@ pub(crate) mod fixture {
 
             // Canonical node order: lexicographic over the key-expression string.
             let mut order: Vec<usize> = (0..n).collect();
-            order.sort_by(|&a, &b| feds[a].1.to_string().cmp(&feds[b].1.to_string()));
+            order.sort_by(|&a, &b| feds[a].2.to_string().cmp(&feds[b].2.to_string()));
 
             let mut nodes: Vec<ManifestNode> = Vec::new();
             let mut chan: Vec<(SecretKey, PublicKey)> = Vec::new();
             for (node_id, &fed_idx) in order.iter().enumerate() {
-                let (fsk, fpk) = feds[fed_idx];
+                let (_, fsk, fpk) = feds[fed_idx];
                 let csk = derive_channel_seckey(&fsk);
                 let cpk = channel_pubkey_of(&csk);
                 chan.push((csk, cpk));
@@ -4929,7 +4984,7 @@ pub(crate) mod fixture {
 
             let mut entries = Vec::new();
             for (node_id, &fed_idx) in order.iter().enumerate() {
-                let (fsk, fpk) = feds[fed_idx];
+                let (kdf, fsk, fpk) = feds[fed_idx];
                 let (_, cpk) = chan[node_id];
                 let digest = endorsement_digest(
                     &wallet_id,
@@ -4943,6 +4998,7 @@ pub(crate) mod fixture {
                 entries.push(Entry {
                     node_id: node_id as u16,
                     fed_sk: fsk,
+                    kdf,
                     fed_pk: fpk,
                     channel_pk: cpk,
                     endpoints: nodes[node_id].endpoints.clone(),
@@ -5044,16 +5100,41 @@ pub(crate) mod fixture {
             self.reseal();
         }
 
+        /// Seal a manifest that names a channel key `node_id` does NOT derive —
+        /// a setup ceremony that published the wrong channel pubkey for a node.
+        /// Re-sealed, so the manifest hash and every endorsement are internally
+        /// consistent: this is the only way that mismatch can survive to the local
+        /// check, because the mandatory `expected_manifest_hash` catches an
+        /// UNSEALED edit of the same field first (which is the point of it).
+        pub(crate) fn replace_channel_pubkey(&mut self, node_id: u16, channel_pk: PublicKey) {
+            self.entries[node_id as usize].channel_pk = channel_pk;
+            self.reseal();
+        }
+
         /// The `[channel]` TOML block for `self_id`, with `opts` (scalar overrides)
         /// spliced in before the `[[channel.nodes]]` array-of-tables.
         pub(crate) fn channel_block(&self, self_id: u16, opts: &str) -> String {
             // Emit the sealed cap explicitly. It is a manifest preimage field, so a
             // config that omitted it while the fixture had re-sealed to a non-default
             // value would compute a different `manifest_hash` and fail startup.
-            let mut s = format!(
-                "[channel]\nnode_id = {self_id}\nmax_msg_bytes = {}\n{opts}",
-                self.max_msg_bytes
-            );
+            //
+            // `expected_manifest_hash` is MANDATORY (ADR-0013 §4), so it is emitted
+            // from the fixture's own sealed hash — UNLESS `opts` names it, which is
+            // how the tests that are ABOUT the anchor supply a wrong or malformed
+            // one. TOML rejects a duplicate key, so the two spellings cannot both
+            // appear and the override has to be exactly that: an override.
+            let mut s = if opts.contains("expected_manifest_hash") {
+                format!(
+                    "[channel]\nnode_id = {self_id}\nmax_msg_bytes = {}\n{opts}",
+                    self.max_msg_bytes
+                )
+            } else {
+                format!(
+                    "[channel]\nnode_id = {self_id}\nmax_msg_bytes = {}\nexpected_manifest_hash = \"{}\"\n{opts}",
+                    self.max_msg_bytes,
+                    to_hex(&self.manifest_hash),
+                )
+            };
             for e in &self.entries {
                 let eps: Vec<String> = e.endpoints.iter().map(|ep| format!("\"{ep}\"")).collect();
                 s += &format!(
@@ -5091,9 +5172,9 @@ pub(crate) mod fixture {
             // fixture that re-sealed to different caps produces configs that match
             // its manifest — and a test that wants the mismatch has to ask for it.
             format!(
-                "listen_port = {}\nnode_seckey = \"{}\"\ndescriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nhot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\nmax_commitment_age_secs = 172800\npolicy_version = 1\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
+                "listen_port = {}\n{}descriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nhot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\nmax_commitment_age_secs = 172800\npolicy_version = 1\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
                 self.ports[self_id as usize],
-                e.fed_sk.display_secret(),
+                crate::test_support::node_key_toml(&e.kdf),
                 self.descriptor,
                 self.hot_desc,
                 self.escape_desc,
@@ -5399,7 +5480,7 @@ pub(crate) mod fixture {
 
         /// Build a `ChannelState` for `self_id` directly (validates the manifest).
         pub(crate) fn channel_state(&self, self_id: u16) -> ChannelState {
-            let node = crate::Node::from_toml_str(&self.config(self_id, 0, ""))
+            let node = crate::test_support::load_node(&self.config(self_id, 0, ""))
                 .expect("valid channel config");
             node.channel.expect("channel present")
         }
@@ -5828,7 +5909,7 @@ mod identity {
     #[test]
     fn a_valid_channel_config_builds() {
         let fx = Fixture::new(2, 3);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("valid config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("valid config");
         assert!(node.channel.is_some());
     }
 
@@ -5854,7 +5935,7 @@ mod identity {
             stripped, valid,
             "the fixture no longer carries the [chain_backend] block this test strips"
         );
-        let err = crate::Node::from_toml_str(&stripped)
+        let err = crate::test_support::load_node(&stripped)
             .err()
             .expect("a channel node with no chain backend must fail startup")
             .to_string();
@@ -5875,7 +5956,7 @@ mod identity {
                 Semaphore::MAX_PERMITS + 1
             ),
         );
-        let err = crate::Node::from_toml_str(&cfg)
+        let err = crate::test_support::load_node(&cfg)
             .err()
             .expect("oversized semaphore limit must fail startup");
         assert!(
@@ -5893,7 +5974,7 @@ mod identity {
         // load, exactly like `combine_slack_secs = 0` and a missing chain backend.
         let fx = Fixture::new(2, 3);
         let cfg = fx.config(0, 0, "per_send_deadline_secs = 0\n");
-        let err = crate::Node::from_toml_str(&cfg)
+        let err = crate::test_support::load_node(&cfg)
             .err()
             .expect("a zero per_send_deadline_secs must fail startup");
         assert!(
@@ -5918,7 +5999,7 @@ mod identity {
             &format!("signing_pubkey = \"{stranger}\""),
             1,
         );
-        let err = crate::Node::from_toml_str(&broken)
+        let err = crate::test_support::load_node(&broken)
             .err()
             .expect("must fail startup");
         assert!(
@@ -5951,7 +6032,7 @@ mod identity {
             &format!("descriptor = \"{duplicate_descriptor}\""),
             1,
         );
-        let err = crate::Node::from_toml_str(&duplicate)
+        let err = crate::test_support::load_node(&duplicate)
             .err()
             .expect("duplicate descriptor node keys must fail startup");
         assert!(
@@ -5969,7 +6050,10 @@ mod identity {
         let base = fx.channel_state(0).manifest_hash;
         // Reverse the config entry order; build must reorder by node_id and hash
         // identically.
-        let mut reversed = String::from("[channel]\nnode_id = 0\n");
+        let mut reversed = format!(
+            "[channel]\nnode_id = 0\nexpected_manifest_hash = \"{}\"\n",
+            to_hex(&fx.manifest_hash)
+        );
         for e in fx.entries.iter().rev() {
             let eps: Vec<String> = e.endpoints.iter().map(|ep| format!("\"{ep}\"")).collect();
             reversed += &format!(
@@ -5978,7 +6062,7 @@ mod identity {
             );
         }
         let cfg = fx.config_with_channel(0, 0, &reversed);
-        let node = crate::Node::from_toml_str(&cfg).expect("valid config");
+        let node = crate::test_support::load_node(&cfg).expect("valid config");
         assert_eq!(node.channel.expect("channel").manifest_hash, base);
     }
 
@@ -6001,7 +6085,9 @@ mod identity {
         let cfg =
             fx.config(0, 0, "")
                 .replacen(&e.endorsement_hex, &to_hex(&bad.serialize_der()), 1);
-        let err = crate::Node::from_toml_str(&cfg).err().expect("must reject");
+        let err = crate::test_support::load_node(&cfg)
+            .err()
+            .expect("must reject");
         assert!(err.to_string().contains("endorsement"), "unexpected: {err}");
     }
 
@@ -6025,7 +6111,9 @@ mod identity {
         let cfg =
             fx.config(0, 0, "")
                 .replacen(&e.endorsement_hex, &to_hex(&bad.serialize_der()), 1);
-        let err = crate::Node::from_toml_str(&cfg).err().expect("must reject");
+        let err = crate::test_support::load_node(&cfg)
+            .err()
+            .expect("must reject");
         assert!(err.to_string().contains("endorsement"), "unexpected: {err}");
     }
 
@@ -6041,16 +6129,45 @@ mod identity {
                 to_hex(&fx.manifest_hash)
             ),
         );
-        assert!(crate::Node::from_toml_str(&ok).is_ok());
+        assert!(crate::test_support::load_node(&ok).is_ok());
         let bad = fx.config(
             0,
             0,
             &format!("expected_manifest_hash = \"{}\"\n", to_hex(&[0u8; 32])),
         );
-        let err = crate::Node::from_toml_str(&bad)
+        let err = crate::test_support::load_node(&bad)
             .err()
             .expect("sealed mismatch");
         assert!(err.to_string().contains("sealed"), "unexpected: {err}");
+    }
+
+    /// `expected_manifest_hash` is MANDATORY (bead btc-policy-9y5.5). It was
+    /// `Option` before, so a hand-written config could simply omit the immutable
+    /// federation anchor and boot with NO anchor at all — silently trusting
+    /// whatever coordinator key, membership, `max_msg_bytes`, and Hot budget its
+    /// own file happened to name, with no cross-check that the federation ever
+    /// agreed to them. An absent anchor must be a fatal STARTUP error: that is the
+    /// only form in which the operator is guaranteed to see it.
+    #[test]
+    fn a_channel_config_without_the_sealed_anchor_is_a_fatal_config() {
+        let fx = Fixture::new(2, 3);
+        let sealed = fx.config(0, 0, "");
+        assert!(
+            sealed.contains("expected_manifest_hash"),
+            "the fixture must emit the anchor, or this test proves nothing"
+        );
+        let stripped: String = sealed
+            .lines()
+            .filter(|line| !line.starts_with("expected_manifest_hash"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let err = crate::test_support::load_node(&stripped)
+            .err()
+            .expect("a config with no federation anchor must not boot");
+        assert!(
+            err.to_string().contains("expected_manifest_hash"),
+            "the refusal must name the missing anchor: {err}"
+        );
     }
 
     #[test]
@@ -6065,7 +6182,7 @@ mod identity {
             &fx.coord_pk.to_string(),
             &fx.entries[1].channel_pk.to_string(),
         );
-        let err = crate::Node::from_toml_str(&cfg)
+        let err = crate::test_support::load_node(&cfg)
             .err()
             .expect("a channel key must be refused as the coordinator key");
         assert!(
@@ -6093,7 +6210,7 @@ mod identity {
             !cfg.contains("[channel]"),
             "this test must exercise the absent-channel path"
         );
-        let err = crate::Node::from_toml_str(&cfg)
+        let err = crate::test_support::load_node(&cfg)
             .err()
             .expect("the derived channel key must be refused as the coordinator key");
         assert!(
@@ -6115,7 +6232,7 @@ mod identity {
         let cfg =
             fx.config(0, 0, "")
                 .replacen(&peer.channel_pk.to_string(), &uncompressed_coord, 1);
-        let err = crate::Node::from_toml_str(&cfg)
+        let err = crate::test_support::load_node(&cfg)
             .err()
             .expect("the same secp point in another encoding must be refused");
         assert!(
@@ -6142,7 +6259,7 @@ mod identity {
         let rotated = fx
             .config(0, 0, &sealed)
             .replace(&fx.coord_pk.to_string(), &keypair(0xC1).1.to_string());
-        let err = crate::Node::from_toml_str(&rotated)
+        let err = crate::test_support::load_node(&rotated)
             .err()
             .expect("a sealed node must refuse a rotated coordinator key");
         assert!(err.to_string().contains("sealed"), "unexpected: {err}");
@@ -6152,18 +6269,14 @@ mod identity {
     fn a_local_channel_key_mismatch_is_fatal() {
         // Corrupt node 0's own channel_pubkey entry: its locally-derived channel
         // key won't match, so it would be permanently unreachable → fatal.
-        let fx = Fixture::new(2, 3);
-        let e = &fx.entries[0];
-        let other = fx.entries[1].channel_pk.to_string();
-        let cfg = fx
-            .config(0, 0, "")
-            .replacen(&e.channel_pk.to_string(), &other, 1);
-        let err = crate::Node::from_toml_str(&cfg)
+        let mut fx = Fixture::new(2, 3);
+        let other = fx.entries[1].channel_pk;
+        fx.replace_channel_pubkey(0, other);
+        let err = crate::test_support::load_node(&fx.config(0, 0, ""))
             .err()
             .expect("must be fatal");
-        // Either the endorsement (over the swapped key) or the self-key check fails.
         assert!(
-            err.to_string().contains("endorsement") || err.to_string().contains("channel pubkey"),
+            err.to_string().contains("channel pubkey"),
             "unexpected: {err}"
         );
     }
@@ -6558,7 +6671,7 @@ mod ingress {
     fn per_peer_quota_is_enforced_by_authenticated_sender() {
         let fx = Fixture::new(2, 3);
         let send = fx.channel_state(0);
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, "per_peer_quota_per_min = 2\n"))
+        let node = crate::test_support::load_node(&fx.config(1, 0, "per_peer_quota_per_min = 2\n"))
             .expect("config");
         let recv = node.channel.as_ref().expect("channel");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
@@ -6585,7 +6698,7 @@ mod ingress {
     fn fresh_nonces_over_quota_do_not_grow_the_replay_cache() {
         let fx = Fixture::new(2, 3);
         let send = fx.channel_state(0);
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, "per_peer_quota_per_min = 2\n"))
+        let node = crate::test_support::load_node(&fx.config(1, 0, "per_peer_quota_per_min = 2\n"))
             .expect("config");
         let recv = node.channel.as_ref().expect("channel");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
@@ -6649,7 +6762,7 @@ mod ingress {
         // same authenticated capture hits the quota instead of amplifying queue
         // work without bound.
         let stale_node =
-            crate::Node::from_toml_str(&fx.config(1, 0, "per_peer_quota_per_min = 1\n"))
+            crate::test_support::load_node(&fx.config(1, 0, "per_peer_quota_per_min = 1\n"))
                 .expect("config");
         let stale_recv = stale_node.channel.as_ref().expect("channel");
         let stale = send
@@ -6673,7 +6786,7 @@ mod ingress {
         // Replay rejection itself is charged as well: one fresh delivery and one
         // replay fill a quota of two, so another replay is rate-limited.
         let replay_node =
-            crate::Node::from_toml_str(&fx.config(1, 0, "per_peer_quota_per_min = 2\n"))
+            crate::test_support::load_node(&fx.config(1, 0, "per_peer_quota_per_min = 2\n"))
                 .expect("config");
         let replay_recv = replay_node.channel.as_ref().expect("channel");
         let replay = send
@@ -6703,7 +6816,7 @@ mod ingress {
         // coordinator-authenticated single-use nonce at the node handler.
         let fx = Fixture::new(2, 3);
         let send = fx.channel_state(0);
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, "per_peer_quota_per_min = 1\n"))
+        let node = crate::test_support::load_node(&fx.config(1, 0, "per_peer_quota_per_min = 1\n"))
             .expect("config");
         let recv = node.channel.as_ref().expect("channel");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
@@ -7133,7 +7246,7 @@ mod partial {
         // never the node's own — and the authorized set is untouched.
         let fx = Fixture::new(2, 3);
         let send = fx.channel_state(0);
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(1, 0, "")).expect("config");
         let recv = node.channel.as_ref().expect("channel");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         recv.register_candidate(fx.candidate(&psbt, "cid", EXPIRY));
@@ -7226,7 +7339,7 @@ mod partial {
     #[test]
     fn at_the_capacity_cap_a_new_candidate_is_not_inserted_and_none_is_evicted() {
         let fx = Fixture::new(2, 3);
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, "max_active_candidates = 1\n"))
+        let node = crate::test_support::load_node(&fx.config(1, 0, "max_active_candidates = 1\n"))
             .expect("config");
         let recv = node.channel.as_ref().expect("channel");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
@@ -7248,8 +7361,9 @@ mod partial {
     #[test]
     fn the_byte_cap_also_blocks_insertion() {
         let fx = Fixture::new(2, 3);
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, "max_candidate_store_bytes = 10\n"))
-            .expect("config");
+        let node =
+            crate::test_support::load_node(&fx.config(1, 0, "max_candidate_store_bytes = 10\n"))
+                .expect("config");
         let recv = node.channel.as_ref().expect("channel");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         assert_eq!(
@@ -7268,7 +7382,7 @@ mod partial {
         // both the canonical PSBT and the separate partial map. Because wire-time
         // capacity rejection is forbidden, insertion must reserve that growth.
         let opts = format!("max_candidate_store_bytes = {}\n", candidate.bytes);
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, &opts)).expect("config");
+        let node = crate::test_support::load_node(&fx.config(1, 0, &opts)).expect("config");
         let recv = node.channel.as_ref().expect("channel");
         assert_eq!(
             recv.register_candidate(candidate),
@@ -7284,7 +7398,7 @@ mod partial {
         let reserved_bytes = reserved_candidate.capacity_bytes;
         drop(probe);
         let opts = format!("max_candidate_store_bytes = {reserved_bytes}\n");
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, &opts)).expect("config");
+        let node = crate::test_support::load_node(&fx.config(1, 0, &opts)).expect("config");
         let recv = node.channel.as_ref().expect("channel");
         assert_eq!(
             recv.register_candidate(fx.candidate(&psbt, "reserved", EXPIRY)),
@@ -7330,7 +7444,7 @@ mod partial {
     ) {
         let fx = Fixture::new(2, 3);
         let sender = fx.channel_state(0);
-        let node = crate::Node::from_toml_str(&fx.config(1, 10, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(1, 10, "")).expect("config");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let original_user_der = psbt.inputs[0]
             .partial_sigs
@@ -7440,7 +7554,7 @@ mod partial {
     #[test]
     fn a_resend_with_a_different_mandatory_escape_is_refused_without_repairing_the_pair() {
         let fx = Fixture::new(2, 3);
-        let node = crate::Node::from_toml_str(&fx.config(1, 10, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(1, 10, "")).expect("config");
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
         let original = fx.spend_request(&spend, NOW + 3_600, "original-pair");
         assert!(matches!(
@@ -7484,7 +7598,7 @@ mod partial {
         // drop itself from the combine set — a coordinator gaining power over
         // assembly, which Model B forbids.
         let fx = Fixture::new(2, 3);
-        let node = crate::Node::from_toml_str(&fx.config(1, 10, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(1, 10, "")).expect("config");
         let mut psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let forged = Secp256k1::signing_only()
             .sign_ecdsa(&Message::from_digest([0xff; 32]), &fx.entries[1].fed_sk);
@@ -7538,7 +7652,7 @@ mod partial {
         // One slot: the first accepted request's PAIR (spend + escape) already
         // needs two. Neither half may be inserted and the request cannot be
         // acknowledged: the coordinator has no signature fallback in Model B.
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, "max_active_candidates = 1\n"))
+        let node = crate::test_support::load_node(&fx.config(1, 0, "max_active_candidates = 1\n"))
             .expect("config");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let req = fx.spend_request(&psbt, NOW + 3_600, "capacity-pair");
@@ -7579,7 +7693,7 @@ mod startup_and_schema {
     fn a_config_without_a_channel_block_runs_in_absent_channel_mode() {
         let fx = Fixture::new(2, 3);
         // No `[channel]` section at all.
-        let node = crate::Node::from_toml_str(&fx.config_with_channel(0, 0, ""))
+        let node = crate::test_support::load_node(&fx.config_with_channel(0, 0, ""))
             .expect("absent-channel config loads");
         assert!(
             node.channel.is_none(),
@@ -7594,7 +7708,7 @@ mod startup_and_schema {
         let cfg = fx
             .config(0, 0, "")
             .replacen("listen_port = 9000", "listen_port = 9999", 1);
-        let err = crate::Node::from_toml_str(&cfg)
+        let err = crate::test_support::load_node(&cfg)
             .err()
             .expect("must be fatal");
         assert!(
@@ -7610,7 +7724,7 @@ mod startup_and_schema {
             .config(0, 0, "")
             .replacen("listen_port = 9000", "listen_port = 0", 1)
             .replacen("127.0.0.1:9000", "127.0.0.1:0", 1);
-        let err = crate::Node::from_toml_str(&cfg)
+        let err = crate::test_support::load_node(&cfg)
             .err()
             .expect("channel mode cannot advertise an OS-selected port");
         assert!(err.to_string().contains("nonzero"), "unexpected: {err}");
@@ -7623,7 +7737,7 @@ mod startup_and_schema {
         let cfg = fx
             .config(0, 0, "")
             .replacen("127.0.0.1:9001", "127.0.0.1:notaport", 1);
-        let err = crate::Node::from_toml_str(&cfg)
+        let err = crate::test_support::load_node(&cfg)
             .err()
             .expect("must be fatal");
         assert!(err.to_string().contains("endpoint"), "unexpected: {err}");
@@ -7669,7 +7783,7 @@ mod startup_and_schema {
     fn freshness_rejections_surface_through_events_with_peer_attribution_and_monotonic_count() {
         let fx = Fixture::new(2, 3);
         let send = fx.channel_state(0);
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(1, 0, "")).expect("config");
         let recv = node.channel.as_ref().expect("channel");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let payload = fx.partial_payload(&psbt, "c", 0, 0).to_bytes();
@@ -7702,7 +7816,7 @@ mod startup_and_schema {
     fn freshness_skew_clamps_authenticated_u64_timestamps_without_overflow() {
         let fx = Fixture::new(2, 3);
         let send = fx.channel_state(0);
-        let node = crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(1, 0, "")).expect("config");
         let recv = node.channel.as_ref().expect("channel");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let payload = fx.partial_payload(&psbt, "c", 0, 0).to_bytes();
@@ -7794,8 +7908,8 @@ mod net {
         let (l0, p0) = ephemeral().await;
         let (l1, p1) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[p0, p1]);
-        let node0 = Arc::new(crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("node0"));
-        let node1 = Arc::new(crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("node1"));
+        let node0 = Arc::new(crate::test_support::load_node(&fx.config(0, 0, "")).expect("node0"));
+        let node1 = Arc::new(crate::test_support::load_node(&fx.config(1, 0, "")).expect("node1"));
         tokio::spawn(serve_pathless_fixture(l0, Arc::clone(&node0)));
         tokio::spawn(serve_pathless_fixture(l1, Arc::clone(&node1)));
 
@@ -7900,8 +8014,10 @@ mod net {
         let (l0, p0) = ephemeral().await;
         let (l1, p1) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[p0, p1]);
-        let node0 = Arc::new(crate::Node::from_toml_str(&fx.config(0, 3_600, "")).expect("node0"));
-        let node1 = Arc::new(crate::Node::from_toml_str(&fx.config(1, 3_600, "")).expect("node1"));
+        let node0 =
+            Arc::new(crate::test_support::load_node(&fx.config(0, 3_600, "")).expect("node0"));
+        let node1 =
+            Arc::new(crate::test_support::load_node(&fx.config(1, 3_600, "")).expect("node1"));
         tokio::spawn(serve_pathless_fixture(l0, Arc::clone(&node0)));
         tokio::spawn(serve_pathless_fixture(l1, Arc::clone(&node1)));
 
@@ -7952,7 +8068,7 @@ mod net {
     fn a_relayed_request_rechecks_expiry_after_waiting_for_the_sign_lock() {
         let fx = Fixture::new(2, 3);
         let sender = fx.channel_state(0);
-        let node = Arc::new(crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("node"));
+        let node = Arc::new(crate::test_support::load_node(&fx.config(1, 0, "")).expect("node"));
         // Escape-class has no hot Hold+slack floor, so only the coordinator expiry
         // decides whether this short-lived request remains admissible.
         let spend = fx.spend_psbt(&fx.escape_spk, 7);
@@ -7990,8 +8106,8 @@ mod net {
         let (l0, p0) = ephemeral().await;
         let (l1, p1) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[p0, p1]);
-        let node0 = Arc::new(crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("node0"));
-        let node1 = Arc::new(crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("node1"));
+        let node0 = Arc::new(crate::test_support::load_node(&fx.config(0, 0, "")).expect("node0"));
+        let node1 = Arc::new(crate::test_support::load_node(&fx.config(1, 0, "")).expect("node1"));
         let served0 = Arc::clone(&node0);
         tokio::spawn(async move {
             axum::serve(
@@ -8048,7 +8164,7 @@ mod net {
         // The cap is a manifest preimage field (V0-4b §0), so shrinking it re-seals
         // the federation rather than just editing one node's TOML.
         fx.reseal_max_msg_bytes(100);
-        let node = Arc::new(crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("node"));
+        let node = Arc::new(crate::test_support::load_node(&fx.config(0, 0, "")).expect("node"));
         tokio::spawn(serve_pathless_fixture(l, Arc::clone(&node)));
         let resp = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{p}/channel"))
@@ -8065,8 +8181,12 @@ mod net {
         let (l, p) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[p, p + 1]);
         let node = Arc::new(
-            crate::Node::from_toml_str(&fx.config(0, 0, "max_concurrent_channel_requests = 1\n"))
-                .expect("node"),
+            crate::test_support::load_node(&fx.config(
+                0,
+                0,
+                "max_concurrent_channel_requests = 1\n",
+            ))
+            .expect("node"),
         );
         // Hold the only permit so the handler's pre-auth acquire fails.
         let _permit = node
@@ -8098,8 +8218,12 @@ mod net {
         let (l, p) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[p, p + 1]);
         let node = Arc::new(
-            crate::Node::from_toml_str(&fx.config(0, 0, "max_concurrent_channel_requests = 1\n"))
-                .expect("node"),
+            crate::test_support::load_node(&fx.config(
+                0,
+                0,
+                "max_concurrent_channel_requests = 1\n",
+            ))
+            .expect("node"),
         );
         let app = crate::server::app_with_channel_body_timeout(
             Arc::clone(&node),
@@ -8154,7 +8278,7 @@ mod net {
         let (l, p) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[p, p + 1]);
         let node = Arc::new(
-            crate::Node::from_toml_str(&fx.config_with_channel(0, 0, "")).expect("absent node"),
+            crate::test_support::load_node(&fx.config_with_channel(0, 0, "")).expect("absent node"),
         );
         assert!(node.channel.is_none());
         // Exercise the parser/router seam directly. The runnable daemon refuses
@@ -8178,7 +8302,7 @@ mod net {
         let (listener, port) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[port, port + 1]);
         let node = Arc::new(
-            crate::Node::from_toml_str(&fx.config_with_channel(0, 0, "")).expect("parsed node"),
+            crate::test_support::load_node(&fx.config_with_channel(0, 0, "")).expect("parsed node"),
         );
         let error = server::serve(listener, node)
             .await
@@ -8191,7 +8315,7 @@ mod net {
     async fn the_public_serving_api_rejects_pathless_node_construction() {
         let (listener, port) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[port, port + 1]);
-        let node = Arc::new(crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("node"));
+        let node = Arc::new(crate::test_support::load_node(&fx.config(0, 0, "")).expect("node"));
 
         let error = server::serve(listener, node)
             .await
@@ -8209,7 +8333,7 @@ mod net {
     async fn send_partial_to_a_dead_peer_errors_while_a_live_peer_still_receives() {
         let (l1, p1) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[9000, p1]);
-        let node1 = Arc::new(crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("node1"));
+        let node1 = Arc::new(crate::test_support::load_node(&fx.config(1, 0, "")).expect("node1"));
         tokio::spawn(serve_pathless_fixture(l1, Arc::clone(&node1)));
         // Sender state (node 0) — never served; used only to build envelopes.
         let ch0 = fx.channel_state(0);
@@ -8528,7 +8652,8 @@ mod net {
             ],
         );
         let sender = fx.channel_state(0);
-        let receiver = Arc::new(crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("node"));
+        let receiver =
+            Arc::new(crate::test_support::load_node(&fx.config(1, 0, "")).expect("node"));
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         receiver
             .channel
@@ -8565,7 +8690,8 @@ mod net {
         drop(sender_listener);
         let fx = Fixture::with_ports(2, &[sender_port, live_port]);
         let sender = fx.channel_state(0);
-        let receiver = Arc::new(crate::Node::from_toml_str(&fx.config(1, 0, "")).expect("node"));
+        let receiver =
+            Arc::new(crate::test_support::load_node(&fx.config(1, 0, "")).expect("node"));
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         receiver
             .channel
@@ -8650,7 +8776,7 @@ mod net {
         // not block /events (independent locks + spawn_blocking).
         let (l, p) = ephemeral().await;
         let fx = Fixture::with_ports(2, &[p, p + 1]);
-        let node = Arc::new(crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("node"));
+        let node = Arc::new(crate::test_support::load_node(&fx.config(0, 0, "")).expect("node"));
         tokio::spawn(serve_pathless_fixture(l, Arc::clone(&node)));
         let client = reqwest::Client::new();
         // Fire a burst of channel requests (they reject fast; the point is load).
@@ -8714,7 +8840,7 @@ mod fire {
     /// plus the spend's commitment id and its PSBT.
     fn accepted_hot_spend(hold_secs: u64) -> (Fixture, crate::Node, String, Psbt) {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, hold_secs, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, hold_secs, "")).expect("config");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let request = fx.spend_request(&psbt, EXPIRY, "fire-fixture");
         assert!(matches!(
@@ -8846,7 +8972,7 @@ mod fire {
     #[tokio::test]
     async fn a_quorum_at_commitment_expiry_still_broadcasts_in_the_final_legal_second() {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let expiry = NOW + 60;
         let request = fx.spend_request(&psbt, expiry, "inclusive-expiry");
@@ -9021,7 +9147,7 @@ mod fire {
     #[test]
     fn quorum_is_required_on_every_input_of_a_multi_input_spend() {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
         let psbt = fx.two_input_spend_psbt(&fx.hot_spk);
         let escape = fx.two_input_spend_psbt(&fx.escape_spk);
         let mut request = fx.spend_request(&psbt, EXPIRY, "multi-input");
@@ -9321,7 +9447,7 @@ mod fire {
     #[test]
     fn a_spend_over_a_vault_authorized_unconfirmed_parent_broadcasts_against_the_mempool_chain() {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
 
         // The parent: an accepted vault spend, so its txid is authorized.
         let parent = fx.spend_psbt(&fx.hot_spk, 7);
@@ -9399,7 +9525,7 @@ mod fire {
     #[test]
     fn a_spend_over_an_external_unconfirmed_deposit_is_never_broadcast() {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
         let deposit_txid = bitcoin::Txid::from_byte_array([0xEE; 32]);
         let spend = fx.spend_psbt_over(&fx.hot_spk, OutPoint::new(deposit_txid, 0));
         let escape = fx.spend_psbt_over(&fx.escape_spk, OutPoint::new(deposit_txid, 0));
@@ -9447,7 +9573,7 @@ mod fire {
     #[test]
     fn a_partial_arriving_before_its_candidate_is_retriable_not_lost() {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let cid = crate::commitment_id_for(&node, &psbt, EXPIRY);
         let channel = node.channel.as_ref().expect("channel");
@@ -9681,7 +9807,7 @@ mod fire {
     #[test]
     fn an_escape_class_spend_cannot_equal_its_mandatory_residual() {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
         let tx = fx.spend_psbt(&fx.escape_spk, 7);
         let mut request = fx.spend_request(&tx, EXPIRY, "self-paired");
         request.escape_psbt = tx.to_string();
@@ -9749,7 +9875,7 @@ mod fire {
     #[test]
     fn both_pins_propagate_over_an_identical_path_count_and_size() {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
 
         let mut normal = fx.spend_request(&psbt, EXPIRY, "pin-normal");
@@ -9828,7 +9954,7 @@ mod fire {
     fn a_request_that_cannot_fit_its_channel_envelope_is_not_accepted() {
         let mut fx = Fixture::new(3, 5);
         fx.reseal_max_msg_bytes(100);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let request = fx.spend_request(&psbt, EXPIRY, "oversized-propagation");
 
@@ -9849,7 +9975,7 @@ mod fire {
     #[test]
     fn a_policy_refused_request_is_non_propagating_and_non_armable() {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
         let unallowlisted = bitcoin::ScriptBuf::from_bytes(
             std::iter::once(0u8)
                 .chain(std::iter::once(20u8))
@@ -9887,7 +10013,7 @@ mod fire {
     #[test]
     fn a_request_that_comes_back_from_a_peer_is_not_propagated_again() {
         let fx = Fixture::new(3, 5);
-        let node = crate::Node::from_toml_str(&fx.config(0, 0, "")).expect("config");
+        let node = crate::test_support::load_node(&fx.config(0, 0, "")).expect("config");
         let psbt = fx.spend_psbt(&fx.hot_spk, 7);
         let request = fx.spend_request(&psbt, EXPIRY, "loop-suppression");
 
@@ -9953,7 +10079,7 @@ mod duress {
             &format!("\n{extra_toplevel}\n[chain_backend]"),
             1,
         );
-        crate::Node::from_toml_str(&cfg).expect("valid duress config")
+        crate::test_support::load_node(&cfg).expect("valid duress config")
     }
 
     /// A backend whose chain view has `psbt`'s single prevout confirmed.
@@ -10578,7 +10704,7 @@ mod duress {
              backoff_schedule = [0, 0, 0]\nlockout_secs = 100\n[chain_backend]",
             1,
         );
-        let node = crate::Node::from_toml_str(&cfg).expect("config");
+        let node = crate::test_support::load_node(&cfg).expect("config");
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
 
         // Unlocked: normal, wrong, and duress all take the SAME pre-pin exit.
@@ -10602,7 +10728,7 @@ mod duress {
         // drive it there with normally-sized carriers to prove the uniformity survives
         // the locked branch too.
         fx.reseal_max_msg_bytes(crate::channel::DEFAULT_MAX_MSG_BYTES);
-        let big = crate::Node::from_toml_str(&fx.config(0, HOLD, "").replacen(
+        let big = crate::test_support::load_node(&fx.config(0, HOLD, "").replacen(
             "\n\n[chain_backend]",
             "\nduress_delay_secs = 600\n[pin_attempt_budget]\nmax_attempts = 3\nwindow_secs = 3600\n\
              backoff_schedule = [0, 0, 0]\nlockout_secs = 100\n[chain_backend]",
@@ -10805,7 +10931,7 @@ mod duress {
             "\nduress_delay_secs = 600\n[chain_backend]",
             1,
         );
-        let node = crate::Node::from_toml_str(&cfg).expect("valid capacity config");
+        let node = crate::test_support::load_node(&cfg).expect("valid capacity config");
         let channel = node.channel.as_ref().expect("channel");
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
         let request = duress_request(&fx, &spend, &default_escape(&fx), "duress-capacity");
@@ -11018,8 +11144,8 @@ mod duress {
             &format!("\nduress_delay_secs = {DELAY}\n[chain_backend]"),
             1,
         );
-        let normal_node = crate::Node::from_toml_str(&cfg).expect("normal node");
-        let duress_node = crate::Node::from_toml_str(&cfg).expect("duress node");
+        let normal_node = crate::test_support::load_node(&cfg).expect("normal node");
+        let duress_node = crate::test_support::load_node(&cfg).expect("duress node");
         let first_expiry = NOW + 200;
 
         let spend = fx.spend_psbt(&fx.escape_spk, 7);
@@ -11255,7 +11381,7 @@ mod duress {
                 1,
             )
         };
-        let node = crate::Node::from_toml_str(&cfg).expect("config");
+        let node = crate::test_support::load_node(&cfg).expect("config");
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
         let request = duress_request(&fx, &spend, &default_escape(&fx), "arm");
         assert!(matches!(
@@ -11273,7 +11399,7 @@ mod duress {
         drop(node);
 
         // A fresh process against the same config starts clean — un-armed.
-        let reborn = crate::Node::from_toml_str(&cfg).expect("config");
+        let reborn = crate::test_support::load_node(&cfg).expect("config");
         assert!(
             reborn
                 .channel
@@ -13461,7 +13587,7 @@ mod duress {
             to_hex(&fx.manifest_hash)
         );
         // The agreed value boots.
-        crate::Node::from_toml_str(&fx.config(0, HOLD, &sealed)).expect("the agreed cap boots");
+        crate::test_support::load_node(&fx.config(0, HOLD, &sealed)).expect("the agreed cap boots");
         // A disagreeing value computes a different manifest_hash and is fatal. The
         // fixture emits its own sealed cap, so override it in the raw TOML — exactly
         // what a mis-provisioned operator would do.
@@ -13470,7 +13596,7 @@ mod duress {
             "max_msg_bytes = 524288",
             1,
         );
-        let err = match crate::Node::from_toml_str(&divergent) {
+        let err = match crate::test_support::load_node(&divergent) {
             Err(e) => e,
             Ok(_) => panic!("a cap the federation did not agree must not boot"),
         };
@@ -13581,7 +13707,7 @@ mod duress {
             ),
             1,
         );
-        let node = crate::Node::from_toml_str(&cfg).expect("config");
+        let node = crate::test_support::load_node(&cfg).expect("config");
         let channel = node.channel.as_ref().expect("channel");
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
 
@@ -13661,7 +13787,7 @@ mod duress {
              [chain_backend]",
             1,
         );
-        let node = crate::Node::from_toml_str(&cfg).expect("config");
+        let node = crate::test_support::load_node(&cfg).expect("config");
         let channel = node.channel.as_ref().expect("channel");
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
 
@@ -13784,7 +13910,7 @@ mod duress {
             "\nduress_delay_secs = 600\n[chain_backend]",
             1,
         );
-        let node = crate::Node::from_toml_str(&cfg).expect("valid capacity config");
+        let node = crate::test_support::load_node(&cfg).expect("valid capacity config");
         let channel = node.channel.as_ref().expect("channel");
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
         let escape = default_escape(&fx);
@@ -13832,7 +13958,7 @@ mod duress {
             "\nduress_delay_secs = 600\n[chain_backend]",
             1,
         );
-        let node = crate::Node::from_toml_str(&cfg).expect("valid capacity config");
+        let node = crate::test_support::load_node(&cfg).expect("valid capacity config");
         let channel = node.channel.as_ref().expect("channel");
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
         let duress = duress_request(&fx, &spend, &default_escape(&fx), "hijack-target");
@@ -14086,7 +14212,7 @@ mod duress {
                 &format!("\n{bad}\n[chain_backend]"),
                 1,
             );
-            let err = match crate::Node::from_toml_str(&cfg) {
+            let err = match crate::test_support::load_node(&cfg) {
                 Err(e) => e,
                 Ok(_) => panic!("{bad} must not load"),
             };
@@ -14097,7 +14223,7 @@ mod duress {
         }
         // The largest value strictly below the cap leaves a non-empty window.
         let base = fx.config(0, HOLD, "");
-        crate::Node::from_toml_str(&base.replacen(
+        crate::test_support::load_node(&base.replacen(
             "\n\n[chain_backend]",
             "\ndelivery_horizon_secs = 172799\n[chain_backend]",
             1,
@@ -14111,7 +14237,7 @@ mod duress {
     #[test]
     fn a_channel_federation_with_threshold_one_is_rejected_at_startup() {
         let fx = Fixture::new(1, 1);
-        let err = match crate::Node::from_toml_str(&fx.config(0, HOLD, "")) {
+        let err = match crate::test_support::load_node(&fx.config(0, HOLD, "")) {
             Err(err) => err,
             Ok(_) => panic!("a t=1 channel vault cannot satisfy confirmation-gated arming"),
         };
@@ -14128,7 +14254,7 @@ mod duress {
     #[test]
     fn a_channel_federation_requires_exact_byzantine_quorum_shape() {
         let non_intersecting = Fixture::new(2, 5);
-        let err = match crate::Node::from_toml_str(&non_intersecting.config(0, HOLD, "")) {
+        let err = match crate::test_support::load_node(&non_intersecting.config(0, HOLD, "")) {
             Err(err) => err,
             Ok(_) => panic!("a 2-of-5 channel vault leaves an unfrozen signing quorum"),
         };
@@ -14138,14 +14264,14 @@ mod duress {
         );
 
         let insufficient_honest = Fixture::new(4, 5);
-        let err = match crate::Node::from_toml_str(&insufficient_honest.config(0, HOLD, "")) {
+        let err = match crate::test_support::load_node(&insufficient_honest.config(0, HOLD, "")) {
             Err(err) => err,
             Ok(_) => panic!("4-of-5 cannot tolerate three withholding members"),
         };
         assert!(err.to_string().contains("n = 2t - 1"));
 
         let intersecting = Fixture::new(3, 5);
-        crate::Node::from_toml_str(&intersecting.config(0, HOLD, ""))
+        crate::test_support::load_node(&intersecting.config(0, HOLD, ""))
             .expect("the default 3-of-5 channel vault has intersecting quorums");
     }
 }
@@ -14204,7 +14330,7 @@ mod hot_budget {
                 1,
             )
         };
-        let node = crate::Node::from_toml_str(&cfg).expect("valid config");
+        let node = crate::test_support::load_node(&cfg).expect("valid config");
         // Pin the Hot budget's monotonic clock to the same synthetic instant these
         // tests hand `handle_sign`, so a test can read one clock rather than two.
         // Production has no such lever — [`HotClock`] is unsteppable on purpose —
@@ -15541,8 +15667,9 @@ mod hot_budget {
         // reserve. This is the site where a leak would block the honest retry exactly
         // when capacity frees up again.
         let fx = fx_with_caps(60_000_000, 60_000_000);
-        let node = crate::Node::from_toml_str(&fx.config(0, HOLD, "max_active_candidates = 1\n"))
-            .expect("valid capacity config");
+        let node =
+            crate::test_support::load_node(&fx.config(0, HOLD, "max_active_candidates = 1\n"))
+                .expect("valid capacity config");
         let channel = node.channel.as_ref().expect("channel");
         let (_, request) = hot_request(&fx, 7, 60_000_000, "1234");
         assert!(matches!(
@@ -15571,7 +15698,7 @@ mod hot_budget {
             to_hex(&fx.manifest_hash)
         );
         // The agreed caps boot.
-        crate::Node::from_toml_str(&fx.config(0, HOLD, &sealed))
+        crate::test_support::load_node(&fx.config(0, HOLD, &sealed))
             .expect("the agreed Hot budget boots");
         // Each cap independently. The fixture emits its own sealed values, so
         // overriding one in the raw TOML is exactly what a mis-provisioned — or a
@@ -15599,7 +15726,7 @@ mod hot_budget {
                 fx.config(0, HOLD, &sealed),
                 "the {field} override must actually have applied"
             );
-            let err = match crate::Node::from_toml_str(&divergent) {
+            let err = match crate::test_support::load_node(&divergent) {
                 Err(e) => e,
                 Ok(_) => panic!("a {field} cap the federation did not agree must not boot"),
             };
@@ -15628,7 +15755,7 @@ mod hot_budget {
             ("escape descriptor", different_escape),
             ("derivation bound", different_derivation_bound),
         ] {
-            let err = match crate::Node::from_toml_str(&divergent) {
+            let err = match crate::test_support::load_node(&divergent) {
                 Err(e) => e,
                 Ok(_) => panic!("a {field} the federation did not agree must not boot"),
             };
@@ -15648,7 +15775,7 @@ mod hot_budget {
         let fx = fx_with_caps(50_000_000, 100_000_000);
         // Equality is the floor and must boot: the fixture already seals
         // `hot_window_secs == max_commitment_age_secs == 172800`.
-        crate::Node::from_toml_str(&fx.config(0, HOLD, "")).expect("equality is admissible");
+        crate::test_support::load_node(&fx.config(0, HOLD, "")).expect("equality is admissible");
         // One second short is fatal — and it is the CONFIG check that fires, before
         // any manifest comparison, so it fails even with no sealed hash.
         let short = fx.config(0, HOLD, "").replacen(
@@ -15656,7 +15783,7 @@ mod hot_budget {
             "hot_window_secs = 172799",
             1,
         );
-        let err = match crate::Node::from_toml_str(&short) {
+        let err = match crate::test_support::load_node(&short) {
             Err(e) => e,
             Ok(_) => panic!("a window shorter than the commitment lifetime must not boot"),
         };
@@ -15675,7 +15802,7 @@ mod hot_budget {
         let fx = fx_with_caps(50_000_000, 100_000_000);
         let boot_err = |from: &str, to: &str| -> String {
             let cfg = fx.config(0, HOLD, "").replacen(from, to, 1);
-            match crate::Node::from_toml_str(&cfg) {
+            match crate::test_support::load_node(&cfg) {
                 Err(e) => e.to_string(),
                 Ok(_) => panic!("`{to}` must not boot"),
             }
@@ -15711,7 +15838,7 @@ mod hot_budget {
         // manifest — editing one in the TOML alone would fail the endorsement check
         // rather than the bound under test.
         let equal = fx_with_caps(100_000_000, 100_000_000);
-        crate::Node::from_toml_str(&equal.config(0, HOLD, ""))
+        crate::test_support::load_node(&equal.config(0, HOLD, ""))
             .expect("a per-tx cap equal to the window cap is admissible");
     }
 

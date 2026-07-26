@@ -14,7 +14,9 @@ or( and( pk(USER), thresh(t, NODE_1, …, NODE_n) ),          # normal branch
 - Wrapped `wsh(...)`, P2WSH, SIGHASH_ALL. `t`-of-`n` default **3-of-5**; permitted `n` ∈ [3, 15], `t` ∈ [2, n] (bounded so the witness stays standard), and — for any vault provisioned with the `[channel]` block, i.e. every production vault — additionally **exactly `n = 2t − 1`** (so `n` is odd and `t = (n+1)/2`; the permitted channel-mode shapes are 2-of-3, 3-of-5, 4-of-7, … up to 8-of-15). Recovery is fixed **2-of-3**. *(**2026-07-19, V0-4b §0; tightened from the `2t > n` first draft.** The exact-shape rule is new and narrows the earlier `t ∈ [2, n]`. It is the conjunction of TWO requirements, and only stating both gives the right constraint. **(a) No unfrozen signing quorum outside an armed set** — confirmation-gated arming admits a carrier through a PIN-INDEPENDENT delivery-horizon gate evaluated against each node's own clock, so at the boundary a subset may admit and arm while the rest refuse before recording an intent; without quorum intersection the unarmed complement can itself sign, e.g. a 2-of-5 vault where two nodes arm leaves three unfrozen nodes able to finalize a pending coerced hot spend. That requirement alone gives `2t > n`. **(b) Tolerate every minority smaller than `t` withholding propagation** — a compromised node can process a carrier and simply not relay it, and `spawn_fan_out` carries no acknowledgement back, so the honest remainder must still reach `t` by itself: `n − (t − 1) ≥ t`. That gives `2t ≤ n + 1`. Together, `n = 2t − 1` exactly. Merely intersecting shapes fail (b): in 4-of-5, three withholding nodes leave the two honest nodes below the arm threshold while those same three plus one honest partial can finalize the coerced spend. `Node::from_toml_str` enforces the exact shape as a fatal config error; the descriptor is immutable, so a vault sealed at any other shape cannot be migrated in place — it must be re-provisioned. Channel-less fixtures are exempt (no peers, no confirmation path, so they can never arm).)*
 - `TIMELOCK` is a **BIP68 relative TIME-based** lock. The 180-day default is `⌈180·86400 / 512⌉ = 30375` **units of 512 seconds**, but the miniscript `older(n)` argument is the **RAW consensus `nSequence`** with the BIP68 type-flag (bit 22) set — rust-miniscript does NOT add the flag: `n = 30375 | (1 << 22) = 4224679 = 0x004076a7` (2026-07-17 correction). So the frozen descriptor contains **`older(4224679)`** (construct via `Sequence::from_512_second_intervals(30375)`); `older(30375)` would be a 30375-BLOCK height lock — the wrong policy. This is the recovery-branch relative-lock; it is unrelated to (and must stay ≫) the ~90-day refresh cadence, so a coin is always re-armed well before its recovery branch matures.
 - The policy form above is not itself the on-chain script. The **exact `wsh(<typed miniscript>)` string is produced once at setup by a PINNED construction** — compiling the fixed template above with a **pinned rust-miniscript version**, which chooses the concrete `and_v`/`or_*`/`thresh`/`multi` fragments and wrappers deterministically — and that exact string (with checksum) is **frozen in the per-vault manifest** (§4). This is not a *runtime* policy compiler (the compile happens once, at setup, and the output is frozen); "fixed hand-written template" and "compiled once at setup" are the same artifact — the point is the fragment is **pinned and identical for all nodes**, never re-derived per-node. Every node parses the frozen string with the same pinned rust-miniscript and asserts its own derived descriptor equals the manifest's **byte-for-byte**; a mismatch is a fatal config error, not a refusal. rust-miniscript is authoritative for parsing, satisfaction (witness construction), and branch recognition; the per-node PSBT checks (policy-core) are hand-rolled scriptPubKey re-derivation, **not** miniscript satisfaction. The setup reference records the exact fragment string for the default 3-of-5/2-of-3/180d template so it is reproducible.
-- Setup **rejects any descriptor outside this template** (exactly one `USER` key on the normal branch, one `thresh` of node keys, one recovery branch of the fixed shape). **Key order is canonical: lexicographic over the full key-EXPRESSION string** (`[origin]xpub.../path/*`, byte-wise on the exact frozen-descriptor substring) within each `thresh` — **NOT** by "compressed pubkey" (2026-07-16 fix: the keys are origin'd ranged xpubs, and derived compressed pubkeys are not stable across derivation indices, so a pubkey-based order is ill-defined and index-dependent). Origins/derivation-paths required, wildcard `/*` ranged. **`node_id` = the node key's 0-based position in this frozen canonical order** — a total, deterministic bijection to descriptor keys that every party (setup and each node) computes identically from the frozen descriptor string alone.
+- Setup **rejects any descriptor outside this template** (exactly one `USER` key on the normal branch, one `thresh` of node keys, one recovery branch of the fixed shape). **Key order is canonical: lexicographic over the full key-EXPRESSION string** (`[origin]xpub.../path/*`, byte-wise on the exact frozen-descriptor substring) within each `thresh` — **NOT** by "compressed pubkey" (2026-07-16 fix: the keys are origin'd ranged xpubs, and derived compressed pubkeys are not stable across derivation indices, so a pubkey-based order is ill-defined and index-dependent). **`node_id` = the node key's 0-based position in this frozen canonical order** — a total, deterministic bijection to descriptor keys that every party (setup and each node) computes identically from the frozen descriptor string alone.
+
+  *(**REVISED 2026-07-25, bead btc-policy-9y5.5 — the VAULT descriptor is DEFINITE.** The original text ended "Origins/derivation-paths required, wildcard `/*` ranged", i.e. production vault keys were to be origin'd ranged xpubs. That is now **rejected at template parse**: every vault key — user, node, recovery — is exactly ONE concrete compressed pubkey, in production as in the regtest demo. `policy_core::parse_vault_template` refuses any key with a derivation path, so setup cannot seal such a vault and no node can be handed one. Three reasons, in the order they bite. (1) **It never worked.** Every node parses the frozen descriptor as a concrete `Descriptor<PublicKey>` at startup — for the witness script, the user key, and the sighash — so a ranged vault descriptor does not load at all; accepting one at setup would seal a vault no node can ever boot against, which under static-policy-forever + sealed hosts is a permanent, unfixable brick. (2) **There is nothing left for a range to express.** The setup ceremony (§4, and `btc-vault setup node-keygen`) has each node birth ONE key on its own host; a node does not have an xpub range to publish. (3) **It removes the caveat this very paragraph was written for.** The "lexicographic over the key-EXPRESSION string, NOT by compressed pubkey" rule exists because derived pubkeys of a ranged key are index-dependent and so ill-defined as an ordering. With definite keys the expression IS the pubkey, so the canonical order is well-defined with no index to disambiguate — the rule above still holds verbatim, it just no longer has a trap under it. **This is the vault descriptor ONLY.** The destination allowlist wallets — hot and escape — stay ranged, origin'd, and bounded by `max_derivation_index`; they legitimately derive a fresh address per spend, and nothing here touches them.)*
 
 ## 2. Tagged request schema (resolves "every request has an escape" vs pin-less refresh)
 
@@ -124,7 +126,7 @@ Each node's `channel_pubkey` is **endorsed by that node's Bitcoin signing key** 
 Adds the security-load-bearing fields DESIGN's sample omitted. All node-enforced.
 
 ```
-listen_port, node_seckey (v0 only; T1 removes at-rest keys), descriptor, policy_version,
+listen_port, node_key_salt + node_key_ops + node_key_mem_kib (the PUBLIC wskdf derivation; NO key at rest — see below), descriptor, policy_version,
 hot_allowlist = [descriptor…], escape_descriptor,
 max_derivation_index, max_commitment_age_secs,
 hold_secs,                         # hot-class Hold (default 86400)
@@ -152,6 +154,36 @@ coordinator_auth_pubkey, manifest_hash,
   per_send_deadline_secs },        # default 5
 [chain_backend] rpc_addr, auth
 ```
+
+**No signing key at rest** (2026-07-25, bead btc-policy-9y5.5 — this REPLACES the
+`node_seckey` field, which carried a hex secret key and was marked "v0 only; T1
+removes at-rest keys"). The config now names the DERIVATION and never the secret:
+`node_key_salt`, `node_key_ops`, and `node_key_mem_kib` are the public parameters
+of a wskdf (Argon2id) pass, and the node derives its federation signing key in RAM
+at startup from them plus an **operator-held preimage read from stdin**. The
+preimage is generated ON THE NODE by `btc-vault setup node-keygen`, printed once
+for the operator to carry, and never written by the daemon. Fail-closed: the
+derived key must be one of the frozen descriptor's federation node keys, or
+startup is a fatal error — a node holding a key no descriptor names would validate
+and "sign" every request while producing partials that can never combine.
+
+This also RESOLVES ADR-0005's open note that "sealing conflicts with in-memory
+wskdf keys on reboot (no SSH to re-enter the preimage)". There is no reboot to
+re-enter anything for: under ADR-0007 a node starts exactly once in its life, at
+provisioning, before the host is sealed. A reboot leaves a bare machine — no
+config, no key, and no way to ask for a preimage — which is node death, as
+intended. The preimage's entropy is wskdf's maximum (63 bits) precisely because
+recovery is NOT wanted here: a lost preimage is a dead node, the federation
+absorbs it, and capacity is restored by rotating to a successor vault.
+
+**`expected_manifest_hash` is MANDATORY** (same bead). It was optional and enforced
+only when present, so a hand-written config could omit the immutable federation
+anchor entirely and boot with no cross-check that the federation ever agreed to its
+coordinator key, membership, `max_msg_bytes`, or Hot budget. An absent hash is now a
+fatal startup error. (Such a node could never talk to correctly-sealed peers — they
+answer `WRONG_MANIFEST` — but that is a liveness symptom found at run time by
+whoever is watching, and it says nothing at all in a federation whose configs were
+ALL written without the anchor.)
 
 ## 6. Precise numeric definitions
 

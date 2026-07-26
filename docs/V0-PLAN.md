@@ -251,6 +251,12 @@ original); the full D8 test matrix; upgrade `demo` to the two-act story
 (refusal + theft caught mid-Hold, clawed back by escape sweep).
 
 ## V0-9 — provisioning: per-vault manifest + config schema + coordinator auth-key backup (NEW — fresh-eyes review)
+> **DELIVERED 2026-07-25, bead btc-policy-9y5.5** — `btc-vault setup` (`crates/vault-cli/src/setup.rs`),
+> procedure in [`docs/SETUP-CEREMONY.md`](SETUP-CEREMONY.md). On-device node keygen (no machine holds two
+> node secrets), the `node_seckey`-at-rest field retired for an in-RAM wskdf derivation, a MANDATORY
+> `expected_manifest_hash`, ceremony-time key-independence refusal with written evidence, and the
+> descriptor/manifest/auth-key artifacts plus backups. `demo` and `attack` drive this same ceremony.
+
 The manifest is the **root of channel + coordinator trust**, so it is load-bearing, not deploy glue
 (previously only DESIGN's T1). Build:
 - **Per-vault manifest (ADR-0013 §4):** written once at setup, hash-pinned, distributed to every node +

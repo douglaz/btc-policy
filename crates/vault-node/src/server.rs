@@ -601,7 +601,8 @@ mod tests {
 
         let fx = crate::channel::fixture::Fixture::new(2, 3);
         let node = Arc::new(
-            Node::from_toml_str(&fx.config(0, 0, "")).expect("valid channel fixture node"),
+            crate::test_support::load_node(&fx.config(0, 0, ""))
+                .expect("valid channel fixture node"),
         );
         let panic_node = Arc::clone(&node);
         let channel_outcome = blocking_with_lockdown_net(Arc::clone(&node), move || {
@@ -630,7 +631,8 @@ mod tests {
     async fn channel_short_circuits_after_critical_poison_reaches_lockdown() {
         let fx = crate::channel::fixture::Fixture::new(2, 3);
         let node = Arc::new(
-            Node::from_toml_str(&fx.config(0, 0, "")).expect("valid channel fixture node"),
+            crate::test_support::load_node(&fx.config(0, 0, ""))
+                .expect("valid channel fixture node"),
         );
         let panic_node = Arc::clone(&node);
         let outcome = blocking_with_lockdown_net(Arc::clone(&node), move || {
@@ -674,7 +676,8 @@ mod tests {
     async fn channel_serves_a_normally_locked_down_node_that_is_not_poisoned() {
         let fx = crate::channel::fixture::Fixture::new(2, 3);
         let node = Arc::new(
-            Node::from_toml_str(&fx.config(0, 0, "")).expect("valid channel fixture node"),
+            crate::test_support::load_node(&fx.config(0, 0, ""))
+                .expect("valid channel fixture node"),
         );
         node.enter_lockdown();
         assert!(node.is_locked_down(), "the node is locked down");

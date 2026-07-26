@@ -15,7 +15,7 @@ use bitcoin::{
     TxOut, Txid, WScriptHash, Witness,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
-use vault_node::{handle_refresh, handle_sign, Node};
+use vault_node::{handle_refresh, handle_sign, nodekey, Node};
 use vault_proto::{RefreshRequest, RefusalCode, SignRequest, SignResponse};
 
 const NORMAL_PIN: &str = "1111";
@@ -90,10 +90,34 @@ fn coord_sign_refresh(req: &mut RefreshRequest) {
     req.coord_sig = sig.serialize_der().to_lower_hex_string();
 }
 
+/// The operator preimage every fixture node here derives from — the stand-in for
+/// what a real operator types at `vault-node` startup (bead btc-policy-9y5.5).
+/// There is no key at rest to put in a config any more, so a fixture has to name
+/// the derivation and supply the secret separately, exactly as production does.
+fn fixture_preimage() -> nodekey::Preimage {
+    nodekey::Preimage::from_hex("00000000000000ff").expect("fixture preimage")
+}
+
+/// This node's PUBLIC derivation parameters, at Argon2id's floor so the suite stays
+/// fast (the cost parameter is not what any invariant here rests on).
+fn node_kdf() -> nodekey::KdfParams {
+    nodekey::KdfParams::new([2u8; nodekey::SALT_BYTES], 1, 8).expect("fixture kdf params")
+}
+
+/// The federation signing key this fixture's node under test derives.
+fn node_seckey() -> SecretKey {
+    nodekey::derive(&fixture_preimage(), &node_kdf()).expect("fixture derivation")
+}
+
 fn descriptor_str() -> String {
     let secp = Secp256k1::new();
     let user = pubkey(&secp, 1).to_string();
-    let nodes: Vec<String> = (2..=6).map(|i| pubkey(&secp, i).to_string()).collect();
+    // Node key 2 is the one this fixture's node DERIVES; 3..=6 are its peers, which
+    // only ever appear as descriptor keys here.
+    let self_node = PublicKey::new(node_seckey().public_key(&secp)).to_string();
+    let nodes: Vec<String> = std::iter::once(self_node)
+        .chain((3..=6).map(|i| pubkey(&secp, i).to_string()))
+        .collect();
     // Throwaway recovery keyset (seeds 0x30..=0x32) — off the normal path these
     // handler tests exercise. The node validates the two-branch template at
     // startup but never signs recovery; the recovery exit is user-side (vault-cli).
@@ -168,7 +192,11 @@ fn build_fixture(hold_secs: u64) -> Fixture {
     let (_, hot_spk) = hot_dest();
     let (_, escape_spk) = escape_dest();
     Fixture {
-        node: Node::from_toml_str(&fixture_config(hold_secs, MAX_AGE, true)).expect("valid config"),
+        node: Node::from_toml_str(
+            &fixture_config(hold_secs, MAX_AGE, true),
+            &fixture_preimage(),
+        )
+        .expect("valid config"),
         descriptor,
         hot_spk,
         escape_spk,
@@ -186,7 +214,9 @@ fn fixture_config(hold_secs: u64, max_commitment_age_secs: u64, allow_escape: bo
     };
     format!(
         "listen_port = 7000\n\
-         node_seckey = \"{}\"\n\
+         node_key_salt = \"{}\"\n\
+         node_key_ops = {}\n\
+         node_key_mem_kib = {}\n\
          descriptor = \"{descriptor_str}\"\n\
          allowlist = [{allowlist}]\n\
          escape_descriptor = \"{escape_desc}\"\n\
@@ -200,7 +230,9 @@ fn fixture_config(hold_secs: u64, max_commitment_age_secs: u64, allow_escape: bo
          pin_normal_hash = \"{}\"\n\
          pin_duress_hash = \"{}\"\n\
          coordinator_auth_pubkey = \"{}\"\n",
-        seckey(2).display_secret(),
+        node_kdf().salt_hex(),
+        node_kdf().ops(),
+        node_kdf().mem_kib(),
         vault_node::argon2id_normal_phc(NORMAL_PIN),
         vault_node::argon2id_duress_phc(DURESS_PIN),
         coord_key().1,
@@ -826,7 +858,7 @@ fn expect_accepted(response: SignResponse) -> vault_proto::Accepted {
 }
 
 fn expect_config_error(raw: String) -> String {
-    match Node::from_toml_str(&raw) {
+    match Node::from_toml_str(&raw, &fixture_preimage()) {
         Ok(_) => panic!("config must be rejected"),
         Err(err) => err.to_string(),
     }
@@ -1045,7 +1077,7 @@ fn the_delivery_horizon_does_not_apply_without_a_channel() {
         "{}delivery_horizon_secs = 7200\n",
         fixture_config(HOLD, MAX_AGE, true)
     );
-    let node = Node::from_toml_str(&config).expect("valid config");
+    let node = Node::from_toml_str(&config, &fixture_preimage()).expect("valid config");
     let fixture = Fixture {
         node,
         descriptor: Descriptor::<PublicKey>::from_str(&descriptor_str()).expect("valid descriptor"),
@@ -1085,7 +1117,7 @@ fn the_delivery_horizon_bound_is_not_enforced_without_a_channel() {
             "{}delivery_horizon_secs = {horizon}\n",
             fixture_config(HOLD, MAX_AGE, true)
         );
-        Node::from_toml_str(&config)
+        Node::from_toml_str(&config, &fixture_preimage())
             .unwrap_or_else(|e| panic!("horizon {horizon} is inert without a channel: {e}"));
     }
 }
@@ -1543,14 +1575,18 @@ mod coord_auth {
         // whichever node holds it. Checked for EVERY node key, not just this
         // node's own — the danger is a peer minting requests at us just as much.
         let secp = Secp256k1::new();
-        for index in 2..=6 {
+        // The federation keys this descriptor really names: the node's own DERIVED
+        // key plus its four peers. Enumerating raw seeds 2..=6 would silently stop
+        // covering the self key once that key became wskdf-derived.
+        let node_keys = std::iter::once(PublicKey::new(node_seckey().public_key(&secp)))
+            .chain((3..=6).map(|i| pubkey(&secp, i)));
+        for key in node_keys {
             let err = expect_config_error(config_with_coord_line(&format!(
-                "coordinator_auth_pubkey = \"{}\"\n",
-                pubkey(&secp, index)
+                "coordinator_auth_pubkey = \"{key}\"\n",
             )));
             assert!(
                 err.contains("must not be one of the descriptor's federation node keys"),
-                "node key {index} must be refused as a coordinator key: {err}"
+                "node key {key} must be refused as a coordinator key: {err}"
             );
         }
     }
