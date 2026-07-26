@@ -1,6 +1,7 @@
 //! The vault-node HTTP surface on axum/tokio. Every connection is its own task.
 //! `/sign` and `/events` retain their coordinator-consumed JSON contract;
 //! undecodable signs remain 400 errors and absent/unparseable cursors read 0.
+//! `/healthz` is the read-only operations liveness surface ([`crate::Health`]).
 //! Edge statuses use axum defaults: oversized body 413, wrong method 405, and
 //! unknown route 404.
 
@@ -169,7 +170,7 @@ where
     outcome
 }
 
-/// Serve the one axum app (`/sign` + `/events`) over `listener`.
+/// Serve the one axum app (`/sign` + `/events` + `/healthz`) over `listener`.
 ///
 /// `listener` is already bound, so this is the last production startup boundary
 /// before any request can arm or register a candidate. Claim the config inode's
@@ -231,7 +232,13 @@ pub(crate) fn app_with_channel_body_timeout(
 fn router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/sign", post(sign))
-        .route("/events", get(events));
+        .route("/events", get(events))
+        // Mounted unconditionally, unlike `/channel`: nothing `/healthz` reports
+        // depends on channel configuration, so the route stays out of that branch.
+        // Not a claim that a channel-less daemon is an observable state — `Node::load`
+        // and `serve` both reject one (`require_channel_mode`, line 182 above), so
+        // every node that ever answers this route is a channel-mode node.
+        .route("/healthz", get(healthz));
     // `/channel` is mounted ONLY in channel mode (absent `[channel]` ⇒ the route
     // does not exist, so a request 404s and the node behaves exactly as today).
     // The handler enforces its OWN `max_msg_bytes` cap and answers a TAGGED
@@ -356,6 +363,44 @@ async fn events(State(state): State<AppState>, uri: Uri) -> Response {
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("cannot encode events: {e}"),
+        ),
+    }
+}
+
+/// `GET /healthz`: the node's non-secret liveness projection ([`crate::Health`]), so
+/// an operator can tell a dead, store-wedged, poison-bricked, or locked-down node
+/// from a healthy one without probing it with a spend (bead btc-policy-9y5.6). What
+/// it deliberately does NOT cover — a backend-blocked release/combine or watchtower
+/// pass — is [`Node::last_deadline_tick`]'s contract, and why.
+///
+/// Read-only and lock-free: [`Node::health`] reads three atomics, takes neither
+/// `sign_state` nor the channel store, and mutates nothing. Both halves matter. It
+/// answers promptly while a `/sign` or a fire pass holds those locks — the
+/// contention an operator probing a stuck node is trying to see through, pinned by
+/// `healthz_answers_while_sign_state_is_held` and
+/// `healthz_answers_while_the_channel_store_is_held` — and it adds no handler-side
+/// lock wait on a surface the hostile-at-wrench coordinator can poll at will. The
+/// heartbeat producer itself can be delayed before a later iteration by shared-store
+/// contention; that narrower scheduler residual is stated in
+/// [`Node::last_deadline_tick`]. The response body's pin-uniformity is
+/// [`crate::Health`]'s contract, not this handler's.
+///
+/// Residual, named rather than implied: what is claimed is that no branch, lock, or
+/// byte of this path depends on arm state — not that a response's wall-clock latency
+/// is independent of everything the HOST is doing. The release/combine pass does
+/// arm-dependent work, so it contributes arm-dependent CPU load, and on a one- or
+/// two-vCPU host that load is in principle schedulable-visible in the latency of any
+/// observation of the machine — this handler, `/events`, or the TCP accept itself.
+/// That channel is a property of co-residency, is not created or widened here, and
+/// has no threat-derived bound to test against the way `/sign` has one Argon2
+/// evaluation, so it is a documented co-residency residual (DESIGN.md), not a tested
+/// `/healthz` property.
+async fn healthz(State(state): State<AppState>) -> Response {
+    match serde_json::to_string(&state.node.health()) {
+        Ok(json) => json_response(StatusCode::OK, json),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("cannot encode health: {e}"),
         ),
     }
 }
@@ -702,6 +747,538 @@ mod tests {
             Some(serde_json::json!({ "error": "channel task failed unexpectedly" })),
             "must not return the poison-500 body"
         );
+    }
+
+    // -- `/healthz`: the operations liveness surface (bead btc-policy-9y5.6) -----
+
+    /// A fresh node answers the full projection: it is serving, not locked down, has
+    /// no fire-driver heartbeat yet, and — being a path-less unit-test node — has
+    /// claimed no process generation. Pins the field NAMES and the exact shape,
+    /// because the wire contract is what an operator and the coordinator relay read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn healthz_reports_serving_on_a_fresh_node() {
+        let (node, _request) = node_and_valid_request();
+        let addr = spawn_app(app(Arc::new(node))).await;
+        let (status, body) = spawn_blocking(move || get(addr, "/healthz"))
+            .await
+            .expect("client task");
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("health json"),
+            serde_json::json!({
+                "serving": true,
+                "locked_down": false,
+                "last_deadline_tick": null,
+                "generation_claimed": false,
+            })
+        );
+    }
+
+    /// Post-`T` Lockdown is PUBLIC state (ADR-0008: the node already answers
+    /// `FRAUD_SUSPECTED` to every spend), and making it readable without a probe spend
+    /// is the point of the endpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn healthz_reports_locked_down_after_lockdown() {
+        let (node, _request) = node_and_valid_request();
+        let node = Arc::new(node);
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+        node.enter_lockdown();
+
+        let (status, body) = spawn_blocking(move || get(addr, "/healthz"))
+            .await
+            .expect("client task");
+        assert_eq!(status, 200);
+        let health: serde_json::Value = serde_json::from_str(&body).expect("health json");
+        assert_eq!(health["locked_down"], serde_json::json!(true));
+        // Still answering: Lockdown blocks signing, it does not take the node off the
+        // air, and an operator reading "locked_down" needs the surface to stay up.
+        assert_eq!(health["serving"], serde_json::json!(true));
+    }
+
+    /// `last_deadline_tick` is the SAFETY deadline driver's heartbeat — the wire name is
+    /// the bead's, the publisher is that driver — so drive its real tick and watch it
+    /// move in [`crate::DEADLINE_HEARTBEAT_RESOLUTION_SECS`] buckets. The best-effort
+    /// release/combine pass does not WRITE it, and this test asserts that direct
+    /// separation: publishing from that completion-scheduled pass would leak its
+    /// phase even if the timestamp itself were bucketed. Shared-store contention can
+    /// still postpone a later deadline iteration; that residual, and the fact that a
+    /// backend-wedged release/combine pass does NOT show up here, are stated in
+    /// [`crate::Node::last_deadline_tick`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn healthz_last_deadline_tick_advances_as_the_deadline_driver_ticks() {
+        use crate::DEADLINE_HEARTBEAT_RESOLUTION_SECS as RESOLUTION;
+
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let node = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 0, "")).expect("channel fixture node"),
+        );
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+        let backend: Arc<dyn ChainBackend + Send + Sync> = Arc::new(SlowBackend {
+            delay: Duration::ZERO,
+            entered: std::sync::Mutex::new(None),
+        });
+        let read = |addr: SocketAddr| async move {
+            let (status, body) = spawn_blocking(move || get(addr, "/healthz"))
+                .await
+                .expect("client task");
+            assert_eq!(status, 200);
+            serde_json::from_str::<serde_json::Value>(&body).expect("health json")
+                ["last_deadline_tick"]
+                .clone()
+        };
+
+        assert_eq!(
+            read(addr).await,
+            serde_json::Value::Null,
+            "before the first pass there is no heartbeat to report"
+        );
+
+        // The absolute-schedule deadline pass publishes the heartbeat.
+        let first = 1_800_000_000;
+        crate::lockdown_tick_with_lockdown_net(&node, first);
+        assert_eq!(read(addr).await, serde_json::json!(first));
+        let later = first + RESOLUTION;
+
+        // A release/combine pass at a later wall time does NOT publish. Its own
+        // completion-scheduled invocation time therefore is not copied directly into
+        // the externally visible heartbeat.
+        crate::fire_tick(Arc::clone(&node), Arc::clone(&backend), later).await;
+        assert_eq!(read(addr).await, serde_json::json!(first));
+
+        crate::lockdown_tick_with_lockdown_net(&node, later);
+        assert_eq!(read(addr).await, serde_json::json!(later));
+
+        // Inside a bucket it does not move — the reported value is the bucket, not a
+        // sub-bucket scheduler instant.
+        crate::lockdown_tick_with_lockdown_net(&node, later + 1);
+        crate::lockdown_tick_with_lockdown_net(&node, later + RESOLUTION - 1);
+        assert_eq!(read(addr).await, serde_json::json!(later));
+    }
+
+    /// The headline operator claim of [`crate::Node::last_deadline_tick`]: a
+    /// POISON-BRICKED node reads as a STALE heartbeat alongside `locked_down: true`,
+    /// which is the state that was externally invisible before bead btc-policy-9y5.6.
+    ///
+    /// That pairing exists only because `record_deadline_tick` sits BELOW
+    /// [`crate::lockdown_tick_with_lockdown_net`]'s terminal-poison early return.
+    /// Hoisting it above the guard reads like a harmless "publish first,
+    /// unconditionally" refactor and would leave every other `/healthz` test green
+    /// while the heartbeat kept advancing on a node whose deadline driver runs no
+    /// further pass — the one signal that names a bricked node, gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn healthz_heartbeat_freezes_on_a_poison_bricked_node() {
+        const NOW: u64 = 1_800_000_000;
+
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let node = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 0, "")).expect("channel fixture node"),
+        );
+        crate::lockdown_tick_with_lockdown_net(&node, NOW);
+        assert_eq!(
+            node.health().last_deadline_tick,
+            Some(NOW),
+            "the live driver publishes before the brick, or this test proves nothing"
+        );
+
+        // Brick it exactly as production does: a request-path panic under the channel
+        // store poisons that lock, and the blocking boundary's net latches the
+        // poison-independent terminal Lockdown.
+        let panic_node = Arc::clone(&node);
+        let outcome = blocking_with_lockdown_net(Arc::clone(&node), move || {
+            panic_node
+                .channel
+                .as_ref()
+                .expect("channel")
+                .panic_while_holding_store();
+        })
+        .await;
+        assert!(outcome.is_err(), "the injected store panic must unwind");
+        assert!(
+            node.is_locked_down() && node.critical_lock_poisoned(),
+            "the brick is the locked-down-AND-poisoned pair"
+        );
+
+        // Every later deadline tick returns at the terminal-poison guard, so it
+        // publishes nothing — however far the wall clock moves on.
+        crate::lockdown_tick_with_lockdown_net(
+            &node,
+            NOW + crate::DEADLINE_HEARTBEAT_RESOLUTION_SECS,
+        );
+        crate::lockdown_tick_with_lockdown_net(
+            &node,
+            NOW + 100 * crate::DEADLINE_HEARTBEAT_RESOLUTION_SECS,
+        );
+
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+        let (status, body) = spawn_blocking(move || get(addr, "/healthz"))
+            .await
+            .expect("client task");
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("health json"),
+            serde_json::json!({
+                "serving": true,
+                "locked_down": true,
+                "last_deadline_tick": NOW,
+                "generation_claimed": false,
+            }),
+            "a poison-bricked node must read as a FROZEN heartbeat next to locked_down: true"
+        );
+    }
+
+    /// Exercise the LIVE publisher tasks across a bucket boundary without lock
+    /// contention. One node is armed and one is idle, and both deadline drivers are
+    /// anchored to the same absolute Tokio schedule, so the direct publisher must
+    /// transition on the same tick. This catches an edit that publishes from the
+    /// completion-scheduled fire pass — deterministically, which no live end-to-end
+    /// harness can do for a timing class without flaking. It deliberately does not
+    /// model contention on the shared store; that store-contention latency residual is
+    /// documented in DESIGN.md, not tested end-to-end.
+    #[tokio::test(start_paused = true)]
+    async fn healthz_live_heartbeat_transition_follows_the_deadline_schedule() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const BUCKET: u64 = 1_800_000_000;
+        const DURESS_DELAY: u64 = 600;
+
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let armed = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 0, "")).expect("channel fixture node"),
+        );
+        let idle = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 0, "")).expect("channel fixture node"),
+        );
+        let wall = Arc::new(AtomicU64::new(
+            BUCKET + crate::DEADLINE_HEARTBEAT_RESOLUTION_SECS - 1,
+        ));
+
+        let armed_wall = Arc::clone(&wall);
+        let armed_driver = tokio::spawn(crate::lockdown_driver_with_clock(
+            Arc::clone(&armed),
+            move || armed_wall.load(Ordering::Acquire),
+        ));
+        let idle_wall = Arc::clone(&wall);
+        let idle_driver = tokio::spawn(crate::lockdown_driver_with_clock(
+            Arc::clone(&idle),
+            move || idle_wall.load(Ordering::Acquire),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            (
+                armed.health().last_deadline_tick,
+                idle.health().last_deadline_tick
+            ),
+            (Some(BUCKET), Some(BUCKET)),
+            "both immediate deadline ticks publish the same starting bucket"
+        );
+
+        assert!(
+            armed
+                .channel
+                .as_ref()
+                .expect("channel")
+                .arm_via_confirmation(
+                    "duress-carrier",
+                    "",
+                    armed.threshold,
+                    BUCKET,
+                    crate::channel::DuressTiming {
+                        duress_delay_secs: DURESS_DELAY,
+                        epsilon_secs: 1,
+                        combine_slack_secs: 60,
+                    },
+                ),
+            "the arm must commit, or the live comparison proves nothing"
+        );
+
+        let boundary = BUCKET + crate::DEADLINE_HEARTBEAT_RESOLUTION_SECS;
+        wall.store(boundary, Ordering::Release);
+        tokio::time::advance(crate::FIRE_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        let armed_body = serde_json::to_vec(&armed.health()).expect("armed health");
+        let idle_body = serde_json::to_vec(&idle.health()).expect("idle health");
+        assert_eq!(
+            armed_body, idle_body,
+            "DURESS ORACLE: the live /healthz heartbeat flipped differently after arming"
+        );
+        assert_eq!(
+            armed.health().last_deadline_tick,
+            Some(boundary),
+            "the common absolute-schedule tick publishes the new bucket"
+        );
+        assert!(!armed.is_locked_down(), "the live comparison remains pre-T");
+
+        armed_driver.abort();
+        idle_driver.abort();
+    }
+
+    /// THE LOAD-BEARING TEST: `/healthz` must not become a duress oracle.
+    ///
+    /// An ARMED-but-pre-`T` node is the state a hostile coordinator most wants to
+    /// read — it is the whole content of the hostage window (ADR-0012 SILENCE). Two
+    /// nodes built from the identical config, one armed through the production
+    /// confirmation path and one untouched, must answer `/healthz` BYTE-IDENTICALLY.
+    ///
+    /// The comparison is on the COMPLETE body, not a chosen field: a leak added later
+    /// would most plausibly arrive as a field nobody thought to name here, and a
+    /// field-by-field check would sail past it. The heartbeat is stamped at the same
+    /// instant on both so it is a compared byte too, rather than a normalized-away
+    /// hole a same-width pin-dependent value could sit in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn healthz_is_byte_identical_on_an_armed_pre_t_node() {
+        const NOW: u64 = 1_800_000_000;
+        const DURESS_DELAY: u64 = 600;
+
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        // The SAME config twice: two nodes whose only difference is the arm below.
+        let armed = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 0, "")).expect("channel fixture node"),
+        );
+        let idle = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 0, "")).expect("channel fixture node"),
+        );
+        let backend: Arc<dyn ChainBackend + Send + Sync> = Arc::new(SlowBackend {
+            delay: Duration::ZERO,
+            entered: std::sync::Mutex::new(None),
+        });
+        // One absolute-schedule deadline pass each at the same instant, so the
+        // heartbeat is part of the compared bytes instead of a hole.
+        crate::lockdown_tick_with_lockdown_net(&armed, NOW);
+        crate::lockdown_tick_with_lockdown_net(&idle, NOW);
+
+        assert!(
+            armed
+                .channel
+                .as_ref()
+                .expect("channel")
+                .arm_via_confirmation(
+                    "duress-carrier",
+                    "",
+                    armed.threshold,
+                    NOW,
+                    crate::channel::DuressTiming {
+                        duress_delay_secs: DURESS_DELAY,
+                        epsilon_secs: 1,
+                        combine_slack_secs: 60,
+                    },
+                ),
+            "the arm must commit, or this test compares two idle nodes and proves nothing"
+        );
+        // Pre-`T`, and it must stay that way for the whole comparison: after `T` the
+        // Lockdown difference is legitimate and public, so a comparison that drifted
+        // past it would be asserting the wrong thing.
+        assert!(
+            !crate::lockdown_tick(&armed, NOW),
+            "the arm is pre-T; Lockdown is what happens AT T"
+        );
+        assert!(!armed.is_locked_down());
+
+        // Deliberately give the completion-scheduled release/combine passes different
+        // start instants after arming. Neither directly WRITES the public heartbeat;
+        // only the explicit deadline ticks below publish in this contention-free
+        // fixture.
+        crate::fire_tick(Arc::clone(&armed), Arc::clone(&backend), NOW + 1).await;
+        crate::fire_tick(Arc::clone(&idle), Arc::clone(&backend), NOW + 2).await;
+        assert_eq!(
+            armed.health().last_deadline_tick,
+            idle.health().last_deadline_tick,
+            "release/combine cadence must not reach the public heartbeat"
+        );
+        let next_bucket = NOW + crate::DEADLINE_HEARTBEAT_RESOLUTION_SECS;
+        crate::lockdown_tick_with_lockdown_net(&armed, next_bucket);
+        crate::lockdown_tick_with_lockdown_net(&idle, next_bucket);
+        assert_eq!(
+            (
+                armed.health().last_deadline_tick,
+                idle.health().last_deadline_tick
+            ),
+            (Some(next_bucket), Some(next_bucket)),
+            "the public transition is fixed by the common deadline-driver schedule"
+        );
+
+        let armed_addr = spawn_app(app(Arc::clone(&armed))).await;
+        let idle_addr = spawn_app(app(Arc::clone(&idle))).await;
+        let (armed_status, armed_body) = spawn_blocking(move || get(armed_addr, "/healthz"))
+            .await
+            .expect("armed client");
+        let (idle_status, idle_body) = spawn_blocking(move || get(idle_addr, "/healthz"))
+            .await
+            .expect("idle client");
+        assert_eq!((armed_status, idle_status), (200, 200));
+        assert_eq!(
+            armed_body, idle_body,
+            "DURESS ORACLE: /healthz differs between an armed pre-T node and an idle one"
+        );
+
+        // And the control that makes the equality mean something: this node really is
+        // armed, and its Lockdown really does land at `T`. Without it the assertion
+        // above would pass just as happily against an arm that never committed.
+        assert!(armed
+            .channel
+            .as_ref()
+            .expect("channel")
+            .armed_snapshot()
+            .is_some());
+        assert!(
+            crate::lockdown_tick(&armed, NOW + DURESS_DELAY),
+            "the armed node must Lock Down at T"
+        );
+        let (_status, after_t) = spawn_blocking(move || get(armed_addr, "/healthz"))
+            .await
+            .expect("armed client after T");
+        assert_ne!(
+            after_t, idle_body,
+            "post-T Lockdown is public state and MUST show up — if it does not, the \
+             pre-T equality above is measuring an endpoint that reports nothing"
+        );
+    }
+
+    /// `/healthz` is an operations surface, not a control surface: it is `GET`-only
+    /// and cannot mutate node state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn healthz_is_read_only() {
+        let (node, _request) = node_and_valid_request();
+        let addr = spawn_app(app(Arc::new(node))).await;
+        let (status, _) = spawn_blocking(move || post(addr, "/healthz", "{}"))
+            .await
+            .expect("client task");
+        assert_eq!(status, 405, "/healthz must not accept a mutating verb");
+    }
+
+    /// THE REASON THE ENDPOINT IS LOCK-FREE: a node stuck behind `sign_state` is the
+    /// state an operator most needs to read, so `/healthz` must answer while that
+    /// lock is held — by a wedged `/sign`, by a fire pass, by anything.
+    ///
+    /// [`Node::health`] reads atomics today, so this passes; the test exists for the
+    /// EDIT that would break it. A later field taking `sign_state` (a pending count,
+    /// say) would leave all six shape tests above green while silently destroying the
+    /// property, because every one of them probes an idle node. One worker, as in
+    /// [`a_blocking_sign_does_not_delay_events`], so an on-runtime regression cannot
+    /// hide behind a spare core.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn healthz_answers_while_sign_state_is_held() {
+        let (node, request) = node_and_valid_request();
+        let node = Arc::new(node);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let addr = spawn_app(app_with_sign_entry(node.clone(), entered_tx)).await;
+
+        // Hold `sign_state` from an OS thread, then wedge a REAL `/sign` behind it.
+        let gate = node.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = gate.sign_state.lock().expect("sign_state lock");
+            held_tx.send(()).expect("signal held");
+            release_rx.recv().expect("await release");
+        });
+        held_rx.recv().expect("lock held");
+        let body = spend_body(&request);
+        let inflight = spawn_blocking(move || post(addr, "/sign", &body));
+
+        // Probe from an OS thread with a socket deadline, and release the lock on
+        // every outcome, so a regression fails bounded instead of hanging the suite.
+        let probe = std::thread::spawn(move || {
+            let result = (|| {
+                entered_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|e| format!("/sign never entered its handler: {e}"))?;
+                get_with_timeout(addr, "/healthz", Duration::from_secs(2))
+                    .map_err(|e| format!("/healthz blocked behind a held sign_state: {e}"))
+            })();
+            let _ = release_tx.send(());
+            result
+        });
+        let (status, body) = spawn_blocking(move || probe.join().expect("probe thread"))
+            .await
+            .expect("probe task")
+            .expect("/healthz lock isolation");
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("health json")["serving"],
+            serde_json::json!(true),
+            "a lock-blocked node must still report the full projection, not a stub"
+        );
+
+        holder.join().expect("holder thread");
+        let _ = tokio::time::timeout(Duration::from_secs(2), inflight)
+            .await
+            .expect("/sign did not finish after release")
+            .expect("inflight sign task");
+    }
+
+    /// The other half of the no-lock contract: the channel store. A wedged store is
+    /// the poison-brick's own neighbourhood — the deadline driver blocks on it, the
+    /// heartbeat freezes, and reading that pair is the whole point of the surface, so
+    /// the read itself must not queue behind the same lock. Exercise the production
+    /// scheduler shape: the deadline and fire-driver prologues occupy two workers, and
+    /// `main`'s three-worker floor leaves a third to poll the listener and this
+    /// handler. A floor on the worker COUNT, not a reservation of one worker — the
+    /// third is shared with the acceptor, every connection task, the watchtower, and
+    /// the cache refresher — and the property holds because all of those reach their
+    /// blocking work through `spawn_blocking` instead of occupying a worker inside it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn healthz_answers_while_the_channel_store_is_held() {
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let node = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 0, "")).expect("channel fixture node"),
+        );
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+
+        let gate = Arc::clone(&node);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            gate.channel
+                .as_ref()
+                .expect("channel")
+                .hold_store_until(&held_tx, &release_rx);
+        });
+        held_rx.recv().expect("store held");
+
+        // These are the exact two synchronous store calls at the heads of the
+        // production deadline and fire drivers. Announce each task before it waits,
+        // then yield once so both consume their worker while the holder owns the
+        // store. With only the host-CPU-sized default runtime on a <=2-vCPU node,
+        // the listener and `/healthz` handler would never be polled.
+        let deadline_node = Arc::clone(&node);
+        let (deadline_entered_tx, deadline_entered_rx) = tokio::sync::oneshot::channel();
+        let deadline_waiter = tokio::spawn(async move {
+            let _ = deadline_entered_tx.send(());
+            deadline_node
+                .channel
+                .as_ref()
+                .expect("channel")
+                .lockdown_due(0)
+        });
+        let fire_node = Arc::clone(&node);
+        let (fire_entered_tx, fire_entered_rx) = tokio::sync::oneshot::channel();
+        let fire_waiter = tokio::spawn(async move {
+            let _ = fire_entered_tx.send(());
+            fire_node.channel.as_ref().expect("channel").prune_store(0);
+        });
+        deadline_entered_rx.await.expect("deadline task entered");
+        fire_entered_rx.await.expect("fire task entered");
+        tokio::task::yield_now().await;
+
+        let probe = std::thread::spawn(move || {
+            let result = get_with_timeout(addr, "/healthz", Duration::from_secs(2))
+                .map_err(|e| format!("/healthz blocked behind a held channel store: {e}"));
+            let _ = release_tx.send(());
+            result
+        });
+        let (status, body) = spawn_blocking(move || probe.join().expect("probe thread"))
+            .await
+            .expect("probe task")
+            .expect("/healthz lock isolation");
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("health json")["serving"],
+            serde_json::json!(true)
+        );
+        holder.join().expect("holder thread");
+        assert!(!deadline_waiter.await.expect("deadline waiter"));
+        fire_waiter.await.expect("fire waiter");
     }
 
     /// Send a `Connection: close` request and read its full response. Oversized
