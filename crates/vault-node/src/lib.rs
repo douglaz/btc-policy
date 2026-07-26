@@ -73,6 +73,50 @@ use crate::watchtower::{AlertQueue, Event};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// The `GET /healthz` projection (bead btc-policy-9y5.6): this node's NON-SECRET
+/// liveness state, and deliberately nothing else.
+///
+/// A poison-bricked node or an engaged Lockdown was otherwise externally invisible —
+/// an operator could not tell a dead node from a healthy one without probing it with
+/// a spend. But `/healthz` is reachable over the same coordinator relay path as
+/// `/sign`, and the coordinator is hostile-at-wrench (ADR-0010/0012), so every field
+/// here must be answerable without reading the PIN, the arm bit, or anything else a
+/// **pre-`T` duress carrier changes**. Each field earns its place on that test:
+///
+/// - `serving` — constant `true`: the daemon parsed its config, built this node, and
+///   is answering HTTP. It carries exactly what the `200` carries and no more — it is
+///   the deliverable's named field, not an authenticated identity claim, and any
+///   process on the port could emit the same byte.
+/// - `locked_down` — the terminal Lockdown latch (ADR-0008). Public by construction:
+///   a locked-down node already answers `FRAUD_SUSPECTED` to every spend, so this
+///   reveals nothing one `/sign` would not. It is reached at `T` by
+///   [`lockdown_tick`], adopted from the terminal persisted latch at startup, or
+///   forced by a critical-lock poison net — never by a PIN- or arm-dependent
+///   pre-`T` path — so it cannot separate an armed pre-`T` node from an idle one.
+/// - `last_deadline_tick` — the coarse SAFETY deadline-driver heartbeat
+///   ([`Node::last_deadline_tick`]), `None` before that driver's first pass. A plain "the
+///   loop ran at time X", not "something armed or fired". Read its field doc for the
+///   exact coverage: it is the deadline driver's heartbeat ALONE, so it goes stale on
+///   a dead process, a starved runtime, a wedged or poison-bricked store — and NOT on
+///   a release/combine/broadcast or watchtower pass stuck in a chain-backend RPC.
+/// - `generation_claimed` — the one-shot process-generation marker (ADR-0007
+///   reboot-death), claimed at the serving boundary before any request exists.
+///
+/// What is ABSENT is the point of the type, and the rule for extending it is the one
+/// that kept those out: **if a pre-`T` duress carrier can change a field, the field
+/// does not belong here.** No arm state, no pending/candidate counts, no `T` or any
+/// hold/fire deadline, no pin class, no per-commitment anything. Each of those is the
+/// duress oracle ADR-0012's SILENCE forbids — a coordinator could poll it to learn
+/// "a duress carrier armed this node" before `T`, which is precisely the knowledge
+/// the hostage window exists to deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Health {
+    pub serving: bool,
+    pub locked_down: bool,
+    pub last_deadline_tick: Option<u64>,
+    pub generation_claimed: bool,
+}
+
 // Lifecycle markers are extended attributes on the already-open config inode,
 // rather than sibling files derived from the caller's pathname. Symlinks and
 // hardlinks therefore resolve to the SAME one-shot generation gate and Lockdown
@@ -778,6 +822,72 @@ pub struct Node {
     /// pin-independent ingress); V0-4b builds the arm/freeze/sweep state machine on
     /// this same seam.
     duress_arm: AtomicU64,
+    /// The SAFETY deadline driver's liveness heartbeat (bead btc-policy-9y5.6): the
+    /// coarse wall-clock bucket of the last absolute-schedule deadline pass this
+    /// process began, or `0` before the first pass. `0` reads as "no pass yet"
+    /// (`unix_now` only returns 0 for a before-epoch clock, which is already the
+    /// fail-safe reading everywhere else).
+    ///
+    /// WHAT IT COVERS, exactly — the wire name `last_deadline_tick` is the one the bead
+    /// fixed, but the publisher is [`lockdown_driver_with_clock`]'s deadline pass,
+    /// NOT [`fire_tick`]. So the heartbeat goes stale on: a dead process, a runtime
+    /// that has stopped scheduling, a channel store lock wedged or held forever (the
+    /// pass blocks in `lockdown_due` on the very next tick), and the POISON-BRICKED
+    /// node — [`lockdown_tick_with_lockdown_net`] deliberately stops running passes
+    /// once a critical lock is poisoned and the fail-closed latch has fired, so a
+    /// stale heartbeat alongside `locked_down: true` is precisely that state, made
+    /// visible from outside for the first time.
+    ///
+    /// It does NOT go stale when the best-effort release/combine/broadcast pass, the
+    /// watchtower scan, or the vault-scan cache refresher is stuck in a chain-backend
+    /// RPC: those three are separately scheduled and none of them publishes here.
+    /// That gap is deliberate, not an oversight. All three reset their ticker from
+    /// pass COMPLETION, so each one's phase is a function of how long its last pass
+    /// took — and for the fire pass that duration depends on what the candidate
+    /// registry holds, i.e. on whether this node is ARMED. Publishing that phase
+    /// would hand a polling coordinator the pre-`T` arm signal ADR-0012's SILENCE
+    /// denies it; bucketing a timestamp coarsens a secret-dependent cadence, it does
+    /// not remove it. The deadline driver's own schedule is never reset and performs
+    /// no backend work, which is what makes this one field publishable at all, and
+    /// pin-uniformity beats coverage wherever the two collide (bead 9y5.6's
+    /// load-bearing constraint).
+    ///
+    /// Be precise about what an operator is left with, because no surface closes it:
+    /// a backend call that FAILS prints on the node's own log (`fire: cannot
+    /// broadcast …`, `fire: cannot check settlement …`, `vault scan cache refresh
+    /// failed …`), while a call that BLOCKS forever prints nothing and queues
+    /// nothing. `/events` is not the fallback either — [`Node::events`] drains the
+    /// alert queue, whose only writers are the watchtower scan and the channel
+    /// freshness reject path, so no sweep progress has ever reached it. A
+    /// backend-wedged sweep is therefore invisible from outside, deliberately: the
+    /// field that would show it is the arm-dependent one SILENCE forbids.
+    ///
+    /// An atomic, deliberately, and not anything reachable through `sign_state` or
+    /// the channel store: a `/healthz` that waited on those locks would queue behind
+    /// exactly the contention an operator is probing for, and would expose a
+    /// lock-contention timing channel on a surface a hostile coordinator can poll.
+    ///
+    /// PIN-UNIFORM on the wire, which is load-bearing (`/healthz` must not become a
+    /// duress oracle): it is stamped by the never-reset [`FIRE_INTERVAL`] deadline
+    /// ticker in [`lockdown_tick_with_lockdown_net`], before the Armed deadline is
+    /// read. The best-effort release/combine pass never WRITES it, so that pass's
+    /// completion-scheduled cadence is not published directly.
+    ///
+    /// Do not overread that separation as a scheduler-isolation guarantee. A
+    /// deadline iteration synchronously waits in [`channel::ChannelState::lockdown_due`]
+    /// on the channel store, and the fire pass also uses that mutex. Contention can
+    /// therefore postpone the NEXT deadline iteration and its bucket publication — a
+    /// co-residency latency residual documented in DESIGN.md (equally present on
+    /// `/events` and the TCP accept), not a tested `/healthz` property.
+    last_deadline_tick: AtomicU64,
+    /// Whether THIS process claimed the one-shot generation marker
+    /// ([`Node::claim_process_generation`]). Reported by `/healthz` as the "this is
+    /// the sealed node that was provisioned, not a reload of its surviving tmpfs key"
+    /// signal (ADR-0007 reboot-death). Pin-independent by construction: the claim
+    /// happens once at the serving boundary, before any request can exist. Production
+    /// [`server::serve`] therefore exposes only `true`; `false` remains meaningful to
+    /// embedders that construct the router directly and to tests.
+    generation_claimed: AtomicBool,
     /// The coordinator authentication pubkey this node is sealed to (ADR-0013
     /// §2): every `/sign` request must be validly coord-signed, carry a fresh
     /// nonce, and fall inside the expiry window before the PIN is even consulted.
@@ -992,6 +1102,10 @@ impl Node {
                  refusing to start"
             )
         })?;
+        // Only AFTER the marker is on the inode AND synced: `/healthz` reports this
+        // as "the one-shot generation is claimed", and a flag set ahead of the write
+        // would claim a generation the inode does not actually record.
+        self.generation_claimed.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -1609,6 +1723,11 @@ impl Node {
             // deployment's Lockdown survives a process restart.
             lifecycle_file: None,
             duress_arm: AtomicU64::new(0),
+            last_deadline_tick: AtomicU64::new(0),
+            // Path-less construction claims no generation (there is no config inode
+            // to claim it on), so `/healthz` on a unit-test node honestly reports
+            // `generation_claimed: false`. `server::serve` is what flips it.
+            generation_claimed: AtomicBool::new(false),
             coordinator_auth,
             wallet_id,
             policy_version: config.policy_version,
@@ -1831,6 +1950,39 @@ impl Node {
     /// a locked-down node answers `FRAUD_SUSPECTED` and does nothing else.
     pub fn is_locked_down(&self) -> bool {
         self.lockdown.load(Ordering::Acquire)
+    }
+
+    /// Stamp the SAFETY deadline driver's liveness heartbeat (bead
+    /// btc-policy-9y5.6). Called from its absolute schedule before any Armed deadline
+    /// is read — see [`Node::last_deadline_tick`] and
+    /// [`DEADLINE_HEARTBEAT_RESOLUTION_SECS`] for why the publisher is separate from the
+    /// completion-scheduled release/combine pass.
+    fn record_deadline_tick(&self, now: u64) {
+        let bucket = now - now % DEADLINE_HEARTBEAT_RESOLUTION_SECS;
+        // Wall time can step backwards. A liveness heartbeat must not regress and
+        // falsely look stalled merely because NTP corrected the clock. The cost of
+        // that choice, stated plainly: a forward clock EXCURSION followed by a
+        // correction leaves the heartbeat ahead of wall time until real time catches
+        // up, masking a genuinely stalled driver for the length of the excursion.
+        // Monotonicity is still the right trade: a regressing heartbeat would cry
+        // stall on every NTP step-back.
+        self.last_deadline_tick.fetch_max(bucket, Ordering::Release);
+    }
+
+    /// The `/healthz` projection ([`Health`]). Reads three atomics and takes NO lock,
+    /// so it cannot queue behind a held `sign_state` or channel store — the
+    /// contention an operator probing a stuck node is trying to see through — and
+    /// cannot mutate anything.
+    pub fn health(&self) -> Health {
+        let last_deadline_tick = self.last_deadline_tick.load(Ordering::Acquire);
+        Health {
+            // Constant: reaching this function at all means the daemon parsed its
+            // config, built this node, and is answering HTTP.
+            serving: true,
+            locked_down: self.is_locked_down(),
+            last_deadline_tick: (last_deadline_tick != 0).then_some(last_deadline_tick),
+            generation_claimed: self.generation_claimed.load(Ordering::Acquire),
+        }
     }
 
     /// Fire the duress arm-hook (the ADR-0012 "internal fire bit"). V0-4a only
@@ -2093,13 +2245,7 @@ pub fn spawn_drivers(node: &Arc<Node>) {
     // One-second resolution matches the node's existing fire-clock resolution and
     // ADR-0012's allowed small skew.
     let lockdown_node = Arc::clone(node);
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(FIRE_INTERVAL);
-        loop {
-            ticker.tick().await;
-            lockdown_tick_with_lockdown_net(&lockdown_node, unix_now());
-        }
-    });
+    tokio::spawn(lockdown_driver_with_clock(lockdown_node, unix_now));
     let node = Arc::clone(node);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(FIRE_INTERVAL);
@@ -2131,6 +2277,36 @@ fn unix_now() -> u64 {
 /// knob: it is scheduling resolution, not policy. One second keeps the demo
 /// snappy and costs nothing — a pass over an empty registry is a lock and a scan.
 pub const FIRE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Resolution, in seconds, of the `/healthz` SAFETY deadline-driver heartbeat
+/// ([`Node::last_deadline_tick`]).
+///
+/// Ten times [`FIRE_INTERVAL`], and that RATIO is the safety property rather than a
+/// tuning preference. Publication comes only from the never-reset deadline ticker,
+/// not from a ticker reset after release/combine pass completion. Actual publication
+/// can still be delayed when the preceding deadline check waits on the channel-store
+/// mutex that the fire pass also uses; bucketing removes ordinary sub-bucket
+/// scheduler jitter without pretending to provide scheduler isolation.
+///
+/// Liveness is not weakened: the loop ticks at 1 Hz, so a heartbeat more than a
+/// bucket or two behind the wall clock is a deadline driver that has stopped
+/// looping — exactly what the field exists to show, and see [`Node::last_deadline_tick`]
+/// for the failure modes that deliberately fall outside it.
+pub const DEADLINE_HEARTBEAT_RESOLUTION_SECS: u64 = 10;
+
+/// Run the unconditional SAFETY deadline driver on an absolute Tokio interval.
+///
+/// The heartbeat publication lives here, not in the completion-scheduled
+/// release/combine loop: an ARMED candidate can change that loop's pass duration
+/// before `T`, so exposing its phase would be a duress oracle even after timestamp
+/// bucketing. This driver never resets its ticker and performs no backend work.
+async fn lockdown_driver_with_clock(node: Arc<Node>, clock: impl Fn() -> u64 + Send + 'static) {
+    let mut ticker = tokio::time::interval(FIRE_INTERVAL);
+    loop {
+        ticker.tick().await;
+        lockdown_tick_with_lockdown_net(&node, clock());
+    }
+}
 
 /// Drive only the unconditional SAFETY transition. Kept separate from every
 /// backend-dependent sweep/combine operation so Lockdown at `T` cannot wait for
@@ -2167,6 +2343,19 @@ fn lockdown_tick_with_lockdown_net(node: &Node, now: u64) {
     if node.is_locked_down() && node.critical_lock_poisoned() {
         return;
     }
+    // Publish before reading the Armed overlay. This prevents the result or duration
+    // of THIS deadline check from changing the stamp, and the completion-scheduled
+    // release/combine pass never writes it. The next scheduled iteration can still
+    // be postponed if this check waits on the store mutex shared with that pass; see
+    // [`Node::last_deadline_tick`] for the precise observable contract.
+    // Its position BELOW the terminal-poison return is equally load-bearing: a
+    // poison-bricked node runs no further pass, and its frozen heartbeat next to
+    // `locked_down: true` is the whole external signal for that state (see
+    // [`Node::last_deadline_tick`]). Hoisting this call above the guard — a plausible
+    // "publish first, unconditionally" refactor — would keep the heartbeat advancing
+    // on a node that is doing nothing, and is pinned by
+    // `server::tests::healthz_heartbeat_freezes_on_a_poison_bricked_node`.
+    node.record_deadline_tick(now);
     let outcome =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lockdown_tick(node, now)));
     // Log on the poison→terminal transition, gated on ACTUAL poison rather than
@@ -7597,6 +7786,64 @@ mod reboot_death_tests {
         );
 
         drop(attempt2);
+        std::fs::remove_file(&path).expect("reboot wipes config and key");
+        std::fs::remove_dir(&dir).expect("reboot wipes deployment tmpfs");
+    }
+
+    /// `/healthz`'s `generation_claimed` field IS this marker, not a proxy for it
+    /// (bead btc-policy-9y5.6): an operator reads it as "this is the sealed node that
+    /// was provisioned", so it must be true exactly when the inode records a claim.
+    ///
+    /// A FAILED claim reporting `true` would be the damaging direction — it would
+    /// vouch for reboot-death on a node that never took the generation — so the
+    /// path-less and refused-second-claim cases are both pinned here.
+    #[test]
+    fn health_reports_the_claimed_process_generation() {
+        // Path-less construction: no config inode, so no generation, and the field
+        // says so rather than assuming the daemon shape.
+        let unclaimed = load_node(&super::test_support::config_with_bounds(0, 172_800, ""))
+            .expect("valid config");
+        assert!(!unclaimed.health().generation_claimed);
+        assert!(
+            unclaimed.claim_process_generation().is_err(),
+            "a node with no config inode cannot claim a generation"
+        );
+        assert!(
+            !unclaimed.health().generation_claimed,
+            "a failed claim must never report a claimed generation"
+        );
+
+        let dir = scratch_dir();
+        let path = dir.join("node.toml");
+        let config = super::test_support::config_with_bounds(0, 172_800, "");
+        std::fs::write(&path, &config).expect("write config to the RAMDISK");
+        let mut node = load_node(&config).expect("valid config");
+        node.apply_persisted_lockdown(File::open(&path).expect("open config"), path.as_path())
+            .expect("bind the lifecycle inode");
+        assert!(
+            !node.health().generation_claimed,
+            "binding the inode is not claiming the generation"
+        );
+
+        node.claim_process_generation()
+            .expect("the first generation is claimable");
+        assert!(node.health().generation_claimed);
+        assert_eq!(
+            read_xattr(
+                node.lifecycle_file.as_ref().expect("lifecycle file"),
+                GENERATION_XATTR,
+            )
+            .expect("read generation marker")
+            .as_deref(),
+            Some(b"claimed\n".as_slice()),
+            "the reported field must match what the inode actually records"
+        );
+
+        // The one-shot refusal must not un-claim what this process already holds.
+        assert!(node.claim_process_generation().is_err());
+        assert!(node.health().generation_claimed);
+
+        drop(node);
         std::fs::remove_file(&path).expect("reboot wipes config and key");
         std::fs::remove_dir(&dir).expect("reboot wipes deployment tmpfs");
     }

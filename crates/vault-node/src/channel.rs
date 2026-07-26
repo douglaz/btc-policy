@@ -3652,6 +3652,21 @@ impl ChannelState {
         panic!("injected panic while holding the channel store");
     }
 
+    /// Test-only: hold the production candidate-store lock until the caller releases
+    /// it. `/healthz`'s no-lock contract (bead btc-policy-9y5.6) is only worth
+    /// anything if a held store cannot delay the probe, and that is unprovable from
+    /// outside this module — `store` is private, deliberately.
+    #[cfg(test)]
+    pub(crate) fn hold_store_until(
+        &self,
+        held: &std::sync::mpsc::Sender<()>,
+        release: &std::sync::mpsc::Receiver<()>,
+    ) {
+        let _guard = self.store.lock().expect("store lock poisoned");
+        held.send(()).expect("signal the store is held");
+        release.recv().expect("await the store release");
+    }
+
     /// Prune expired candidates — driven from the same `/sign` sweep the replay
     /// log runs on (§5); the `/channel` lookup also evicts expired candidates so an
     /// idle node still rejects them.

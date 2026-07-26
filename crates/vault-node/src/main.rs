@@ -5,15 +5,43 @@ use std::sync::Arc;
 
 use vault_node::{server, spawn_drivers, Node};
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+/// Floor on Tokio worker threads. The Lockdown-deadline and fire-driver prologues
+/// both touch the synchronous channel store; if that lock is wedged, each can pin one
+/// worker, so a third is what keeps the lock-free `/healthz` operations surface
+/// schedulable on a one- or two-vCPU sealed host. A FLOOR and not a cap: a larger
+/// sealed host keeps its `available_parallelism()` workers, which is the count Tokio
+/// itself defaults to and what the daemon ran on before this floor existed.
+///
+/// Setting the count explicitly does mean `TOKIO_WORKER_THREADS` no longer applies,
+/// and that is the intended reading: this floor exists precisely so the number cannot
+/// drop below what keeps `/healthz` answerable on a wedged store, and nothing in a
+/// sealed v0 deployment asks for a different one.
+const MIN_WORKER_THREADS: usize = 3;
+
+fn main() -> ExitCode {
+    let workers = std::thread::available_parallelism().map_or(MIN_WORKER_THREADS, |cpus| {
+        cpus.get().max(MIN_WORKER_THREADS)
+    });
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("vault-node: {e}");
-            ExitCode::FAILURE
+            eprintln!("vault-node: cannot start the async runtime: {e}");
+            return ExitCode::FAILURE;
         }
-    }
+    };
+    runtime.block_on(async {
+        match run().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vault-node: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 async fn run() -> Result<(), vault_node::Error> {
