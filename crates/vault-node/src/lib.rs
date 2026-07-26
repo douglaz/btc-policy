@@ -25,6 +25,7 @@
 
 pub mod chain;
 pub mod channel;
+pub mod nodekey;
 mod pin;
 mod replay;
 pub mod server;
@@ -420,11 +421,22 @@ pub struct BadRequest(pub String);
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub listen_port: u16,
-    /// Hex-encoded 32-byte secret key. A key at rest is a deliberate
-    /// first-light deviation from DESIGN.md D4/T1 (on-node key birth,
-    /// in-memory wskdf-derived keys); the v0 provisioning task replaces this
-    /// field. Only throwaway regtest keys ever land here.
-    pub node_seckey: String,
+    /// The PUBLIC half of this node's key derivation (DESIGN.md D4/T1, ADR-0007;
+    /// bead btc-policy-9y5.5): the wskdf salt, as `2 * SALT_BYTES` hex characters.
+    ///
+    /// **There is no key at rest.** The config names the derivation, never the
+    /// secret: the node's federation signing key is derived in RAM at startup from
+    /// this salt plus the operator-held preimage read from stdin
+    /// ([`nodekey`]). A host-level attacker reading this file learns the
+    /// parameters of a 63-bit-preimage Argon2id derivation, which is not the key —
+    /// where before it learned the key itself.
+    pub node_key_salt: String,
+    /// Argon2id pass count for the node-key derivation (public; see
+    /// [`nodekey::DEFAULT_KDF_OPS`]).
+    pub node_key_ops: u32,
+    /// Argon2id memory, in KiB, for the node-key derivation (public; see
+    /// [`nodekey::DEFAULT_KDF_MEM_KIB`]).
+    pub node_key_mem_kib: u32,
     /// The node's own copy of the vault descriptor.
     pub descriptor: String,
     /// Allowlisted destination WALLETS as descriptors (hot + escape), never
@@ -746,10 +758,12 @@ pub struct Node {
     /// refusal, and the [`Node::enter_lockdown`] entry point; V0-4b drives WHEN it
     /// is entered (at T under duress).
     lockdown: AtomicBool,
-    /// A PRE-OPENED handle to the RAMDISK config inode containing `node_seckey`.
-    /// Lockdown and the one-shot process generation are extended attributes on THIS
-    /// inode, so they have the key's exact durability and cannot be bypassed by
-    /// loading the same config through a symlink or hardlink. Opened once by
+    /// A PRE-OPENED handle to the RAMDISK config inode — the artifact that names
+    /// this node's key derivation, the key itself now living only in RAM
+    /// ([`nodekey`]). Lockdown and the one-shot process generation are extended
+    /// attributes on THIS inode, so they have the config's durability — which under
+    /// the tmpfs deployment is the same zero as the key's — and cannot be bypassed
+    /// by loading the same config through a symlink or hardlink. Opened once by
     /// [`Node::load`] before the server accepts connections and held for life, so
     /// [`Node::enter_lockdown`] needs no fresh fd (EMFILE-safe). The Lockdown
     /// attribute is created empty on a fresh boot to prove the future write is
@@ -909,7 +923,26 @@ impl Node {
         lifecycle_file
             .read_to_string(&mut raw)
             .map_err(|e| format!("cannot read config {path}: {e}"))?;
-        let mut node = Node::from_toml_str(&raw)?;
+        // The one secret this node holds arrives HERE, on stdin, from the operator —
+        // never from the config inode above (bead btc-policy-9y5.5; DESIGN.md T1).
+        // Read after the config so a destroyed deployment still fails on the config,
+        // which is what the reboot-death drill reads as its evidence, and so an
+        // operator is not asked for a secret by a process that was going to die
+        // anyway.
+        //
+        // Nothing re-prompts and nothing retries: under ADR-0007 a node starts once
+        // in its life, at provisioning, before the host is sealed (ADR-0005). A
+        // reboot does not come back here — it comes back to a bare machine with no
+        // config, no key, and no way to ask for one. That is the resolution ADR-0005
+        // recorded as open: sealing and an in-memory key do not conflict, because
+        // there is no second startup to hand a preimage to.
+        let preimage = nodekey::Preimage::read_from_stdin().map_err(|e| {
+            format!(
+                "cannot read the operator node-key preimage from stdin ({e}); a vault-node \
+                 derives its signing key at startup and holds none at rest"
+            )
+        })?;
+        let mut node = Node::from_toml_str(&raw, &preimage)?;
         node.require_channel_mode()?;
         node.apply_persisted_lockdown(lifecycle_file, Path::new(path))?;
         // The one-shot process generation is NOT claimed here. The public serving
@@ -1003,11 +1036,24 @@ impl Node {
         Ok(())
     }
 
-    pub fn from_toml_str(raw: &str) -> Result<Node, Error> {
+    /// Build a node from its config TOML plus the operator-held preimage.
+    ///
+    /// The preimage is a PARAMETER, not a config field, and that is the whole point
+    /// of this signature: the config is an artifact at rest on the node's tmpfs, the
+    /// preimage is not, and the type system is where that distinction is cheapest to
+    /// keep true. Production reaches this through [`Node::load`], which reads the
+    /// preimage from stdin.
+    pub fn from_toml_str(raw: &str, preimage: &nodekey::Preimage) -> Result<Node, Error> {
         let config: ConfigFile = toml::from_str(raw).map_err(|e| format!("bad config: {e}"))?;
         let secp = Secp256k1::new();
-        let seckey = SecretKey::from_str(&config.node_seckey)
-            .map_err(|e| format!("bad node_seckey: {e}"))?;
+        // Derive the federation signing key in RAM. Nothing this reads from the
+        // config is secret; the secret arrived on stdin and dies with the process.
+        let kdf = nodekey::KdfParams::from_hex_salt(
+            &config.node_key_salt,
+            config.node_key_ops,
+            config.node_key_mem_kib,
+        )?;
+        let seckey = nodekey::derive(preimage, &kdf)?;
         let pubkey = PublicKey::new(seckey.public_key(&secp));
         // The coordinator authentication pubkey this vault is configured with
         // (ADR-0013 §2). Parsed once here; it arms the `/sign` coord-auth gate and
@@ -1053,6 +1099,28 @@ impl Node {
         let user_pubkey = template.user_key;
         let threshold = template.threshold;
         let node_keys = template.node_keys;
+        // The derived key must be a key this vault actually names. This is the
+        // fail-closed end of the wskdf path: a mistyped preimage, a salt from
+        // another node's bundle, or a config paired with the wrong operator secret
+        // all land here, and all of them must be a FATAL startup error rather than a
+        // daemon that serves with a key no descriptor contains. Such a node would
+        // authenticate, validate, and "sign" every request while producing partials
+        // that can never combine — the whole federation would look healthy and no
+        // spend would ever complete, with nothing on the wire to say why.
+        //
+        // `[channel]` mode re-derives a stronger form of this (the manifest's self
+        // entry must equal this key, and every manifest entry must equal a canonical
+        // descriptor key — `ChannelState::build`). This check is what covers the
+        // channel-LESS fixtures, and it runs first so the error names the cause.
+        if !node_keys.iter().any(|key| key.inner == pubkey.inner) {
+            return Err(format!(
+                "the wskdf-derived node key {pubkey} is not one of the vault descriptor's \
+                 federation node keys: the operator preimage does not match this node's \
+                 node_key_salt/node_key_ops/node_key_mem_kib, or the config belongs to a \
+                 different node"
+            )
+            .into());
+        }
         // Confirmation-gated arming commits only on a peer `/channel` receipt. A
         // 1-of-n channel federation has no peer receipt to wait for when n = 1, and
         // treating self-holding as an ingress commit would violate V0-4b §0's
@@ -6280,6 +6348,56 @@ pub(crate) mod test_support {
         (sk, PublicKey::new(sk.public_key(&secp)))
     }
 
+    /// Argon2id cost every fixture derives its node key at: the implementation
+    /// FLOOR. The suite stands up hundreds of nodes, and a production-cost pass
+    /// (~1s each, [`nodekey::DEFAULT_KDF_OPS`]) would turn a fast test run into a
+    /// coffee break while proving nothing extra — the cost parameter is not what any
+    /// invariant here rests on.
+    pub(crate) const FIXTURE_KDF_OPS: u32 = 1;
+    pub(crate) const FIXTURE_KDF_MEM_KIB: u32 = 8;
+
+    /// The one preimage every fixture node derives from. Fixtures separate their
+    /// nodes by SALT rather than by preimage, which is a real production shape too
+    /// (nothing in the node cares which of the two varies) and keeps a single
+    /// constant standing in for "the operator typed the right secret".
+    pub(crate) fn fixture_preimage() -> nodekey::Preimage {
+        nodekey::Preimage::from_hex("00000000000000ff").expect("fixture preimage")
+    }
+
+    /// A fixture node key: the public derivation parameters plus the secret and
+    /// public halves [`fixture_preimage`] yields under them. `seed` separates nodes.
+    pub(crate) fn fixture_node_key(seed: u8) -> (nodekey::KdfParams, SecretKey, PublicKey) {
+        let params = nodekey::KdfParams::new(
+            [seed; nodekey::SALT_BYTES],
+            FIXTURE_KDF_OPS,
+            FIXTURE_KDF_MEM_KIB,
+        )
+        .expect("fixture kdf params");
+        let seckey = nodekey::derive(&fixture_preimage(), &params).expect("fixture derivation");
+        let secp = Secp256k1::new();
+        let pubkey = PublicKey::new(seckey.public_key(&secp));
+        (params, seckey, pubkey)
+    }
+
+    /// The `node_key_*` config lines for a fixture node — the PUBLIC derivation
+    /// parameters that replaced `node_seckey`.
+    pub(crate) fn node_key_toml(params: &nodekey::KdfParams) -> String {
+        format!(
+            "node_key_salt = \"{}\"\nnode_key_ops = {}\nnode_key_mem_kib = {}\n",
+            params.salt_hex(),
+            params.ops(),
+            params.mem_kib(),
+        )
+    }
+
+    /// `Node::from_toml_str` with the fixture preimage — the test-side stand-in for
+    /// the operator typing their secret at `vault-node` startup. Every in-crate test
+    /// loads through this, so a config that does not name the fixture derivation
+    /// fails exactly as a production config paired with the wrong preimage would.
+    pub(crate) fn load_node(raw: &str) -> Result<Node, Error> {
+        Node::from_toml_str(raw, &fixture_preimage())
+    }
+
     /// The two-branch vault descriptor (ADR-0013 §1) for a `t = node_keys.len()`
     /// fixture: `user` + all `node_keys` on the normal branch, plus a fixed
     /// throwaway 2-of-3 recovery keyset (seeds 0x30..=0x32). The recovery branch is
@@ -6305,12 +6423,12 @@ pub(crate) mod test_support {
         extra: &str,
     ) -> String {
         let (_, user) = key(1);
-        let (nsk, node_pub) = key(2);
+        let (node_kdf, _, node_pub) = fixture_node_key(2);
         let (_, hot_key) = key(10);
         let (_, escape_key) = key(11);
         let descriptor = test_vault_descriptor(&user, &[node_pub]);
         format!(
-            "listen_port = 0\nnode_seckey = \"{}\"\ndescriptor = \"{descriptor}\"\n\
+            "listen_port = 0\n{}descriptor = \"{descriptor}\"\n\
              allowlist = [\"wpkh({hot_key})\", \"wpkh({escape_key})\"]\n\
              escape_descriptor = \"wpkh({escape_key})\"\n\
              max_derivation_index = 5\nhold_secs = {hold_secs}\n\
@@ -6319,7 +6437,7 @@ pub(crate) mod test_support {
              max_commitment_age_secs = {max_commitment_age_secs}\npolicy_version = 1\n\
              pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
              coordinator_auth_pubkey = \"{}\"\n{extra}",
-            nsk.display_secret(),
+            node_key_toml(&node_kdf),
             channel::TEST_HOT_BUDGET.max_per_tx_sat,
             channel::TEST_HOT_BUDGET.max_per_window_sat,
             // The velocity window must cover the commitment lifetime, and this
@@ -6371,9 +6489,15 @@ pub(crate) mod test_support {
     /// re-derives from this exact descriptor. Callers that DO hold the node pass
     /// `&node.wallet_id` directly.
     pub(crate) fn test_wallet_id() -> [u8; 32] {
-        let descriptor =
-            Descriptor::<PublicKey>::from_str(&test_vault_descriptor(&key(1).1, &[key(2).1]))
-                .expect("standard test descriptor parses");
+        // The node key is the DERIVED one (`fixture_node_key`), not a raw seed:
+        // `wallet_id` is the hash of the descriptor these fixtures actually build,
+        // and it is the coord-auth digest's domain separator, so a stale copy here
+        // makes every request fail `CoordAuthInvalid` instead of reaching the pin.
+        let descriptor = Descriptor::<PublicKey>::from_str(&test_vault_descriptor(
+            &key(1).1,
+            &[fixture_node_key(2).2],
+        ))
+        .expect("standard test descriptor parses");
         sha256::Hash::hash(descriptor.to_string().as_bytes()).to_byte_array()
     }
 
@@ -6469,7 +6593,7 @@ pub(crate) mod test_support {
     /// enrol a small `max_attempts` with a zero backoff (no real sleeping).
     pub(crate) fn node_and_valid_request_with_budget(budget_toml: &str) -> (Node, SignRequest) {
         let (_, user) = key(1);
-        let (nsk, node_pub) = key(2);
+        let (node_kdf, _, node_pub) = fixture_node_key(2);
         let (_, hot_key) = key(10);
         let (_, escape_key) = key(11);
         let descriptor = test_vault_descriptor(&user, &[node_pub]);
@@ -6482,14 +6606,14 @@ pub(crate) mod test_support {
             .expect("definite")
             .script_pubkey();
         let config = format!(
-            "listen_port = 0\nnode_seckey = \"{}\"\ndescriptor = \"{descriptor}\"\n\
+            "listen_port = 0\n{}descriptor = \"{descriptor}\"\n\
              allowlist = [\"{hot}\", \"{escape}\"]\nescape_descriptor = \"{escape}\"\n\
              max_derivation_index = 5\nhold_secs = 0\n\
              hot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\n\
              max_commitment_age_secs = 172800\npolicy_version = 1\n\
              pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
              coordinator_auth_pubkey = \"{}\"\n{budget_toml}",
-            nsk.display_secret(),
+            node_key_toml(&node_kdf),
             channel::TEST_HOT_BUDGET.max_per_tx_sat,
             channel::TEST_HOT_BUDGET.max_per_window_sat,
             channel::TEST_HOT_BUDGET.window_secs,
@@ -6497,7 +6621,7 @@ pub(crate) mod test_support {
             argon2id_duress_phc("9999"),
             coord_key().1,
         );
-        let node = Node::from_toml_str(&config).expect("valid config");
+        let node = load_node(&config).expect("valid config");
         let escape_spk = escape
             .at_derivation_index(0)
             .expect("definite")
@@ -6651,14 +6775,93 @@ mod commitment_parity_tests {
 
 #[cfg(test)]
 mod config_bounds_tests {
-    use super::test_support::config_with_bounds;
-    use super::Node;
+    use super::test_support::{
+        config_with_bounds, fixture_node_key, fixture_preimage, load_node, node_key_toml,
+    };
+    use super::{nodekey, Node, PublicKey, Secp256k1};
+
+    /// The wskdf key path, end to end and on the node's own terms: the config names
+    /// a DERIVATION, and the key the node ends up holding is exactly the descriptor
+    /// key that derivation produces.
+    #[test]
+    fn the_wskdf_derived_key_is_the_node_key_the_descriptor_names() {
+        let config = config_with_bounds(0, 172_800, "");
+        assert!(
+            !config.contains("node_seckey"),
+            "the retired at-rest key field must not be in any config"
+        );
+        let (params, expected_seckey, expected_pubkey) = fixture_node_key(2);
+        assert!(config.contains(&format!("node_key_salt = \"{}\"", params.salt_hex())));
+        assert!(
+            !config.contains(&expected_seckey.display_secret().to_string()),
+            "no key material at rest"
+        );
+
+        let node = load_node(&config).expect("the right preimage loads");
+        assert_eq!(
+            node.pubkey, expected_pubkey,
+            "the node holds the key its config's derivation produces"
+        );
+        assert!(
+            config.contains(&expected_pubkey.to_string()),
+            "and that key is one the frozen descriptor names"
+        );
+    }
+
+    /// FAIL CLOSED on the wrong secret. A node that booted with a key no descriptor
+    /// names would authenticate, validate, and "sign" every request while producing
+    /// partials that can never combine: the federation would look healthy and no
+    /// spend would ever complete, with nothing on the wire to say why. It must
+    /// refuse to start instead.
+    #[test]
+    fn a_wrong_preimage_refuses_to_start_rather_than_signing_with_a_stranger_key() {
+        let config = config_with_bounds(0, 172_800, "");
+        let wrong = nodekey::Preimage::from_hex("0000000000000001").expect("a valid preimage");
+        let err = Node::from_toml_str(&config, &wrong)
+            .err()
+            .expect("a key the descriptor does not name must not boot");
+        assert!(
+            err.to_string()
+                .contains("not one of the vault descriptor's"),
+            "the refusal must name the cause: {err}"
+        );
+    }
+
+    /// The derivation parameters are load-time validated like every other config
+    /// bound, so nonsense fails at startup rather than inside Argon2id.
+    #[test]
+    fn malformed_node_key_derivation_parameters_are_a_fatal_config() {
+        let (params, _, _) = fixture_node_key(2);
+        let good = node_key_toml(&params);
+        for (what, broken) in [
+            ("salt", good.replace(&params.salt_hex(), "00")),
+            ("ops", good.replace("node_key_ops = 1", "node_key_ops = 0")),
+            (
+                "memory",
+                good.replace("node_key_mem_kib = 8", "node_key_mem_kib = 1"),
+            ),
+        ] {
+            let config = config_with_bounds(0, 172_800, "").replace(&good, &broken);
+            assert!(
+                Node::from_toml_str(&config, &fixture_preimage()).is_err(),
+                "a broken {what} must be a fatal config"
+            );
+        }
+        // And the fixture's own parameters really do derive the fixture key, so the
+        // negatives above are about the mutation and not about a broken baseline.
+        let secp = Secp256k1::new();
+        let derived = nodekey::derive(&fixture_preimage(), &params).expect("derive");
+        assert_eq!(
+            PublicKey::new(derived.public_key(&secp)),
+            fixture_node_key(2).2
+        );
+    }
 
     /// A zero-width combine window is a silent broadcast trap, so it is a fatal
     /// config, not a runtime surprise.
     #[test]
     fn a_zero_combine_slack_is_a_fatal_config() {
-        let err = Node::from_toml_str(&config_with_bounds(0, 172_800, "combine_slack_secs = 0\n"))
+        let err = load_node(&config_with_bounds(0, 172_800, "combine_slack_secs = 0\n"))
             .err()
             .expect("zero combine slack must be rejected at load");
         assert!(
@@ -6677,7 +6880,7 @@ mod config_bounds_tests {
     #[test]
     fn a_combine_slack_shorter_than_twice_the_cache_refresh_interval_is_a_fatal_config() {
         let short = 2 * crate::watchtower::SCAN_INTERVAL.as_secs() - 1;
-        let err = Node::from_toml_str(&config_with_bounds(
+        let err = load_node(&config_with_bounds(
             0,
             172_800,
             &format!("combine_slack_secs = {short}\n"),
@@ -6694,7 +6897,7 @@ mod config_bounds_tests {
     /// impossible to trip, disabling ADR-0013 §6's burn-rate bound.
     #[test]
     fn a_zero_refresh_interval_is_a_fatal_config() {
-        let err = Node::from_toml_str(&config_with_bounds(
+        let err = load_node(&config_with_bounds(
             0,
             172_800,
             "refresh_min_interval_secs = 0\n",
@@ -6711,7 +6914,7 @@ mod config_bounds_tests {
     /// cap, every hot spend is silently refused — also a fatal config.
     #[test]
     fn hold_plus_slack_past_max_commitment_age_is_a_fatal_config() {
-        let err = Node::from_toml_str(&config_with_bounds(
+        let err = load_node(&config_with_bounds(
             0,
             172_800,
             "combine_slack_secs = 200000\n",
@@ -6729,7 +6932,7 @@ mod config_bounds_tests {
     /// with no override loads.
     #[test]
     fn the_default_combine_slack_still_loads() {
-        Node::from_toml_str(&config_with_bounds(0, 172_800, ""))
+        load_node(&config_with_bounds(0, 172_800, ""))
             .expect("a config on the default combine slack is valid");
     }
 
@@ -6741,7 +6944,7 @@ mod config_bounds_tests {
     /// Reject it at load (Reviewer round-12 P1).
     #[test]
     fn duress_delay_past_max_commitment_age_is_a_fatal_config() {
-        let err = Node::from_toml_str(&config_with_bounds(
+        let err = load_node(&config_with_bounds(
             0,
             172_800,
             "duress_delay_secs = 172801\n",
@@ -6761,7 +6964,7 @@ mod config_bounds_tests {
     /// ordinary operation.
     #[test]
     fn duress_delay_at_max_commitment_age_still_loads() {
-        Node::from_toml_str(&config_with_bounds(
+        load_node(&config_with_bounds(
             0,
             172_800,
             "duress_delay_secs = 172800\n",
@@ -6773,7 +6976,7 @@ mod config_bounds_tests {
     /// leaves no protected satoshi available to pay it. The pair is unsatisfiable.
     #[test]
     fn full_coverage_with_a_positive_feerate_floor_is_a_fatal_config() {
-        let err = Node::from_toml_str(&config_with_bounds(
+        let err = load_node(&config_with_bounds(
             0,
             172_800,
             "escape_coverage_pct = 100\nescape_feerate_floor = 1\n",
@@ -6791,7 +6994,7 @@ mod config_bounds_tests {
     /// rather than being silently ignored by serde.
     #[test]
     fn an_unknown_top_level_config_field_is_fatal() {
-        let err = Node::from_toml_str(&config_with_bounds(
+        let err = load_node(&config_with_bounds(
             0,
             172_800,
             "max_commitment_age_sec = 86400\n",
@@ -6807,7 +7010,7 @@ mod config_bounds_tests {
     /// A misspelled budget key must not fall back to the default attempt limit.
     #[test]
     fn an_unknown_pin_attempt_budget_field_is_fatal() {
-        let err = Node::from_toml_str(&config_with_bounds(
+        let err = load_node(&config_with_bounds(
             0,
             172_800,
             "[pin_attempt_budget]\nmax_attemps = 2\n",
@@ -6868,8 +7071,8 @@ mod sign_clock_tests {
 mod pin_substrate_tests {
     use super::pin::{PinEvaluator, PinSlot};
     use super::test_support::{
-        coord_sign, node_and_valid_request, node_and_valid_request_with_budget, test_wallet_id,
-        valid_refresh_request,
+        coord_sign, load_node, node_and_valid_request, node_and_valid_request_with_budget,
+        test_wallet_id, valid_refresh_request,
     };
     use super::{handle_refresh, handle_sign, Node};
     use std::sync::Arc;
@@ -7176,7 +7379,7 @@ mod pin_substrate_tests {
     fn a_non_argon2id_pin_digest_is_a_fatal_config() {
         let config = super::test_support::config_with_bounds(0, 172_800, "");
         let bad = config.replacen(&crate::argon2id_normal_phc("1234"), "deadbeef", 1);
-        let err = Node::from_toml_str(&bad)
+        let err = load_node(&bad)
             .err()
             .expect("a SHA-256 digest must be rejected");
         assert!(
@@ -7189,7 +7392,7 @@ mod pin_substrate_tests {
     /// be undefined).
     #[test]
     fn a_zero_max_attempts_budget_is_a_fatal_config() {
-        let err = Node::from_toml_str(&super::test_support::config_with_bounds(
+        let err = load_node(&super::test_support::config_with_bounds(
             0,
             172_800,
             "[pin_attempt_budget]\nmax_attempts = 0\n",
@@ -7205,7 +7408,7 @@ mod pin_substrate_tests {
     /// An empty `backoff_schedule` is fatal (`len-1` would be undefined).
     #[test]
     fn an_empty_backoff_schedule_is_a_fatal_config() {
-        let err = Node::from_toml_str(&super::test_support::config_with_bounds(
+        let err = load_node(&super::test_support::config_with_bounds(
             0,
             172_800,
             "[pin_attempt_budget]\nbackoff_schedule = []\n",
@@ -7220,18 +7423,22 @@ mod pin_substrate_tests {
 }
 
 /// Reboot-death (codex C5): the entire node deployment — OS image, binary, config
-/// (INCLUDING `node_seckey`), and every piece of runtime state — lives on tmpfs
-/// (ADR-0007), so a reboot leaves a BARE machine. The attempt budget dies with the
-/// signing key in the same stroke; the node cannot restart or rejoin the vault.
+/// (the wskdf derivation PARAMETERS; the signing key itself is derived into RAM from
+/// the operator's stdin preimage and is never at rest, bead 9y5.5), and every piece
+/// of runtime state — lives on tmpfs (ADR-0007), so a reboot leaves a BARE machine.
+/// The attempt budget dies with the in-RAM signing key in the same stroke; the node
+/// cannot restart or rejoin the vault.
 ///
 /// Lockdown and the pin-independent one-shot generation marker are attributes on the
-/// tmpfs config/key inode, with durability EQUAL to the signing key's. A MACHINE
+/// tmpfs config inode, with durability EQUAL to the derivation parameters' — and thus
+/// to the in-RAM signing key's, which cannot outlive them. A MACHINE
 /// reboot wipes all three (node death), while a PROCESS restart cannot reload the key
 /// after RAM-only Armed/candidate state may have existed. The latch remains
 /// independently verified below: any explicit lower-level adoption of surviving
 /// tmpfs state observes Lockdown rather than an unlocked state.
 #[cfg(test)]
 mod reboot_death_tests {
+    use super::test_support::load_node;
     use super::{read_xattr, File, Node, GENERATION_XATTR, LOCKDOWN_XATTR};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -7251,15 +7458,17 @@ mod reboot_death_tests {
         let config = super::test_support::config_with_bounds(0, 172_800, "");
         std::fs::write(&path, &config).expect("write config to the RAMDISK");
 
-        // While the RAMDISK holds its config + node_seckey the node loads and can be
+        // While the RAMDISK holds its config (the derivation parameters) the node
+        // loads — deriving its key in RAM from the fixture preimage — and can be
         // driven into terminal Lockdown.
-        let node = Node::from_toml_str(&std::fs::read_to_string(&path).expect("read config"))
-            .expect("valid config");
+        let node =
+            load_node(&std::fs::read_to_string(&path).expect("read config")).expect("valid config");
         node.enter_lockdown();
         assert!(node.is_locked_down());
 
-        // Reboot = tmpfs wiped: destroy the config (INCLUDING node_seckey and its
-        // inode-attached lifecycle attributes) and the whole deployment dir.
+        // Reboot = tmpfs wiped: destroy the config (the derivation parameters and
+        // their inode-attached lifecycle attributes; the signing key was only ever in
+        // RAM) and the whole deployment dir.
         std::fs::remove_file(&path).expect("wipe config");
         std::fs::remove_dir(&dir).expect("wipe RAMDISK dir");
 
@@ -7291,7 +7500,7 @@ mod reboot_death_tests {
         std::os::unix::fs::symlink(&path, &symlink).expect("create config symlink");
         std::fs::hard_link(&path, &hardlink).expect("create config hardlink");
 
-        let mut first = Node::from_toml_str(&config).expect("valid config");
+        let mut first = load_node(&config).expect("valid config");
         first
             .apply_persisted_lockdown(
                 File::open(&path).expect("open config inode"),
@@ -7320,7 +7529,7 @@ mod reboot_death_tests {
         );
 
         for alias in [&symlink, &hardlink] {
-            let mut through_alias = Node::from_toml_str(&config).expect("valid config");
+            let mut through_alias = load_node(&config).expect("valid config");
             through_alias
                 .apply_persisted_lockdown(
                     File::open(alias).expect("open config alias"),
@@ -7361,7 +7570,7 @@ mod reboot_death_tests {
         // Attempt 1 does everything `load` does — parse + adopt any latch — then a
         // later fallible startup step (the listener bind) fails, so the process exits
         // WITHOUT ever reaching `claim_process_generation`.
-        let mut attempt1 = Node::from_toml_str(&config).expect("valid config");
+        let mut attempt1 = load_node(&config).expect("valid config");
         attempt1
             .apply_persisted_lockdown(File::open(&path).expect("open config"), path.as_path())
             .expect("attempt 1 adopts the latch");
@@ -7369,7 +7578,7 @@ mod reboot_death_tests {
 
         // Attempt 2 (the operator's retry) reloads cleanly and CAN claim the still
         // -available generation: the failed first attempt did not brick the key.
-        let mut attempt2 = Node::from_toml_str(&config).expect("valid config");
+        let mut attempt2 = load_node(&config).expect("valid config");
         attempt2
             .apply_persisted_lockdown(File::open(&path).expect("open config"), path.as_path())
             .expect("attempt 2 adopts the latch");
@@ -7407,7 +7616,7 @@ mod reboot_death_tests {
 
         // Process 1 boots clean: apply_persisted_lockdown binds the config inode and
         // creates its empty latch attribute, then Lockdown fires.
-        let mut p1 = Node::from_toml_str(&config_str).expect("valid config");
+        let mut p1 = load_node(&config_str).expect("valid config");
         p1.apply_persisted_lockdown(File::open(&path).expect("open config"), path.as_path())
             .expect("read latch");
         assert!(!p1.is_locked_down(), "a fresh node starts unlocked");
@@ -7437,7 +7646,7 @@ mod reboot_death_tests {
         // HARDLINK. Production
         // would subsequently reject its process-generation claim, but even this
         // lower-level seam MUST read terminal Lockdown first.
-        let mut p2 = Node::from_toml_str(&config_str).expect("valid config");
+        let mut p2 = load_node(&config_str).expect("valid config");
         assert!(
             !p2.is_locked_down(),
             "in-RAM default is unlocked before the flag is consulted"
@@ -7456,7 +7665,7 @@ mod reboot_death_tests {
         std::fs::remove_file(&alias).expect("reboot wipes hardlink");
         std::fs::remove_file(&path).expect("reboot wipes old config inode");
         std::fs::write(&path, &config_str).expect("fresh boot recreates config");
-        let mut p3 = Node::from_toml_str(&config_str).expect("valid config");
+        let mut p3 = load_node(&config_str).expect("valid config");
         p3.apply_persisted_lockdown(
             File::open(&path).expect("open fresh config"),
             path.as_path(),

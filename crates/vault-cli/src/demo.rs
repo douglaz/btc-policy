@@ -70,9 +70,10 @@ use vault_proto::{RefusalCode, SignRequest, SignResponse};
 
 use crate::bitcoind::Bitcoind;
 use crate::fed::{
-    build_spend, build_spend_n, commitment_expiry, free_ports, locate_vault_node, p2wpkh_spk,
-    sign_all_inputs, summarize, unix_now, utxo_paying, wallet_id, Actor, Coordinator, Manifest,
-    NodeParams, NodeProcess, NodeSpawn, TempDir, Utxo, Wallet,
+    build_spend, build_spend_n, commitment_expiry, free_ports, locate_btc_vault, locate_vault_node,
+    p2wpkh_spk, sign_all_inputs, summarize, unix_now, utxo_paying, wallet_id, Actor,
+    CeremonyParams, Coordinator, Manifest, NodeDevice, NodeParams, NodeProcess, NodeSpawn, TempDir,
+    Utxo, Wallet,
 };
 use crate::http::Error;
 
@@ -217,28 +218,27 @@ struct Federation {
 }
 
 impl Federation {
-    /// Generate throwaway keys, start a private regtest bitcoind, fund the vault,
-    /// run the setup ceremony, and start `NODE_COUNT` daemons. Prints steps 1–3 of
-    /// each demo's 4; step 4 is the acts.
+    /// Run the REAL setup ceremony, start a private regtest bitcoind, fund the
+    /// vault, and start `NODE_COUNT` daemons. Prints steps 1–3 of each demo's 4;
+    /// step 4 is the acts.
     ///
-    /// Deliberate demo deviation from DESIGN.md D4/T1 (on-node key birth, no machine
-    /// ever holds two node keys, nothing at rest): this one process births every
-    /// throwaway regtest key and writes node seckeys into temp-dir TOML. The v0
-    /// provisioning task (T1) removes this.
+    /// Each node's key is born in that node's OWN `btc-vault setup node-keygen`
+    /// process, in that node's own directory (DESIGN.md D4/T1): this process, the
+    /// coordinator, handles only public bundles and never holds a node secret. The
+    /// daemons derive their keys in RAM from a preimage handed to them on stdin;
+    /// nothing writes a key at rest. The single documented harness deviation is that
+    /// the preimage is a file in the node's own directory rather than a line a human
+    /// types — see [`NodeDevice`].
     fn bring_up(tag: &str, params: NodeParams) -> Result<Federation, Error> {
         let secp = Secp256k1::new();
 
         // RAII cleanup: locals drop in reverse order, so declaring temp dir →
         // bitcoind → node processes tears down nodes first, then bitcoind, then
         // removes the temp dir — even on the error path.
-        println!("[1/4] generating throwaway keys (user, {NODE_COUNT} nodes, destinations)");
+        println!("[1/4] running the setup ceremony: {NODE_COUNT} nodes generate their OWN keys");
         let temp = TempDir::new(tag)?;
         let mut urandom = File::open("/dev/urandom")?;
         let user = Actor::random(&secp, &mut urandom)?;
-        let node_actors: Vec<Actor> = (0..NODE_COUNT)
-            .map(|_| Actor::random(&secp, &mut urandom))
-            .collect::<Result<_, _>>()?;
-        // Regtest provisioning — no SSH; the real ceremony is later V0-9.
         let coordinator = Coordinator::random(&secp, &mut urandom)?;
         let coord_auth_pubkey = coordinator.pubkey.to_string();
         // Hot and escape wallets are ranged xpub descriptors, so every spend pays a
@@ -248,35 +248,93 @@ impl Federation {
         //
         // Escape-key independence is a HARD assumption (ADR-0012 threat model): a
         // shared-seed escape turns the claw-back into theft outright. This wallet is
-        // born from its own seed.
+        // born from its own seed, and the ceremony below REFUSES to seal the vault if
+        // it can detect any overlap with the user, node, or recovery keys.
         let hot_wallet = Wallet::random(&secp, &mut urandom)?;
         let escape_wallet = Wallet::random(&secp, &mut urandom)?;
         let hot_spk = hot_wallet.address_spk(&secp, HOT_INDEX)?;
         let escape_spk = escape_wallet.address_spk(&secp, 0)?;
         let attacker_spk = p2wpkh_spk(&Actor::random(&secp, &mut urandom)?);
-
-        // The demo vault: user key AND 3-of-5 node keys on the normal branch, OR the
-        // timelocked recovery branch — `older(4224679)` + a 2-of-3 recovery keyset
-        // (ADR-0013 §1, V0-10). The recovery keys are throwaway regtest keys, UNUSED
-        // on the normal path both demos exercise: they prove the recovery branch does
-        // not disturb the normal spend, and `demo recovery-drill` exercises the exit.
-        let node_pubkeys: Vec<String> = node_actors.iter().map(|a| a.pubkey.to_string()).collect();
-        let recovery_pubkeys: Vec<String> = (0..policy_core::RECOVERY_KEYS)
-            .map(|_| Ok(Actor::random(&secp, &mut urandom)?.pubkey.to_string()))
+        // Throwaway 2-of-3 recovery keyset, UNUSED on the normal path both demos
+        // exercise: it proves the recovery branch does not disturb the normal spend,
+        // and `demo recovery-drill` exercises the exit.
+        let recovery_keys: Vec<PublicKey> = (0..policy_core::RECOVERY_KEYS)
+            .map(|_| Ok(Actor::random(&secp, &mut urandom)?.pubkey))
             .collect::<Result<_, Error>>()?;
-        let descriptor_str = policy_core::vault_descriptor_string(
-            &user.pubkey.to_string(),
-            QUORUM,
-            &node_pubkeys,
-            &recovery_pubkeys,
-        );
+
+        // Round one, ON EACH NODE HOST: `btc-vault setup node-keygen` in its own
+        // process, in its own directory. This process never sees a node secret —
+        // only the PUBLIC bundles those children print.
+        let ports = free_ports(1 + NODE_COUNT)?;
+        let node_ports: Vec<u16> = ports[1..=NODE_COUNT].to_vec();
+        let btc_vault = locate_btc_vault()?;
+        let devices_dir = temp.path.join("devices");
+        let devices: Vec<NodeDevice> = node_ports
+            .iter()
+            .enumerate()
+            .map(|(index, port)| {
+                NodeDevice::provision(&btc_vault, devices_dir.join(format!("node{index}")), *port)
+            })
+            .collect::<Result<_, Error>>()?;
+
+        // The ONE destination allowlist, written once. Every node gets exactly this in
+        // its config, and the ceremony's sealed `hot_allowlist` is DERIVED from it by
+        // the same rule `Node::load` applies — drop the escape descriptor, which is an
+        // allowlist entry so its sweep passes the destination check but is never a hot
+        // destination. Two hand-maintained copies would let a later edit to one of them
+        // seal a `manifest_hash` no node can reproduce, and every node would then fail
+        // startup on the manifest check.
+        let node_allowlist = vec![
+            hot_wallet.descriptor.clone(),
+            escape_wallet.descriptor.clone(),
+        ];
+        let ceremony_hot_allowlist: Vec<String> = node_allowlist
+            .iter()
+            .filter(|descriptor| **descriptor != escape_wallet.descriptor)
+            .cloned()
+            .collect();
+        // The setup ceremony (ADR-0013 §4): assemble the descriptor + manifest from
+        // the public bundles, check key independence, then collect each node's
+        // channel endorsement from that node's own process. Every byte is computed by
+        // the node's own code (`vault_node::channel::ceremony`) through the same
+        // `setup` functions `btc-vault setup` runs, so the federation this provisions
+        // agrees with itself by construction rather than by luck.
+        let manifest = Manifest::assemble(
+            &btc_vault,
+            &coordinator.pubkey,
+            &devices,
+            &CeremonyParams {
+                hot_allowlist: &ceremony_hot_allowlist,
+                escape_descriptor: &escape_wallet.descriptor,
+                threshold: QUORUM,
+                user_key: user.pubkey,
+                recovery_keys: &recovery_keys,
+            },
+            &params,
+        )?;
+        let descriptor_str = manifest.descriptor().to_string();
         let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str)?;
         let vault_spk = descriptor.script_pubkey();
         let witness_script = descriptor.explicit_script()?;
         let vault_address = descriptor.address(Network::Regtest)?;
+        println!(
+            "      no machine holds two node secrets: each key was born in its own \
+             `setup node-keygen`"
+        );
+        // The ceremony's own evidence, not a claim this function makes: `assemble`
+        // REFUSES to seal a vault whose escape wallet overlaps the user key, any
+        // node key, any recovery key, or the hot wallet, so reaching this line at
+        // all IS the verdict. Print the report's own words rather than a summary of
+        // them. (`btc-vault setup` writes the full report to `independence.txt`;
+        // this federation lives in a temp dir that is about to be deleted, so a copy
+        // here would be an artifact nobody could read.)
+        for line in manifest.independence_report().lines() {
+            if line.starts_with("VERDICT") {
+                println!("      escape/recovery independence — {line}");
+            }
+        }
 
         println!("[2/4] starting private regtest bitcoind, funding the vault");
-        let ports = free_ports(1 + NODE_COUNT)?;
         let mut bitcoind = Bitcoind::start(temp.path.join("bitcoind"), ports[0])?;
         bitcoind.create_wallet(tag)?;
         let mining_address = bitcoind.call_str("getnewaddress", json!([]))?;
@@ -294,7 +352,7 @@ impl Federation {
             vault_address, vault_utxo.txout.value, vault_utxo.outpoint
         );
 
-        println!("[3/4] running the setup ceremony, starting {NODE_COUNT} vault-node processes");
+        println!("[3/4] starting {NODE_COUNT} vault-node processes on the sealed configs");
         // The effective per-vault policy, printed rather than left implicit: it is
         // what a reader (or a CI artifact) needs to interpret every line below.
         println!(
@@ -310,45 +368,14 @@ impl Federation {
         let node_bin = locate_vault_node()?;
         let nodes_dir = temp.path.join("nodes");
         std::fs::create_dir_all(&nodes_dir)?;
-        let node_ports: Vec<u16> = ports[1..=NODE_COUNT].to_vec();
-        // The ONE destination allowlist, written once. Every node gets exactly this in
-        // its config, and the ceremony's sealed `hot_allowlist` is DERIVED from it by
-        // the same rule `Node::load` applies — drop the escape descriptor, which is an
-        // allowlist entry so its sweep passes the destination check but is never a hot
-        // destination. Two hand-maintained copies would let a later edit to one of them
-        // seal a `manifest_hash` no node can reproduce, and every node would then fail
-        // startup on the manifest check.
-        let node_allowlist = [
-            hot_wallet.descriptor.as_str(),
-            escape_wallet.descriptor.as_str(),
-        ];
-        let ceremony_hot_allowlist: Vec<String> = node_allowlist
-            .iter()
-            .filter(|descriptor| **descriptor != escape_wallet.descriptor.as_str())
-            .map(|descriptor| (*descriptor).to_string())
-            .collect();
-        // The setup ceremony (ADR-0013 §4): assemble the manifest over every node's
-        // keys + endpoints, hash it, and endorse each channel key with that node's own
-        // signing key. Every byte is computed by the node's own code (see
-        // `vault_node::channel::ceremony`), so the federation this provisions agrees
-        // with itself by construction rather than by luck.
-        let manifest = Manifest::assemble(
-            &wallet_id(&descriptor),
-            &coordinator.pubkey,
-            &node_actors,
-            &node_ports,
-            &params.ceremony(&ceremony_hot_allowlist, &escape_wallet.descriptor),
-        )?;
         let mut nodes = Vec::new();
-        for (index, actor) in node_actors.iter().enumerate() {
+        for (index, device) in devices.iter().enumerate() {
             nodes.push(NodeProcess::spawn(
                 &node_bin,
                 &nodes_dir,
                 NodeSpawn {
                     index,
-                    port: node_ports[index],
-                    actor,
-                    descriptor: &descriptor_str,
+                    device,
                     allowlist: &node_allowlist,
                     escape_descriptor: &escape_wallet.descriptor,
                     // The one coordinator auth root, provisioned identically into

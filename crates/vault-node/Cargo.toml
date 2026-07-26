@@ -18,7 +18,9 @@ base64 = { workspace = true }
 argon2 = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
+wskdf-core = { workspace = true }
 bytes = { workspace = true }
+libc = { workspace = true }
 policy-core = { path = "../policy-core" }
 vault-proto = { path = "../vault-proto" }
 

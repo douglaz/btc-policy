@@ -72,9 +72,12 @@ const SELF_ID: u16 = 0;
 /// through would silently stop testing the decoder.
 fn channel_node() -> (Fixture, Node) {
     let fixture = Fixture::new(2, 3);
-    let node =
-        Node::from_toml_str(&fixture.config(SELF_ID, 0, "per_peer_quota_per_min = 1000000\n"))
-            .expect("valid channel config");
+    let node = crate::test_support::load_node(&fixture.config(
+        SELF_ID,
+        0,
+        "per_peer_quota_per_min = 1000000\n",
+    ))
+    .expect("valid channel config");
     (fixture, node)
 }
 
@@ -415,7 +418,7 @@ fn no_single_byte_corruption_of_a_valid_envelope_changes_what_the_node_acts_on()
             // an earlier case's (semantically-equal) corruption was accepted and
             // consumed the shared nonce (v0-exit review 2026-07-23, codex). The
             // envelope stays built once above (deterministic); only the receiver resets.
-            let node = Node::from_toml_str(
+            let node = crate::test_support::load_node(
                 &fixture.config(SELF_ID, 0, "per_peer_quota_per_min = 1000000\n"),
             )
             .expect("valid channel config");

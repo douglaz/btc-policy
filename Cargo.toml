@@ -35,11 +35,26 @@ base64 = "0.22"
 # branch-free constant-time selection of the pin verdict; `zeroize` scrubs the
 # ephemeral pin from every owned buffer (ADR-0008 "never persisted, RAM only").
 argon2 = { version = "0.5", features = ["zeroize"] }
+# The node's own federation signing key is wskdf-derived at startup from an
+# operator-held preimage and lives only in RAM (DESIGN.md T1, ADR-0007): there is
+# no `node_seckey` at rest any more. wskdf is the user's own crate
+# (github.com/douglaz/wskdf) and is reused rather than re-implemented — a
+# key-derivation function is not something to hand-roll, and its `rust-argon2`
+# feature keeps the build C-compiler-free (`alkali`, the libsodium path, would not).
+# Pinned to a rev: a mutable git ref in a custody build is a supply-chain hole.
+wskdf-core = { git = "https://github.com/douglaz/wskdf", rev = "7a840406704b1b070995eb7a301ba1f500790728", default-features = false, features = ["rust-argon2"] }
 subtle = "2"
 zeroize = { version = "1", features = ["serde"] }
 # `Bytes::from_owner` lets reqwest carry a zeroizing channel-body owner all the
 # way through the transport; the allocation is wiped when the last body clone drops.
 bytes = "1"
+# The node-key preimage is a signing secret typed by the operator at startup and
+# `setup node-endorse`. When stdin is a terminal it must be read with echo OFF, or
+# the secret lands in the display, scrollback, and any session recording. There is
+# no std API for terminal echo, so this is the one place a thin `termios` FFI is
+# needed; `libc` is already in the tree transitively, adds no new crate, and is the
+# minimal way to do it (a purpose-built crate like `rpassword` would be heavier).
+libc = "0.2"
 # DEV-ONLY (V0-7). DESIGN.md T3 makes property-based mutation testing part of the
 # core-proven gate, and a generator/shrinker framework is not something to
 # hand-roll: shrinking a 30-output PSBT mutation down to the minimal

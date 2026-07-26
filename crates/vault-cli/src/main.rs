@@ -7,6 +7,7 @@ mod demo;
 mod fed;
 mod http;
 mod recovery;
+mod setup;
 
 use std::process::ExitCode;
 
@@ -36,10 +37,16 @@ fn main() -> ExitCode {
         // scenario name runs just that one, for iterating on a failure.
         ["attack"] | ["attack", "all"] => attack::run(None),
         ["attack", scenario] => attack::run(Some(scenario)),
+        // The production setup ceremony (ADR-0013 §4). Distinct from the demo
+        // federation's bring-up in WHO RUNS WHAT, not in what it computes: the
+        // demos drive these same functions, with the node-side steps in their own
+        // processes, so what the acceptance runs is the real provisioning path.
+        ["setup", rest @ ..] => setup::run(rest),
         _ => {
             eprintln!(
                 "usage: btc-vault demo <first-light|theft-refused|recovery-drill>\n\
-                        btc-vault attack [all|{}]",
+                        btc-vault attack [all|{}]\n\
+                        btc-vault setup <step>   (see `btc-vault setup` for the ceremony)",
                 attack::SCENARIO_NAMES.join("|")
             );
             ExitCode::from(2)

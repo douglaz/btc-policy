@@ -66,9 +66,10 @@ use vault_proto::{
 use crate::adversary::{CompromisedNode, PartialSeen, USER_SIG_HASH_TAG};
 use crate::bitcoind::Bitcoind;
 use crate::fed::{
-    build_spend, build_spend_n, commitment_expiry, encode_request, free_ports, locate_vault_node,
-    p2wpkh_spk, sign_all_inputs, summarize, unix_now, utxo_paying, wallet_id, Actor, Coordinator,
-    Manifest, NodeParams, NodeProcess, NodeSpawn, TempDir, Utxo, Wallet,
+    build_spend, build_spend_n, commitment_expiry, encode_request, free_ports, locate_btc_vault,
+    locate_vault_node, p2wpkh_spk, sign_all_inputs, summarize, unix_now, utxo_paying, wallet_id,
+    Actor, CeremonyParams, Coordinator, Manifest, NodeDevice, NodeParams, NodeProcess, NodeSpawn,
+    TempDir, Utxo, Wallet,
 };
 use crate::http::Error;
 
@@ -454,15 +455,13 @@ impl Vault {
         let mut urandom = std::fs::File::open("/dev/urandom")?;
 
         let user = Actor::random(&secp, &mut urandom)?;
-        let node_actors: Vec<Actor> = (0..N)
-            .map(|_| Actor::random(&secp, &mut urandom))
-            .collect::<Result<_, _>>()?;
         let coordinator = Coordinator::random(&secp, &mut urandom)?;
         let hot_wallet = Wallet::random(&secp, &mut urandom)?;
         // Escape-key independence is a HARD assumption (ADR-0012 threat model): a
         // shared-seed escape turns duress into theft outright. This wallet is born
         // from its own seed, so the harness attacks the mechanism rather than a
-        // deployment that already lost.
+        // deployment that already lost — and the ceremony below refuses to seal the
+        // vault at all if it can detect an overlap.
         let escape_wallet = Wallet::random(&secp, &mut urandom)?;
         let hot_spk = hot_wallet.address_spk(&secp, HOT_INDEX)?;
         let escape_spk = escape_wallet.address_spk(&secp, 0)?;
@@ -471,34 +470,7 @@ impl Vault {
         let recovery_keys: Vec<Actor> = (0..policy_core::RECOVERY_KEYS)
             .map(|_| Actor::random(&secp, &mut urandom))
             .collect::<Result<_, _>>()?;
-        let node_pubkeys: Vec<String> = node_actors.iter().map(|a| a.pubkey.to_string()).collect();
-        let recovery_pubkeys: Vec<String> =
-            recovery_keys.iter().map(|a| a.pubkey.to_string()).collect();
-        let descriptor_str = policy_core::vault_descriptor_string(
-            &user.pubkey.to_string(),
-            T,
-            &node_pubkeys,
-            &recovery_pubkeys,
-        );
-        let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str)?;
-        let vault_spk = descriptor.script_pubkey();
-        let witness_script = descriptor.explicit_script()?;
-        let vault_address = descriptor.address(Network::Regtest)?;
-
-        let ports = free_ports(1 + N)?;
-        let mut bitcoind =
-            Bitcoind::start_with_args(temp.path.join("bitcoind"), ports[0], setup.bitcoind_args)?;
-        bitcoind.create_wallet("attack")?;
-        let mining_address = bitcoind.call_str("getnewaddress", json!([]))?;
-        bitcoind.call("generatetoaddress", json!([101, mining_address]))?;
-        let funding_txid = bitcoind.call_str(
-            "sendtoaddress",
-            json!([vault_address.to_string(), FUND.to_btc()]),
-        )?;
-        bitcoind.call("generatetoaddress", json!([1, mining_address]))?;
-        let funding_hex = bitcoind.call_str("getrawtransaction", json!([funding_txid]))?;
-        let funding_tx: Transaction = deserialize_hex(&funding_hex)?;
-        let vault_utxo = utxo_paying(&funding_tx, &vault_spk)?;
+        let recovery_pubkeys: Vec<PublicKey> = recovery_keys.iter().map(|a| a.pubkey).collect();
 
         let params = NodeParams {
             hold_secs: setup.hold_secs,
@@ -521,36 +493,69 @@ impl Vault {
             escape_feerate_floor: setup.escape_feerate_floor,
         };
 
+        // Round one of the REAL ceremony: every node births its own key in its own
+        // `btc-vault setup node-keygen` process, in its own directory. This process
+        // sees only the public bundles — including for the identities the adversary
+        // will take over, which it takes by COMPROMISING those hosts below rather
+        // than by having been handed their keys at setup.
+        let ports = free_ports(1 + N)?;
         let node_ports: Vec<u16> = ports[1..=N].to_vec();
-        let node_allowlist = [
-            hot_wallet.descriptor.as_str(),
-            escape_wallet.descriptor.as_str(),
+        let btc_vault = locate_btc_vault()?;
+        let devices_dir = temp.path.join("devices");
+        let devices: Vec<NodeDevice> = node_ports
+            .iter()
+            .enumerate()
+            .map(|(index, port)| {
+                NodeDevice::provision(&btc_vault, devices_dir.join(format!("node{index}")), *port)
+            })
+            .collect::<Result<_, Error>>()?;
+
+        let node_allowlist = vec![
+            hot_wallet.descriptor.clone(),
+            escape_wallet.descriptor.clone(),
         ];
         let ceremony_hot_allowlist: Vec<String> = node_allowlist
             .iter()
-            .filter(|d| **d != escape_wallet.descriptor.as_str())
-            .map(|d| (*d).to_string())
+            .filter(|d| **d != escape_wallet.descriptor)
+            .cloned()
             .collect();
         let manifest = Manifest::assemble(
-            &wallet_id(&descriptor),
+            &btc_vault,
             &coordinator.pubkey,
-            &node_actors,
-            &node_ports,
-            &params.ceremony(&ceremony_hot_allowlist, &escape_wallet.descriptor),
+            &devices,
+            &CeremonyParams {
+                hot_allowlist: &ceremony_hot_allowlist,
+                escape_descriptor: &escape_wallet.descriptor,
+                threshold: T,
+                user_key: user.pubkey,
+                recovery_keys: &recovery_pubkeys,
+            },
+            &params,
         )?;
-        let node_pubkeys = manifest
-            .entries
-            .iter()
-            .map(|entry| PublicKey::from_str(&entry.signing_pubkey))
-            .collect::<Result<Vec<_>, _>>()?;
-        let channel_pubkeys = manifest
-            .entries
-            .iter()
-            .map(|entry| PublicKey::from_str(&entry.channel_pubkey))
-            .collect::<Result<Vec<_>, _>>()?;
+        let descriptor_str = manifest.descriptor().to_string();
+        let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str)?;
+        let vault_spk = descriptor.script_pubkey();
+        let witness_script = descriptor.explicit_script()?;
+        let vault_address = descriptor.address(Network::Regtest)?;
+        let node_pubkeys = manifest.signing_pubkeys();
+        let channel_pubkeys = manifest.channel_pubkeys();
+
+        let mut bitcoind =
+            Bitcoind::start_with_args(temp.path.join("bitcoind"), ports[0], setup.bitcoind_args)?;
+        bitcoind.create_wallet("attack")?;
+        let mining_address = bitcoind.call_str("getnewaddress", json!([]))?;
+        bitcoind.call("generatetoaddress", json!([101, mining_address]))?;
+        let funding_txid = bitcoind.call_str(
+            "sendtoaddress",
+            json!([vault_address.to_string(), FUND.to_btc()]),
+        )?;
+        bitcoind.call("generatetoaddress", json!([1, mining_address]))?;
+        let funding_hex = bitcoind.call_str("getrawtransaction", json!([funding_txid]))?;
+        let funding_tx: Transaction = deserialize_hex(&funding_hex)?;
+        let vault_utxo = utxo_paying(&funding_tx, &vault_spk)?;
 
         // Which identities the adversary takes over is decided by `node_id`, not by
-        // which actor the harness happens to like: `node_id` is the canonical
+        // which device the harness happens to like: `node_id` is the canonical
         // (lexicographic) position in the frozen descriptor, so the adversary — like
         // any real attacker — gets whatever the ceremony assigned. It takes the
         // HIGHEST ids so honest node_ids stay 0..HONEST and the scenarios read
@@ -562,16 +567,20 @@ impl Vault {
 
         let mut honest = Vec::new();
         let mut compromised = Vec::new();
-        for (index, actor) in node_actors.iter().enumerate() {
-            let node_id = manifest.node_id_of(actor);
-            let port = node_ports[index];
+        for (index, device) in devices.iter().enumerate() {
+            let node_id = manifest.node_id_of(device);
             if compromised_ids.contains(&node_id) {
+                // Taking a node means taking its HOST: the adversary reads that
+                // device's own operator preimage and re-derives its key, which is
+                // exactly what root on a node host yields. Nothing at setup handed
+                // it over.
+                let stolen = device.compromise(&secp)?;
                 compromised.push(CompromisedNode::new(
                     &secp,
-                    actor,
+                    &stolen,
                     node_id,
-                    port,
-                    wallet_id(&descriptor),
+                    device.port,
+                    manifest.wallet_id(),
                     &manifest.manifest_hash,
                     &channel_pubkeys,
                 )?);
@@ -588,9 +597,7 @@ impl Vault {
                     &nodes_dir,
                     NodeSpawn {
                         index,
-                        port,
-                        actor,
-                        descriptor: &descriptor_str,
+                        device,
                         allowlist: &node_allowlist,
                         escape_descriptor: &escape_wallet.descriptor,
                         coord_auth_pubkey: &coordinator.pubkey.to_string(),

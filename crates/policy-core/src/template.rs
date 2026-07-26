@@ -17,6 +17,11 @@
 //! parse, and the "setup rejects any descriptor outside the template" check all
 //! agree by construction rather than by three copies staying in sync.
 //!
+//! Every key in this template is **definite** — one concrete compressed pubkey per
+//! role, never a ranged xpub (2026-07-25, bead btc-policy-9y5.5). The destination
+//! allowlist wallets are the opposite and stay ranged; [`parse_vault_template`]
+//! records why the two differ and enforces the rule for the vault.
+//!
 //! rust-miniscript is authoritative for parsing the frozen string; the concrete
 //! `wsh(or_i(and_v(...),and_v(...)))` fragment below is the pinned construction the
 //! ADR describes (compiled once, then hand-written here so every party derives the
@@ -63,8 +68,10 @@ pub fn recovery_sequence() -> Sequence {
 
 /// Build the canonical two-branch vault descriptor STRING (an unchecksummed
 /// miniscript expression, ready to `Descriptor::from_str`). `user`, `nodes`, and
-/// `recovery` are key EXPRESSIONS — concrete compressed pubkeys for the regtest
-/// demo, origin'd ranged xpubs in production. The `older(...)` argument is the raw
+/// `recovery` are DEFINITE key expressions — one concrete compressed pubkey per
+/// role, in production exactly as in the regtest demo (see
+/// [`parse_vault_template`] for why the vault descriptor is definite and the
+/// destination allowlist is not). The `older(...)` argument is the raw
 /// [`RECOVERY_TIMELOCK_NSEQUENCE`], not the unit count.
 ///
 /// This is the ONE place the fragment shape lives; callers parse the result with
@@ -196,15 +203,44 @@ pub fn parse_vault_template<Pk: MiniscriptKey>(
     // double-counts and defeats the branch separation. Every vault key — the user
     // key, each node key, each recovery key — must be DISTINCT.
     let mut seen = std::collections::HashSet::new();
-    for (role, key) in std::iter::once(("user", user_key.to_string()))
-        .chain(nodes.data().iter().map(|k| ("node", k.to_string())))
-        .chain(
-            recovery_keys
-                .data()
-                .iter()
-                .map(|k| ("recovery", k.to_string())),
-        )
+    for (role, key) in std::iter::once(("user", user_key))
+        .chain(nodes.data().iter().map(|k| ("node", k)))
+        .chain(recovery_keys.data().iter().map(|k| ("recovery", k)))
     {
+        // The VAULT descriptor is DEFINITE: exactly one concrete public key per
+        // role, never a ranged/extended key expression (2026-07-25, bead
+        // btc-policy-9y5.5; supersedes ADR-0013 §1's original "origins/derivation-
+        // paths required, wildcard `/*` ranged" for the vault descriptor ONLY).
+        //
+        // Three reasons, in the order they bite:
+        //  1. Every node parses the frozen descriptor as a concrete
+        //     `Descriptor<PublicKey>` at startup for the witness script, the user
+        //     key, and the sighash. A ranged vault descriptor therefore does not
+        //     load at all — accepting one here would let setup seal a vault no node
+        //     can ever boot against, which is a permanent, unfixable brick (static
+        //     policy forever, sealed hosts).
+        //  2. The setup ceremony now generates each node key ON THE NODE, and a
+        //     node births ONE key, not an xpub range. There is nothing left for a
+        //     range to express.
+        //  3. `node_id` is the key's position in the canonical LEXICOGRAPHIC order.
+        //     ADR-0013 §1 had to define that over the full key-EXPRESSION string
+        //     precisely because derived pubkeys of a ranged key are index-dependent
+        //     and so ill-defined; with definite keys the expression IS the pubkey,
+        //     so the order is well-defined with no caveat left to get wrong.
+        //
+        // This rule is about the vault descriptor alone. The destination allowlist
+        // wallets (hot + escape) stay ranged — they legitimately derive a fresh
+        // address per spend within `max_derivation_index` — and nothing here
+        // touches them.
+        if key.num_der_paths() != 0 {
+            return Err(format!(
+                "vault descriptor {role} key {key} is a ranged/extended key expression; the \
+                 VAULT descriptor must be DEFINITE (one concrete public key per role) because \
+                 every node parses it as a concrete descriptor at startup. Destination \
+                 allowlist wallets (hot, escape) stay ranged — this rule is only the vault"
+            ));
+        }
+        let key = key.to_string();
         if !seen.insert(key.clone()) {
             return Err(format!(
                 "key {key} appears more than once (in the {role} set) — every vault key \
@@ -250,6 +286,21 @@ mod tests {
 
     fn keys(seeds: std::ops::Range<u8>) -> Vec<String> {
         seeds.map(pk).collect()
+    }
+
+    /// An origin'd extended key expression — the shape a production vault key would
+    /// have had under ADR-0013 §1's original ranged-xpub wording. Built from a real
+    /// master key so the string is a genuine xpub, not a lookalike that miniscript
+    /// would reject for its checksum before the template check ever runs.
+    fn xkey(seed: u8, suffix: &str) -> String {
+        use bitcoin::bip32::{Xpriv, Xpub};
+        use bitcoin::NetworkKind;
+        let secp = Secp256k1::new();
+        let xpriv = Xpriv::new_master(NetworkKind::Main, &[seed; 32]).expect("master");
+        format!(
+            "[d34db33f/84h/0h/0h]{}{suffix}",
+            Xpub::from_priv(&secp, &xpriv)
+        )
     }
 
     fn template_desc() -> String {
@@ -392,6 +443,54 @@ mod tests {
             parse_vault_template(&desc).is_err(),
             "3-of-3 recovery must reject"
         );
+    }
+
+    /// A ranged VAULT descriptor is rejected at template parse (bead 9y5.5,
+    /// deliverable 4). This is the resolution of the ranged-xpub question: setup
+    /// refuses the shape rather than the node discovering at startup that the
+    /// descriptor it was sealed with does not parse as a concrete descriptor — by
+    /// which point the vault is already frozen and the hosts already sealed.
+    #[test]
+    fn a_ranged_vault_descriptor_is_rejected() {
+        // A well-formed origin'd ranged xpub in the NODE position: exactly what a
+        // production descriptor would have looked like under ADR-0013 §1's original
+        // wording, and exactly what `Descriptor::<PublicKey>::from_str` cannot load.
+        let xpub = xkey(9, "/0/*");
+        let ranged = format!(
+            "wsh(or_i(and_v(v:pk({}),multi(3,{},{},{},{},{})),and_v(v:older({}),multi(2,{}))))",
+            pk(1),
+            xpub,
+            pk(3),
+            pk(4),
+            pk(5),
+            pk(6),
+            RECOVERY_TIMELOCK_NSEQUENCE,
+            keys(20..23).join(","),
+        );
+        let desc = Descriptor::<DescriptorPublicKey>::from_str(&ranged).expect("parse");
+        let err = parse_vault_template(&desc).expect_err("ranged vault descriptor must reject");
+        assert!(
+            err.contains("DEFINITE") && err.contains("node"),
+            "err names the definiteness rule and the offending role: {err}"
+        );
+    }
+
+    /// The same rule, on the USER key and with no wildcard: an xpub is not definite
+    /// even when it is not ranged, because the node still cannot parse it as a
+    /// concrete key. `num_der_paths` — not `has_wildcard` — is the predicate.
+    #[test]
+    fn a_wildcardless_xpub_vault_key_is_still_rejected() {
+        let xpub = xkey(11, "/0/7");
+        let fixed = format!(
+            "wsh(or_i(and_v(v:pk({}),multi(3,{})),and_v(v:older({}),multi(2,{}))))",
+            xpub,
+            keys(2..7).join(","),
+            RECOVERY_TIMELOCK_NSEQUENCE,
+            keys(20..23).join(","),
+        );
+        let desc = Descriptor::<DescriptorPublicKey>::from_str(&fixed).expect("parse");
+        let err = parse_vault_template(&desc).expect_err("xpub vault key must reject");
+        assert!(err.contains("DEFINITE") && err.contains("user"), "{err}");
     }
 
     #[test]

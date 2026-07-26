@@ -9,12 +9,16 @@
 //! assertion made against it would be about that weaker vault instead.
 //!
 //! Nothing here computes a manifest byte itself: [`Manifest::assemble`] delegates
-//! to `vault_node::channel::ceremony`, the node's own definitions, so a federation
-//! this provisions agrees with itself by construction.
+//! to [`crate::setup`], which delegates to `vault_node::channel::ceremony` — the
+//! node's own definitions — so a federation this provisions agrees with itself by
+//! construction. It is also literally the code `btc-vault setup` runs, so the demos
+//! are evidence about the production ceremony rather than about a harness twin.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -33,11 +37,11 @@ use bitcoin::{
     ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
-use vault_node::channel::ceremony;
 use vault_proto::{SignRequest, SignResponse, TaggedRequest, MAX_PIN_BYTES};
 use zeroize::Zeroizing;
 
 use crate::http::{self, Error};
+use crate::setup;
 
 // ---------------------------------------------------------------------------
 // Keys and destinations
@@ -273,28 +277,170 @@ pub(crate) fn commitment_expiry(ttl_secs: u64) -> Result<u64, Error> {
 
 // ---------------------------------------------------------------------------
 // The setup ceremony
+//
+// The harness plays the CEREMONY, not a shortcut around it. Every node-side step
+// runs in its OWN process against its OWN directory (`NodeDevice`), and this
+// process — the coordinator — only ever handles the public bytes those processes
+// print. That is not decoration: the property the ceremony exists to establish is
+// "no machine holds two node secrets", and a bring-up that generated five keys in
+// one address space would be evidence about a different system than the one
+// `btc-vault setup` provisions.
 
-/// The assembled per-vault manifest (ADR-0013 §4): membership, the hash every
-/// node is sealed to, and each node's channel endorsement.
-pub(crate) struct Manifest {
-    /// Per node, in `node_id` order.
-    pub(crate) entries: Vec<ManifestEntry>,
-    pub(crate) manifest_hash: String,
-    /// The `max_msg_bytes` that went into `manifest_hash`. Carried on the manifest
-    /// rather than re-read from the params at config-writing time so the value the
-    /// hash was taken over is BY CONSTRUCTION the value written into every
-    /// `[channel]` block: any other arrangement lets the two drift, and a node whose
-    /// configured cap disagrees with the sealed one fails startup outright
-    /// (`channel.rs`, `expected_manifest_hash`).
-    pub(crate) max_msg_bytes: u64,
+/// One node HOST, as a single-machine harness can model one: a directory that
+/// stands in for that node's own machine, holding its own preimage and its own
+/// published bundle.
+///
+/// The coordinator process **never reads the preimage**. It passes the file to a
+/// child on stdin (`Stdio::from(File)`, so the bytes go kernel-to-kernel) and
+/// otherwise touches only the path. The one exception is [`NodeDevice::compromise`],
+/// which is the adversary taking the host — and taking the host is exactly how a
+/// real attacker gets a node key.
+///
+/// The preimage IS a file here, which production's `setup node-keygen` deliberately
+/// avoids: a real ceremony prints it once for a human to write down. A regtest run
+/// has no human, so the harness uses the documented `--preimage-file` automation
+/// escape hatch, in the node's own directory. That is the ONE deviation the demo
+/// federation makes from the production key path, and it is confined to this type.
+pub(crate) struct NodeDevice {
+    /// This node host's own directory.
+    dir: PathBuf,
+    /// The operator secret, in the node's own directory and nowhere else.
+    preimage_path: PathBuf,
+    bundle: setup::NodeBundle,
+    pub(crate) signing_pubkey: PublicKey,
+    pub(crate) port: u16,
 }
 
-pub(crate) struct ManifestEntry {
-    pub(crate) node_id: u16,
-    pub(crate) signing_pubkey: String,
-    pub(crate) channel_pubkey: String,
-    pub(crate) channel_endorsement: String,
-    pub(crate) endpoint: String,
+/// The Argon2id cost the harness derives node keys at: the implementation floor.
+/// `attack all` stands up sixteen five-node federations, each key derived twice
+/// (keygen, then the daemon), and production cost would add minutes to a run while
+/// proving nothing — the derivation's CORRECTNESS is what the harness exercises,
+/// and that is cost-independent.
+const HARNESS_KDF_OPS: u32 = 1;
+const HARNESS_KDF_MEM_KIB: u32 = 8;
+
+impl NodeDevice {
+    /// Run `btc-vault setup node-keygen` ON this device. The key is born in that
+    /// child process, on this host, and only its PUBLIC half comes back.
+    pub(crate) fn provision(cli: &Path, dir: PathBuf, port: u16) -> Result<NodeDevice, Error> {
+        std::fs::create_dir_all(&dir)?;
+        let preimage_path = dir.join("preimage");
+        // Owner-only: node-keygen redirects its banner — WHICH INCLUDES THE PREIMAGE —
+        // here, and this box may be multi-tenant. Even a modeled regtest preimage must
+        // not be world-readable during the run.
+        let log = File::options()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(dir.join("keygen.log"))?;
+        let output = Command::new(cli)
+            .args(["setup", "node-keygen", "--device-dir"])
+            .arg(&dir)
+            .args(["--endpoint", &format!("127.0.0.1:{port}")])
+            .args(["--kdf-ops", &HARNESS_KDF_OPS.to_string()])
+            .args(["--kdf-mem-kib", &HARNESS_KDF_MEM_KIB.to_string()])
+            // This regtest harness builds many nodes per run and derives at the KDF
+            // floor for speed; production keygen refuses that without this opt-in.
+            .arg("--allow-weak-kdf")
+            .arg("--preimage-file")
+            .arg(&preimage_path)
+            // The keygen banner (including the preimage) goes to the device's own
+            // log, never to this process's stdout/stderr.
+            .stderr(log)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot run {} setup node-keygen: {e}", cli.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "node-keygen failed on {} ({}): {}",
+                dir.display(),
+                output.status,
+                log_tail(&dir.join("keygen.log"))
+            )
+            .into());
+        }
+        let bundle: setup::NodeBundle = serde_json::from_slice(&output.stdout)
+            .map_err(|e| format!("node-keygen did not publish a readable bundle: {e}"))?;
+        let signing_pubkey = bundle.signing_pubkey()?;
+        Ok(NodeDevice {
+            dir,
+            preimage_path,
+            bundle,
+            signing_pubkey,
+            port,
+        })
+    }
+
+    pub(crate) fn bundle(&self) -> &setup::NodeBundle {
+        &self.bundle
+    }
+
+    /// Round two, ON this device: re-derive the key from the preimage and endorse
+    /// this node's channel identity over the freshly agreed `manifest_hash`.
+    fn endorse(
+        &self,
+        cli: &Path,
+        wallet_id: &[u8; 32],
+        manifest_hash: &str,
+        node_id: u16,
+    ) -> Result<String, Error> {
+        // Owner-only for the same reason as keygen.log: node-endorse re-derives from
+        // the preimage, and its banner is redirected here.
+        let log = File::options()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(self.dir.join("endorse.log"))?;
+        let output = Command::new(cli)
+            .args(["setup", "node-endorse", "--device-dir"])
+            .arg(&self.dir)
+            .args(["--wallet-id", &wallet_id.to_lower_hex_string()])
+            .args(["--manifest-hash", manifest_hash])
+            .args(["--node-id", &node_id.to_string()])
+            // The preimage reaches the child on stdin without this process ever
+            // holding the bytes.
+            .stdin(Stdio::from(File::open(&self.preimage_path)?))
+            .stderr(log)
+            .output()
+            .map_err(|e| format!("cannot run {} setup node-endorse: {e}", cli.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "node-endorse failed for node {node_id} ({}): {}",
+                output.status,
+                log_tail(&self.dir.join("endorse.log"))
+            )
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    }
+
+    /// TAKE THIS HOST. Reads the device's own preimage and re-derives its signing
+    /// key — precisely what an attacker with root on a node host obtains, and the
+    /// only way the adversarial harness can play a compromised node (it has to
+    /// hold that node's keys to combine partials as it does).
+    ///
+    /// Nothing else in the harness may call this: it is the one place a node secret
+    /// legitimately enters the coordinator process, because at that point the
+    /// coordinator process IS the attacker.
+    pub(crate) fn compromise(&self, secp: &Secp256k1<All>) -> Result<Actor, Error> {
+        let preimage = vault_node::nodekey::Preimage::from_hex(&std::fs::read_to_string(
+            &self.preimage_path,
+        )?)?;
+        let seckey = vault_node::nodekey::derive(&preimage, &self.bundle.kdf()?)?;
+        Ok(Actor {
+            seckey,
+            pubkey: PublicKey::new(seckey.public_key(secp)),
+        })
+    }
+}
+
+/// The assembled per-vault manifest (ADR-0013 §4): the frozen descriptor, the hash
+/// every node is sealed to, and each node's channel endorsement — all computed by
+/// [`setup`], the same code path `btc-vault setup assemble`/`finalize` runs.
+pub(crate) struct Manifest {
+    assembled: setup::Assembled,
+    endorsements: BTreeMap<u16, String>,
+    pub(crate) manifest_hash: String,
 }
 
 /// Everything the ceremony seals besides membership. Bundled because the manifest
@@ -304,135 +450,104 @@ pub(crate) struct ManifestEntry {
 pub(crate) struct CeremonyParams<'a> {
     pub(crate) hot_allowlist: &'a [String],
     pub(crate) escape_descriptor: &'a str,
-    pub(crate) max_derivation_index: u32,
-    pub(crate) max_msg_bytes: u64,
-    pub(crate) hot_budget: vault_node::HotBudget,
+    pub(crate) threshold: usize,
+    pub(crate) user_key: PublicKey,
+    pub(crate) recovery_keys: &'a [PublicKey],
 }
 
 impl Manifest {
+    /// Run both ceremony rounds over `devices`, which have already published their
+    /// public bundles. Returns the sealed manifest AND the frozen descriptor: the
+    /// ceremony produces the descriptor, so nothing upstream may build its own.
     pub(crate) fn assemble(
-        wallet_id: &[u8; 32],
+        cli: &Path,
         coord_auth_pubkey: &PublicKey,
-        node_actors: &[Actor],
-        ports: &[u16],
-        params: &CeremonyParams,
+        devices: &[NodeDevice],
+        ceremony: &CeremonyParams,
+        params: &NodeParams,
     ) -> Result<Manifest, Error> {
-        // `node_id` is the node key's 0-based position in the descriptor's
-        // CANONICAL order — lexicographic over the full key expression (§1). Every
-        // party derives it from the frozen descriptor alone, so the mapping is a
-        // total bijection and never a table anyone maintains.
-        let mut canonical: Vec<&Actor> = node_actors.iter().collect();
-        canonical.sort_by_key(|actor| actor.pubkey.to_string());
-        let ceremony_nodes: Vec<ceremony::CeremonyNode> = canonical
-            .iter()
-            .enumerate()
-            .map(|(node_id, actor)| ceremony::CeremonyNode {
-                node_id: node_id as u16,
-                signing_pubkey: actor.pubkey,
-                endpoints: vec![endpoint_of(actor, node_actors, ports)],
-            })
-            .collect();
-        let channel_pubkeys: Vec<PublicKey> = canonical
-            .iter()
-            .map(|actor| ceremony::channel_pubkey(&actor.seckey))
-            .collect();
-        // `max_msg_bytes` is a federation-uniform preimage field (V0-4b §0): a node
-        // configured otherwise fails startup. That uniformity is itself a safety
-        // property the attack harness asserts — it is what denies a hostile
-        // coordinator the "oversize the carrier past ONE peer's cap" split vector.
-        let hash = ceremony::manifest_hash(
-            wallet_id,
-            coord_auth_pubkey,
-            &ceremony_nodes,
-            &channel_pubkeys,
-            params.max_msg_bytes,
-            params.hot_budget,
-            params.hot_allowlist,
-            params.escape_descriptor,
-            params.max_derivation_index,
+        let bundles: Vec<setup::NodeBundle> = devices.iter().map(|d| d.bundle().clone()).collect();
+        let assembled = setup::assemble(
+            &bundles,
+            ceremony.threshold,
+            ceremony.user_key,
+            ceremony.recovery_keys,
+            *coord_auth_pubkey,
+            ceremony.escape_descriptor,
+            ceremony.hot_allowlist,
+            &params.policy(),
         )?;
-        let entries = canonical
-            .iter()
-            .zip(&ceremony_nodes)
-            .zip(&channel_pubkeys)
-            .map(|((actor, node), channel_pubkey)| ManifestEntry {
-                node_id: node.node_id,
-                signing_pubkey: actor.pubkey.to_string(),
-                channel_pubkey: channel_pubkey.to_string(),
-                // Each node's channel key is endorsed by that node's OWN Bitcoin
-                // signing key: peers accept a channel identity only if a key already
-                // in the federation vouches for it, so the coordinator cannot mint or
-                // impersonate a node.
-                channel_endorsement: ceremony::endorse(
-                    &actor.seckey,
-                    wallet_id,
-                    &hash,
-                    node.node_id,
-                    &node.endpoints,
-                ),
-                endpoint: node.endpoints[0].clone(),
-            })
-            .collect();
+        let manifest_hash = assembled.manifest_hash.to_lower_hex_string();
+
+        // Round two: each device endorses its own channel key, in its own process.
+        let mut endorsements = BTreeMap::new();
+        for node in &assembled.nodes {
+            let device = devices
+                .iter()
+                .find(|d| d.signing_pubkey == node.signing_pubkey)
+                .ok_or("assembled node is not one of the provisioned devices")?;
+            let endorsement =
+                device.endorse(cli, &assembled.wallet_id, &manifest_hash, node.node_id)?;
+            // Verify before sealing, exactly as `setup finalize` does: a bad
+            // endorsement is otherwise a federation that fails startup after the
+            // hosts are sealed.
+            assembled.verify_endorsement(node.node_id, &endorsement)?;
+            endorsements.insert(node.node_id, endorsement);
+        }
         Ok(Manifest {
-            entries,
-            manifest_hash: hash.to_lower_hex_string(),
-            max_msg_bytes: params.max_msg_bytes,
+            assembled,
+            endorsements,
+            manifest_hash,
         })
     }
 
-    /// This node's `node_id` — its position in the canonical order.
-    pub(crate) fn node_id_of(&self, actor: &Actor) -> u16 {
-        let pubkey = actor.pubkey.to_string();
-        self.entries
+    /// The frozen vault descriptor the ceremony produced.
+    pub(crate) fn descriptor(&self) -> &str {
+        &self.assembled.descriptor
+    }
+
+    pub(crate) fn wallet_id(&self) -> [u8; 32] {
+        self.assembled.wallet_id
+    }
+
+    /// The federation signing keys, in `node_id` order.
+    pub(crate) fn signing_pubkeys(&self) -> Vec<PublicKey> {
+        self.assembled
+            .nodes
             .iter()
-            .find(|entry| entry.signing_pubkey == pubkey)
-            .map(|entry| entry.node_id)
-            .expect("every node actor is in the manifest")
+            .map(|node| node.signing_pubkey)
+            .collect()
     }
 
-    /// The `[channel]` config block: this node's id, the FULL membership including
-    /// itself (§5), the sealed `manifest_hash`, and the `max_msg_bytes` that hash
-    /// was taken over.
-    ///
-    /// `max_msg_bytes` is written EXPLICITLY rather than left to
-    /// `ChannelConfig::default_max_msg_bytes`. Leaving it out happens to boot only
-    /// while the sealed value equals that default; seal any other cap and every node
-    /// computes a different `manifest_hash` and refuses to start. Emitting the
-    /// sealed value keeps the federation-uniform cap — the invariant that denies a
-    /// hostile coordinator the "oversize past ONE peer's cap" split vector — true by
-    /// construction instead of by coincidence.
-    pub(crate) fn channel_toml(&self, actor: &Actor) -> String {
-        let mut toml = format!(
-            "\n[channel]\nnode_id = {}\nexpected_manifest_hash = \"{}\"\nmax_msg_bytes = {}\n",
-            self.node_id_of(actor),
-            self.manifest_hash,
-            self.max_msg_bytes,
-        );
-        for entry in &self.entries {
-            toml.push_str(&format!(
-                "\n[[channel.nodes]]\nnode_id = {}\nsigning_pubkey = \"{}\"\n\
-                 channel_pubkey = \"{}\"\nchannel_endorsement = \"{}\"\n\
-                 endpoints = [\"{}\"]\n",
-                entry.node_id,
-                entry.signing_pubkey,
-                entry.channel_pubkey,
-                entry.channel_endorsement,
-                entry.endpoint,
-            ));
-        }
-        toml
+    /// The channel identities, in `node_id` order.
+    pub(crate) fn channel_pubkeys(&self) -> Vec<PublicKey> {
+        self.assembled
+            .nodes
+            .iter()
+            .map(|node| node.channel_pubkey)
+            .collect()
     }
-}
 
-/// The loopback endpoint a node listens on. Endpoints are deliberately PINNED in
-/// the manifest (§4, anti-redirection): nobody — not a compromised coordinator,
-/// not a later config writer — can repoint one node's view of a peer.
-pub(crate) fn endpoint_of(actor: &Actor, node_actors: &[Actor], ports: &[u16]) -> String {
-    let index = node_actors
-        .iter()
-        .position(|a| a.pubkey == actor.pubkey)
-        .expect("actor is one of the node actors");
-    format!("127.0.0.1:{}", ports[index])
+    /// This device's `node_id` — its position in the canonical order.
+    pub(crate) fn node_id_of(&self, device: &NodeDevice) -> u16 {
+        self.assembled
+            .nodes
+            .iter()
+            .find(|node| node.signing_pubkey == device.signing_pubkey)
+            .map(|node| node.node_id)
+            .expect("every provisioned device is in the manifest")
+    }
+
+    /// The `[channel]` config block for `node_id` (ADR-0013 §5), carrying the
+    /// MANDATORY `expected_manifest_hash` anchor and the sealed `max_msg_bytes`.
+    pub(crate) fn channel_toml(&self, node_id: u16) -> String {
+        self.assembled.channel_toml(node_id, &self.endorsements)
+    }
+
+    /// The ceremony's key-independence evidence (ADR-0003, ADR-0012 §10).
+    pub(crate) fn independence_report(&self) -> &str {
+        &self.assembled.independence_report
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,19 +582,24 @@ pub(crate) struct NodeParams {
 }
 
 impl NodeParams {
-    /// The ceremony's view of these params. Derived rather than passed separately
-    /// so the sealed manifest cannot disagree with the configs.
-    pub(crate) fn ceremony<'a>(
-        &'a self,
-        hot_allowlist: &'a [String],
-        escape_descriptor: &'a str,
-    ) -> CeremonyParams<'a> {
-        CeremonyParams {
-            hot_allowlist,
-            escape_descriptor,
+    /// These params as the ONE policy struct the ceremony hashes and the config
+    /// writer emits. Derived rather than carried separately so the sealed manifest
+    /// cannot disagree with the configs it is sealed alongside.
+    pub(crate) fn policy(&self) -> setup::PolicyParams {
+        setup::PolicyParams {
             max_derivation_index: self.max_derivation_index,
+            hold_secs: self.hold_secs,
+            duress_delay_secs: self.duress_delay_secs,
+            epsilon_secs: self.epsilon_secs,
+            combine_slack_secs: self.combine_slack_secs,
+            delivery_horizon_secs: self.delivery_horizon_secs,
+            max_commitment_age_secs: self.max_commitment_age_secs,
+            policy_version: self.policy_version,
+            escape_feerate_floor: self.escape_feerate_floor,
+            hot_max_per_tx: self.hot_budget.max_per_tx_sat,
+            hot_max_per_window: self.hot_budget.max_per_window_sat,
+            hot_window_secs: self.hot_budget.window_secs,
             max_msg_bytes: self.max_msg_bytes,
-            hot_budget: self.hot_budget,
         }
     }
 }
@@ -506,6 +626,10 @@ pub(crate) struct NodeProcess {
     child: Child,
     config_path: PathBuf,
     log_path: PathBuf,
+    /// This node host's own preimage file. The daemon reads its signing key's
+    /// preimage from stdin, so every launch — first, restart, or the reboot-death
+    /// drill — has to be handed this path; the harness never reads the bytes.
+    preimage_path: PathBuf,
     node_bin: PathBuf,
 }
 
@@ -513,10 +637,10 @@ pub(crate) struct NodeProcess {
 /// where positional arguments stay readable.
 pub(crate) struct NodeSpawn<'a> {
     pub(crate) index: usize,
-    pub(crate) port: u16,
-    pub(crate) actor: &'a Actor,
-    pub(crate) descriptor: &'a str,
-    pub(crate) allowlist: &'a [&'a str],
+    /// This node's own host. Supplies its listen port, its PUBLIC derivation
+    /// parameters, and the preimage path the daemon reads its secret from.
+    pub(crate) device: &'a NodeDevice,
+    pub(crate) allowlist: &'a [String],
     pub(crate) escape_descriptor: &'a str,
     pub(crate) coord_auth_pubkey: &'a str,
     pub(crate) bitcoind_rpc_addr: SocketAddr,
@@ -533,9 +657,7 @@ impl NodeProcess {
     ) -> Result<NodeProcess, Error> {
         let NodeSpawn {
             index,
-            port,
-            actor,
-            descriptor,
+            device,
             allowlist,
             escape_descriptor,
             coord_auth_pubkey,
@@ -544,71 +666,48 @@ impl NodeProcess {
             manifest,
             params,
         } = spawn;
-        let allowlist_toml: Vec<String> =
-            allowlist.iter().map(|desc| format!("\"{desc}\"")).collect();
-        // Table headers end the top-level section, so `[chain_backend]` and
-        // `[channel]` come last. `coordinator_auth_pubkey` is the trust root
-        // (ADR-0013 §2/§4): the same key in every node's config, and — in channel
-        // mode — hashed into `manifest_hash`, so a node sealed to this manifest will
-        // not boot under a swapped coordinator.
+        let node_id = manifest.node_id_of(device);
+        let rpc_addr = bitcoind_rpc_addr.to_string();
+        // ONE config writer for the ceremony and the harness (`setup::node_config_toml`),
+        // so a field that reaches production configs reaches these too. It writes
+        // `node_key_salt`/`_ops`/`_mem_kib` — the PUBLIC derivation — and no key:
+        // the daemon's secret arrives on stdin below.
         //
         // `[chain_backend]` is MANDATORY here: with `[channel]` on, this node
         // combines and broadcasts, and a node that could not broadcast would accept
         // spends it can never complete.
-        let config = format!(
-            "listen_port = {port}\n\
-             node_seckey = \"{}\"\n\
-             descriptor = \"{descriptor}\"\n\
-             allowlist = [{}]\n\
-             escape_descriptor = \"{escape_descriptor}\"\n\
-             max_derivation_index = {}\n\
-             hold_secs = {}\n\
-             duress_delay_secs = {}\n\
-             epsilon_secs = {}\n\
-             combine_slack_secs = {}\n\
-             delivery_horizon_secs = {}\n\
-             hot_max_per_tx = {}\n\
-             hot_max_per_window = {}\n\
-             hot_window_secs = {}\n\
-             max_commitment_age_secs = {}\n\
-             policy_version = {}\n\
-             escape_feerate_floor = {}\n\
-             pin_normal_hash = \"{}\"\n\
-             pin_duress_hash = \"{}\"\n\
-             coordinator_auth_pubkey = \"{coord_auth_pubkey}\"\n\
-             \n[chain_backend]\n\
-             rpc_addr = \"{bitcoind_rpc_addr}\"\n\
-             auth = \"{bitcoind_auth}\"\n\
-             {}",
-            actor.seckey.display_secret(),
-            allowlist_toml.join(", "),
-            params.max_derivation_index,
-            params.hold_secs,
-            params.duress_delay_secs,
-            params.epsilon_secs,
-            params.combine_slack_secs,
-            params.delivery_horizon_secs,
-            params.hot_budget.max_per_tx_sat,
-            params.hot_budget.max_per_window_sat,
-            params.hot_budget.window_secs,
-            params.max_commitment_age_secs,
-            params.policy_version,
-            params.escape_feerate_floor,
-            vault_node::argon2id_normal_phc_at(&params.normal_pin, params.pin_m_cost_kib),
-            vault_node::argon2id_duress_phc_at(&params.duress_pin, params.pin_m_cost_kib),
-            manifest.channel_toml(actor),
-        );
+        let config = setup::node_config_toml(&setup::NodeConfig {
+            listen_port: device.port,
+            kdf: &device.bundle().kdf()?,
+            descriptor: manifest.descriptor(),
+            allowlist,
+            escape_descriptor,
+            policy: &params.policy(),
+            coordinator_auth_pubkey: coord_auth_pubkey,
+            pin_normal_hash: &vault_node::argon2id_normal_phc_at(
+                &params.normal_pin,
+                params.pin_m_cost_kib,
+            ),
+            pin_duress_hash: &vault_node::argon2id_duress_phc_at(
+                &params.duress_pin,
+                params.pin_m_cost_kib,
+            ),
+            chain_backend: Some((&rpc_addr, bitcoind_auth)),
+            channel_toml: &manifest.channel_toml(node_id),
+        });
         let config_path = nodes_dir.join(format!("node{index}.toml"));
         std::fs::write(&config_path, config)?;
         let log_path = nodes_dir.join(format!("node{index}.log"));
-        let child = spawn_child(node_bin, &config_path, &log_path)?;
+        let preimage_path = device.preimage_path.clone();
+        let child = spawn_child(node_bin, &config_path, &log_path, Some(&preimage_path))?;
         Ok(NodeProcess {
             index,
-            node_id: manifest.node_id_of(actor),
-            port,
+            node_id,
+            port: device.port,
             child,
             config_path,
             log_path,
+            preimage_path,
             node_bin: node_bin.to_path_buf(),
         })
     }
@@ -671,7 +770,16 @@ impl NodeProcess {
     pub(crate) fn restart_must_be_refused(&mut self) -> Result<String, Error> {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let mut second = spawn_child(&self.node_bin, &self.config_path, &self.log_path)?;
+        // The second generation gets the preimage, so it reaches the one-shot
+        // generation claim rather than dying earlier for want of a key. That is the
+        // point of this drill: even a host that kept everything cannot get back to
+        // signing.
+        let mut second = spawn_child(
+            &self.node_bin,
+            &self.config_path,
+            &self.log_path,
+            Some(&self.preimage_path),
+        )?;
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             // A bare `?` on `try_wait` would return while the child is still alive,
@@ -730,29 +838,58 @@ impl NodeProcess {
         .into())
     }
 
-    /// Kill the node AND destroy its deployment — config, keys, log. Models
-    /// ADR-0007 reboot-death under the tmpfs deployment: the machine comes back
-    /// bare, holding no signing key, no schedule, and no partials, so it cannot
-    /// restart or rejoin. Deletion of the key-bearing config is mandatory, and the
-    /// method attempts a restart against the vanished path to prove the dead
-    /// deployment cannot serve again.
+    /// Kill the node AND destroy its deployment — config, the host's copy of the
+    /// operator preimage, and the log. Models ADR-0007 reboot-death under the tmpfs
+    /// deployment: the machine comes back bare, holding no signing key, no
+    /// schedule, and no partials, so it cannot restart or rejoin. The method then
+    /// attempts a restart against the vanished paths to prove the dead deployment
+    /// cannot serve again.
+    ///
+    /// Since bead btc-policy-9y5.5 the config holds no key at all — only the PUBLIC
+    /// derivation parameters — so what has to go is the pair: without the config the
+    /// daemon has nothing to load, and without the preimage it could derive nothing
+    /// even if it did. A production reboot has neither to delete: the key was only
+    /// ever in RAM and the preimage only ever on the operator's paper.
     pub(crate) fn destroy(mut self) -> Result<(), Error> {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // The whole DEVICE directory goes, not just the preimage file inside it: the
+        // harness also writes that node's `setup node-keygen` banner there, and that
+        // banner contains the preimage in plain text. Deleting one copy of a secret
+        // and leaving another on the same modeled host would make this drill's claim
+        // false — however little a temp directory that is about to be removed anyway
+        // matters in practice. The host is what reboots, so the host is what is wiped.
+        let device_dir = self
+            .preimage_path
+            .parent()
+            .ok_or("the node's preimage has no device directory")?
+            .to_path_buf();
+        std::fs::remove_dir_all(&device_dir).map_err(|e| {
+            format!(
+                "cannot destroy node {} device host {}: {e}",
+                self.number(),
+                device_dir.display()
+            )
+        })?;
         std::fs::remove_file(&self.config_path).map_err(|e| {
             format!(
-                "cannot destroy node {} key-bearing config {}: {e}",
+                "cannot destroy node {} config {}: {e}",
                 self.number(),
                 self.config_path.display()
             )
         })?;
-        if self.config_path.exists() {
-            return Err(format!(
-                "node {} key-bearing config still exists after deletion: {}",
-                self.number(),
-                self.config_path.display()
-            )
-            .into());
+        for (what, path) in [
+            ("config", &self.config_path),
+            ("operator preimage", &self.preimage_path),
+        ] {
+            if path.exists() {
+                return Err(format!(
+                    "node {} {what} still exists after deletion: {}",
+                    self.number(),
+                    path.display()
+                )
+                .into());
+            }
         }
         std::fs::remove_file(&self.log_path).map_err(|e| {
             format!(
@@ -766,7 +903,9 @@ impl NodeProcess {
         // non-zero exit is not reboot-death evidence: a renamed CLI flag or loader
         // bug would fail too. Preserve stderr and require the daemon's exact
         // missing-config refusal below.
-        let mut restart = spawn_child(&self.node_bin, &self.config_path, &self.log_path)
+        // No preimage either: the rebooted machine has nothing. Its stdin is empty,
+        // so even a node whose config somehow survived could not derive a key.
+        let mut restart = spawn_child(&self.node_bin, &self.config_path, &self.log_path, None)
             .map_err(|e| format!("cannot attempt reboot-death restart: {e}"))?;
         let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -927,7 +1066,15 @@ impl NodeProcess {
     }
 }
 
-fn spawn_child(node_bin: &Path, config_path: &Path, log_path: &Path) -> Result<Child, Error> {
+/// Launch a vault-node daemon. `preimage_path` is the node host's own operator
+/// secret; `None` models a machine that no longer has one — the rebooted, bare
+/// host of ADR-0007, which gets an EMPTY stdin and must refuse to start.
+fn spawn_child(
+    node_bin: &Path,
+    config_path: &Path,
+    log_path: &Path,
+    preimage_path: Option<&Path>,
+) -> Result<Child, Error> {
     // Append rather than truncate so a second process generation's log keeps the
     // first generation's lines: `restart_must_be_refused` reads the tail for the
     // line the refusal died on, and the evidence spans both processes.
@@ -949,7 +1096,19 @@ fn spawn_child(node_bin: &Path, config_path: &Path, log_path: &Path) -> Result<C
         .env("BTC_VAULT_ALLOW_DURABLE_STORAGE", "1")
         .stdout(log.try_clone()?)
         .stderr(log)
-        .stdin(Stdio::null())
+        // The node derives its signing key from the operator preimage it reads
+        // here; it holds none at rest (bead btc-policy-9y5.5). Handing the file
+        // directly means the bytes go kernel-to-kernel and this process — the
+        // coordinator — never holds a node secret in its own memory.
+        .stdin(match preimage_path {
+            Some(path) => Stdio::from(File::open(path).map_err(|e| {
+                format!(
+                    "cannot open the node's own preimage {}: {e}",
+                    path.display()
+                )
+            })?),
+            None => Stdio::null(),
+        })
         .spawn()
         .map_err(|e| format!("cannot spawn {}: {e}", node_bin.display()).into())
 }
@@ -1013,19 +1172,39 @@ pub(crate) fn log_tail(path: &Path) -> String {
 pub(crate) fn locate_vault_node() -> Result<PathBuf, Error> {
     static VAULT_NODE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
-    match VAULT_NODE.get_or_init(|| locate_vault_node_uncached().map_err(|e| e.to_string())) {
+    match VAULT_NODE
+        .get_or_init(|| locate_binary("vault-node", "vault-node").map_err(|e| e.to_string()))
+    {
         Ok(path) => Ok(path.clone()),
         Err(error) => Err(error.clone().into()),
     }
 }
 
-fn locate_vault_node_uncached() -> Result<PathBuf, Error> {
+/// The `btc-vault` binary itself — the harness re-executes it for every NODE-SIDE
+/// ceremony step, so those steps run in their own process against their own
+/// directory instead of inside the coordinator's address space.
+///
+/// Found the same way as `vault-node` rather than reusing `current_exe()`: under
+/// `cargo test` the current executable is a test harness, which has no `setup`
+/// subcommand at all.
+pub(crate) fn locate_btc_vault() -> Result<PathBuf, Error> {
+    static BTC_VAULT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+    match BTC_VAULT
+        .get_or_init(|| locate_binary("vault-cli", "btc-vault").map_err(|e| e.to_string()))
+    {
+        Ok(path) => Ok(path.clone()),
+        Err(error) => Err(error.clone().into()),
+    }
+}
+
+fn locate_binary(package: &str, binary: &str) -> Result<PathBuf, Error> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().ok_or("current executable has no parent dir")?;
     // Test binaries live in `<profile>/deps`; ordinary `cargo run` binaries live in
-    // `<profile>`. In either case, execute the node from the profile we actually
-    // build. Otherwise `cargo run --release` builds a fresh DEV node and silently
-    // executes a potentially stale `target/release/vault-node`.
+    // `<profile>`. In either case, execute from the profile we actually build.
+    // Otherwise `cargo run --release` builds a fresh DEV binary and silently
+    // executes a potentially stale `target/release/<binary>`.
     let profile_dir = if dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
         dir.parent()
             .ok_or("test executable has no profile parent")?
@@ -1033,21 +1212,21 @@ fn locate_vault_node_uncached() -> Result<PathBuf, Error> {
         dir
     };
     let release = profile_dir.file_name().and_then(|name| name.to_str()) == Some("release");
-    let sibling = profile_dir.join("vault-node");
+    let sibling = profile_dir.join(binary);
 
-    println!("      building vault-node...");
+    println!("      building {binary}...");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
-    command.args(["build", "-p", "vault-node"]);
+    command.args(["build", "-p", package]);
     if release {
         command.arg("--release");
     }
     let status = command
         .status()
-        .map_err(|e| format!("cannot run cargo to build vault-node: {e}"))?;
+        .map_err(|e| format!("cannot run cargo to build {binary}: {e}"))?;
     if !status.success() {
         return Err(format!(
-            "cargo build -p vault-node{} failed",
+            "cargo build -p {package}{} failed",
             if release { " --release" } else { "" }
         )
         .into());
@@ -1056,7 +1235,7 @@ fn locate_vault_node_uncached() -> Result<PathBuf, Error> {
     if sibling.exists() {
         Ok(sibling)
     } else {
-        Err("cannot locate the vault-node binary after cargo build".into())
+        Err(format!("cannot locate the {binary} binary after cargo build").into())
     }
 }
 
