@@ -437,6 +437,31 @@ struct ManifestNode {
 /// silently weaker vault.
 /// Ordered after `max_msg_bytes` and before the classification inputs and node
 /// count, so the V0-9 prefix through `max_msg_bytes` keeps its byte offsets.
+///
+/// **`escape_feerate_floor` and `escape_coverage_pct` are pinned for the same
+/// reason (bead btc-policy-9y5.7).** Both are federation-uniform inputs to the
+/// fire-time rung selector, and a node that disagrees on either breaks the same
+/// invariant — "combine at T" — though by different mechanisms:
+///
+///  - **The floor** sets the release floor: `select_escape_rung` needs
+///    `required = max(bump_target, escape_feerate_floor)`, so a node with a laxer
+///    floor picks a LOWER cheapest-admissible rung on an identical chain. A 3-of-5
+///    whose floors split the release floor 2/2/1 has fewer than `t` holders on any
+///    single rung, so no rung reaches `t` signatures.
+///  - **The coverage percentage** decides which rungs are admissible, and coverage
+///    is monotone NON-increasing up the ladder (a higher rung pays more fee, so
+///    delivers less). A stricter node therefore prunes the admissible TOP — or, if
+///    even the base rung is under its threshold, finds NO admissible rung and
+///    releases zero shares at T (`select_escape_rung` errors → no latch → the funds
+///    exit through Recovery). Either way the honest set no longer shares a rung it
+///    can all sign, so the sweep cannot combine.
+///
+/// Hashing both into the manifest makes any disagreement a startup failure (a
+/// `WRONG_MANIFEST` at every peer), so at run time both are provably uniform — the
+/// property the deterministic-across-the-honest-set selector rests on. Ordered after
+/// the escape classification inputs (`escape_descriptor`, `max_derivation_index`) and
+/// before the node list, so the documented prefix through `max_derivation_index`
+/// keeps its byte offsets.
 #[allow(clippy::too_many_arguments)]
 fn base_manifest_bytes(
     wallet_id: &[u8; 32],
@@ -448,6 +473,8 @@ fn base_manifest_bytes(
     hot_allowlist: &[String],
     escape_descriptor: &str,
     max_derivation_index: u32,
+    escape_feerate_floor: u64,
+    escape_coverage_pct: u8,
 ) -> Vec<u8> {
     let mut e = Enc::new();
     e.fixed(wallet_id);
@@ -469,6 +496,9 @@ fn base_manifest_bytes(
     }
     e.var(escape_descriptor.as_bytes());
     e.u32(max_derivation_index);
+    // The two federation-uniform fire-time selector inputs (see the doc above).
+    e.u64(escape_feerate_floor);
+    e.u8(escape_coverage_pct);
     e.u32(nodes.len() as u32);
     for n in nodes {
         e.u16(n.node_id);
@@ -490,6 +520,8 @@ fn compute_manifest_hash(
     hot_allowlist: &[String],
     escape_descriptor: &str,
     max_derivation_index: u32,
+    escape_feerate_floor: u64,
+    escape_coverage_pct: u8,
 ) -> [u8; 32] {
     tagged_hash(
         MANIFEST_TAG,
@@ -503,6 +535,8 @@ fn compute_manifest_hash(
             hot_allowlist,
             escape_descriptor,
             max_derivation_index,
+            escape_feerate_floor,
+            escape_coverage_pct,
         ),
     )
 }
@@ -789,6 +823,14 @@ pub mod ceremony {
     /// Valid descriptor strings are canonicalized here before hashing, exactly as
     /// `Node::load` canonicalizes them; callers may therefore supply equivalent forms
     /// with or without a checksum without sealing an unreproducible manifest.
+    ///
+    /// `escape_feerate_floor` and `escape_coverage_pct` are the two federation-uniform
+    /// fire-time selector inputs (bead btc-policy-9y5.7): seal the SAME values every
+    /// node is configured with, or a node whose floor/coverage differs computes a
+    /// different `manifest_hash` and fails startup — which is the point. A split floor
+    /// splits the release floor, and split coverage prunes (or empties) a stricter
+    /// node's admissible set; either way the honest set no longer shares a rung it can
+    /// all sign, so the armed sweep cannot combine. See [`base_manifest_bytes`].
     #[allow(clippy::too_many_arguments)]
     pub fn manifest_hash(
         wallet_id: &[u8; 32],
@@ -800,6 +842,8 @@ pub mod ceremony {
         hot_allowlist: &[String],
         escape_descriptor: &str,
         max_derivation_index: u32,
+        escape_feerate_floor: u64,
+        escape_coverage_pct: u8,
     ) -> Result<[u8; 32], Error> {
         let canonical_hot = hot_allowlist
             .iter()
@@ -821,6 +865,8 @@ pub mod ceremony {
             &canonical_hot,
             &canonical_escape,
             max_derivation_index,
+            escape_feerate_floor,
+            escape_coverage_pct,
         ))
     }
 
@@ -1046,6 +1092,9 @@ impl FireWindow {
 /// blocking package path re-authorize immediately before `sendrawtransaction`.
 pub(crate) struct FinalizedCandidate {
     pub(crate) tx: Transaction,
+    /// Which fee-ladder rung this is (`0` = the base transaction, the only value a
+    /// candidate without a ladder ever produces).
+    pub(crate) rung: usize,
     pub(crate) deadline: u64,
 }
 
@@ -1378,7 +1427,6 @@ impl ScheduleWorkCounters {
 /// by `commitment_id` (the same txid can back several live commitments).
 pub(crate) struct Candidate {
     commitment_id: String,
-    unsigned_txid: Txid,
     /// This candidate's role in its request's mandatory pair (§4).
     role: CandidateRole,
     /// Whether this is a **hot-class** spend — the class that a duress arm FREEZES
@@ -1402,31 +1450,66 @@ pub(crate) struct Candidate {
     /// carrier sets this bit under the same store lock that activates the hot freeze,
     /// so the hot candidate is never observable in an open-but-not-yet-frozen state.
     holder_quorum_reached: bool,
-    /// This node's canonical PSBT; verified peer partials are imported here (never
-    /// blind-merged from a peer PSBT). This node's OWN partial is present from
-    /// registration: Model B signs at ingress (ADR-0012).
-    psbt: Psbt,
-    /// Per-input sighash recomputed by THIS node.
-    sighashes: Vec<[u8; 32]>,
-    /// Tagged SHA-256 over the user's DER signature(s) + sighash-type byte(s), in
-    /// input order, as this node verified them at ingress.
-    user_sig_hash: [u8; 32],
+    /// The candidate's own transaction — the one its `commitment_id` binds. Rung 0
+    /// of the escape fee ladder when `bumps` is non-empty.
+    base: SigningVariant,
+    /// **The escape fee-bump ladder** (bead btc-policy-9y5.7): pre-authorized,
+    /// higher-fee replacements of `base` over the SAME inputs and the SAME output
+    /// scripts, ascending by fee. Empty for every candidate that carries no ladder,
+    /// which is every Spend and every escape submitted without one — those behave
+    /// exactly as they did before the ladder existed.
+    ///
+    /// Each rung is a full signing variant because each is a DIFFERENT transaction:
+    /// its sighashes, and therefore its partial signatures, are its own. They live
+    /// inside ONE candidate rather than as sibling candidates so the arm overlay,
+    /// the delayed escape slot, capacity accounting, and the expiry exemption keep
+    /// naming exactly one escape commitment — the ladder changes what may be
+    /// broadcast, never the duress state machine.
+    bumps: Vec<SigningVariant>,
+    /// The **monotone latched rung**: the highest ladder index this node has
+    /// authorized for release and broadcast (`0` = the base escape, the value every
+    /// candidate without a ladder keeps forever).
+    ///
+    /// Monotone because a bump is a mempool REPLACEMENT: having released rung `k`'s
+    /// partials and broadcast it, going back down would be a lower-fee conflict the
+    /// network rejects, and re-deciding each tick is how a fee reading that jitters
+    /// across a quantization boundary would turn one bump into an unbounded
+    /// bump/unbump loop. Latching also makes a reorg re-broadcast idempotent: the
+    /// same rung is re-sent, never a fresh, higher one.
+    rung: usize,
+    /// The **lowest rung whose partials may leave this node**: the cheapest ladder
+    /// index the fire-time predicate judged ADMISSIBLE on the pass that latched
+    /// `rung` (`0` — release from the base — for every candidate without a ladder,
+    /// and for every ladder whose base is admissible).
+    ///
+    /// A partial is finalizable authority (ADR-0012 invariant vii), so a rung this
+    /// node refused to fire must not be handed to peers who could then combine and
+    /// broadcast it. The one refusal that hits LOW rungs is the panic feerate floor
+    /// — coverage only ever bites the expensive end — and it is a pure function of
+    /// the rung's bytes and the sealed floor, so every honest node computes the same
+    /// value and the prefix release below still converges.
+    release_floor: usize,
     /// The commitment's own fixed eviction horizon (no extension in V0-8a).
     expiry: u64,
     /// This candidate's fire event + combine window, or `None` while its fixed
     /// delayed slot has not yet been installed. For an Escape candidate, the
     /// separate fixed-shape schedule selector must also authorize the slot.
     fire: Option<FireWindow>,
-    /// Whether this node has already released its own partials to peers. Set once,
-    /// at fire, by [`ChannelState::release_partials`] — so a re-tick re-sends
-    /// nothing and the release remains a single authorized event.
+    /// Whether this node has released ANY of its own partials to peers. Monotone,
+    /// set at the first release by [`ChannelState::release_partials`]. It is the
+    /// EXPOSURE bit the hot-budget refund reads: once a share has left, a peer may
+    /// still complete the spend, so the budget stays metered.
     released: bool,
+    /// The highest ladder rung whose partials have left this node, or `None` before
+    /// the first release. Without a ladder this is `None` then `Some(0)` and the
+    /// release remains the single authorized event it always was; with one, a pass
+    /// whose latch has risen releases only the newly authorized rungs, so no rung's
+    /// partials are ever sent twice.
+    released_through: Option<usize>,
     /// Whether this node has already broadcast this candidate, so a re-tick does
     /// not re-broadcast. (A redundant broadcast of identical bytes is harmless —
     /// peers dedup it — but re-doing the package test every tick is waste.)
     broadcast: bool,
-    /// At most one partial per `(input, signer_node_id)` (DER bytes).
-    partials: HashMap<(u32, u16), Vec<u8>>,
     /// Byte accounting: stored PSBT + sighashes + user_sig_hash + partials.
     bytes: usize,
     /// Capacity charged at registration: current bytes plus the maximum growth of
@@ -1436,11 +1519,125 @@ pub(crate) struct Candidate {
     capacity_bytes: usize,
 }
 
+/// ONE signable transaction inside a candidate: this node's canonical PSBT for it,
+/// the sighashes it recomputed, the user-signature digest it verified, and the
+/// federation partials collected against it.
+///
+/// A candidate normally has exactly one of these. An escape carrying a fee-bump
+/// ladder has one per rung, because each rung is a distinct transaction with
+/// distinct sighashes — a partial for rung 1 verifies against nothing in rung 0 and
+/// must not be filed there.
+struct SigningVariant {
+    /// The unsigned transaction's txid. Also the ROUTING key for an inbound partial:
+    /// a peer's `partial` payload already carries the txid it signed, so a rung is
+    /// identified from the wire with no new field and no new message type.
+    unsigned_txid: Txid,
+    /// This node's canonical PSBT; verified peer partials are imported here (never
+    /// blind-merged from a peer PSBT). This node's OWN partial is present from
+    /// registration: Model B signs at ingress (ADR-0012).
+    psbt: Psbt,
+    /// Per-input sighash recomputed by THIS node.
+    sighashes: Vec<[u8; 32]>,
+    /// Tagged SHA-256 over the user's DER signature(s) + sighash-type byte(s), in
+    /// input order, as this node verified them at ingress.
+    user_sig_hash: [u8; 32],
+    /// At most one partial per `(input, signer_node_id)` (DER bytes).
+    partials: HashMap<(u32, u16), Vec<u8>>,
+}
+
+impl SigningVariant {
+    /// Canonicalize one PSBT into a signing variant: pin the descriptor's P2WSH
+    /// fields, strip every partial signature this node has not itself verified or
+    /// produced, and recompute the per-input sighashes plus the user-signature
+    /// digest. See [`Candidate::build`] for why the strip is load-bearing.
+    fn build(psbt: &Psbt, keys: &CandidateKeys) -> Result<SigningVariant, Error> {
+        let mut psbt = psbt.clone();
+        for input in &mut psbt.inputs {
+            // Finalization metadata is coordinator input, not part of the exact
+            // unsigned transaction the user signature commits to. Canonicalize the
+            // P2WSH fields from this node's configured descriptor and discard any
+            // pre-finalized witness/script so quorum finalization cannot preserve a
+            // coordinator-supplied witness or fail because `witness_script` was
+            // omitted/replaced. The verified user and node partials below are the
+            // only satisfaction material retained at ingress.
+            input.witness_script = Some(keys.witness_script.clone());
+            input.redeem_script = None;
+            input.sighash_type = Some(EcdsaSighashType::All.into());
+            input.final_script_sig = None;
+            input.final_script_witness = None;
+            input
+                .partial_sigs
+                .retain(|pk, _| pk == keys.user_pubkey || pk == keys.self_signing_pubkey);
+        }
+        let unsigned_txid = psbt.unsigned_tx.compute_txid();
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        let mut sighashes = Vec::with_capacity(psbt.inputs.len());
+        let mut usig = Enc::new();
+        for (i, input) in psbt.inputs.iter().enumerate() {
+            let utxo = input
+                .witness_utxo
+                .as_ref()
+                .ok_or_else(|| format!("input {i} has no witness_utxo"))?;
+            let sh = cache
+                .p2wsh_signature_hash(i, keys.witness_script, utxo.value, EcdsaSighashType::All)
+                .map_err(|e| format!("sighash for input {i}: {e}"))?;
+            sighashes.push(sh.to_byte_array());
+            let sig = input
+                .partial_sigs
+                .get(keys.user_pubkey)
+                .ok_or_else(|| format!("input {i} missing the user partial signature"))?;
+            usig.var(&sig.signature.serialize_der());
+            usig.u8(sig.sighash_type.to_u32() as u8);
+        }
+        let user_sig_hash = tagged_hash(USER_SIG_HASH_TAG, &usig.0);
+        Ok(SigningVariant {
+            unsigned_txid,
+            psbt,
+            sighashes,
+            user_sig_hash,
+            partials: HashMap::new(),
+        })
+    }
+
+    /// This variant's stored size: PSBT + sighashes + the user-signature digest.
+    fn bytes(&self) -> usize {
+        self.psbt.serialize().len() + self.sighashes.len() * 32 + 32
+    }
+
+    /// Distinct valid federation signatures on `input`, counted over this variant's
+    /// canonical PSBT. Every entry got there either from this node's own ingress
+    /// signing or through `accept_partial`'s verification against the recomputed
+    /// sighash and the expected descriptor key, so presence IS validity.
+    fn signature_count(&self, input: usize, nodes: &[ManifestNode]) -> usize {
+        let Some(psbt_input) = self.psbt.inputs.get(input) else {
+            return 0;
+        };
+        nodes
+            .iter()
+            .filter(|node| psbt_input.partial_sigs.contains_key(&node.signing_pubkey))
+            .count()
+    }
+
+    /// Whether EVERY input carries at least `t` distinct valid federation
+    /// signatures — the combine precondition (§1). Per-input, never a total: a tx
+    /// with `t` signatures on input 0 and none on input 1 cannot be finalized, and
+    /// a global count would call it ready.
+    fn has_quorum(&self, threshold: usize, nodes: &[ManifestNode]) -> bool {
+        !self.psbt.inputs.is_empty()
+            && (0..self.psbt.inputs.len()).all(|i| self.signature_count(i, nodes) >= threshold)
+    }
+}
+
 /// Everything that describes ONE candidate of a request's pair, so registering
 /// the spend and registering the escape are the same call with different data.
 pub(crate) struct CandidateSpec<'a> {
     /// This node's own decoded PSBT for this transaction.
     pub(crate) psbt: &'a Psbt,
+    /// The escape's validated fee-bump ladder, ascending by fee (bead
+    /// btc-policy-9y5.7); empty for everything else. The ingress handler has already
+    /// proved each rung is user-signed, escape-class, over the same inputs and output
+    /// scripts as `psbt`, and strictly higher-fee.
+    pub(crate) escape_bumps: &'a [Psbt],
     /// Its exact-byte commitment id (ADR-0012 / V0-2b).
     pub(crate) commitment_id: &'a str,
     /// The sibling's commitment id (the pairing, §4).
@@ -1518,100 +1715,101 @@ impl Candidate {
     /// The candidate is born fully signed and fully WITHHELD: nothing here releases
     /// a partial, and `spec.fire` alone decides when one may (ADR-0012 invariant 7).
     pub(crate) fn build(spec: CandidateSpec, keys: &CandidateKeys) -> Result<Candidate, Error> {
-        let mut psbt = spec.psbt.clone();
-        for input in &mut psbt.inputs {
-            // Finalization metadata is coordinator input, not part of the exact
-            // unsigned transaction the user signature commits to. Canonicalize the
-            // P2WSH fields from this node's configured descriptor and discard any
-            // pre-finalized witness/script so quorum finalization cannot preserve a
-            // coordinator-supplied witness or fail because `witness_script` was
-            // omitted/replaced. The verified user and node partials below are the
-            // only satisfaction material retained at ingress.
-            input.witness_script = Some(keys.witness_script.clone());
-            input.redeem_script = None;
-            input.sighash_type = Some(EcdsaSighashType::All.into());
-            input.final_script_sig = None;
-            input.final_script_witness = None;
-            input
-                .partial_sigs
-                .retain(|pk, _| pk == keys.user_pubkey || pk == keys.self_signing_pubkey);
-        }
-        let unsigned_txid = psbt.unsigned_tx.compute_txid();
-        let mut cache = SighashCache::new(&psbt.unsigned_tx);
-        let mut sighashes = Vec::with_capacity(psbt.inputs.len());
-        let mut usig = Enc::new();
-        for (i, input) in psbt.inputs.iter().enumerate() {
-            let utxo = input
-                .witness_utxo
-                .as_ref()
-                .ok_or_else(|| format!("input {i} has no witness_utxo"))?;
-            let sh = cache
-                .p2wsh_signature_hash(i, keys.witness_script, utxo.value, EcdsaSighashType::All)
-                .map_err(|e| format!("sighash for input {i}: {e}"))?;
-            sighashes.push(sh.to_byte_array());
-            let sig = input
-                .partial_sigs
-                .get(keys.user_pubkey)
-                .ok_or_else(|| format!("input {i} missing the user partial signature"))?;
-            usig.var(&sig.signature.serialize_der());
-            usig.u8(sig.sighash_type.to_u32() as u8);
-        }
-        let user_sig_hash = tagged_hash(USER_SIG_HASH_TAG, &usig.0);
-        let bytes = psbt.serialize().len() + sighashes.len() * 32 + 32;
+        let base = SigningVariant::build(spec.psbt, keys)?;
+        let bumps = spec
+            .escape_bumps
+            .iter()
+            .map(|bump| SigningVariant::build(bump, keys))
+            .collect::<Result<Vec<_>, Error>>()?;
+        // ONE candidate's byte accounting covers its whole ladder: the rungs share the
+        // candidate's single store slot, so their bytes must be charged against the
+        // same reservation or a laddered escape would slip past the configured cap.
+        let bytes = std::iter::once(&base)
+            .chain(&bumps)
+            .fold(0usize, |total, variant| {
+                total.saturating_add(variant.bytes())
+            });
         Ok(Candidate {
             commitment_id: spec.commitment_id.to_string(),
-            unsigned_txid,
             role: spec.role,
             hot: spec.hot,
             paired_commitment_id: spec.paired_commitment_id.to_string(),
             holder_quorum_reached: spec.holder_quorum_reached,
-            psbt,
-            sighashes,
-            user_sig_hash,
+            base,
+            bumps,
+            rung: 0,
+            release_floor: 0,
             expiry: spec.expiry,
             fire: spec.fire,
             released: false,
+            released_through: None,
             broadcast: false,
-            partials: HashMap::new(),
             bytes,
             capacity_bytes: bytes,
         })
     }
 
-    /// Distinct valid federation signatures on `input`, counted over this node's
-    /// canonical PSBT. Every entry got there either from this node's own ingress
-    /// signing or through `accept_partial`'s verification against the recomputed
-    /// sighash and the expected descriptor key, so presence IS validity.
-    fn signature_count(&self, input: usize, nodes: &[ManifestNode]) -> usize {
-        let Some(psbt_input) = self.psbt.inputs.get(input) else {
-            return 0;
-        };
-        nodes
-            .iter()
-            .filter(|node| psbt_input.partial_sigs.contains_key(&node.signing_pubkey))
-            .count()
+    /// Every signing variant of this candidate, rung 0 first — the base transaction
+    /// followed by its fee-bump ladder in ascending-fee order.
+    fn variants(&self) -> impl Iterator<Item = &SigningVariant> {
+        std::iter::once(&self.base).chain(self.bumps.iter())
     }
 
-    /// Whether EVERY input carries at least `t` distinct valid federation
-    /// signatures — the combine precondition (§1). Per-input, never a total: a tx
-    /// with `t` signatures on input 0 and none on input 1 cannot be finalized, and
-    /// a global count would call it ready.
-    fn has_quorum(&self, threshold: usize, nodes: &[ManifestNode]) -> bool {
-        !self.psbt.inputs.is_empty()
-            && (0..self.psbt.inputs.len()).all(|i| self.signature_count(i, nodes) >= threshold)
+    /// The variant at ladder index `rung` (`0` = base), or `None` past the ladder.
+    fn variant(&self, rung: usize) -> Option<&SigningVariant> {
+        match rung.checked_sub(1) {
+            None => Some(&self.base),
+            Some(bump) => self.bumps.get(bump),
+        }
+    }
+
+    /// The mutable form of [`Self::variant`].
+    fn variant_mut(&mut self, rung: usize) -> Option<&mut SigningVariant> {
+        match rung.checked_sub(1) {
+            None => Some(&mut self.base),
+            Some(bump) => self.bumps.get_mut(bump),
+        }
+    }
+
+    /// The ladder index carrying `txid`, used to route an inbound partial to the rung
+    /// its signer actually signed.
+    fn rung_of_txid(&self, txid: Txid) -> Option<usize> {
+        self.variants()
+            .position(|variant| variant.unsigned_txid == txid)
+    }
+
+    /// The highest rung this node may act on right now: the latch, clamped to the
+    /// ladder it actually holds. Clamping is defensive only — the latch is written
+    /// through [`ChannelState::latch_escape_rung`], which bounds it — but reading it
+    /// through one accessor keeps every consumer honest about the bound.
+    fn authorized_rung(&self) -> usize {
+        self.rung.min(self.bumps.len())
+    }
+
+    /// The lowest rung this node may release, clamped the same way.
+    fn release_floor(&self) -> usize {
+        self.release_floor.min(self.bumps.len())
     }
 
     /// Whether another registration under this commitment id describes the same
     /// combinable candidate. `fire`/release/broadcast state is deliberately absent:
     /// a later idempotent delivery must retain the resident candidate's original
-    /// authorization window and monotonic release state.
+    /// authorization window and monotonic release state — and, since 9y5.7, its
+    /// latched rung, so a resubmission can never walk a bump back down.
+    ///
+    /// The whole LADDER is compared, not just rung 0: two registrations that agree on
+    /// the base escape but differ in their bumps authorize different replacements, and
+    /// treating them as the same candidate would silently keep whichever arrived first.
     fn matches_registration(&self, other: &Candidate) -> bool {
-        self.unsigned_txid == other.unsigned_txid
-            && self.role == other.role
+        self.role == other.role
             && self.paired_commitment_id == other.paired_commitment_id
-            && self.sighashes == other.sighashes
-            && self.user_sig_hash == other.user_sig_hash
             && self.expiry == other.expiry
+            && self.bumps.len() == other.bumps.len()
+            && self.variants().zip(other.variants()).all(|(mine, theirs)| {
+                mine.unsigned_txid == theirs.unsigned_txid
+                    && mine.sighashes == theirs.sighashes
+                    && mine.user_sig_hash == theirs.user_sig_hash
+            })
     }
 
     /// Reserve all future descriptor-signature growth. Peer signatures need one
@@ -1619,21 +1817,29 @@ impl Candidate {
     /// signature can be added by a later Signed verdict and needs only its PSBT
     /// entry. Existing PSBT entries reserve only their possible growth to the
     /// canonical maximum.
+    ///
+    /// Reserved over EVERY rung: each ladder rung collects its own partial set, so a
+    /// laddered escape whose reservation covered only rung 0 would overrun the store
+    /// cap exactly when the peers' bump partials arrive.
     fn reserve_partial_capacity(&mut self, nodes: &[ManifestNode], self_node_id: u16) {
         let mut capacity = self.bytes;
-        for input in &self.psbt.inputs {
-            for node in nodes {
-                let existing_entry_bytes = input
-                    .partial_sigs
-                    .get(&node.signing_pubkey)
-                    .map(|sig| PSBT_PARTIAL_SIG_FIXED_BYTES + sig.signature.serialize_der().len())
-                    .unwrap_or(0);
-                capacity = capacity.saturating_add(
-                    (PSBT_PARTIAL_SIG_FIXED_BYTES + MAX_ECDSA_DER_BYTES)
-                        .saturating_sub(existing_entry_bytes),
-                );
-                if node.node_id != self_node_id {
-                    capacity = capacity.saturating_add(MAX_ECDSA_DER_BYTES);
+        for variant in self.variants() {
+            for input in &variant.psbt.inputs {
+                for node in nodes {
+                    let existing_entry_bytes = input
+                        .partial_sigs
+                        .get(&node.signing_pubkey)
+                        .map(|sig| {
+                            PSBT_PARTIAL_SIG_FIXED_BYTES + sig.signature.serialize_der().len()
+                        })
+                        .unwrap_or(0);
+                    capacity = capacity.saturating_add(
+                        (PSBT_PARTIAL_SIG_FIXED_BYTES + MAX_ECDSA_DER_BYTES)
+                            .saturating_sub(existing_entry_bytes),
+                    );
+                    if node.node_id != self_node_id {
+                        capacity = capacity.saturating_add(MAX_ECDSA_DER_BYTES);
+                    }
                 }
             }
         }
@@ -2197,14 +2403,23 @@ impl PartialStore {
         let Some(c) = self.candidates.get_mut(p.commitment_id) else {
             return ChannelReply::UnknownCandidate;
         };
-        if p.txid != c.unsigned_txid {
+        // ROUTE THE PARTIAL TO ITS RUNG. A laddered escape holds several distinct
+        // transactions under one commitment id, and a signature only ever verifies
+        // against the one its signer actually hashed. The payload already names that
+        // transaction by txid, so the rung is read off the wire rather than added to
+        // it — a peer that signed rung 2 files under rung 2, and a txid belonging to
+        // no rung is the same WrongTxid refusal it has always been.
+        let Some(rung) = c.rung_of_txid(p.txid) else {
             return ChannelReply::Rejected(RejectReason::WrongTxid);
-        }
-        if p.user_sig_hash != c.user_sig_hash {
+        };
+        let Some(variant) = c.variant(rung) else {
+            return ChannelReply::Rejected(RejectReason::WrongTxid);
+        };
+        if p.user_sig_hash != variant.user_sig_hash {
             return ChannelReply::Rejected(RejectReason::WrongUserSigHash);
         }
         let input = p.input as usize;
-        if input >= c.sighashes.len() || input >= c.psbt.inputs.len() {
+        if input >= variant.sighashes.len() || input >= variant.psbt.inputs.len() {
             return ChannelReply::Rejected(RejectReason::WrongInput);
         }
         // Fail-closed bounds check (bead btc-policy-9y5.2): `p.signer` is a raw
@@ -2223,25 +2438,27 @@ impl PartialStore {
             Ok(s) => s,
             Err(_) => return ChannelReply::Rejected(RejectReason::BadPartialSig),
         };
-        let sighash = c.sighashes[input];
+        let sighash = variant.sighashes[input];
         if Secp256k1::verification_only()
             .verify_ecdsa(&Message::from_digest(sighash), &sig, &expected.inner)
             .is_err()
         {
             return ChannelReply::Rejected(RejectReason::BadPartialSig);
         }
-        // Store: ≤1 per (input, signer); a re-delivery (same or different) is an
+        // Store: ≤1 per (rung, input, signer); a re-delivery (same or different) is an
         // idempotent no-op that never evicts the first verified partial.
         let key = (p.input, p.signer);
-        if c.partials.contains_key(&key) {
+        let Some(variant) = c.variant_mut(rung) else {
+            return ChannelReply::Rejected(RejectReason::WrongTxid);
+        };
+        if variant.partials.contains_key(&key) {
             return ChannelReply::Accepted;
         }
         let canonical_der = sig.serialize_der();
-        let old_psbt_bytes = c.psbt.serialize().len();
-        let Some(psbt_input) = c.psbt.inputs.get_mut(input) else {
+        let old_psbt_bytes = variant.psbt.serialize().len();
+        let Some(psbt_input) = variant.psbt.inputs.get_mut(input) else {
             return ChannelReply::Rejected(RejectReason::WrongInput);
         };
-        c.partials.insert(key, canonical_der.to_vec());
         psbt_input.partial_sigs.insert(
             expected,
             ecdsa::Signature {
@@ -2249,7 +2466,8 @@ impl PartialStore {
                 sighash_type: EcdsaSighashType::All,
             },
         );
-        let new_psbt_bytes = c.psbt.serialize().len();
+        variant.partials.insert(key, canonical_der.to_vec());
+        let new_psbt_bytes = variant.psbt.serialize().len();
         c.bytes = c
             .bytes
             .saturating_sub(old_psbt_bytes)
@@ -2506,6 +2724,13 @@ impl ChannelState {
         hot_allowlist: &[String],
         escape_descriptor: &str,
         max_derivation_index: u32,
+        // The two federation-uniform fire-time selector inputs (bead btc-policy-9y5.7),
+        // hashed into `manifest_hash` (via [`base_manifest_bytes`]) so a node whose
+        // floor/coverage differs from the sealed federation value fails startup rather
+        // than diverging at fire time on the release floor (floor) or the admissible
+        // rung set (coverage) and splitting the sweep. See `base_manifest_bytes`.
+        escape_feerate_floor: u64,
+        escape_coverage_pct: u8,
         alerts: Arc<Mutex<AlertQueue>>,
     ) -> Result<ChannelState, Error> {
         // Tokio's constructor panics above this implementation limit. Treat a
@@ -2643,11 +2868,13 @@ impl ChannelState {
             hot_allowlist,
             escape_descriptor,
             max_derivation_index,
+            escape_feerate_floor,
+            escape_coverage_pct,
         );
         let expected = from_hex_32(&cfg.expected_manifest_hash)
             .map_err(|_| Error::from("[channel] expected_manifest_hash is not 32-byte hex"))?;
         if expected != manifest_hash {
-            return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes, Hot budget, or Hot-budget classification input disagreeing with the federation-uniform manifest values is one cause)".into());
+            return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes, Hot budget, Hot-budget classification input, or escape_feerate_floor/escape_coverage_pct disagreeing with the federation-uniform manifest values is one cause)".into());
         }
 
         // Verify every node's channel-key endorsement against its signing key
@@ -3855,32 +4082,131 @@ impl ChannelState {
             return None;
         }
         // The gate. An unscheduled candidate (`fire == None`) never passes; a
-        // scheduled one passes only inside its open combine window, and only once.
+        // scheduled one passes only inside its open combine window, and only once per
+        // rung. Without a ladder that is exactly the original "only once": `rung` is
+        // pinned at 0, so the second call finds rung 0 already released and returns
+        // `None`. With a ladder, a LATER pass whose latch has risen may release the
+        // newly authorized rungs — and only those, so a rung's partials still leave
+        // this node exactly once.
         let window = candidate.fire?;
-        if !window.is_open(now) || candidate.released {
+        if !window.is_open(now) {
+            return None;
+        }
+        let authorized = candidate.authorized_rung();
+        // Bound the prefix release by the per-peer envelope quota. The release fans out
+        // `(released rungs × inputs)` `partial` envelopes to EACH peer, and each peer
+        // charges them to THIS node's per-peer quota; if that product exceeds
+        // `per_peer_quota_per_min`, the top rung's tail is rate-limited at every
+        // recipient and cannot reach quorum before the combine deadline — the bump
+        // silently degrades (codex 9y5.7 review). Cap the top RELEASED rung so the whole
+        // prefix that actually leaves this node — `[release_floor ..= cap] × inputs` —
+        // fits the quota. This cap is now a best-effort "don't send rungs that will not
+        // fit" bound, NOT the convergence guarantee: base-first per-peer fan-out
+        // (`spawn_fan_out`) makes each recipient charge the common base rung before any
+        // higher rung OF THE SAME RELEASE, so even a cap that overestimates the live
+        // quota can never cost the base rung its quorum — only the higher rungs' tails.
+        // Anchor the cap at the release floor, NOT rung 0: the prefix
+        // starts at the floor, so capping the absolute index would let a below-floor base
+        // plus extreme fragmentation drive the cap under the floor and WEDGE the release
+        // (`first > authorized` → permanent `None`) in exactly the case the ladder exists
+        // to rescue (Fable 9y5.7 pass-2). `per_peer_quota_per_min` is a per-node config
+        // field, not a manifest preimage field, so nodes with different quotas compute
+        // different caps — but each still releases its own capped prefix from the common
+        // floor, and `try_finalize` converges on the highest quorum-complete rung (the
+        // one every honest node's prefix reached), so a heterogeneous quota shifts WHICH
+        // rung wins, never splits the sweep. (A vault so fragmented that even the base
+        // rung's inputs exceed the quota is a pre-existing limit this bead does not create.)
+        let inputs_per_variant = candidate
+            .variants()
+            .next()
+            .map(|variant| variant.psbt.inputs.len())
+            .unwrap_or(1)
+            .max(1);
+        // Reserve headroom for the non-partial envelopes this sender already charged to
+        // each recipient's rolling quota in the same window — chiefly the relayed
+        // `request` that carried this candidate — so the partial fan-out plus those does
+        // not push a boundary-sized prefix's tail past the quota and out of the combine
+        // window (codex 9y5.7 pass-2). This is a heuristic, not an exact accounting of the
+        // recipient's rolling window (this node does not track its own per-peer send rate);
+        // it can under- or over-estimate prior consumption. That is tolerable precisely
+        // because base-first fan-out protects the base rung's quorum regardless — a wrong
+        // headroom only shifts which HIGHER rung is the last to fit, never the base. Floored
+        // at 1 so a pathologically tiny quota still releases the base rung.
+        const RELEASE_QUOTA_HEADROOM: u64 = 2;
+        let partial_budget = self
+            .limits
+            .per_peer_quota_per_min
+            .saturating_sub(RELEASE_QUOTA_HEADROOM)
+            .max(1) as usize;
+        let quota_rung_cap = candidate
+            .release_floor()
+            .saturating_add((partial_budget / inputs_per_variant).saturating_sub(1));
+        let authorized = authorized.min(quota_rung_cap);
+        let first_unreleased = match candidate.released_through {
+            None => 0,
+            Some(released) => released.saturating_add(1),
+        };
+        // Never below the release floor: a rung the fire-time predicate refused (in
+        // practice a base rung under the panic feerate floor) must not leave this
+        // node, or a `t-1` compromised set could combine our honest share into
+        // exactly the under-fee escape we declined to fire.
+        let first = first_unreleased.max(candidate.release_floor());
+        if first > authorized {
             return None;
         }
         candidate.released = true;
-        let payloads = (0..candidate.psbt.inputs.len())
-            .filter_map(|input| {
-                let sig = candidate.psbt.inputs[input].partial_sigs.get(&signer)?;
-                Some(PartialPayload {
-                    commitment_id: commitment_id.to_string(),
-                    wallet_id: to_hex(&self.wallet_id),
-                    txid: candidate.unsigned_txid.to_string(),
-                    input: input as u32,
-                    signer_node_id: self.node_id,
-                    sighash_type: EcdsaSighashType::All.to_u32(),
-                    // A non-authoritative hint (ADR-0012): every peer derives the
-                    // class from the outputs itself and ignores this.
-                    spend_purpose: match candidate.role {
-                        CandidateRole::Spend => "spend",
-                        CandidateRole::Escape => "escape",
-                    }
-                    .to_string(),
-                    user_sig_hash: to_hex(&candidate.user_sig_hash),
-                    partial_sig: to_hex(&sig.signature.serialize_der()),
-                })
+        candidate.released_through = Some(authorized);
+        // RELEASE THE RELEASE FLOOR THROUGH THE LATCHED RUNG, never only the latched one.
+        //
+        // A bump target is derived from a chain reading, and two honest nodes can hold
+        // tips one block apart at the instant they fire. If each released only the rung
+        // it personally selected, that ordinary disagreement would scatter the partials
+        // across rungs, no single rung would reach `t`, and the sweep would simply never
+        // combine — the one failure mode this whole design exists to avoid (the escape
+        // must confirm precisely when the federation is under duress). Releasing the
+        // prefix instead makes every rung up to the LOWEST selection reach quorum, so
+        // the federation converges on a rung all of it authorized. The prefix starts at
+        // the release floor rather than at rung 0 because a rung the predicate REFUSED
+        // is not one this node authorized for anyone, and every honest node computes
+        // that floor from the same sealed floor and the same bytes.
+        //
+        // It costs nothing in exposure: the highest rung any `t-1` compromised set can
+        // assemble from these shares is the highest rung an HONEST node selected, and
+        // every rung is independently capped by the fire-time coverage predicate before
+        // it is released at all. Releasing the whole ladder unconditionally would hand
+        // that set the top rung — the maximum authorized fee — for free, which is why
+        // the prefix stops at the latch.
+        let role = candidate.role;
+        let payloads = candidate
+            .variants()
+            .take(authorized.saturating_add(1))
+            .skip(first)
+            .flat_map(|variant| {
+                variant
+                    .psbt
+                    .inputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(input, psbt_input)| {
+                        let sig = psbt_input.partial_sigs.get(&signer)?;
+                        Some(PartialPayload {
+                            commitment_id: commitment_id.to_string(),
+                            wallet_id: to_hex(&self.wallet_id),
+                            txid: variant.unsigned_txid.to_string(),
+                            input: input as u32,
+                            signer_node_id: self.node_id,
+                            sighash_type: EcdsaSighashType::All.to_u32(),
+                            // A non-authoritative hint (ADR-0012): every peer derives
+                            // the class from the outputs itself and ignores this.
+                            spend_purpose: match role {
+                                CandidateRole::Spend => "spend",
+                                CandidateRole::Escape => "escape",
+                            }
+                            .to_string(),
+                            user_sig_hash: to_hex(&variant.user_sig_hash),
+                            partial_sig: to_hex(&sig.signature.serialize_der()),
+                        })
+                    })
             })
             .collect();
         Some(Release {
@@ -3893,6 +4219,13 @@ impl ChannelState {
     /// open and EVERY input carries ≥ `threshold` distinct valid federation
     /// signatures (§1); `None` otherwise — including when the quorum is not yet
     /// present, which is the ordinary "still collecting" case.
+    ///
+    /// With a fee-bump ladder this finalizes the HIGHEST rung that is both authorized
+    /// (≤ the monotone latch) and quorum-complete, falling back down the ladder when a
+    /// higher rung's partials have not all arrived. Falling back is safe and is not a
+    /// "downgrade": a rung below the latch has not necessarily been broadcast, and the
+    /// caller's own settlement check refuses to send a rung the mempool already holds a
+    /// higher conflict for.
     ///
     /// Finalization runs on a CLONE: the canonical candidate keeps its partials, so
     /// a later tick can retry if the broadcast fails.
@@ -3914,28 +4247,36 @@ impl ChannelState {
         if !window.is_open(now) || candidate.broadcast {
             return None;
         }
-        if !candidate.has_quorum(threshold, &self.nodes) {
-            return None;
-        }
-        let mut psbt = candidate.psbt.clone();
-        // miniscript builds the witness from the descriptor + the collected
-        // signatures. A failure here is a real inconsistency (a candidate whose
-        // signatures do not satisfy its own script), so it is logged and skipped —
-        // never a panic on the fire path.
-        if let Err(e) = psbt.finalize_mut(&Secp256k1::verification_only()) {
-            eprintln!("channel: cannot finalize candidate {commitment_id}: {e:?}");
-            return None;
-        }
-        match psbt.extract_tx() {
-            Ok(tx) => Some(FinalizedCandidate {
-                tx,
-                deadline: window.deadline,
-            }),
-            Err(e) => {
-                eprintln!("channel: cannot extract candidate {commitment_id}: {e}");
-                None
+        let authorized = candidate.authorized_rung();
+        for rung in (0..=authorized).rev() {
+            let variant = candidate.variant(rung)?;
+            if !variant.has_quorum(threshold, &self.nodes) {
+                continue;
+            }
+            let mut psbt = variant.psbt.clone();
+            // miniscript builds the witness from the descriptor + the collected
+            // signatures. A failure here is a real inconsistency (a candidate whose
+            // signatures do not satisfy its own script), so it is logged and skipped —
+            // never a panic on the fire path.
+            if let Err(e) = psbt.finalize_mut(&Secp256k1::verification_only()) {
+                eprintln!("channel: cannot finalize candidate {commitment_id} rung {rung}: {e:?}");
+                continue;
+            }
+            match psbt.extract_tx() {
+                Ok(tx) => {
+                    return Some(FinalizedCandidate {
+                        tx,
+                        rung,
+                        deadline: window.deadline,
+                    })
+                }
+                Err(e) => {
+                    eprintln!("channel: cannot extract candidate {commitment_id} rung {rung}: {e}");
+                    continue;
+                }
             }
         }
+        None
     }
 
     /// Linearize final network-send authorization with the Armed overlay.
@@ -3986,13 +4327,93 @@ impl ChannelState {
     /// Exact txid of a resident candidate, independent of local partial count.
     /// Used to recognize that a peer already settled the transaction even when
     /// this node never received enough partials to finalize its own copy.
+    ///
+    /// This is rung 0. A laddered escape can settle as ANY rung, so its settlement
+    /// check reads [`Self::candidate_rung_txids`] instead; this accessor stays the
+    /// base-transaction identity every non-laddered path already means by it.
     pub(crate) fn candidate_txid(&self, commitment_id: &str) -> Option<Txid> {
         self.store
             .lock()
             .expect("store lock poisoned")
             .candidates
             .get(commitment_id)
-            .map(|candidate| candidate.unsigned_txid)
+            .map(|candidate| candidate.base.unsigned_txid)
+    }
+
+    /// Every rung's txid for a resident candidate, rung 0 first. A laddered escape
+    /// settles when ANY rung of it does: the rungs conflict by construction (one
+    /// input set), so exactly one can ever confirm, and treating only rung 0 as "the"
+    /// transaction would leave a confirmed bump looking unsettled forever.
+    pub(crate) fn candidate_rung_txids(&self, commitment_id: &str) -> Option<Vec<Txid>> {
+        self.store
+            .lock()
+            .expect("store lock poisoned")
+            .candidates
+            .get(commitment_id)
+            .map(|candidate| {
+                candidate
+                    .variants()
+                    .map(|variant| variant.unsigned_txid)
+                    .collect()
+            })
+    }
+
+    /// The unsigned transaction of every fee-ladder rung of a resident candidate,
+    /// rung 0 first — the input the fire-time rung selector evaluates its coverage and
+    /// feerate predicate over, one rung at a time.
+    pub(crate) fn candidate_rung_txs(&self, commitment_id: &str) -> Option<Vec<Transaction>> {
+        self.store
+            .lock()
+            .expect("store lock poisoned")
+            .candidates
+            .get(commitment_id)
+            .map(|candidate| {
+                candidate
+                    .variants()
+                    .map(|variant| variant.psbt.unsigned_tx.clone())
+                    .collect()
+            })
+    }
+
+    /// The candidate's currently latched rung (`0` when it has no ladder).
+    pub(crate) fn escape_rung(&self, commitment_id: &str) -> Option<usize> {
+        self.store
+            .lock()
+            .expect("store lock poisoned")
+            .candidates
+            .get(commitment_id)
+            .map(|candidate| candidate.authorized_rung())
+    }
+
+    /// **Latch the escape's fee-bump rung, monotonically.** Raises the candidate's
+    /// authorized rung to `rung` (clamped to the ladder it holds) and returns the
+    /// value now in force; a `rung` at or below the latch changes nothing.
+    ///
+    /// Monotone on purpose, and this is the whole of the "non-spinning, idempotent"
+    /// requirement. The selector re-runs every fire tick and after a reorg
+    /// re-surfaces the sweep; if the latch could fall, a fee reading that oscillates
+    /// across a quantization step would alternate rungs forever, and each alternation
+    /// would be a fresh broadcast. It cannot: the rung only ever rises, at most
+    /// `bumps.len()` times over the candidate's life, so the bump count is
+    /// structurally bounded by the ladder the user signed.
+    ///
+    /// `lowest_admissible` is the other end of the same authorization: the cheapest
+    /// rung the caller's fire-time predicate ACCEPTED on this pass. It is recorded
+    /// under the same lock because release reads both — see [`Candidate::release_floor`].
+    pub(crate) fn latch_escape_rung(
+        &self,
+        commitment_id: &str,
+        rung: usize,
+        lowest_admissible: usize,
+    ) -> Option<usize> {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        let candidate = store.candidates.get_mut(commitment_id)?;
+        let bounded = rung.min(candidate.bumps.len());
+        if bounded > candidate.rung {
+            candidate.rung = bounded;
+        }
+        candidate.release_floor = lowest_admissible.min(bounded);
+        Some(candidate.authorized_rung())
     }
 
     /// Mark `commitment_id` broadcast so later ticks skip it (the `else` branch —
@@ -4076,12 +4497,16 @@ impl ChannelState {
     ) -> Option<CandidateCoverageContext> {
         let store = self.store.lock().expect("store lock poisoned");
         let candidate = store.candidates.get(commitment_id)?;
+        // Rung 0. Every ladder rung spends the SAME inputs (proved at ingress), so the
+        // input set and their values are rung-independent; the transaction returned
+        // here is only used for its inputs and its paired-spend facts.
         let inputs: Option<Vec<(OutPoint, u64)>> = candidate
+            .base
             .psbt
             .unsigned_tx
             .input
             .iter()
-            .zip(&candidate.psbt.inputs)
+            .zip(&candidate.base.psbt.inputs)
             .map(|(txin, input)| {
                 Some((
                     txin.previous_output,
@@ -4092,7 +4517,7 @@ impl ChannelState {
         Some(CandidateCoverageContext {
             hot: candidate.hot,
             inputs: inputs?,
-            tx: candidate.psbt.unsigned_tx.clone(),
+            tx: candidate.base.psbt.unsigned_tx.clone(),
         })
     }
 
@@ -4897,6 +5322,12 @@ pub(crate) mod fixture {
         /// The federation-uniform Hot budget this manifest is sealed to (ADR-0014
         /// §6). Emitted into every generated config for the same reason.
         pub(crate) hot_budget: HotBudget,
+        /// The two federation-uniform fire-time selector inputs this manifest is
+        /// sealed to (bead btc-policy-9y5.7). Emitted into every generated config so
+        /// a fixture that re-sealed to a non-default floor/coverage produces configs
+        /// that still match its manifest — the same discipline as `max_msg_bytes`.
+        pub(crate) escape_feerate_floor: u64,
+        pub(crate) escape_coverage_pct: u8,
     }
 
     impl Fixture {
@@ -4995,6 +5426,8 @@ pub(crate) mod fixture {
                 std::slice::from_ref(&hot_desc),
                 &escape_desc,
                 5,
+                crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+                crate::DEFAULT_ESCAPE_COVERAGE_PCT,
             );
 
             let mut entries = Vec::new();
@@ -5039,6 +5472,8 @@ pub(crate) mod fixture {
                 ports: ports.to_vec(),
                 max_msg_bytes: DEFAULT_MAX_MSG_BYTES,
                 hot_budget: TEST_HOT_BUDGET,
+                escape_feerate_floor: crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+                escape_coverage_pct: crate::DEFAULT_ESCAPE_COVERAGE_PCT,
             }
         }
 
@@ -5060,6 +5495,17 @@ pub(crate) mod fixture {
         /// which is the property making the caps provably federation-uniform.
         pub(crate) fn reseal_hot_budget(&mut self, hot_budget: HotBudget) {
             self.hot_budget = hot_budget;
+            self.reseal();
+        }
+
+        /// Re-seal the federation to a different escape feerate floor (bead
+        /// btc-policy-9y5.7). The floor is a manifest preimage field, so raising it
+        /// is a NEW manifest and every endorsement is rebuilt — exactly what the
+        /// ceremony does. A test that raised the floor by editing only the TOML would
+        /// get the production symptom: a startup failure, because a split floor splits
+        /// the release floor and the armed sweep could not combine.
+        pub(crate) fn reseal_escape_floor(&mut self, escape_feerate_floor: u64) {
+            self.escape_feerate_floor = escape_feerate_floor;
             self.reseal();
         }
 
@@ -5086,6 +5532,8 @@ pub(crate) mod fixture {
                 std::slice::from_ref(&self.hot_desc),
                 &self.escape_desc,
                 5,
+                self.escape_feerate_floor,
+                self.escape_coverage_pct,
             );
             for entry in &mut self.entries {
                 let digest = endorsement_digest(
@@ -5186,8 +5634,13 @@ pub(crate) mod fixture {
             // The Hot budget is emitted from the fixture's own SEALED values, so a
             // fixture that re-sealed to different caps produces configs that match
             // its manifest — and a test that wants the mismatch has to ask for it.
+            // `escape_feerate_floor` and `escape_coverage_pct` are emitted from the
+            // fixture's own SEALED values (bead btc-policy-9y5.7): both are manifest
+            // preimage fields, so a config that omitted them while the fixture had
+            // re-sealed to a non-default floor/coverage would compute a different
+            // `manifest_hash` and fail startup — the same discipline as the cap above.
             format!(
-                "listen_port = {}\n{}descriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nhot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\nmax_commitment_age_secs = 172800\npolicy_version = 1\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
+                "listen_port = {}\n{}descriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nhot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\nmax_commitment_age_secs = 172800\npolicy_version = 1\nescape_feerate_floor = {}\nescape_coverage_pct = {}\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
                 self.ports[self_id as usize],
                 crate::test_support::node_key_toml(&e.kdf),
                 self.descriptor,
@@ -5197,6 +5650,8 @@ pub(crate) mod fixture {
                 self.hot_budget.max_per_tx_sat,
                 self.hot_budget.max_per_window_sat,
                 self.hot_budget.window_secs,
+                self.escape_feerate_floor,
+                self.escape_coverage_pct,
                 crate::argon2id_normal_phc("1234"),
                 crate::argon2id_duress_phc("9999"),
                 self.coord_pk,
@@ -5254,6 +5709,7 @@ pub(crate) mod fixture {
             let mut request = SignRequest {
                 psbt: spend.to_string(),
                 escape_psbt: escape.to_string(),
+                escape_bumps: Vec::new(),
                 pin: "1234".into(),
                 nonce: String::new(),
                 expiry,
@@ -5425,6 +5881,7 @@ pub(crate) mod fixture {
             Candidate::build(
                 CandidateSpec {
                     psbt,
+                    escape_bumps: &[],
                     commitment_id,
                     // These fixtures register one candidate at a time, so it is its
                     // own pair; `register_pair` is what builds real pairs.
@@ -5461,12 +5918,12 @@ pub(crate) mod fixture {
             PartialPayload {
                 commitment_id: commitment_id.to_string(),
                 wallet_id: to_hex(&self.wallet_id),
-                txid: c.unsigned_txid.to_string(),
+                txid: c.base.unsigned_txid.to_string(),
                 input,
                 signer_node_id: signer_id,
                 sighash_type: EcdsaSighashType::All.to_u32(),
                 spend_purpose: "hot".to_string(),
-                user_sig_hash: to_hex(&c.user_sig_hash),
+                user_sig_hash: to_hex(&c.base.user_sig_hash),
                 partial_sig: to_hex(&der),
             }
         }
@@ -5554,9 +6011,9 @@ mod golden {
     /// Regenerated when ADR-0014 added the Hot budget and its classification
     /// descriptors to the preimage; the V0-9 prefix through `max_msg_bytes` is
     /// byte-identical, which is what the offset assertions below check.
-    const FROZEN_MANIFEST_PREIMAGE_HEX: &str = "222222222222222222222222222222222222222222222222222222222222222200000000038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c2360000100000000000111111110000000022222222000000003333333300000000010000000900000077706b6828686f74290c00000077706b68286573636170652905000000020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031";
+    const FROZEN_MANIFEST_PREIMAGE_HEX: &str = "222222222222222222222222222222222222222222222222222222222222222200000000038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c2360000100000000000111111110000000022222222000000003333333300000000010000000900000077706b6828686f74290c00000077706b6828657363617065290500000001000000000000005f020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031";
     const FROZEN_MANIFEST_HASH_HEX: &str =
-        "e22e9d0fc88579f0507adde529985265de61aa5509bec7d00b5a91dff228d3fb";
+        "f71ea65bac9966e61997d6d041499fb05facd426b15c13ac3cfb795f95385307";
 
     #[test]
     fn manifest_vector_is_frozen() {
@@ -5605,6 +6062,8 @@ mod golden {
             &hot_allowlist,
             escape_descriptor,
             5,
+            crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+            crate::DEFAULT_ESCAPE_COVERAGE_PCT,
         );
         assert_eq!(to_hex(&bytes), FROZEN_MANIFEST_PREIMAGE_HEX);
         assert_eq!(
@@ -5663,6 +6122,8 @@ mod golden {
             &hot_allowlist,
             escape_descriptor,
             5,
+            crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+            crate::DEFAULT_ESCAPE_COVERAGE_PCT,
         );
         let with_b = compute_manifest_hash(
             &wallet_id,
@@ -5674,6 +6135,8 @@ mod golden {
             &hot_allowlist,
             escape_descriptor,
             5,
+            crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+            crate::DEFAULT_ESCAPE_COVERAGE_PCT,
         );
         assert_ne!(
             with_a, with_b,
@@ -5708,6 +6171,8 @@ mod golden {
                 &hot_allowlist,
                 escape_descriptor,
                 5,
+                crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+                crate::DEFAULT_ESCAPE_COVERAGE_PCT,
             )
         };
         let sealed = hash_of(TEST_HOT_BUDGET);
@@ -5742,6 +6207,61 @@ mod golden {
         }
     }
 
+    /// The uniformity property for the two fire-time selector inputs (bead
+    /// btc-policy-9y5.7): the escape feerate floor and coverage percentage each
+    /// independently change `manifest_hash`, so a node provisioned with a laxer floor
+    /// or coverage than its peers computes a different hash and fails its sealed check.
+    /// Without this, an identical chain would give heterogeneous nodes different
+    /// release floors, so a `2/2/1` floor split would release fewer than `t` shares for
+    /// every rung and the armed sweep could never combine.
+    #[test]
+    fn manifest_hash_changes_when_an_escape_selector_input_changes() {
+        let wallet_id = [0x22u8; 32];
+        let nodes = vec![ManifestNode {
+            node_id: 0,
+            signing_pubkey: pk(1),
+            channel_pubkey: pk(2),
+            endpoints: vec!["127.0.0.1:9000".to_string()],
+        }];
+        let hot_allowlist = vec!["wpkh(hot)".to_string()];
+        let escape_descriptor = "wpkh(escape)";
+        let hash_of = |floor: u64, coverage: u8| {
+            compute_manifest_hash(
+                &wallet_id,
+                PROTOCOL_VERSION_V0,
+                &pk(0xC0),
+                &nodes,
+                DEFAULT_MAX_MSG_BYTES,
+                TEST_HOT_BUDGET,
+                &hot_allowlist,
+                escape_descriptor,
+                5,
+                floor,
+                coverage,
+            )
+        };
+        let sealed = hash_of(
+            crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+            crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+        );
+        assert_ne!(
+            sealed,
+            hash_of(
+                crate::DEFAULT_ESCAPE_FEERATE_FLOOR + 1,
+                crate::DEFAULT_ESCAPE_COVERAGE_PCT
+            ),
+            "a node disagreeing on the escape feerate floor must not share a manifest"
+        );
+        assert_ne!(
+            sealed,
+            hash_of(
+                crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+                crate::DEFAULT_ESCAPE_COVERAGE_PCT - 1
+            ),
+            "a node disagreeing on the escape coverage percentage must not share a manifest"
+        );
+    }
+
     #[test]
     fn manifest_hash_changes_when_hot_budget_classification_changes() {
         let wallet_id = [0x22u8; 32];
@@ -5762,6 +6282,8 @@ mod golden {
                 hot_allowlist,
                 escape_descriptor,
                 max_derivation_index,
+                crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+                crate::DEFAULT_ESCAPE_COVERAGE_PCT,
             )
         };
         let hot = vec!["wpkh(hot)".to_string()];
@@ -5841,6 +6363,8 @@ mod golden {
                 &[hot],
                 &escape,
                 5,
+                crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+                crate::DEFAULT_ESCAPE_COVERAGE_PCT,
             )
             .expect("valid ceremony descriptors")
         };
@@ -6369,7 +6893,7 @@ impl ChannelState {
             .expect("store lock")
             .candidates
             .get(cid)
-            .map(|c| c.partials.contains_key(&(input, signer)))
+            .map(|c| c.base.partials.contains_key(&(input, signer)))
             .unwrap_or(false)
     }
     pub(crate) fn stored_partial_der(&self, cid: &str, input: u32, signer: u16) -> Option<Vec<u8>> {
@@ -6378,7 +6902,7 @@ impl ChannelState {
             .expect("store lock")
             .candidates
             .get(cid)
-            .and_then(|c| c.partials.get(&(input, signer)).cloned())
+            .and_then(|c| c.base.partials.get(&(input, signer)).cloned())
     }
     pub(crate) fn psbt_has_pubkey(&self, cid: &str, input: u32, pk: &PublicKey) -> bool {
         self.store
@@ -6386,7 +6910,7 @@ impl ChannelState {
             .expect("store lock")
             .candidates
             .get(cid)
-            .and_then(|c| c.psbt.inputs.get(input as usize))
+            .and_then(|c| c.base.psbt.inputs.get(input as usize))
             .map(|i| i.partial_sigs.contains_key(pk))
             .unwrap_or(false)
     }
@@ -6954,7 +7478,7 @@ mod partial {
         psbt.inputs[0].final_script_witness = Some(Witness::from_slice(&[b"coordinator"]));
 
         let candidate = fx.candidate(&psbt, "canonical-finalization", EXPIRY);
-        let input = &candidate.psbt.inputs[0];
+        let input = &candidate.base.psbt.inputs[0];
         assert_eq!(
             input.witness_script.as_ref(),
             Some(&fx.witness_script),
@@ -7429,10 +7953,10 @@ mod partial {
         }
         let store = recv.store.lock().expect("store");
         let stored = store.candidates.get("reserved").expect("candidate");
-        let actual_bytes = stored.psbt.serialize().len()
-            + stored.sighashes.len() * 32
+        let actual_bytes = stored.base.psbt.serialize().len()
+            + stored.base.sighashes.len() * 32
             + 32
-            + stored.partials.values().map(Vec::len).sum::<usize>();
+            + stored.base.partials.values().map(Vec::len).sum::<usize>();
         assert_eq!(stored.bytes, actual_bytes, "complete actual accounting");
         assert_eq!(
             store.reserved_bytes, reserved_bytes,
@@ -7481,6 +8005,7 @@ mod partial {
             .candidates
             .get(&commitment_id)
             .expect("candidate")
+            .base
             .user_sig_hash;
         // Sign-at-ingress: this node's own partial is in the candidate already,
         // before any Hold elapses and before any peer says anything.
@@ -7542,11 +8067,11 @@ mod partial {
             .get(&commitment_id)
             .expect("candidate remains registered");
         assert_eq!(
-            candidate.user_sig_hash, original_user_sig_hash,
+            candidate.base.user_sig_hash, original_user_sig_hash,
             "the candidate retains the user-signature instance peer payloads name"
         );
         assert_eq!(
-            candidate.psbt.inputs[0]
+            candidate.base.psbt.inputs[0]
                 .partial_sigs
                 .get(&fx.user_pk)
                 .expect("retained user signature")
@@ -7555,11 +8080,11 @@ mod partial {
             original_user_der
         );
         assert!(
-            candidate.partials.contains_key(&(0, 0)),
+            candidate.base.partials.contains_key(&(0, 0)),
             "the peer partial must survive a re-send"
         );
         assert!(
-            candidate.psbt.inputs[0]
+            candidate.base.psbt.inputs[0]
                 .partial_sigs
                 .contains_key(&fx.entries[1].fed_pk),
             "this node's own partial must survive a re-send"
@@ -12223,8 +12748,12 @@ mod duress {
             escape: Psbt,
             quorum: bool,
             share_withheld: bool,
+            // The escape feerate floor to re-seal the federation to for this case. A
+            // manifest preimage field now (bead btc-policy-9y5.7), so it is set by
+            // re-sealing rather than by editing one node's TOML top-level.
+            escape_floor: u64,
         }
-        let fx = Fixture::new(3, 5);
+        let mut fx = Fixture::new(3, 5);
         let base = format!("duress_delay_secs = {DELAY}");
         let cases = vec![
             // Below quorum: no partials delivered, so the sweep cannot combine.
@@ -12234,6 +12763,7 @@ mod duress {
                 escape: default_escape(&fx),
                 quorum: false,
                 share_withheld: false,
+                escape_floor: crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             },
             // Coverage-fail: a 6%-fee escape (passes the 10% ingress cap) delivers
             // only 94% to the escape wallet, under the 95% floor.
@@ -12243,6 +12773,7 @@ mod duress {
                 escape: escape_with(&fx, 94_000_000, Sequence::MAX),
                 quorum: true,
                 share_withheld: true,
+                escape_floor: crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             },
             // Feerate-fail: 10k sat over the UNSIGNED tx's ~82 vB appears to clear
             // 100 sat/vB, but the fully-satisfied 3-of-5 vault witness makes the real
@@ -12250,10 +12781,11 @@ mod duress {
             // missing witness and withhold the share.
             Case {
                 label: "feerate-fail",
-                extra: format!("{base}\nescape_feerate_floor = 100"),
+                extra: base.clone(),
                 escape: default_escape(&fx),
                 quorum: true,
                 share_withheld: true,
+                escape_floor: 100,
             },
             // Non-final nSequence: RBF-signaling 0xfffffffe is not broadcastable-at-T.
             Case {
@@ -12262,6 +12794,7 @@ mod duress {
                 escape: escape_with(&fx, 99_990_000, Sequence::from_consensus(0xffff_fffe)),
                 quorum: true,
                 share_withheld: true,
+                escape_floor: crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             },
             // Package-reject: admissible per this node's checks, but the backend's
             // full-package testmempoolaccept refuses it.
@@ -12271,6 +12804,7 @@ mod duress {
                 escape: default_escape(&fx),
                 quorum: true,
                 share_withheld: false,
+                escape_floor: crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             },
             // Broadcast-fail: quorum + admissibility + package-acceptance all pass,
             // but `sendrawtransaction` itself errors — the `broadcast_package` `Err`
@@ -12282,10 +12816,14 @@ mod duress {
                 escape: default_escape(&fx),
                 quorum: true,
                 share_withheld: false,
+                escape_floor: crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             },
         ];
 
         for case in cases {
+            // Re-seal to this case's floor before building the node (a manifest
+            // preimage field now): the emitted config and the sealed hash must agree.
+            fx.reseal_escape_floor(case.escape_floor);
             let node = duress_node(&fx, HOLD, &case.extra);
             let spend = fx.spend_psbt(&fx.hot_spk, 7);
             let request = duress_request(&fx, &spend, &case.escape, case.label);
@@ -14289,6 +14827,1505 @@ mod duress {
         crate::test_support::load_node(&intersecting.config(0, HOLD, ""))
             .expect("the default 3-of-5 channel vault has intersecting quorums");
     }
+
+    // -- Bounded deterministic fee bumping (bead btc-policy-9y5.7) -----------
+
+    mod fee_bump {
+        //! **The armed escape's bounded, deterministic fee ladder.**
+        //!
+        //! ADR-0012's Firing row said "re-broadcast until CONFIRMED (fixed
+        //! panic-fee)". A fixed panic fee is exactly wrong during a sustained fee
+        //! spike, which is precisely when a wrench victim needs the escape to
+        //! confirm: the sweep would sit unconfirmable and the vault would exit
+        //! through the 180-day Recovery path instead.
+        //!
+        //! The federation holds no key that can raise a fee (the escape is
+        //! user-signed SIGHASH_ALL over its exact bytes), so a bump is only ever a
+        //! pre-authorized higher-fee rung. Which rung fires is decided at `T` from
+        //! consensus-observable state alone. These tests pin the four properties the
+        //! design rests on: the choice is IDENTICAL across honest nodes, it is
+        //! BOUNDED by the coverage guard, each bump is a BIP125-valid replacement,
+        //! and the latch makes it non-spinning and reorg-idempotent.
+        use super::*;
+        use crate::chain::ChainBackend;
+
+        /// A ladder over 7:0 whose escape output values are `outs` — descending, so
+        /// the fee ascends. Every rung, base included, signals BIP125 replacement.
+        ///
+        /// Sized against the fixture's single 100_000_000 sat vault coin, which is
+        /// also the coverage denominator: the 95% guard admits any rung paying at
+        /// least 95_000_000 sat to the escape wallet.
+        fn ladder(fx: &Fixture, outs: &[u64]) -> (Psbt, Vec<Psbt>) {
+            let mut rungs: Vec<Psbt> = outs
+                .iter()
+                .map(|out| {
+                    let mut psbt = fx.spend_psbt(&fx.escape_spk, 7);
+                    psbt.unsigned_tx.output[0].value = Amount::from_sat(*out);
+                    for input in &mut psbt.unsigned_tx.input {
+                        input.sequence = Sequence::from_consensus(crate::ESCAPE_RBF_SEQUENCE);
+                    }
+                    fx.user_sign_all(&mut psbt);
+                    psbt
+                })
+                .collect();
+            let base = rungs.remove(0);
+            (base, rungs)
+        }
+
+        /// Rung 0 pays a 10_000 sat fee (99.99% coverage), rung 1 pays 1_000_000
+        /// (99%), rung 2 pays 6_000_000 — which delivers only 94% and is therefore
+        /// OVER the coverage cap and must never be selectable.
+        const LADDER_OUTS: [u64; 3] = [99_990_000, 99_000_000, 94_000_000];
+        /// The index of the over-cap rung in [`LADDER_OUTS`].
+        const OVER_CAP_RUNG: usize = 2;
+
+        /// A DURESS request carrying `base` plus its ladder, coordinator-signed over
+        /// the whole thing (the ladder is part of the authenticated request).
+        fn laddered_request(
+            fx: &Fixture,
+            spend: &Psbt,
+            base: &Psbt,
+            bumps: &[Psbt],
+            nonce: &str,
+        ) -> SignRequest {
+            let mut request = fx.spend_request(spend, EXPIRY, nonce);
+            request.escape_psbt = base.to_string();
+            request.escape_bumps = bumps.iter().map(Psbt::to_string).collect();
+            request.pin = "9999".into();
+            fx.coord_sign(&mut request, nonce);
+            request
+        }
+
+        /// Arm `node` (which must be `self_id`) with a laddered duress request, and
+        /// deliver every peer partial for every rung so any rung the selector picks
+        /// can actually combine. Returns the escape ladder and its commitment id.
+        fn arm_laddered(
+            node: &crate::Node,
+            fx: &Fixture,
+            self_id: u16,
+            outs: &[u64],
+            nonce: &str,
+        ) -> (Psbt, Vec<Psbt>, String) {
+            let (base, bumps) = ladder(fx, outs);
+            let escape_cid = arm_ladder(node, fx, self_id, &base, &bumps, nonce);
+            (base, bumps, escape_cid)
+        }
+
+        /// [`arm_laddered`] over a ladder the caller built itself.
+        fn arm_ladder(
+            node: &crate::Node,
+            fx: &Fixture,
+            self_id: u16,
+            base: &Psbt,
+            bumps: &[Psbt],
+            nonce: &str,
+        ) -> String {
+            let spend = fx.spend_psbt(&fx.hot_spk, 7);
+            let request = laddered_request(fx, &spend, base, bumps, nonce);
+            assert!(
+                matches!(
+                    crate::handle_sign(node, &request, NOW).expect("decodable"),
+                    SignResponse::Accepted(_)
+                ),
+                "a well-formed ladder must be accepted at ingress"
+            );
+            // Two peers that are not this node bring the carrier to the 3-of-5 quorum.
+            let carrier = crate::arm_carrier_id(node, request.coord_request());
+            let peers: Vec<u16> = (0..5u16).filter(|id| *id != self_id).take(2).collect();
+            let mut armed = false;
+            for peer in &peers {
+                armed |= node.confirm_carrier(*peer, &carrier, NOW).armed;
+            }
+            assert!(armed, "the duress carrier reaching t holders must arm");
+
+            let escape_cid = crate::commitment_id_for(node, base, EXPIRY);
+            let channel = node.channel.as_ref().expect("channel");
+            for rung in std::iter::once(base).chain(bumps) {
+                for peer in &peers {
+                    let payload = fx.partial_payload(rung, &escape_cid, 0, *peer);
+                    assert_eq!(
+                        deliver(
+                            &fx.channel_state(*peer),
+                            channel,
+                            MSG_TYPE_PARTIAL,
+                            &payload.to_bytes(),
+                            NOW,
+                            NOW
+                        ),
+                        ChannelReply::Accepted,
+                        "peer {peer}'s partial for this rung must store"
+                    );
+                }
+            }
+            escape_cid
+        }
+
+        /// A 3-of-5 duress node at `self_id`.
+        fn node_at(fx: &Fixture, self_id: u16) -> crate::Node {
+            node_with(fx, self_id, "")
+        }
+
+        /// [`node_at`] with extra top-level config lines (a raised panic feerate
+        /// floor, say).
+        fn node_with(fx: &Fixture, self_id: u16, extra: &str) -> crate::Node {
+            let base = fx.config(self_id, HOLD, "");
+            let cfg = base.replacen(
+                "\n\n[chain_backend]",
+                &format!("\nduress_delay_secs = {DELAY}\n{extra}\n[chain_backend]"),
+                1,
+            );
+            crate::test_support::load_node(&cfg).expect("valid duress config")
+        }
+
+        /// `backend_for`, plus a chain whose `tip` sits at `tip` and whose anchor
+        /// block reports `median_feerate` sat/vB.
+        fn backend_at(psbt: &Psbt, tip: u32, anchor: u32, median_feerate: u64) -> MockBackend {
+            let mut backend = backend_for(psbt);
+            backend.tip = tip;
+            backend.median_feerates.insert(anchor, median_feerate);
+            backend
+        }
+
+        /// The single transaction a backend broadcast.
+        fn only_broadcast(backend: &MockBackend) -> bitcoin::Transaction {
+            let sent = backend.broadcasts.lock().expect("broadcasts");
+            assert_eq!(sent.len(), 1, "exactly one broadcast");
+            bitcoin::consensus::deserialize(&sent[0]).expect("a real tx")
+        }
+
+        /// **THE determinism test.** Two honest nodes, given the same ladder and the
+        /// same confirmed chain, bump to the IDENTICAL rung and broadcast the
+        /// IDENTICAL transaction — even though their tips differ by three blocks.
+        ///
+        /// This is the load-bearing property of the whole feature. Partial signatures
+        /// are per-transaction: if two honest nodes chose different rungs and released
+        /// only their own, no rung would collect `t` signatures and the sweep would
+        /// never combine — the escape failing at exactly the moment it is needed. The
+        /// target is therefore quantized on both axes (a six-block anchor height and a
+        /// 5 sat/vB step), which is what makes tips 98 and 101 agree here.
+        #[tokio::test]
+        async fn two_honest_nodes_bump_to_the_identical_rung_and_transaction() {
+            let fx = Fixture::new(3, 5);
+            let mut broadcast_txids = Vec::new();
+            let mut rungs_chosen = Vec::new();
+            // Different tips inside ONE anchor quantum, and a median feerate the base
+            // escape cannot pay: both nodes must climb, and climb to the same place.
+            for (self_id, tip) in [(0u16, 98u32), (1u16, 101u32)] {
+                let node = node_at(&fx, self_id);
+                let (base, _bumps, escape_cid) =
+                    arm_laddered(&node, &fx, self_id, &LADDER_OUTS, "ladder-determinism");
+                let backend = Arc::new(backend_at(&base, tip, 96, 100));
+                let node = Arc::new(node);
+                assert_eq!(
+                    crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY).await,
+                    1,
+                    "node {self_id} must sweep at T"
+                );
+                rungs_chosen.push(
+                    node.channel
+                        .as_ref()
+                        .expect("channel")
+                        .escape_rung(&escape_cid)
+                        .expect("resident escape"),
+                );
+                broadcast_txids.push(only_broadcast(&backend).compute_txid());
+            }
+            assert_eq!(
+                rungs_chosen[0], rungs_chosen[1],
+                "both honest nodes must latch the same fee-bump rung"
+            );
+            assert_eq!(
+                rungs_chosen[0], 1,
+                "the observed feerate is above the base escape's, so both must bump one rung"
+            );
+            assert_eq!(
+                broadcast_txids[0], broadcast_txids[1],
+                "both honest nodes must broadcast the IDENTICAL bumped transaction, or their \
+                 partials cover different transactions and no rung ever reaches t signatures"
+            );
+        }
+
+        /// Tips can straddle the six-block anchor boundary, so quantization cannot
+        /// eliminate every honest-node target disagreement. Prefix release is the
+        /// convergence mechanism for that admitted case: a node selecting rung 1
+        /// releases rung 0 too, allowing two honest 2-of-3 members to reach quorum on
+        /// the lower common rung even when the third member contributes nothing.
+        #[test]
+        fn honest_nodes_across_an_anchor_boundary_converge_on_the_common_prefix_rung() {
+            let fx = Fixture::new(2, 3);
+            let node0 = node_at(&fx, 0);
+            let node1 = node_at(&fx, 1);
+            let spend = fx.spend_psbt(&fx.hot_spk, 7);
+            let (base, bumps) = ladder(&fx, &LADDER_OUTS[..2]);
+            let request = laddered_request(&fx, &spend, &base, &bumps, "anchor-boundary-prefix");
+
+            for node in [&node0, &node1] {
+                assert!(matches!(
+                    crate::handle_sign(node, &request, NOW).expect("decodable"),
+                    SignResponse::Accepted(_)
+                ));
+            }
+            let carrier0 = crate::arm_carrier_id(&node0, request.coord_request());
+            let carrier1 = crate::arm_carrier_id(&node1, request.coord_request());
+            assert!(node0.confirm_carrier(1, &carrier0, NOW).armed);
+            assert!(node1.confirm_carrier(0, &carrier1, NOW).armed);
+
+            let escape_cid = crate::commitment_id_for(&node0, &base, EXPIRY);
+            let low_backend = backend_at(&base, 101, 96, 1);
+            let high_backend = backend_at(&base, 102, 102, 100);
+            let context0 = crate::escape_sweep_pre_release_admissible(
+                &node0,
+                &low_backend,
+                node0.channel.as_ref().expect("channel"),
+                &escape_cid,
+            )
+            .expect("the low-tip node admits the base rung");
+            let context1 = crate::escape_sweep_pre_release_admissible(
+                &node1,
+                &high_backend,
+                node1.channel.as_ref().expect("channel"),
+                &escape_cid,
+            )
+            .expect("the high-tip node admits the bump rung");
+            assert_eq!(
+                node0
+                    .channel
+                    .as_ref()
+                    .expect("channel")
+                    .escape_rung(&escape_cid),
+                Some(0)
+            );
+            assert_eq!(
+                node1
+                    .channel
+                    .as_ref()
+                    .expect("channel")
+                    .escape_rung(&escape_cid),
+                Some(1),
+                "the nodes deliberately disagree across the anchor boundary"
+            );
+
+            let release0 = node0
+                .channel
+                .as_ref()
+                .expect("channel")
+                .release_partials(&escape_cid, NOW + DELAY)
+                .expect("base release");
+            let release1 = node1
+                .channel
+                .as_ref()
+                .expect("channel")
+                .release_partials(&escape_cid, NOW + DELAY)
+                .expect("prefix release");
+            assert_eq!(release0.payloads.len(), 1, "the low node releases rung 0");
+            assert_eq!(
+                release1.payloads.len(),
+                2,
+                "the high node releases the common rung 0 prefix plus rung 1"
+            );
+            // Base-first ORDER, not just base-inclusion: the payloads are emitted
+            // cheapest-rung-first, and `spawn_fan_out` sends each peer's messages in this
+            // order, so the common base rung is charged to a tight `per_peer_quota_per_min`
+            // BEFORE any higher rung. Were the order reversed (or raced concurrently), a
+            // higher rung could win the last quota slot and the base — the one rung every
+            // honest prefix shares — could be rate-limited into scattering the sweep
+            // (codex 9y5.7 review).
+            assert_eq!(
+                release1.payloads[0].txid,
+                base.unsigned_tx.compute_txid().to_string(),
+                "the common base rung must be fanned out first"
+            );
+            assert_eq!(
+                release1.payloads[1].txid,
+                bumps[0].unsigned_tx.compute_txid().to_string(),
+                "the higher rung follows the base in the ordered prefix"
+            );
+            for payload in &release0.payloads {
+                assert_eq!(
+                    deliver(
+                        node0.channel.as_ref().expect("channel"),
+                        node1.channel.as_ref().expect("channel"),
+                        MSG_TYPE_PARTIAL,
+                        &payload.to_bytes(),
+                        NOW + DELAY,
+                        NOW + DELAY,
+                    ),
+                    ChannelReply::Accepted
+                );
+            }
+            for payload in &release1.payloads {
+                assert_eq!(
+                    deliver(
+                        node1.channel.as_ref().expect("channel"),
+                        node0.channel.as_ref().expect("channel"),
+                        MSG_TYPE_PARTIAL,
+                        &payload.to_bytes(),
+                        NOW + DELAY,
+                        NOW + DELAY,
+                    ),
+                    ChannelReply::Accepted
+                );
+            }
+
+            let contexts0 = HashMap::from([(escape_cid.clone(), context0)]);
+            let contexts1 = HashMap::from([(escape_cid.clone(), context1)]);
+            assert_eq!(
+                crate::combine_and_broadcast_with_contexts(
+                    &node0,
+                    &low_backend,
+                    std::slice::from_ref(&escape_cid),
+                    &contexts0,
+                    || NOW + DELAY,
+                ),
+                1
+            );
+            assert_eq!(
+                crate::combine_and_broadcast_with_contexts(
+                    &node1,
+                    &high_backend,
+                    std::slice::from_ref(&escape_cid),
+                    &contexts1,
+                    || NOW + DELAY,
+                ),
+                1
+            );
+            assert_eq!(
+                only_broadcast(&low_backend).compute_txid(),
+                base.unsigned_tx.compute_txid()
+            );
+            assert_eq!(
+                only_broadcast(&high_backend).compute_txid(),
+                base.unsigned_tx.compute_txid(),
+                "both nodes must finalize and broadcast the same lower common rung"
+            );
+        }
+
+        /// **Bounded by the coverage guard.** Under a spike so severe that NO rung
+        /// reaches the target, the node still refuses to climb past the last rung the
+        /// `>= 95%` coverage guard admits: the over-cap rung is never latched, never
+        /// released, and never broadcast. Paying it would eat 6% of the swept value,
+        /// which is the self-defeating outcome the guard exists to prevent.
+        #[tokio::test]
+        async fn a_bump_past_the_coverage_cap_is_refused_however_high_the_target() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, bumps, escape_cid) = arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-cap");
+            // A target no rung on this ladder can pay.
+            let backend = Arc::new(backend_at(&base, 0, 0, 100_000));
+            let node = Arc::new(node);
+            assert_eq!(
+                crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY).await,
+                1,
+                "the best AFFORDABLE rung still sweeps"
+            );
+            let channel = node.channel.as_ref().expect("channel");
+            let latched = channel.escape_rung(&escape_cid).expect("resident escape");
+            assert_eq!(
+                latched,
+                OVER_CAP_RUNG - 1,
+                "the latch stops at the last rung the coverage guard admits"
+            );
+            // Rung `r` of the ladder is `bumps[r - 1]`; rung 0 is the base.
+            let sent = only_broadcast(&backend).compute_txid();
+            assert_eq!(
+                sent,
+                bumps[latched - 1].unsigned_tx.compute_txid(),
+                "the broadcast rung is the highest coverage-admissible one"
+            );
+            assert_ne!(
+                sent,
+                bumps[OVER_CAP_RUNG - 1].unsigned_tx.compute_txid(),
+                "the over-cap rung must never be broadcast"
+            );
+        }
+
+        /// The bumped transaction is a BIP125-valid replacement of the rung below it:
+        /// the same inputs (so it conflicts at all), every input signalling
+        /// replaceability (rule 1), a strictly higher absolute fee (rule 3), and a
+        /// strictly higher FEERATE (rule 4 — which follows because a bump may change
+        /// only output VALUES, never the output set, so the size is fixed).
+        #[tokio::test]
+        async fn the_broadcast_bump_is_a_bip125_valid_replacement() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, _bumps, _cid) = arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-bip125");
+            let backend = Arc::new(backend_at(&base, 0, 0, 100));
+            let node = Arc::new(node);
+            assert_eq!(
+                crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY).await,
+                1
+            );
+            let replacement = only_broadcast(&backend);
+            let replaced = &base.unsigned_tx;
+            assert_ne!(
+                replacement.compute_txid(),
+                replaced.compute_txid(),
+                "this test is about a REPLACEMENT, so the bump must differ from the base"
+            );
+            let inputs = |tx: &bitcoin::Transaction| -> Vec<OutPoint> {
+                tx.input.iter().map(|i| i.previous_output).collect()
+            };
+            assert_eq!(
+                inputs(&replacement),
+                inputs(replaced),
+                "BIP125 replacement requires the same inputs — otherwise it conflicts with \
+                 nothing and simply sits beside the rung it was meant to replace"
+            );
+            assert!(
+                replacement
+                    .input
+                    .iter()
+                    .all(|i| i.sequence.to_consensus_u32() < 0xffff_fffe),
+                "BIP125 rule 1: every rung signals replaceability"
+            );
+            let out = |tx: &bitcoin::Transaction| -> u64 {
+                tx.output
+                    .iter()
+                    .fold(0u64, |t, o| t.saturating_add(o.value.to_sat()))
+            };
+            // One input set, so a smaller output total IS a strictly higher fee.
+            let (replaced_fee, replacement_fee) = (
+                Fixture::INPUT_SAT - out(replaced),
+                Fixture::INPUT_SAT - out(&replacement),
+            );
+            assert!(
+                replacement_fee > replaced_fee,
+                "BIP125 rule 3: {replacement_fee} must exceed {replaced_fee}"
+            );
+            assert!(
+                replacement_fee - replaced_fee >= replacement.vsize() as u64,
+                "BIP125 incremental relay rule: the fee increase must pay at least the \
+                 replacement's {} vB at 1 sat/vB",
+                replacement.vsize()
+            );
+            assert!(
+                u128::from(replacement_fee) * u128::from(replaced.vsize() as u64)
+                    > u128::from(replaced_fee) * u128::from(replacement.vsize() as u64),
+                "BIP125 rule 4: the replacement's feerate must also be strictly higher"
+            );
+            let outputs = |tx: &bitcoin::Transaction| -> Vec<ScriptBuf> {
+                tx.output.iter().map(|o| o.script_pubkey.clone()).collect()
+            };
+            assert_eq!(
+                outputs(&replacement),
+                outputs(replaced),
+                "a bump may change the FEE and nothing else: same destination, same coverage"
+            );
+        }
+
+        /// A real Core mempool hides an escape's prevouts once rung 0 is resident.
+        /// The next tick must nevertheless preflight, release, package-test, and
+        /// broadcast rung 1 as its replacement.
+        #[tokio::test]
+        async fn a_later_tick_replaces_a_lower_rung_already_in_the_local_mempool() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-real-mempool");
+            let node = Arc::new(node);
+
+            // Tick 1 has no observed pressure, so rung 0 enters the mempool first.
+            let calm = Arc::new(backend_for(&base));
+            assert_eq!(
+                crate::fire_tick(node.clone(), calm.clone(), NOW + DELAY).await,
+                1
+            );
+            let base_raw = calm
+                .broadcasts
+                .lock()
+                .expect("broadcasts")
+                .first()
+                .cloned()
+                .expect("base broadcast");
+
+            // Tick 2 sees a spike while Core still holds rung 0. Model Core's real
+            // gettxout behavior: the rung's input disappears from both prevout and
+            // the vault-unspent scan because the mempool transaction spends it.
+            let mut spiking = backend_at(&base, 0, 0, 100);
+            spiking
+                .raw_txs
+                .insert(base.unsigned_tx.compute_txid(), base_raw);
+            spiking.hide_mempool_spent_prevouts = true;
+            let outpoint = base.unsigned_tx.input[0].previous_output;
+            assert!(
+                spiking.prevout(&outpoint).expect("mock prevout").is_none(),
+                "the regression backend must model Core hiding mempool-spent prevouts"
+            );
+            let spiking = Arc::new(spiking);
+            assert_eq!(
+                crate::fire_tick(node.clone(), spiking.clone(), NOW + DELAY + 1).await,
+                1,
+                "the higher rung must replace the lower mempool rung on a later tick"
+            );
+            assert_eq!(
+                node.channel
+                    .as_ref()
+                    .expect("channel")
+                    .escape_rung(&escape_cid),
+                Some(1)
+            );
+            assert_eq!(
+                only_broadcast(&spiking).compute_txid(),
+                bumps[0].unsigned_tx.compute_txid(),
+                "rung 1, not the already-resident base, is broadcast"
+            );
+            assert_eq!(
+                spiking
+                    .packages_tested
+                    .lock()
+                    .expect("packages tested")
+                    .len(),
+                1,
+                "the replacement still passes the full package-acceptance gate"
+            );
+        }
+
+        /// The deterministic fee signal is optional liveness input. If that RPC is
+        /// unavailable, a laddered escape still fires at the sealed static floor.
+        #[tokio::test]
+        async fn a_fee_signal_backend_error_falls_back_to_the_base_escape() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, _bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-fee-read-error");
+            let mut backend = backend_for(&base);
+            backend.median_feerate_error = Some("getblockstats unavailable".into());
+            let backend = Arc::new(backend);
+            let node = Arc::new(node);
+
+            assert_eq!(
+                crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY).await,
+                1,
+                "an optional fee-signal failure must not suppress the sweep"
+            );
+            assert_eq!(
+                node.channel
+                    .as_ref()
+                    .expect("channel")
+                    .escape_rung(&escape_cid),
+                Some(0),
+                "without a reading, the sealed floor leaves this fixture on rung 0"
+            );
+            assert_eq!(
+                only_broadcast(&backend).compute_txid(),
+                base.unsigned_tx.compute_txid()
+            );
+        }
+
+        /// A rung becomes monotone release authority only after ancestry validation.
+        /// A transient failure after selection must leave the old latch untouched.
+        #[tokio::test]
+        async fn a_failed_ancestry_preflight_does_not_commit_the_higher_rung_latch() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, _bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-latch-after-checks");
+            let parent = base.unsigned_tx.input[0].previous_output.txid;
+            node.authorized.lock().expect("authorized").insert(parent);
+            let mut backend = backend_at(&base, 0, 0, 100);
+            backend
+                .prevouts
+                .get_mut(&base.unsigned_tx.input[0].previous_output)
+                .expect("fixture prevout")
+                .confirmed = false;
+            // The prevout is visible and authorized, so coverage + selection pass.
+            // Its unconfirmed parent is absent from the mempool, so the later
+            // ancestry walk fails.
+            let node = Arc::new(node);
+            let backend = Arc::new(backend);
+
+            assert_eq!(
+                crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY).await,
+                0
+            );
+            assert_eq!(
+                node.channel
+                    .as_ref()
+                    .expect("channel")
+                    .escape_rung(&escape_cid),
+                Some(0),
+                "the failed pass must not permanently burn rung 1"
+            );
+            assert!(backend.broadcasts.lock().expect("broadcasts").is_empty());
+        }
+
+        /// **Non-spinning and reorg-idempotent.** Re-ticking inside the window — and
+        /// a reorg that un-confirms the sweep and puts it back in play — re-broadcasts
+        /// the SAME latched rung. The latch is monotone, so the number of bumps over
+        /// the candidate's whole life is bounded by the ladder the user signed, not by
+        /// how many times the fire driver runs.
+        #[tokio::test]
+        async fn a_reorg_re_broadcast_repeats_the_latched_rung_and_never_double_bumps() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, _bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-reorg");
+            let backend = Arc::new(backend_at(&base, 0, 0, 100));
+            let node = Arc::new(node);
+            let channel = node.channel.as_ref().expect("channel");
+
+            assert_eq!(
+                crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY).await,
+                1
+            );
+            let bumped = channel.escape_rung(&escape_cid).expect("resident escape");
+            assert_eq!(bumped, 1, "the spike bumps one rung");
+            let first = only_broadcast(&backend).compute_txid();
+
+            // The bump confirms. Model Core faithfully: once mined, the escape input
+            // is spent and `gettxout` cannot supply it to the ordinary sweep preflight.
+            // Confirmation must be recognized BEFORE any fallback preflight, and the
+            // candidate must remain resident for an in-window reorg.
+            let mut confirmed = backend_at(&base, 0, 0, 100);
+            confirmed.confirmed_txs.insert(first);
+            confirmed
+                .prevouts
+                .remove(&base.unsigned_tx.input[0].previous_output);
+            let confirmed = Arc::new(confirmed);
+            assert_eq!(
+                crate::fire_tick(node.clone(), confirmed, NOW + DELAY + 1).await,
+                0,
+                "a confirmed escape is observed without trying to re-admit its spent prevout"
+            );
+            assert_eq!(
+                channel.escape_rung(&escape_cid),
+                Some(bumped),
+                "confirmation retains the exact latched candidate for reorg recovery"
+            );
+            assert!(
+                !node
+                    .sign_state
+                    .lock()
+                    .expect("sign_state")
+                    .pending
+                    .has_any(NOW + DELAY + 1),
+                "observing confirmation settles the paired pending Hold"
+            );
+
+            // A reorg removes the confirmation and makes the original prevout visible
+            // again. Two passes inside the window re-broadcast the SAME latched rung:
+            // the first is the reorg recovery, the second is ordinary bounded
+            // re-broadcast-until-confirmed.
+            let reorged = Arc::new(backend_at(&base, 0, 0, 100));
+            for tick in 1..=2u64 {
+                assert_eq!(
+                    crate::fire_tick(node.clone(), reorged.clone(), NOW + DELAY + 1 + tick).await,
+                    1,
+                    "the re-surfaced sweep re-broadcasts inside its window"
+                );
+                assert_eq!(
+                    channel.escape_rung(&escape_cid).expect("resident escape"),
+                    bumped,
+                    "a re-tick must not walk the latch up another rung"
+                );
+            }
+            let sent = reorged.broadcasts.lock().expect("broadcasts");
+            assert_eq!(sent.len(), 2, "one reorg broadcast per pass, none skipped");
+            for raw in sent.iter() {
+                let tx: bitcoin::Transaction =
+                    bitcoin::consensus::deserialize(raw).expect("a real tx");
+                assert_eq!(
+                    tx.compute_txid(),
+                    first,
+                    "every re-broadcast — including one a reorg triggers — is the SAME latched \
+                     rung, never a fresh bump and never a second fee paid"
+                );
+            }
+        }
+
+        /// The fail-safe pair, side by side on one ladder:
+        ///
+        ///  - a spike ABOVE the base escape's feerate but BELOW the coverage cap is
+        ///    answered by a bump, and that bumped transaction confirms;
+        ///  - a spike above what the cap can pay leaves the sweep unconfirmed, the
+        ///    node locked down, and the funds on the Recovery path — the pre-existing
+        ///    fail-safe, unchanged.
+        #[tokio::test]
+        async fn a_below_cap_spike_confirms_after_a_bump_and_an_above_cap_spike_falls_to_recovery()
+        {
+            // Below the cap: the spike bumps one rung, that rung goes out, and then it
+            // confirms — after which the sweep is done and nothing re-broadcasts.
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-confirms");
+            let node = Arc::new(node);
+            let spiking = Arc::new(backend_at(&base, 0, 0, 100));
+            assert_eq!(
+                crate::fire_tick(node.clone(), spiking.clone(), NOW + DELAY).await,
+                1,
+                "the spike is answered by a bumped broadcast"
+            );
+            assert!(node.is_locked_down(), "Lockdown at T is unconditional");
+            let bumped_txid = only_broadcast(&spiking).compute_txid();
+            assert_eq!(
+                bumped_txid,
+                bumps[0].unsigned_tx.compute_txid(),
+                "the transaction that went out is the bumped rung, not the base escape"
+            );
+            // That transaction now confirms. The same chain view, one block later.
+            let mut confirmed = backend_at(&base, 0, 0, 100);
+            confirmed.confirmed_txs.insert(bumped_txid);
+            let confirmed = Arc::new(confirmed);
+            assert_eq!(
+                crate::fire_tick(node.clone(), confirmed.clone(), NOW + DELAY + 1).await,
+                0,
+                "a confirmed bump is settled: nothing is re-broadcast"
+            );
+            assert!(
+                confirmed.broadcasts.lock().expect("broadcasts").is_empty(),
+                "the confirmed sweep must not be sent again"
+            );
+            assert_eq!(
+                node.channel
+                    .as_ref()
+                    .expect("channel")
+                    .escape_rung(&escape_cid)
+                    .expect("resident escape"),
+                1,
+                "the latch stays where the bump put it"
+            );
+
+            // Above the cap: the same ladder, a target nothing can reach, and a chain
+            // that confirms nothing. The sweep never lands; the vault exits via
+            // Recovery, exactly as it did before fee bumping existed.
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, _bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-recovery");
+            let backend = Arc::new(backend_at(&base, 0, 0, 100_000));
+            let node = Arc::new(node);
+            crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY).await;
+            assert!(node.is_locked_down(), "Lockdown at T is unconditional");
+            let channel = node.channel.as_ref().expect("channel");
+            assert!(
+                channel.escape_rung(&escape_cid).expect("resident escape") < OVER_CAP_RUNG,
+                "the cap is never crossed, however severe the spike"
+            );
+            // Past the window the Firing job is complete: nothing re-broadcasts, and
+            // the frozen funds' only exit is the Recovery path.
+            channel.prune_store(NOW + DELAY + SLACK + 1);
+            let after =
+                crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY + SLACK + 2).await;
+            assert_eq!(
+                after, 0,
+                "the bump loop is finite — it stops with the window"
+            );
+            assert!(node.is_locked_down(), "Lockdown stays terminal");
+        }
+
+        /// With no observable fee pressure the ladder is inert: the node fires the
+        /// BASE escape and pays the fee the user composed. A ladder must never cost
+        /// money it did not have to.
+        #[tokio::test]
+        async fn without_fee_pressure_the_ladder_is_inert_and_the_base_escape_fires() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, _bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-calm");
+            // No `median_feerates` entry at all: the backend reports no reading.
+            let backend = Arc::new(backend_for(&base));
+            let node = Arc::new(node);
+            assert_eq!(
+                crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY).await,
+                1
+            );
+            assert_eq!(
+                node.channel
+                    .as_ref()
+                    .expect("channel")
+                    .escape_rung(&escape_cid)
+                    .expect("resident escape"),
+                0,
+                "no reading means no pressure, so no bump"
+            );
+            assert_eq!(
+                only_broadcast(&backend).compute_txid(),
+                base.unsigned_tx.compute_txid(),
+                "the base escape is what fires"
+            );
+        }
+
+        /// The other half of "a ladder must never cost money it did not have to": a
+        /// LOW but non-zero reading. The target is the anchor block's median
+        /// quantized DOWN to the step, so an escape already paying the chain's own
+        /// median stays on its base rung. Quantizing UP would round any median at
+        /// all up to a whole step and buy a full 4× rung under no fee pressure —
+        /// the user's money, spent for nothing.
+        #[tokio::test]
+        async fn a_median_the_base_escape_already_pays_buys_no_rung() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            // Size the base fee at a feerate that is deliberately NOT a multiple of
+            // the quantization step, so the rounding DIRECTION decides the outcome.
+            let vsize = crate::maximum_finalized_vsize(
+                &node,
+                &fx.spend_psbt(&fx.escape_spk, 7).unsigned_tx,
+            )
+            .expect("the fixture escape has a finite maximum vsize");
+            const BASE_FEERATE: u64 = 41;
+            assert_ne!(
+                BASE_FEERATE % crate::FEE_TARGET_STEP_SAT_VB,
+                0,
+                "this test is only meaningful off the step boundary"
+            );
+            let (base, bumps) = ladder(
+                &fx,
+                &[
+                    Fixture::INPUT_SAT - BASE_FEERATE * vsize,
+                    Fixture::INPUT_SAT - 200 * vsize,
+                ],
+            );
+            let escape_cid = arm_ladder(&node, &fx, 0, &base, &bumps, "ladder-low-median");
+            // The chain's own median is exactly what the base escape already pays.
+            let backend = Arc::new(backend_at(&base, 0, 0, BASE_FEERATE));
+            let node = Arc::new(node);
+            assert_eq!(
+                crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY).await,
+                1
+            );
+            assert_eq!(
+                node.channel
+                    .as_ref()
+                    .expect("channel")
+                    .escape_rung(&escape_cid),
+                Some(0),
+                "the base escape already pays the observed median, so no rung is bought"
+            );
+            assert_eq!(
+                only_broadcast(&backend).compute_txid(),
+                base.unsigned_tx.compute_txid(),
+                "the base escape is what fires"
+            );
+        }
+
+        /// **The federation must not alarm on its own successful sweep.** A bumped
+        /// rung that confirms is a normal-branch spend of a vault UTXO, so unless
+        /// its txid is in this node's validated-AND-policy-accepted set the
+        /// watchtower queues `UnrecognizedSpend` — a theft alert on the escape,
+        /// raised by every node, during the one incident where an alert has to mean
+        /// something. Every rung is validated and accepted at the same ingress as
+        /// the base escape, so every rung is recognized (and every rung is equally
+        /// usable as an authorized unconfirmed parent).
+        #[test]
+        fn every_ladder_rung_is_recognized_by_this_nodes_own_watchtower() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, bumps, _cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-recognized");
+            let vault_spend = |txid: bitcoin::Txid| crate::chain::SpendSeen {
+                spend_txid: txid,
+                outpoint: base.unsigned_tx.input[0].previous_output,
+                script: node.vault_scripts()[0].clone(),
+                // A non-empty `or_i` selector: the NORMAL branch, so this is not a
+                // recovery-path alert but the recognition question itself.
+                witness: bitcoin::Witness::from_slice(&[
+                    vec![0x30u8; 71],
+                    vec![0x01u8],
+                    vec![0xABu8; 32],
+                ]),
+            };
+            for rung in std::iter::once(&base).chain(&bumps) {
+                assert!(
+                    node.authorized
+                        .lock()
+                        .expect("authorized")
+                        .contains(&rung.unsigned_tx.compute_txid()),
+                    "every rung this node signed at ingress is vault-authorized"
+                );
+            }
+            let backend = MockBackend {
+                spends: std::iter::once(&base)
+                    .chain(&bumps)
+                    .map(|rung| vault_spend(rung.unsigned_tx.compute_txid()))
+                    .collect(),
+                ..Default::default()
+            };
+            assert_eq!(
+                node.watchtower_tick(&backend, 0).expect("scan"),
+                0,
+                "no rung of the federation's own escape may raise a theft alert"
+            );
+
+            // The control: an escape this node never accepted still alerts, so the
+            // recognition above is about acceptance and not about the scan going quiet.
+            let stranger = node_at(&fx, 0);
+            let backend = MockBackend {
+                spends: vec![crate::chain::SpendSeen {
+                    script: stranger.vault_scripts()[0].clone(),
+                    ..vault_spend(
+                        escape_with(&fx, 99_500_000, Sequence::MAX)
+                            .unsigned_tx
+                            .compute_txid(),
+                    )
+                }],
+                ..Default::default()
+            };
+            assert_eq!(
+                stranger.watchtower_tick(&backend, 0).expect("scan"),
+                1,
+                "an unrecognized vault spend still alerts"
+            );
+        }
+
+        /// **Coverage counts the swept coins once.** With a rung resident in this
+        /// node's mempool, Core hides the vault coins it spends, so the fire-time
+        /// environment restores them from the candidate's stored inputs — while that
+        /// same rung's own vault CHANGE (permitted in every class) is an authorized
+        /// unconfirmed output the balance scan still returns. Counting both inflates
+        /// the denominator by the change, and a near-threshold escape then becomes
+        /// spuriously inadmissible on exactly the tick it wants to bump.
+        #[tokio::test]
+        async fn a_resident_rungs_own_vault_change_is_not_counted_twice() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            // An escape-class ladder that also returns change to the vault, sitting
+            // just above the 95% coverage guard: 96% at the base, 95.5% at rung 1.
+            let mut base = fx.spend_psbt_paying(&fx.escape_spk, 7, 96_000_000);
+            base.unsigned_tx.input[0].sequence =
+                Sequence::from_consensus(crate::ESCAPE_RBF_SEQUENCE);
+            fx.user_sign_all(&mut base);
+            assert_eq!(base.unsigned_tx.output.len(), 2, "escape plus vault change");
+            let mut bump = base.clone();
+            bump.unsigned_tx.output[0].value = Amount::from_sat(95_500_000);
+            fx.user_sign_all(&mut bump);
+            let bumps = vec![bump];
+            let escape_cid = arm_ladder(&node, &fx, 0, &base, &bumps, "ladder-change");
+            let node = Arc::new(node);
+
+            // Tick 1: no pressure, so the base rung enters the mempool.
+            let calm = Arc::new(backend_for(&base));
+            assert_eq!(
+                crate::fire_tick(node.clone(), calm.clone(), NOW + DELAY).await,
+                1
+            );
+            let base_raw = calm
+                .broadcasts
+                .lock()
+                .expect("broadcasts")
+                .first()
+                .cloned()
+                .expect("base broadcast");
+
+            // Tick 2: a spike, with the base rung still resident. Core hides the coin
+            // it spends and surfaces its unconfirmed vault change instead.
+            let base_txid = base.unsigned_tx.compute_txid();
+            let mut spiking = backend_at(&base, 0, 0, 100);
+            spiking.raw_txs.insert(base_txid, base_raw);
+            spiking.hide_mempool_spent_prevouts = true;
+            spiking.prevouts.insert(
+                OutPoint::new(base_txid, 1),
+                Prevout {
+                    txout: base.unsigned_tx.output[1].clone(),
+                    confirmed: false,
+                },
+            );
+            let spiking = Arc::new(spiking);
+            assert_eq!(
+                crate::fire_tick(node.clone(), spiking.clone(), NOW + DELAY + 1).await,
+                1,
+                "the sweep must still be admissible: its change is not a second coin"
+            );
+            assert_eq!(
+                node.channel
+                    .as_ref()
+                    .expect("channel")
+                    .escape_rung(&escape_cid),
+                Some(1)
+            );
+            assert_eq!(
+                only_broadcast(&spiking).compute_txid(),
+                bumps[0].unsigned_tx.compute_txid(),
+                "rung 1 replaces the resident base rung"
+            );
+        }
+
+        /// **A rung this node refused is released to nobody.** A partial is
+        /// finalizable authority the moment a `t-1` compromised set holds it, which
+        /// is why every fire-time check runs BEFORE release. The prefix release
+        /// therefore starts at the cheapest ADMISSIBLE rung, not at rung 0: under a
+        /// raised panic floor the base escape is the rung that fails — the one
+        /// refusal that hits the cheap end, since coverage only ever bites the
+        /// expensive one — and handing out its partials would let those peers
+        /// combine and broadcast the very under-fee escape this node declined to
+        /// fire.
+        #[test]
+        fn a_rung_under_the_panic_floor_is_never_released() {
+            let mut fx = Fixture::new(3, 5);
+            // The floor is a manifest preimage field now (bead btc-policy-9y5.7), so
+            // raise it by re-sealing the federation rather than editing one node's TOML
+            // — an unsealed floor edit is a startup failure, which is the whole point.
+            fx.reseal_escape_floor(100);
+            let node = node_with(&fx, 0, "");
+            let (base, bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-under-floor");
+            let backend = backend_for(&base);
+            let channel = node.channel.as_ref().expect("channel");
+            crate::escape_sweep_pre_release_admissible(&node, &backend, channel, &escape_cid)
+                .expect("the ladder carries a rung above the raised floor");
+            let release = channel
+                .release_partials(&escape_cid, NOW + DELAY)
+                .expect("the admissible rung releases");
+            let released: HashSet<String> =
+                release.payloads.iter().map(|p| p.txid.clone()).collect();
+            assert!(
+                !released.contains(&base.unsigned_tx.compute_txid().to_string()),
+                "the base rung pays under the panic floor: its share must not leave this node"
+            );
+            assert_eq!(
+                released,
+                HashSet::from([bumps[0].unsigned_tx.compute_txid().to_string()]),
+                "exactly the cheapest rung that clears the floor is released"
+            );
+        }
+
+        /// The per-peer-quota cap must anchor at the RELEASE FLOOR, not rung 0: a base
+        /// below a raised panic floor plus a tight quota must still release the
+        /// admissible rung, never wedge it. With `per_peer_quota_per_min = 1` and a
+        /// single-input escape the pre-fix absolute-index cap was `1/1 − 1 = 0`, which
+        /// with a release floor of 1 (the below-floor base) gave `first (1) > authorized
+        /// (0)` → `release_partials` returned `None` FOREVER — the sweep the ladder exists
+        /// to rescue would never combine (Fable 9y5.7 pass-2). The floor-anchored cap
+        /// (`release_floor + quota/inputs − 1`) releases the admissible rung instead.
+        #[test]
+        fn a_tight_quota_does_not_wedge_the_release_above_a_raised_floor() {
+            let mut fx = Fixture::new(3, 5);
+            // The raised panic floor is a manifest preimage field now (bead
+            // btc-policy-9y5.7): re-seal the federation to it so the sealed hash and the
+            // emitted config agree. `per_peer_quota_per_min` is a `[channel]` field (so
+            // it rides `fx.config`'s channel opts) and `duress_delay_secs` is top-level.
+            fx.reseal_escape_floor(100);
+            let base_cfg = fx.config(0, HOLD, "per_peer_quota_per_min = 1\n");
+            let cfg = base_cfg.replacen(
+                "\n\n[chain_backend]",
+                &format!("\nduress_delay_secs = {DELAY}\n[chain_backend]"),
+                1,
+            );
+            let node = crate::test_support::load_node(&cfg).expect("valid duress config");
+            // Arm WITHOUT delivering peer partials: `release_partials` releases only
+            // THIS node's own signatures (signed at ingress), so no peer delivery is
+            // needed — and a tight quota would otherwise rate-limit the harness's own
+            // multi-rung peer deliveries rather than the code under test.
+            let spend = fx.spend_psbt(&fx.hot_spk, 7);
+            let (base, bumps) = ladder(&fx, &LADDER_OUTS);
+            let request = laddered_request(&fx, &spend, &base, &bumps, "quota-floor-no-wedge");
+            assert!(matches!(
+                crate::handle_sign(&node, &request, NOW).expect("decodable"),
+                SignResponse::Accepted(_)
+            ));
+            let carrier = crate::arm_carrier_id(&node, request.coord_request());
+            let mut armed = false;
+            for peer in [1u16, 2u16] {
+                armed |= node.confirm_carrier(peer, &carrier, NOW).armed;
+            }
+            assert!(armed, "the duress carrier reaching t holders must arm");
+            let escape_cid = crate::commitment_id_for(&node, &base, EXPIRY);
+            let backend = backend_at(&base, 102, 102, 100);
+            let channel = node.channel.as_ref().expect("channel");
+            crate::escape_sweep_pre_release_admissible(&node, &backend, channel, &escape_cid)
+                .expect("the ladder carries a rung above the raised floor");
+            // The floor-anchored cap must NOT wedge: the admissible above-floor rung
+            // still releases under the tight quota (`expect` would panic on the wedge).
+            let release = channel
+                .release_partials(&escape_cid, NOW + DELAY)
+                .expect("the floor-anchored quota cap must release the admissible rung, not wedge");
+            let released: HashSet<String> =
+                release.payloads.iter().map(|p| p.txid.clone()).collect();
+            assert!(
+                !released.contains(&base.unsigned_tx.compute_txid().to_string()),
+                "the below-floor base still never leaves this node"
+            );
+            assert!(
+                !released.is_empty(),
+                "the admissible rung must release despite the tight quota — no wedge"
+            );
+        }
+
+        /// A peer's partial for a BUMP rung files against that rung, not against the
+        /// base: the ladder shares one commitment id, and the payload's txid is what
+        /// routes it. Filing a rung-1 signature under rung 0 would leave rung 0 holding
+        /// a signature that does not satisfy it — an unfinalizable candidate.
+        #[test]
+        fn a_bump_rungs_partial_files_against_that_rung_and_not_the_base() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-route");
+            let channel = node.channel.as_ref().expect("channel");
+            let store = channel.store.lock().expect("store");
+            let candidate = store.candidates.get(&escape_cid).expect("escape candidate");
+            assert_eq!(
+                candidate.bumps.len(),
+                bumps.len(),
+                "the whole ladder is resident"
+            );
+            assert_eq!(
+                candidate.base.unsigned_txid,
+                base.unsigned_tx.compute_txid()
+            );
+            for (index, bump) in bumps.iter().enumerate() {
+                let variant = candidate.variant(index + 1).expect("rung");
+                assert_eq!(variant.unsigned_txid, bump.unsigned_tx.compute_txid());
+                assert_eq!(
+                    variant.partials.len(),
+                    2,
+                    "both peers' partials for rung {} file against rung {}",
+                    index + 1,
+                    index + 1
+                );
+            }
+            // Two peers plus this node's own ingress signature on every rung.
+            assert!(
+                candidate
+                    .variants()
+                    .all(|variant| variant.has_quorum(3, &channel.nodes)),
+                "every rung is independently combinable"
+            );
+        }
+
+        /// **SILENCE: the ladder is pin-independent at ingress.** The rungs are
+        /// decoded, validated, signed, and registered identically under the normal and
+        /// the duress PIN — same acceptance, same candidate count, same stored bytes,
+        /// and no arm from ingress alone.
+        ///
+        /// This is the one place the ladder could have become a duress oracle. It adds
+        /// real per-rung work to `/sign` — decode, user-signature verification, policy,
+        /// classification, and a signing operation each — and if any of it were skipped
+        /// or added on one pin, the coordinator could read the pin off the response.
+        /// Which rung fires is decided at `T`, after unconditional Lockdown, never here.
+        #[test]
+        fn a_ladder_is_processed_identically_under_both_pins() {
+            let fx = Fixture::new(3, 5);
+            let spend = fx.spend_psbt(&fx.hot_spk, 7);
+            let (base, bumps) = ladder(&fx, &LADDER_OUTS);
+            let escape_cid = {
+                let probe = node_at(&fx, 0);
+                crate::commitment_id_for(&probe, &base, EXPIRY)
+            };
+            let mut shapes = Vec::new();
+            for pin in ["1234", "9999"] {
+                let node = node_at(&fx, 0);
+                let mut request = laddered_request(&fx, &spend, &base, &bumps, "pin-uniform");
+                request.pin = pin.into();
+                fx.coord_sign(&mut request, "pin-uniform");
+                let response = crate::handle_sign(&node, &request, NOW).expect("decodable");
+                assert!(
+                    matches!(response, SignResponse::Accepted(_)),
+                    "pin {pin}: {response:?}"
+                );
+                let channel = node.channel.as_ref().expect("channel");
+                assert!(
+                    channel.armed_snapshot().is_none(),
+                    "pin {pin}: ingress never arms — only t-of-n carrier confirmation does"
+                );
+                let store = channel.store.lock().expect("store");
+                let candidate = store.candidates.get(&escape_cid).expect("escape candidate");
+                shapes.push((
+                    store.candidates.len(),
+                    store.reserved_bytes,
+                    candidate.bumps.len(),
+                    candidate.bytes,
+                    candidate.capacity_bytes,
+                    // EVERY rung carries this node's own ingress signature under both
+                    // PINs. Signing a rung only on one of them would be the oracle.
+                    candidate
+                        .variants()
+                        .map(|variant| {
+                            variant.psbt.inputs[0]
+                                .partial_sigs
+                                .contains_key(&fx.entries[0].fed_pk)
+                        })
+                        .collect::<Vec<_>>(),
+                ));
+                assert!(
+                    shapes
+                        .last()
+                        .is_some_and(|shape| shape.5.iter().all(|signed| *signed)),
+                    "pin {pin}: every ladder rung is signed at ingress"
+                );
+            }
+            assert_eq!(
+                shapes[0], shapes[1],
+                "the ladder must cost the node the identical observable work under both PINs"
+            );
+        }
+
+        /// A partial whose txid belongs to no rung is still the WrongTxid refusal it
+        /// always was — routing by txid must not become a way to smuggle a signature
+        /// over an unrelated transaction into the candidate.
+        #[test]
+        fn a_partial_for_a_transaction_outside_the_ladder_is_refused() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (_base, _bumps, escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-stranger");
+            let channel = node.channel.as_ref().expect("channel");
+            // A perfectly valid escape that is simply not on this ladder.
+            let stranger = escape_with(&fx, 99_500_000, Sequence::MAX);
+            let payload = fx.partial_payload(&stranger, &escape_cid, 0, 1);
+            assert_eq!(
+                deliver(
+                    &fx.channel_state(1),
+                    channel,
+                    MSG_TYPE_PARTIAL,
+                    &payload.to_bytes(),
+                    NOW,
+                    NOW
+                ),
+                ChannelReply::Rejected(RejectReason::WrongTxid),
+                "a txid outside the ladder is refused exactly as before"
+            );
+        }
+
+        // -- Ingress: the ladder's structural contract -----------------------
+
+        /// Submit a request under `pin` whose ladder is `bumps`, and return the
+        /// response.
+        fn submit_ladder(
+            fx: &Fixture,
+            node: &crate::Node,
+            bumps: &[Psbt],
+            nonce: &str,
+            pin: &str,
+        ) -> SignResponse {
+            let spend = fx.spend_psbt(&fx.hot_spk, 7);
+            let (base, _) = ladder(fx, &LADDER_OUTS[..1]);
+            let mut request = laddered_request(fx, &spend, &base, bumps, nonce);
+            request.pin = pin.into();
+            fx.coord_sign(&mut request, nonce);
+            crate::handle_sign(node, &request, NOW).expect("decodable")
+        }
+
+        /// Every way a ladder can be structurally wrong is refused at ingress, under
+        /// both PINs identically (this is ordinary escape validation, never an arm
+        /// gate). Each clause is load-bearing: an input-set change means the rung
+        /// cannot replace anything, an output-script change means the bump moved the
+        /// money rather than the fee, a non-ascending fee breaks BIP125 rule 3, and a
+        /// non-signalling rung cannot be replaced by the rung above it.
+        #[test]
+        fn a_structurally_invalid_ladder_is_refused_at_ingress() {
+            let fx = Fixture::new(3, 5);
+            let rbf = Sequence::from_consensus(crate::ESCAPE_RBF_SEQUENCE);
+
+            // A rung over a DIFFERENT input.
+            let mut wrong_input = fx.spend_psbt(&fx.escape_spk, 9);
+            wrong_input.unsigned_tx.output[0].value = Amount::from_sat(99_000_000);
+            wrong_input.unsigned_tx.input[0].sequence = rbf;
+            fx.user_sign_all(&mut wrong_input);
+
+            // A rung paying a DIFFERENT script (the hot wallet) — caught as a class
+            // violation before the ladder's own shape check even runs, which is the
+            // stronger refusal.
+            let mut wrong_output = fx.spend_psbt(&fx.hot_spk, 7);
+            wrong_output.unsigned_tx.input[0].sequence = rbf;
+            fx.user_sign_all(&mut wrong_output);
+
+            // A rung that pays LESS fee than the base.
+            let (_, cheaper) = ladder(&fx, &[LADDER_OUTS[0], 99_995_000]);
+
+            // A rung that raises the fee by only one satoshi. It is strictly higher,
+            // but does not pay the replacement's relay bandwidth at 1 sat/vB.
+            let (_, one_sat_higher) = ladder(&fx, &[LADDER_OUTS[0], LADDER_OUTS[0] - 1]);
+
+            // A rung that does not signal replacement.
+            let mut non_signalling = fx.spend_psbt(&fx.escape_spk, 7);
+            non_signalling.unsigned_tx.output[0].value = Amount::from_sat(99_000_000);
+            fx.user_sign_all(&mut non_signalling);
+
+            // A rung with a different transaction version. Version changes are not
+            // fee changes and can opt the replacement into different relay policy
+            // (for example v3/TRUC), so every rung must inherit the base's version.
+            let (_, mut wrong_version) = ladder(&fx, &[LADDER_OUTS[0], 99_000_000]);
+            wrong_version[0].unsigned_tx.version = bitcoin::transaction::Version(3);
+            fx.user_sign_all(&mut wrong_version[0]);
+
+            let (_, three) = ladder(&fx, &[LADDER_OUTS[0], 99_900_000, 99_800_000, 99_700_000]);
+            let (_, one_over) = ladder(
+                &fx,
+                &[
+                    LADDER_OUTS[0],
+                    99_900_000,
+                    99_800_000,
+                    99_700_000,
+                    99_600_000,
+                ],
+            );
+            assert_eq!(three.len(), crate::MAX_ESCAPE_BUMPS);
+            assert_eq!(one_over.len(), crate::MAX_ESCAPE_BUMPS + 1);
+
+            for (label, bumps) in [
+                ("a rung over different inputs", vec![wrong_input]),
+                ("a rung paying a different script", vec![wrong_output]),
+                ("a rung cheaper than the base", cheaper),
+                ("a one-satoshi fee increase", one_sat_higher),
+                ("a non-signalling rung", vec![non_signalling]),
+                ("a rung with a different transaction version", wrong_version),
+                ("more rungs than the bound", one_over),
+            ] {
+                // Under BOTH PINs, and the refusal must be the identical one. A
+                // ladder that was refused on one pin and accepted (or refused with a
+                // different code) on the other would be a duress oracle in the
+                // refusal path — the accepted path is pinned by
+                // `a_ladder_is_processed_identically_under_both_pins`, and silence
+                // needs both halves.
+                let mut refusals = Vec::new();
+                for pin in ["1234", "9999"] {
+                    let node = node_at(&fx, 0);
+                    let nonce = format!("{label}-{pin}");
+                    let response = submit_ladder(&fx, &node, &bumps, &nonce, pin);
+                    let SignResponse::Refusal(refusal) = response else {
+                        panic!("{label} under pin {pin} must be refused: {response:?}");
+                    };
+                    assert_eq!(
+                        refusal.code,
+                        vault_proto::RefusalCode::PsbtInconsistent,
+                        "{label} under pin {pin}"
+                    );
+                    assert!(
+                        node.channel
+                            .as_ref()
+                            .expect("channel")
+                            .armed_snapshot()
+                            .is_none(),
+                        "{label}: a malformed ladder must not arm anything"
+                    );
+                    refusals.push((refusal.code, refusal.check, refusal.detail));
+                }
+                assert_eq!(
+                    refusals[0], refusals[1],
+                    "{label}: the refusal must be byte-identical under both PINs"
+                );
+            }
+
+            // The maximum-length ladder is accepted — the bound is a bound, not a ban.
+            let node = node_at(&fx, 0);
+            assert!(
+                matches!(
+                    submit_ladder(&fx, &node, &three, "max-length", "9999"),
+                    SignResponse::Accepted(_)
+                ),
+                "a ladder at the bound must still be accepted"
+            );
+        }
+
+        /// A rung that RAISES an output value is refused at ingress — the per-output
+        /// monotonicity guard (codex 9y5.7 pass-2). On a two-output escape+change ladder
+        /// a hostile-at-wrench coordinator could shift value from vault change INTO the
+        /// escape output (same scripts, still ascending fee) so an INTERMEDIATE rung dips
+        /// below the ≥95% coverage guard while a higher rung passes; the downward-closed
+        /// coverage assumption the prefix release rests on would break, and
+        /// `release_partials` would hand a t−1 set this node's honest share for the
+        /// under-coverage rung. The guard rejects any rung whose output rose, keeping
+        /// coverage monotone — pinned here so a later "sum-descending is enough" refactor
+        /// cannot silently reopen it.
+        #[test]
+        fn a_ladder_rung_that_raises_an_output_is_refused_at_ingress() {
+            let fx = Fixture::new(3, 5);
+            let rbf = Sequence::from_consensus(crate::ESCAPE_RBF_SEQUENCE);
+            let mut base = fx.spend_psbt_paying(&fx.escape_spk, 7, 96_000_000);
+            base.unsigned_tx.input[0].sequence = rbf;
+            fx.user_sign_all(&mut base);
+            assert_eq!(base.unsigned_tx.output.len(), 2, "escape plus vault change");
+            // Raise the escape output above the base and lower the vault change by MORE,
+            // so the fee strictly ascends yet output 0 rose — the non-monotone shape.
+            let mut non_monotone = base.clone();
+            non_monotone.unsigned_tx.output[0].value = Amount::from_sat(96_500_000);
+            non_monotone.unsigned_tx.output[1].value =
+                base.unsigned_tx.output[1].value - Amount::from_sat(1_000_000);
+            fx.user_sign_all(&mut non_monotone);
+            let spend = fx.spend_psbt(&fx.hot_spk, 7);
+            // Under BOTH PINs, and the refusal must be byte-identical — this is ordinary
+            // structural validation, so a monotonicity rung refused on one pin but
+            // accepted (or refused differently) on the other would be a duress oracle in
+            // the refusal path. Every other structural refusal is pinned this way in
+            // `a_structurally_invalid_ladder_is_refused_at_ingress`, which cannot host
+            // this case because its base is single-output; silence needs this one too.
+            let mut refusals = Vec::new();
+            for pin in ["1234", "9999"] {
+                let node = node_at(&fx, 0);
+                let nonce = format!("ladder-non-monotone-{pin}");
+                let mut request =
+                    laddered_request(&fx, &spend, &base, &[non_monotone.clone()], &nonce);
+                request.pin = pin.into();
+                fx.coord_sign(&mut request, &nonce);
+                let SignResponse::Refusal(refusal) =
+                    crate::handle_sign(&node, &request, NOW).expect("decodable")
+                else {
+                    panic!(
+                        "a rung that raises an output must be refused under pin {pin}, never armed"
+                    );
+                };
+                assert_eq!(
+                    refusal.code,
+                    vault_proto::RefusalCode::PsbtInconsistent,
+                    "pin {pin}"
+                );
+                assert!(
+                    refusal.detail.contains("raises an output value"),
+                    "pin {pin}: the refusal must name the monotonicity violation: {}",
+                    refusal.detail
+                );
+                refusals.push((refusal.code, refusal.check, refusal.detail));
+            }
+            assert_eq!(
+                refusals[0], refusals[1],
+                "the monotonicity refusal must be byte-identical under both PINs (silence)"
+            );
+        }
+
+        /// A ladder-less escape keeps the pre-9y5.7 contract exactly: non-signalling,
+        /// final through `nSequence`, and refused at fire time if it is anything else.
+        /// The ladder must not have quietly relaxed the bare escape's shape.
+        #[test]
+        fn a_ladderless_escape_still_requires_a_non_signalling_sequence() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let spend = fx.spend_psbt(&fx.hot_spk, 7);
+            // RBF-signalling but with NO ladder: nothing authorizes a replacement, so
+            // the escape must be the final, non-signalling shape it always was.
+            let signalling = escape_with(
+                &fx,
+                99_990_000,
+                Sequence::from_consensus(crate::ESCAPE_RBF_SEQUENCE),
+            );
+            let request = duress_request(&fx, &spend, &signalling, "ladderless-rbf");
+            assert!(matches!(
+                crate::handle_sign(&node, &request, NOW).expect("decodable"),
+                SignResponse::Accepted(_)
+            ));
+            assert!(confirm_to_quorum(&node, &request));
+            let escape_cid = crate::commitment_id_for(&node, &signalling, EXPIRY);
+            deliver_partials(
+                &fx,
+                node.channel.as_ref().expect("channel"),
+                &signalling,
+                &escape_cid,
+                2,
+            );
+            let node = Arc::new(node);
+            let backend = Arc::new(backend_for(&signalling));
+            let broadcasts =
+                futures_lite_block_on(crate::fire_tick(node.clone(), backend.clone(), NOW + DELAY));
+            assert_eq!(
+                broadcasts, 0,
+                "an RBF-signalling escape with no ladder is not broadcastable-at-T"
+            );
+            assert!(
+                node.is_locked_down(),
+                "Lockdown at T is still unconditional"
+            );
+        }
+
+        /// A tiny blocking runner so the one synchronous test above can drive the
+        /// async fire pass without pulling in another executor.
+        fn futures_lite_block_on<F: std::future::Future>(future: F) -> F::Output {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(future)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -14618,6 +16655,7 @@ mod hot_budget {
                 duress: false,
                 confirmation_required: true,
                 escape: &escape,
+                escape_bumps: &[],
                 escape_commitment_id: &escape_cid,
                 fire: FireWindow {
                     fire_at: corrected + HOLD,

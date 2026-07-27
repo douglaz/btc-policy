@@ -349,6 +349,7 @@ impl Fixture {
         let mut request = SignRequest {
             psbt: spend.to_string(),
             escape_psbt: escape.to_string(),
+            escape_bumps: Vec::new(),
             pin: pin.into(),
             nonce: String::new(),
             expiry,
@@ -636,6 +637,7 @@ fn undecodable_psbt_is_a_bad_request_not_a_refusal() {
     let mut request = SignRequest {
         psbt: "not base64 at all".into(),
         escape_psbt: "also not".into(),
+        escape_bumps: Vec::new(),
         pin: NORMAL_PIN.into(),
         nonce: String::new(),
         expiry: EXPIRY,

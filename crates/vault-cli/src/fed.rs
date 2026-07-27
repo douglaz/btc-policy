@@ -231,6 +231,154 @@ pub(crate) fn build_spend_n(
     Ok(psbt)
 }
 
+/// The `nSequence` every rung of a fee-bump ladder carries: BIP125-replaceable
+/// (`< 0xfffffffe`) with bit 31 still set, so BIP68 relative timelocks stay
+/// disabled. The node checks this exact value at ingress, so it comes from the
+/// shared wire crate rather than from a second copy tied only by a comment.
+const ESCAPE_RBF_SEQUENCE: u32 = vault_proto::ESCAPE_RBF_SEQUENCE;
+
+/// Multipliers on the base escape's fee, one per ladder rung (bead
+/// btc-policy-9y5.7). Geometric so three rungs span two orders of magnitude of
+/// feerate: a spike that a 4× bump does not clear is usually one that needs 16× or
+/// 64×, and intermediate steps would only add stored PSBTs without adding reach.
+const ESCAPE_BUMP_MULTIPLIERS: [u64; 3] = [4, 16, 64];
+
+/// A ladder longer than the node's bound is refused at ingress — and that refusal
+/// takes the whole spend with it, not just the bump. Fail at COMPILE time instead.
+const _: () = assert!(ESCAPE_BUMP_MULTIPLIERS.len() <= vault_proto::MAX_ESCAPE_BUMPS);
+
+/// The share of the swept value the top ladder rung may pay in fee.
+///
+/// The node's own guard is the coverage check (fee ≤ `100 − escape_coverage_pct`
+/// percent, i.e. 5% by default), enforced at fire time on whichever rung is
+/// selected. This coordinator-side bound sits an order of magnitude below it, so a
+/// composed ladder never proposes a rung the node would refuse and never brushes
+/// the policy fee cap either.
+const ESCAPE_BUMP_MAX_FEE_PCT: u64 = 1;
+
+/// Below this the reduced escape output would be dust, so the rung is dropped.
+const ESCAPE_BUMP_MIN_OUTPUT_SAT: u64 = 10_000;
+
+/// **Compose the escape's pre-signed fee-bump ladder** (bead btc-policy-9y5.7).
+///
+/// Returns the escape rewritten as the ladder's base — same inputs, same outputs,
+/// same values, only its `nSequence` changed to signal BIP125 replacement — plus the
+/// higher-fee rungs. The federation cannot raise a fee on its own (the escape is
+/// user-signed SIGHASH_ALL over its exact bytes), so the only bump that can ever
+/// exist is one the user authorizes here, at composition time, alongside the escape
+/// itself. The caller user-signs the base and every rung.
+///
+/// Each rung takes the extra fee out of the LARGEST escape output and changes nothing
+/// else — same inputs, same output scripts, strictly higher fee — which is exactly
+/// the shape the node's `ensure_escape_ladder` requires. Rungs that would exceed
+/// [`ESCAPE_BUMP_MAX_FEE_PCT`] of the swept value, leave a dust output, or raise the
+/// fee over the rung below by LESS than the node's incremental-relay minimum are
+/// simply not offered: an unoffered rung is a bump that cannot happen, which is the
+/// correct failure direction.
+///
+/// **The incremental-relay filter is load-bearing (bead btc-policy-9y5.7).** The node
+/// refuses at ingress any rung whose absolute fee increase over the rung below it is
+/// under `maximum_finalized_vsize · incremental_relay_rate`, and that refusal takes
+/// the WHOLE `SpendRequest` — the duress carrier included. A small base fee makes the
+/// unconditional 4× rung's `3·base_fee` delta fall under that minimum; offering it
+/// would strand an otherwise-valid escape. So each rung is kept only if its fee clears
+/// the last KEPT rung by at least the node's minimum, measured with the very same
+/// [`vault_node::escape_replacement_min_fee_delta`] the node enforces (fed from the
+/// vault descriptor's `max_weight_to_satisfy`, so the two cannot drift). Dropping a
+/// too-close rung leaves the next rung a LARGER gap to clear; if none can, the escape
+/// gets no ladder and degrades to the recovery path — never theft.
+///
+/// An escape with no outputs, no inputs, or an unknown input value gets NO ladder
+/// (and keeps `Sequence::MAX`) rather than a half-formed one.
+pub(crate) fn escape_fee_ladder(
+    escape: &Psbt,
+    max_vault_satisfaction_weight: u64,
+) -> Result<(Psbt, Vec<Psbt>), Error> {
+    let total_in = escape.inputs.iter().try_fold(0u64, |total, input| {
+        input
+            .witness_utxo
+            .as_ref()
+            .map(|utxo| total.saturating_add(utxo.value.to_sat()))
+    });
+    let Some(total_in) = total_in else {
+        return Ok((escape.clone(), Vec::new()));
+    };
+    // Fund each bump's fee from the LARGEST escape output, not the last: a multi-output
+    // escape whose LAST output is small would otherwise silently get fewer or zero rungs
+    // even when the total swept value could easily fund them (Fable 9y5.7 review). The
+    // node accepts a bump that shrinks ANY output — it checks same output scripts in the
+    // same order + a strictly higher fee, never which output shrank — so drawing from the
+    // largest output is valid. Ties break to the lowest index for a deterministic choice.
+    let Some(fund_idx) = escape
+        .unsigned_tx
+        .output
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, output)| (output.value.to_sat(), std::cmp::Reverse(*index)))
+        .map(|(index, _)| index)
+    else {
+        return Ok((escape.clone(), Vec::new()));
+    };
+    let total_out = escape
+        .unsigned_tx
+        .output
+        .iter()
+        .fold(0u64, |total, output| {
+            total.saturating_add(output.value.to_sat())
+        });
+    let base_fee = total_in.saturating_sub(total_out);
+    let mut base = escape.clone();
+    for input in &mut base.unsigned_tx.input {
+        input.sequence = Sequence::from_consensus(ESCAPE_RBF_SEQUENCE);
+    }
+    let fee_ceiling = total_in.saturating_mul(ESCAPE_BUMP_MAX_FEE_PCT) / 100;
+    let fund_value = base.unsigned_tx.output[fund_idx].value.to_sat();
+    // The node's per-rung minimum absolute fee increase, computed the SAME way it does
+    // (`maximum_finalized_vsize · incremental_relay_rate`). Every rung shares the base's
+    // inputs and output scripts, so the finalized size — and hence this minimum — is one
+    // value for the whole ladder; bound it once from the base.
+    let minimum_delta = vault_node::escape_replacement_min_fee_delta(
+        max_vault_satisfaction_weight,
+        &base.unsigned_tx,
+    )
+    .map_err(Error::from)?;
+    let mut rungs = Vec::new();
+    // The fee of the last rung actually KEPT (the base to start): a dropped rung is not
+    // submitted, so the node measures the next rung's delta against this, not against the
+    // rung that was skipped.
+    let mut last_kept_fee = base_fee;
+    for multiplier in ESCAPE_BUMP_MULTIPLIERS {
+        let fee = base_fee.saturating_mul(multiplier);
+        let extra = fee.saturating_sub(base_fee);
+        if fee <= base_fee || fee > fee_ceiling {
+            continue;
+        }
+        // A rung whose delta over the last kept rung is under the node's incremental-relay
+        // minimum would be refused at ingress, taking the whole spend with it. Skip it: the
+        // next multiplier clears a larger gap over this same `last_kept_fee`.
+        if fee.saturating_sub(last_kept_fee) < minimum_delta {
+            continue;
+        }
+        let Some(reduced) = fund_value.checked_sub(extra) else {
+            continue;
+        };
+        if reduced < ESCAPE_BUMP_MIN_OUTPUT_SAT {
+            continue;
+        }
+        let mut rung = base.clone();
+        rung.unsigned_tx.output[fund_idx].value = Amount::from_sat(reduced);
+        rungs.push(rung);
+        last_kept_fee = fee;
+    }
+    // Without a rung there is nothing to replace, so leave the escape exactly as it
+    // was: non-signalling and final through `nSequence`, the pre-ladder shape the
+    // node still requires of a ladder-less escape.
+    if rungs.is_empty() {
+        return Ok((escape.clone(), Vec::new()));
+    }
+    Ok((base, rungs))
+}
+
 pub(crate) fn sign_all_inputs(
     secp: &Secp256k1<All>,
     psbt: &mut Psbt,
@@ -596,6 +744,9 @@ impl NodeParams {
             max_commitment_age_secs: self.max_commitment_age_secs,
             policy_version: self.policy_version,
             escape_feerate_floor: self.escape_feerate_floor,
+            // The harness never varies coverage, so seal + emit the shared default;
+            // a heterogeneity test would add the field to `NodeParams` and set it here.
+            escape_coverage_pct: vault_node::DEFAULT_ESCAPE_COVERAGE_PCT,
             hot_max_per_tx: self.hot_budget.max_per_tx_sat,
             hot_max_per_window: self.hot_budget.max_per_window_sat,
             hot_window_secs: self.hot_budget.window_secs,
@@ -1278,4 +1429,187 @@ pub(crate) fn free_ports(count: usize) -> Result<Vec<u16>, Error> {
         listeners.push(listener);
     }
     Ok(ports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::Txid;
+
+    /// A representative 3-of-5 P2WSH vault satisfaction weight (wu). The exact value
+    /// only sets the node's per-rung relay-delta minimum; tests that care derive that
+    /// minimum from [`vault_node::escape_replacement_min_fee_delta`] rather than a
+    /// magic number, so the ladder is exercised against the bound the node enforces.
+    const TEST_MAX_SAT_WEIGHT: u64 = 500;
+
+    /// A one-input, one-output escape sweeping `input` sat to `dest` for `fee`.
+    fn escape(input: u64, fee: u64) -> Psbt {
+        let dest = ScriptBuf::from_hex("0014aabbccddeeff00112233445566778899aabbccdd")
+            .expect("a valid p2wpkh scriptPubKey");
+        let vault = ScriptBuf::from_hex(
+            "0020112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00",
+        )
+        .expect("a valid p2wsh scriptPubKey");
+        let utxo = Utxo {
+            outpoint: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            txout: TxOut {
+                script_pubkey: vault.clone(),
+                value: Amount::from_sat(input),
+            },
+        };
+        build_spend(&utxo, &vault, &[(dest, Amount::from_sat(input - fee))]).expect("escape")
+    }
+
+    /// The composed ladder is exactly what the node's `ensure_escape_ladder` demands:
+    /// the base rewritten to signal BIP125 replacement, rungs over the same inputs and
+    /// output scripts, and strictly ascending fees.
+    #[test]
+    fn the_composed_ladder_ascends_over_one_input_set_and_signals_replacement() {
+        let base_fee = 10_000;
+        let (base, rungs) =
+            escape_fee_ladder(&escape(1_000_000_000, base_fee), TEST_MAX_SAT_WEIGHT)
+                .expect("ladder");
+        assert_eq!(rungs.len(), ESCAPE_BUMP_MULTIPLIERS.len());
+        let fee_of = |psbt: &Psbt| -> u64 {
+            let out: u64 = psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .map(|o| o.value.to_sat())
+                .sum();
+            1_000_000_000 - out
+        };
+        assert_eq!(fee_of(&base), base_fee, "the base's own fee is untouched");
+        let mut previous = base_fee;
+        for (index, rung) in rungs.iter().enumerate() {
+            assert_eq!(
+                rung.unsigned_tx
+                    .input
+                    .iter()
+                    .map(|i| i.previous_output)
+                    .collect::<Vec<_>>(),
+                base.unsigned_tx
+                    .input
+                    .iter()
+                    .map(|i| i.previous_output)
+                    .collect::<Vec<_>>(),
+                "rung {index} must spend the base's inputs or it replaces nothing"
+            );
+            assert_eq!(
+                rung.unsigned_tx
+                    .output
+                    .iter()
+                    .map(|o| &o.script_pubkey)
+                    .collect::<Vec<_>>(),
+                base.unsigned_tx
+                    .output
+                    .iter()
+                    .map(|o| &o.script_pubkey)
+                    .collect::<Vec<_>>(),
+                "a bump changes the fee, never what is swept"
+            );
+            let fee = fee_of(rung);
+            assert!(
+                fee > previous,
+                "rung {index} pays {fee}, not more than {previous}"
+            );
+            assert_eq!(fee, base_fee * ESCAPE_BUMP_MULTIPLIERS[index]);
+            previous = fee;
+        }
+        for rung in std::iter::once(&base).chain(&rungs) {
+            assert!(
+                rung.unsigned_tx
+                    .input
+                    .iter()
+                    .all(|i| i.sequence.to_consensus_u32() == ESCAPE_RBF_SEQUENCE),
+                "every rung, base included, must signal replacement"
+            );
+        }
+        assert_eq!(
+            base.unsigned_tx.lock_time,
+            LockTime::ZERO,
+            "a replaceable escape's finality comes from nLockTime, not nSequence"
+        );
+    }
+
+    /// A rung the swept value cannot afford is simply not offered — and with no rung
+    /// to replace it with, the escape keeps the non-signalling, final shape a
+    /// ladder-less escape must have.
+    #[test]
+    fn an_unaffordable_ladder_is_not_offered_and_leaves_the_escape_unchanged() {
+        // A fee already above 1% of the input: every multiplier overshoots the cap.
+        let bare = escape(1_000_000, 50_000);
+        let (base, rungs) = escape_fee_ladder(&bare, TEST_MAX_SAT_WEIGHT).expect("ladder");
+        assert!(
+            rungs.is_empty(),
+            "no rung fits under the coordinator's fee bound"
+        );
+        assert_eq!(
+            base.unsigned_tx, bare.unsigned_tx,
+            "with nothing to replace, the escape is left exactly as composed"
+        );
+        assert!(base
+            .unsigned_tx
+            .input
+            .iter()
+            .all(|i| i.sequence == Sequence::MAX));
+    }
+
+    /// A rung whose fee increase over the rung below is UNDER the node's
+    /// incremental-relay minimum is dropped, not offered — because the node refuses
+    /// such a rung at ingress and that refusal takes the whole spend, duress carrier
+    /// included (bead btc-policy-9y5.7). With a base fee small enough that the 4× rung's
+    /// `3·base_fee` delta is under the minimum, the 4× rung must vanish and the 16× rung
+    /// (whose `15·base_fee` clears it) becomes the first offered — and every offered
+    /// rung must clear the minimum over the rung below it, exactly what the node checks.
+    #[test]
+    fn a_rung_below_the_incremental_relay_delta_is_dropped_not_offered() {
+        // The node's per-rung minimum for this single-input ladder shape, computed the
+        // same way the node does. The sequence rewrite in the ladder base does not change
+        // the serialized size, so a plain escape's unsigned tx yields the same value.
+        let minimum_delta = vault_node::escape_replacement_min_fee_delta(
+            TEST_MAX_SAT_WEIGHT,
+            &escape(1_000_000_000, 1).unsigned_tx,
+        )
+        .expect("delta");
+        // `3·base_fee < minimum_delta ≤ 15·base_fee`: the 4× rung is under the floor, the
+        // 16× rung clears it.
+        let base_fee = (minimum_delta / 4).max(1);
+        assert!(3 * base_fee < minimum_delta && 15 * base_fee >= minimum_delta);
+        let (base, rungs) =
+            escape_fee_ladder(&escape(1_000_000_000, base_fee), TEST_MAX_SAT_WEIGHT)
+                .expect("ladder");
+        let fee_of = |psbt: &Psbt| -> u64 {
+            1_000_000_000
+                - psbt
+                    .unsigned_tx
+                    .output
+                    .iter()
+                    .map(|o| o.value.to_sat())
+                    .sum::<u64>()
+        };
+        assert_eq!(fee_of(&base), base_fee, "the base's own fee is untouched");
+        assert_eq!(
+            rungs.len(),
+            2,
+            "the 4× rung is under the relay delta and must be dropped, leaving 16× and 64×"
+        );
+        assert_eq!(
+            fee_of(&rungs[0]),
+            base_fee * 16,
+            "the first OFFERED rung is the 16× — the too-close 4× was dropped"
+        );
+        assert_eq!(fee_of(&rungs[1]), base_fee * 64);
+        // Every offered rung clears the node's minimum over the rung below it (the base
+        // to start) — so `ensure_escape_ladder` accepts the whole ladder.
+        let mut previous = base_fee;
+        for rung in &rungs {
+            let fee = fee_of(rung);
+            assert!(
+                fee.saturating_sub(previous) >= minimum_delta,
+                "each offered rung must clear the relay minimum over the one below it"
+            );
+            previous = fee;
+        }
+    }
 }

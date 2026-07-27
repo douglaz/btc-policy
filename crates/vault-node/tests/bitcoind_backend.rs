@@ -60,30 +60,63 @@ fn run() -> Result<(), Error> {
         .ok_or("funding paid no watched output")? as u32;
     let funding_outpoint = OutPoint::new(Txid::from_str(&funding_txid)?, vout);
 
-    // Build + sign a spend of that outpoint WITHOUT broadcasting it — the
-    // backend does the broadcast.
+    // Build + sign two RBF rungs over that outpoint WITHOUT broadcasting them —
+    // the backend broadcasts the base and then its higher-fee replacement.
     let dest = node.call_str("getnewaddress", json!([]))?;
     let raw = node.call_str(
         "createrawtransaction",
-        json!([[{"txid": funding_txid, "vout": vout}], {dest: 0.999}]),
+        json!([[{"txid": funding_txid, "vout": vout, "sequence": 4_294_967_293u64}], {dest.clone(): 0.999}]),
     )?;
     let signed = node.call("signrawtransactionwithwallet", json!([raw]))?;
     let signed_hex = signed["hex"].as_str().ok_or("signed hex")?;
-    let signed_tx: Transaction = deserialize_hex(signed_hex)?;
-    let raw_bytes = bitcoin::consensus::encode::serialize(&signed_tx);
+    let base_tx: Transaction = deserialize_hex(signed_hex)?;
+    let base_bytes = bitcoin::consensus::encode::serialize(&base_tx);
+    let replacement_raw = node.call_str(
+        "createrawtransaction",
+        json!([[{"txid": funding_txid, "vout": vout, "sequence": 4_294_967_293u64}], {dest: 0.998}]),
+    )?;
+    let replacement_signed = node.call("signrawtransactionwithwallet", json!([replacement_raw]))?;
+    let replacement_hex = replacement_signed["hex"]
+        .as_str()
+        .ok_or("replacement signed hex")?;
+    let replacement_tx: Transaction = deserialize_hex(replacement_hex)?;
+    let replacement_bytes = bitcoin::consensus::encode::serialize(&replacement_tx);
 
-    // --- package acceptance + broadcast ---
+    // --- package acceptance + resident-rung replacement ---
     let backend = BitcoindBackend::new(node.rpc_addr, node.auth.clone());
     assert_eq!(
-        backend.test_package_accept(std::slice::from_ref(&raw_bytes))?,
+        backend.test_package_accept(std::slice::from_ref(&base_bytes))?,
         PackageVerdict::Accepted,
-        "the live Core response parses and admits the valid spend before broadcast"
+        "the live Core response parses and admits the base rung before broadcast"
     );
-    let spend_txid = backend.broadcast(&raw_bytes)?;
+    let base_txid = backend.broadcast(&base_bytes)?;
+    assert_eq!(
+        base_txid,
+        base_tx.compute_txid(),
+        "base broadcast returns its txid"
+    );
+    assert!(
+        backend.prevout(&funding_outpoint)?.is_none(),
+        "Core hides an outpoint once the resident base rung spends it"
+    );
+    assert_eq!(
+        backend.test_package_accept(std::slice::from_ref(&replacement_bytes))?,
+        PackageVerdict::Accepted,
+        "Core package-tests the higher rung as a valid replacement despite the hidden prevout"
+    );
+    let spend_txid = backend.broadcast(&replacement_bytes)?;
     assert_eq!(
         spend_txid,
-        signed_tx.compute_txid(),
-        "broadcast returns the txid"
+        replacement_tx.compute_txid(),
+        "the higher rung replaces the resident base"
+    );
+    assert!(
+        backend.mempool_transaction(&base_txid)?.is_none(),
+        "the replaced base rung leaves the mempool"
+    );
+    assert!(
+        backend.mempool_transaction(&spend_txid)?.is_some(),
+        "the higher replacement rung is now resident"
     );
     assert!(
         !backend.transaction_confirmed(&spend_txid)?,

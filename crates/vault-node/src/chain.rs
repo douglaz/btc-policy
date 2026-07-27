@@ -117,6 +117,26 @@ pub trait ChainBackend {
     /// rather than silently advancing past re-orged blocks it never re-classified.
     fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, Error>;
 
+    /// The **median feerate, in sat/vB, of the block at `height`** in this node's
+    /// ACTIVE chain — the one fee signal the escape fee-bump selector is allowed to
+    /// read (bead btc-policy-9y5.7).
+    ///
+    /// It is a *confirmed-chain* reading on purpose. The armed escape's bump target
+    /// must be a pure function of consensus-observable state, because every honest
+    /// node has to land on the SAME target or their partials cover different
+    /// transactions and the sweep never reaches `t` signatures. A node's own mempool
+    /// — `mempoolminfee`, `estimatesmartfee`, local eviction history — is exactly the
+    /// per-node state that would split them, so no bump input may come from it.
+    ///
+    /// `None` means "this node has no fee reading here" (no such block, or a backend
+    /// that does not report fee statistics). The selector treats `None` as *no
+    /// observed fee pressure* and stays on the base escape, which is the pre-9y5.7
+    /// behaviour — never an excuse to bump. The default implementation returns `None`
+    /// so mocks and alternate backends opt in rather than having to stub it.
+    fn block_median_feerate(&self, _height: u32) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
+
     /// Spends of any of `scripts` observed in the inclusive block range
     /// `from_height..=through_height`, against this node's own chain data, together
     /// with the validated `(height, hash)` chain of the blocks traversed (see
@@ -202,6 +222,14 @@ pub trait ChainBackend {
 /// package the backend will reject after the fact.
 pub const MAX_PACKAGE_ANCESTORS: usize = 24;
 
+/// Highest Bitcoin Core `incrementalfee` this build supports, in sat/kvB.
+///
+/// Escape-ladder ingress requires each rung to raise the absolute fee by at least
+/// one sat/vB of its maximum finalized size. A backend configured above that rate
+/// would accept the ladder while being unable to relay its replacements, so the
+/// production startup check rejects it.
+pub const MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB: u64 = 1_000;
+
 /// Assemble the mempool-acceptance package for `tx` after validating every
 /// unconfirmed ancestor it chains off (ADR-0012, "build over the mempool UTXO
 /// set"). The returned package contains `tx` alone: every discovered ancestor is
@@ -236,6 +264,45 @@ pub fn assemble_package(
     let mut seen = HashSet::new();
     validate_ancestors(backend, tx, authorized, &mut seen, true)?;
     Ok(vec![consensus::serialize(tx)])
+}
+
+/// Assemble a package for `replacement` when `replaced` is an exact, authorized
+/// lower fee-ladder rung already in this node's mempool.
+///
+/// Core's `gettxout(..., include_mempool=true)` hides every input spent by
+/// `replaced`, so [`assemble_package`] cannot distinguish this legitimate RBF case
+/// from an unrelated double spend. The resident lower rung supplies that missing
+/// proof: the two transactions must spend the exact same outpoints, and walking the
+/// resident transaction with `inputs_are_unspent = false` validates the same
+/// confirmed-or-authorized ancestry without asking `gettxout` for outputs the
+/// mempool deliberately hides.
+pub fn assemble_replacement_package(
+    backend: &dyn ChainBackend,
+    replacement: &Transaction,
+    replaced: &Transaction,
+    authorized: &HashSet<Txid>,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let replacement_inputs: Vec<OutPoint> = replacement
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect();
+    let replaced_inputs: Vec<OutPoint> = replaced
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect();
+    if replacement_inputs != replaced_inputs {
+        return Err(format!(
+            "replacement {} does not spend the exact input set of resident rung {}",
+            replacement.compute_txid(),
+            replaced.compute_txid()
+        )
+        .into());
+    }
+    let mut seen = HashSet::new();
+    validate_ancestors(backend, replaced, authorized, &mut seen, false)?;
+    Ok(vec![consensus::serialize(replacement)])
 }
 
 /// Walk `tx`'s unconfirmed authorized ancestors. `seen` dedups diamond ancestry
@@ -396,11 +463,14 @@ impl BitcoindBackend {
         }))
     }
 
-    /// Fail startup unless Core's transaction index is present and caught up AND
-    /// the node has left initial block download. Escape-class union coverage must
-    /// distinguish a paired spend that confirmed from one absent from the mempool;
-    /// `getrawtransaction(txid, true)` cannot make that distinction reliably without
-    /// `-txindex=1`, and neither lookup is reliable against a stale IBD chain view.
+    /// Fail startup unless Core's transaction index is present and caught up, the
+    /// node has left initial block download, AND its incremental relay fee is no
+    /// higher than the escape ladder's ingress bound. Escape-class union coverage
+    /// must distinguish a paired spend that confirmed from one absent from the
+    /// mempool; `getrawtransaction(txid, true)` cannot make that distinction reliably
+    /// without `-txindex=1`, and neither lookup is reliable against a stale IBD chain
+    /// view. A higher `incrementalfee` would make a locally accepted ladder
+    /// unreplaceable when it is needed.
     pub fn verify_required_indexes(&self) -> Result<(), Error> {
         // `getindexinfo`'s `synced` only means the txindex has caught up to THIS
         // node's current tip. During initial block download that tip still lags the
@@ -430,6 +500,20 @@ impl BitcoindBackend {
                  confirmation lookup is reliable"
                     .into(),
             );
+        }
+        let network = self.call("getnetworkinfo", json!([]))?;
+        let incremental_btc_kvb = network["incrementalfee"]
+            .as_f64()
+            .ok_or("getnetworkinfo: incrementalfee is not a number")?;
+        let incremental_sat_kvb = Amount::from_btc(incremental_btc_kvb)
+            .map_err(|e| format!("getnetworkinfo: bad incrementalfee: {e}"))?
+            .to_sat();
+        if incremental_sat_kvb > MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB {
+            return Err(format!(
+                "bitcoind incrementalfee is {incremental_sat_kvb} sat/kvB, above the supported \
+                 {MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB} sat/kvB escape-replacement bound"
+            )
+            .into());
         }
         Ok(())
     }
@@ -686,6 +770,30 @@ impl ChainBackend for BitcoindBackend {
             .call("getblockcount", json!([]))?
             .as_u64()
             .ok_or("getblockcount: not a number")? as u32)
+    }
+
+    fn block_median_feerate(&self, height: u32) -> Result<Option<u64>, Error> {
+        // `feerate_percentiles[2]` is Core's 50th-percentile feerate for the block at
+        // `height` on its ACTIVE chain, in sat/vB. Two nodes agreeing on the chain
+        // therefore agree on this number exactly, which is the property the escape
+        // bump target rests on. Code -8 is "block height out of range" (above the tip
+        // / a chain shortened by a reorg); that means "no reading here", so the
+        // selector simply does not bump. Every other RPC error surfaces.
+        let reply = self.call_reply("getblockstats", json!([height, ["feerate_percentiles"]]))?;
+        if !reply["error"].is_null() {
+            if reply["error"]["code"].as_i64() == Some(-8) {
+                return Ok(None);
+            }
+            return Err(format!("bitcoind getblockstats: {}", reply["error"]).into());
+        }
+        let percentiles = reply["result"]["feerate_percentiles"]
+            .as_array()
+            .ok_or("getblockstats: feerate_percentiles is not an array")?;
+        let median = percentiles
+            .get(2)
+            .and_then(Value::as_u64)
+            .ok_or("getblockstats: no integer 50th-percentile feerate")?;
+        Ok(Some(median))
     }
 
     fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, Error> {
@@ -1223,11 +1331,20 @@ pub(crate) mod mock {
         pub spends: Vec<SpendSeen>,
         pub broadcasts: Mutex<Vec<Vec<u8>>>,
         pub tip: u32,
+        /// Optional failure for the deterministic fee-target tip read.
+        pub tip_error: Option<String>,
         pub spend_block: u32,
         /// Per-height block-hash overrides for the reorg-cursor tests. A height
         /// absent here reads its deterministic epoch-0 [`mock_block_hash`];
         /// [`Self::reorg_at`] inserts epoch-1 hashes to model a reorg.
         pub block_hashes: HashMap<u32, BlockHash>,
+        /// Per-height median feerate (sat/vB) for the escape fee-bump target (bead
+        /// btc-policy-9y5.7). A height absent here reports `None` — "no reading" —
+        /// which is what every test that is not about fee bumping wants: no observed
+        /// pressure, so the sweep stays on its base rung.
+        pub median_feerates: HashMap<u32, u64>,
+        /// Optional failure for the deterministic fee-target block-stat read.
+        pub median_feerate_error: Option<String>,
         /// If set, the first completed `spends_of` switches every hash at and above
         /// this height to a distinct epoch. This models the scan/hash-collection
         /// reorg race without mutating the mock through `&self`.
@@ -1257,6 +1374,10 @@ pub(crate) mod mock {
         pub prevout_fetch_continue: Option<Arc<Barrier>>,
         pub prevout_fetch_paused: AtomicBool,
         pub raw_txs: HashMap<Txid, Vec<u8>>,
+        /// When true, model Core's `gettxout(..., include_mempool=true)` semantics:
+        /// an outpoint spent by any transaction in `raw_txs` is absent from both
+        /// `prevout` and `vault_unspent`.
+        pub hide_mempool_spent_prevouts: bool,
         pub confirmed_txs: HashSet<Txid>,
         pub package_rejection: Option<String>,
         /// Forces `broadcast` to fail AFTER package acceptance (the "quorum +
@@ -1336,6 +1457,9 @@ pub(crate) mod mock {
         }
 
         fn tip_height(&self) -> Result<u32, Error> {
+            if let Some(reason) = &self.tip_error {
+                return Err(reason.clone().into());
+            }
             // A pass reads the tip once, right after reconcile: that read commits the
             // armed tip-read reorg, so the subsequent tip-hash capture and scan see the
             // new (taller) fork while reconcile already matched the pre-reorg anchor.
@@ -1352,6 +1476,13 @@ pub(crate) mod mock {
                 return Ok(None);
             }
             Ok(Some(self.block_hash_of(height)))
+        }
+
+        fn block_median_feerate(&self, height: u32) -> Result<Option<u64>, Error> {
+            if let Some(reason) = &self.median_feerate_error {
+                return Err(reason.clone().into());
+            }
+            Ok(self.median_feerates.get(&height).copied())
         }
 
         fn spends_of(
@@ -1422,6 +1553,17 @@ pub(crate) mod mock {
             if let Some(reason) = &self.prevout_error {
                 return Err(reason.clone().into());
             }
+            if self.hide_mempool_spent_prevouts
+                && self.raw_txs.values().any(|raw| {
+                    consensus::deserialize::<Transaction>(raw).is_ok_and(|tx| {
+                        tx.input
+                            .iter()
+                            .any(|input| input.previous_output == *outpoint)
+                    })
+                })
+            {
+                return Ok(None);
+            }
             Ok(self.prevouts.get(outpoint).cloned())
         }
 
@@ -1437,6 +1579,14 @@ pub(crate) mod mock {
                 .filter(|(outpoint, prevout)| {
                     watched.contains(&prevout.txout.script_pubkey)
                         && (prevout.confirmed || authorized.contains(&outpoint.txid))
+                        && (!self.hide_mempool_spent_prevouts
+                            || !self.raw_txs.values().any(|raw| {
+                                consensus::deserialize::<Transaction>(raw).is_ok_and(|tx| {
+                                    tx.input
+                                        .iter()
+                                        .any(|input| input.previous_output == **outpoint)
+                                })
+                            }))
                 })
                 .map(|(outpoint, prevout)| (*outpoint, prevout.clone()))
                 .collect();
@@ -1476,7 +1626,7 @@ mod tests {
     use super::mock::MockBackend;
     use super::{
         assemble_package, BitcoindBackend, ChainBackend, Prevout, MAX_PACKAGE_ANCESTORS,
-        MAX_VAULT_SCAN_DELTA_BLOCKS,
+        MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB, MAX_VAULT_SCAN_DELTA_BLOCKS,
     };
 
     use bitcoin::absolute::LockTime;
@@ -1612,6 +1762,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn block_median_feerate_reads_cores_50th_percentile_statistic() {
+        let (addr, server) = scripted_rpc(vec![(
+            "getblockstats",
+            serde_json::json!({
+                "feerate_percentiles": [2, 7, 19, 31, 55]
+            }),
+        )]);
+        let backend = BitcoindBackend::new(addr, "ignored".into());
+        assert_eq!(
+            backend.block_median_feerate(42).expect("block stats"),
+            Some(19)
+        );
+        server.join().expect("scripted RPC server");
+    }
+
     // -- package assembly over the authorized set (§5) -----------------------
 
     /// A transaction spending `parents` (each an outpoint) and paying `value`.
@@ -1659,12 +1825,47 @@ mod tests {
                     "txindex": { "synced": true, "best_block_height": 321 }
                 }),
             ),
+            (
+                "getnetworkinfo",
+                serde_json::json!({ "incrementalfee": 0.00001000 }),
+            ),
         ]);
         let backend = BitcoindBackend::new(addr, String::new());
 
         backend
             .verify_required_indexes()
             .expect("a current, synced txindex satisfies the production backend contract");
+        server.join().expect("scripted RPC completed");
+    }
+
+    #[test]
+    fn required_index_check_rejects_an_unsupported_incremental_relay_fee() {
+        let (addr, server) = scripted_rpc(vec![
+            (
+                "getblockchaininfo",
+                serde_json::json!({ "initialblockdownload": false }),
+            ),
+            (
+                "getindexinfo",
+                serde_json::json!({
+                    "txindex": { "synced": true, "best_block_height": 321 }
+                }),
+            ),
+            (
+                "getnetworkinfo",
+                serde_json::json!({ "incrementalfee": 0.00002000 }),
+            ),
+        ]);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let error = backend
+            .verify_required_indexes()
+            .expect_err("a relay fee above the ladder's bound must fail startup")
+            .to_string();
+        assert!(
+            error.contains("incrementalfee")
+                && error.contains(&MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB.to_string()),
+            "the startup failure must state the unsupported relay policy: {error}"
+        );
         server.join().expect("scripted RPC completed");
     }
 
