@@ -40,19 +40,39 @@ fn config() -> ProptestConfig {
 fn tagged_request_strategy() -> impl Strategy<Value = TaggedRequest> {
     let text = ".{0,64}";
     prop_oneof![
-        (text, text, text, text, any::<u64>(), any::<u32>(), text,).prop_map(
-            |(psbt, escape_psbt, pin, nonce, expiry, policy_version, coord_sig)| {
-                TaggedRequest::Spend(SignRequest {
+        (
+            text,
+            text,
+            prop::collection::vec(text, 0..3),
+            text,
+            text,
+            any::<u64>(),
+            any::<u32>(),
+            text,
+        )
+            .prop_map(
+                |(
                     psbt,
                     escape_psbt,
-                    pin: pin.as_str().into(),
+                    escape_bumps,
+                    pin,
                     nonce,
                     expiry,
                     policy_version,
                     coord_sig,
-                })
-            }
-        ),
+                )| {
+                    TaggedRequest::Spend(SignRequest {
+                        psbt,
+                        escape_psbt,
+                        escape_bumps,
+                        pin: pin.as_str().into(),
+                        nonce,
+                        expiry,
+                        policy_version,
+                        coord_sig,
+                    })
+                }
+            ),
         (text, text, any::<u64>(), any::<u32>(), text).prop_map(
             |(refresh_psbt, nonce, expiry, policy_version, coord_sig)| TaggedRequest::Refresh(
                 RefreshRequest {
@@ -269,6 +289,10 @@ proptest! {
         let mut request = SignRequest {
             psbt: "cHNidP8B".into(),
             escape_psbt: "cHNidP8C".into(),
+            // A non-empty fee-bump ladder: the redaction claim has to hold for the
+            // laddered shape too, and the ladder is public PSBT text that must render
+            // in full so an operator can still identify the request from a log line.
+            escape_bumps: vec!["cHNidP8D".into()],
             pin: plaintext.as_str().into(),
             nonce: "n".into(),
             expiry: 1,
@@ -279,13 +303,15 @@ proptest! {
         let rendered_view = format!("{:?}", request.coord_request());
         prop_assert_eq!(
             rendered,
-            "SignRequest { psbt: \"cHNidP8B\", escape_psbt: \"cHNidP8C\", pin: \
-             Pin(<redacted>), nonce: \"n\", expiry: 1, policy_version: 1, coord_sig: \"00\" }"
+            "SignRequest { psbt: \"cHNidP8B\", escape_psbt: \"cHNidP8C\", escape_bumps: \
+             [\"cHNidP8D\"], pin: Pin(<redacted>), nonce: \"n\", expiry: 1, policy_version: 1, \
+             coord_sig: \"00\" }"
         );
         prop_assert_eq!(
             rendered_view,
             "CoordRequest::Spend { spend_psbt: \"cHNidP8B\", escape_psbt: \"cHNidP8C\", \
-             pin: \"<redacted>\", nonce: \"n\", expiry: 1, policy_version: 1 }"
+             escape_bumps: [\"cHNidP8D\"], pin: \"<redacted>\", nonce: \"n\", expiry: 1, \
+             policy_version: 1 }"
         );
         // The preimage the coordinator signs DOES contain the plaintext — that is
         // what binds the pin to the request — which is exactly why it comes back
@@ -310,6 +336,7 @@ proptest! {
         let json = serde_json::to_string(&SignRequest {
             psbt: String::new(),
             escape_psbt: String::new(),
+            escape_bumps: Vec::new(),
             pin: plaintext.as_str().into(),
             nonce: String::new(),
             expiry: 0,

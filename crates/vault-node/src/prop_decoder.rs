@@ -635,6 +635,7 @@ fn a_correctly_coordinator_signed_request_of_garbage_is_refused_not_panicked() {
             let mut request = SignRequest {
                 psbt: if reuse_valid_spend { valid.psbt.clone() } else { spend },
                 escape_psbt: escape,
+                escape_bumps: Vec::new(),
                 // Keep the enrolled PIN fixed: PIN-shape and lockout behavior have
                 // their own properties, while every case here must reach a PSBT
                 // decoder rather than eventually short-circuit on attempt lockout.

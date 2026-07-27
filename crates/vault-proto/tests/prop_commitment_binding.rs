@@ -221,6 +221,11 @@ enum OwnedRequest {
     Spend {
         spend_psbt: String,
         escape_psbt: String,
+        /// The escape fee-bump ladder (bead btc-policy-9y5.7). Generated because the
+        /// only NEW length-prefix ambiguity the ladder could introduce — `[a, b]`
+        /// reading back as `[ab]`, or a dropped trailing rung — is exactly what the
+        /// digest-distinctness property below is here to catch.
+        escape_bumps: Vec<String>,
         pin: String,
         nonce: String,
         expiry: u64,
@@ -240,6 +245,7 @@ impl OwnedRequest {
             OwnedRequest::Spend {
                 spend_psbt,
                 escape_psbt,
+                escape_bumps,
                 pin,
                 nonce,
                 expiry,
@@ -247,6 +253,7 @@ impl OwnedRequest {
             } => CoordRequest::Spend {
                 spend_psbt,
                 escape_psbt,
+                escape_bumps,
                 pin,
                 nonce,
                 expiry: *expiry,
@@ -284,16 +291,18 @@ fn owned_request_strategy() -> impl Strategy<Value = OwnedRequest> {
         (
             field_strategy(),
             field_strategy(),
+            prop::collection::vec(field_strategy(), 0..3),
             field_strategy(),
             field_strategy(),
             0u64..4,
             0u32..4,
         )
             .prop_map(
-                |(spend_psbt, escape_psbt, pin, nonce, expiry, policy_version)| {
+                |(spend_psbt, escape_psbt, escape_bumps, pin, nonce, expiry, policy_version)| {
                     OwnedRequest::Spend {
                         spend_psbt,
                         escape_psbt,
+                        escape_bumps,
                         pin,
                         nonce,
                         expiry,
@@ -458,6 +467,7 @@ proptest! {
     fn the_wire_dtos_authenticate_the_fields_they_carry(
         psbt in field_strategy(),
         escape in field_strategy(),
+        escape_bumps in prop::collection::vec(field_strategy(), 0..3),
         pin in field_strategy(),
         nonce in field_strategy(),
         expiry in any::<u64>(),
@@ -467,6 +477,7 @@ proptest! {
         let request = SignRequest {
             psbt: psbt.clone(),
             escape_psbt: escape.clone(),
+            escape_bumps: escape_bumps.clone(),
             pin: pin.as_str().into(),
             nonce: nonce.clone(),
             expiry,
@@ -476,6 +487,7 @@ proptest! {
         let expected = CoordRequest::Spend {
             spend_psbt: &psbt,
             escape_psbt: &escape,
+            escape_bumps: &escape_bumps,
             pin: &pin,
             nonce: &nonce,
             expiry,

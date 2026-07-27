@@ -211,6 +211,35 @@ impl Commitment {
 /// (see [`CoordRequest::auth_digest`]).
 pub const COORD_REQUEST_TAG: &str = "btc-policy/coord-request/v0";
 
+/// The `nSequence` every rung of an escape **fee-bump ladder** carries — the base
+/// escape included (ADR-0013 §2, bead btc-policy-9y5.7).
+///
+/// `0xfffffffd` is below `0xfffffffe`, so the transaction opts in to BIP125
+/// replacement, which is what a bump IS: a mempool replacement of a lower rung. Bit
+/// 31 stays SET, so BIP68 relative timelocks remain disabled exactly as under
+/// `0xffffffff` — no relative lock can delay the sweep. Finality then no longer
+/// comes free from `nSequence`, which is why a laddered escape must also carry
+/// `nLockTime == 0`.
+///
+/// It lives HERE because the coordinator composes ladders and the node refuses the
+/// ones that do not match: two copies of this number agreeing is a claim only a
+/// shared definition can actually make. The whole crate exists so "drift is a
+/// compile error".
+pub const ESCAPE_RBF_SEQUENCE: u32 = 0xffff_fffd;
+
+/// The maximum number of fee-bump rungs one request may authorize (ADR-0013 §2:
+/// `0..=3` bumps beyond the base escape).
+///
+/// Small on purpose: the ladder's top rung is already at the node's fire-time
+/// coverage cap, so extra rungs only refine *how much* of that cap gets paid, while
+/// each one costs a stored PSBT, an ingress signing operation, and a partial set per
+/// peer. It is also what makes "bounded number of bumps" structural — the node's
+/// rung latch is monotone, so a sweep can be bumped at most this many times, ever.
+///
+/// Normative for both sides: the coordinator must not compose more rungs than the
+/// node will accept, or the whole spend is refused at ingress.
+pub const MAX_ESCAPE_BUMPS: usize = 3;
+
 /// BIP340-style tagged SHA-256, `SHA256(SHA256(tag) ‖ SHA256(tag) ‖ msg)` — the
 /// exact construction the node-to-node channel uses (docs/adr/0013 §4), so an
 /// independent derivation on the coordinator and the node agree byte-for-byte.
@@ -258,10 +287,16 @@ pub fn push_var(out: &mut Vec<u8>, b: &[u8]) {
 /// and a Refresh with otherwise-identical fields can never share a digest.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CoordRequest<'a> {
-    /// `SpendRequest{spend, escape, pin, nonce, expiry, policy_version}` (§2).
+    /// `SpendRequest{spend, escape, escape_bumps, pin, nonce, expiry, policy_version}` (§2).
     Spend {
         spend_psbt: &'a str,
         escape_psbt: &'a str,
+        /// The escape's pre-signed fee-bump ladder, in the request's order (bead
+        /// btc-policy-9y5.7). Bound here for the same reason `escape_psbt` is: a rung
+        /// is user-signed spending authority, so a coordinator signature that did not
+        /// cover the ladder would let a relay append or drop rungs on the way to a
+        /// peer and split the federation's view of one carrier.
+        escape_bumps: &'a [String],
         pin: &'a str,
         nonce: &'a str,
         expiry: u64,
@@ -284,6 +319,7 @@ impl fmt::Debug for CoordRequest<'_> {
             CoordRequest::Spend {
                 spend_psbt,
                 escape_psbt,
+                escape_bumps,
                 nonce,
                 expiry,
                 policy_version,
@@ -292,6 +328,7 @@ impl fmt::Debug for CoordRequest<'_> {
                 .debug_struct("CoordRequest::Spend")
                 .field("spend_psbt", spend_psbt)
                 .field("escape_psbt", escape_psbt)
+                .field("escape_bumps", escape_bumps)
                 .field("pin", &"<redacted>")
                 .field("nonce", nonce)
                 .field("expiry", expiry)
@@ -360,12 +397,18 @@ impl<'a> CoordRequest<'a> {
             CoordRequest::Spend {
                 spend_psbt,
                 escape_psbt,
+                escape_bumps,
                 pin,
                 nonce,
                 ..
-            } => 29usize
+            } => 33usize
                 .saturating_add(spend_psbt.len())
                 .saturating_add(escape_psbt.len())
+                .saturating_add(
+                    escape_bumps
+                        .iter()
+                        .fold(0usize, |total, bump| total.saturating_add(bump.len() + 4)),
+                )
                 .saturating_add(pin.len())
                 .saturating_add(nonce.len()),
             CoordRequest::Refresh {
@@ -382,6 +425,7 @@ impl<'a> CoordRequest<'a> {
             CoordRequest::Spend {
                 spend_psbt,
                 escape_psbt,
+                escape_bumps,
                 pin,
                 nonce,
                 expiry,
@@ -390,6 +434,13 @@ impl<'a> CoordRequest<'a> {
                 out.push(Self::SPEND_TAG);
                 push_var(&mut out, spend_psbt.as_bytes());
                 push_var(&mut out, escape_psbt.as_bytes());
+                // The ladder is length-prefixed and then each rung is itself
+                // length-prefixed, so `[a, b]` and `[ab]` cannot collide and neither
+                // can a dropped trailing rung.
+                out.extend_from_slice(&(escape_bumps.len() as u32).to_le_bytes());
+                for bump in escape_bumps {
+                    push_var(&mut out, bump.as_bytes());
+                }
                 push_var(&mut out, pin.as_bytes());
                 push_var(&mut out, nonce.as_bytes());
                 out.extend_from_slice(&expiry.to_le_bytes());
@@ -462,6 +513,30 @@ pub struct SignRequest {
     /// Wire name `escape` (ADR-0013 §2; see [`SignRequest::psbt`]).
     #[serde(rename = "escape")]
     pub escape_psbt: String,
+    /// The escape's **pre-signed fee-bump ladder** (bead btc-policy-9y5.7): zero or
+    /// more additional user-signed escape variants over the SAME inputs and the SAME
+    /// output scripts, ascending by fee, that the Firing job may broadcast instead of
+    /// `escape_psbt` when the fee environment at `T` has moved above the escape's own
+    /// feerate.
+    ///
+    /// It has to arrive here, with the escape, because the escape is user-signed
+    /// SIGHASH_ALL over its exact bytes: the federation holds no key that can raise a
+    /// fee on its own, so a bump is only ever possible as material the user already
+    /// authorized. Each rung is validated and signed at ingress exactly as
+    /// `escape_psbt` is (pin-independent, both PINs identical); *which* rung fires is
+    /// a fire-time decision (see the node's escape rung selector), never an ingress or
+    /// arm gate.
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if`: a request without a ladder is
+    /// byte-identical to a pre-9y5.7 body, so nothing that never bumps pays for this
+    /// field. An empty ladder simply means "no bump is authorized" — the escape is
+    /// still mandatory and unchanged.
+    #[serde(
+        rename = "escape_bumps",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub escape_bumps: Vec<String>,
     /// PIN in plaintext (Argon2id-compared on the node; ADR-0008 accepts plaintext
     /// transport for MVP). A [`Pin`], not a `String`: zeroized on drop and redacted
     /// in `Debug`, so no owned copy of the pin outlives its compare or reaches a log.
@@ -502,6 +577,7 @@ impl SignRequest {
         CoordRequest::Spend {
             spend_psbt: &self.psbt,
             escape_psbt: &self.escape_psbt,
+            escape_bumps: &self.escape_bumps,
             pin: self.pin.as_str(),
             nonce: &self.nonce,
             expiry: self.expiry,
@@ -718,6 +794,7 @@ mod tests {
         let req = SignRequest {
             psbt: "cHNidP8B".into(),
             escape_psbt: "cHNidP8C".into(),
+            escape_bumps: Vec::new(),
             pin: "482913".into(),
             nonce: "ab12".into(),
             expiry: 1_752_500_000,
@@ -738,6 +815,7 @@ mod tests {
         let spend = TaggedRequest::Spend(SignRequest {
             psbt: "spend".into(),
             escape_psbt: "escape".into(),
+            escape_bumps: Vec::new(),
             pin: "482913".into(),
             nonce: "spend-nonce".into(),
             expiry: 1_752_500_000,
@@ -851,6 +929,7 @@ mod tests {
         let mut req = SignRequest {
             psbt: "cHNidP8B".into(),
             escape_psbt: "cHNidP8C".into(),
+            escape_bumps: Vec::new(),
             pin: "super-secret-pin".into(),
             nonce: "ab12".into(),
             expiry: 1,
@@ -887,6 +966,7 @@ mod tests {
         let request = SignRequest {
             psbt: "spend".into(),
             escape_psbt: "escape".into(),
+            escape_bumps: Vec::new(),
             pin: "canonical-secret".into(),
             nonce: "nonce".into(),
             expiry: 1,
@@ -994,6 +1074,7 @@ mod tests {
         CoordRequest::Spend {
             spend_psbt: "cHNidP8BSPEND",
             escape_psbt: "cHNidP8BESCAPE",
+            escape_bumps: &[],
             pin: "246802",
             nonce,
             expiry: 1_752_500_000,
@@ -1068,6 +1149,7 @@ mod tests {
             CoordRequest::Spend {
                 spend_psbt: "cHNidP8BTAMPER",
                 escape_psbt: "cHNidP8BESCAPE",
+                escape_bumps: &[],
                 pin: "246802",
                 nonce: "nonce-1",
                 expiry: 1_752_500_000,
@@ -1076,6 +1158,7 @@ mod tests {
             CoordRequest::Spend {
                 spend_psbt: "cHNidP8BSPEND",
                 escape_psbt: "cHNidP8BTAMPER",
+                escape_bumps: &[],
                 pin: "246802",
                 nonce: "nonce-1",
                 expiry: 1_752_500_000,
@@ -1084,6 +1167,7 @@ mod tests {
             CoordRequest::Spend {
                 spend_psbt: "cHNidP8BSPEND",
                 escape_psbt: "cHNidP8BESCAPE",
+                escape_bumps: &[],
                 pin: "999999",
                 nonce: "nonce-1",
                 expiry: 1_752_500_000,
@@ -1092,6 +1176,7 @@ mod tests {
             CoordRequest::Spend {
                 spend_psbt: "cHNidP8BSPEND",
                 escape_psbt: "cHNidP8BESCAPE",
+                escape_bumps: &[],
                 pin: "246802",
                 nonce: "nonce-2",
                 expiry: 1_752_500_000,
@@ -1100,6 +1185,7 @@ mod tests {
             CoordRequest::Spend {
                 spend_psbt: "cHNidP8BSPEND",
                 escape_psbt: "cHNidP8BESCAPE",
+                escape_bumps: &[],
                 pin: "246802",
                 nonce: "nonce-1",
                 expiry: 1_752_500_001,
@@ -1108,6 +1194,7 @@ mod tests {
             CoordRequest::Spend {
                 spend_psbt: "cHNidP8BSPEND",
                 escape_psbt: "cHNidP8BESCAPE",
+                escape_bumps: &[],
                 pin: "246802",
                 nonce: "nonce-1",
                 expiry: 1_752_500_000,
@@ -1129,6 +1216,7 @@ mod tests {
         let spend = CoordRequest::Spend {
             spend_psbt: "P",
             escape_psbt: "",
+            escape_bumps: &[],
             pin: "",
             nonce: "n",
             expiry: 7,

@@ -1146,6 +1146,21 @@ impl Vault {
 
     /// The same, but over PSBTs the caller already signed (or deliberately
     /// mis-signed — the corrupt-escape attack vector).
+    ///
+    /// **No escape fee-bump ladder here, deliberately** (bead btc-policy-9y5.7). The
+    /// coordinator that ships to users composes one — see `fed::escape_fee_ladder` and
+    /// its use in `demo` — but this harness must not. Two reasons, and both are about
+    /// keeping the 16 adversarial scenarios meaningful:
+    ///
+    ///  - a ladder rewrites the escape's `nSequence` to signal BIP125 replacement,
+    ///    which changes its txid; every scenario that waits for the exact escape it
+    ///    composed would then be waiting for a transaction that was never sent;
+    ///  - *which* rung the nodes fire is a function of the regtest chain's own block
+    ///    fee statistics, so a scenario's on-chain expectation would turn on how many
+    ///    blocks its funding happened to mine. That is precisely the "flaky live fee
+    ///    timing threaded through the tight pre-T window" this bead was told not to
+    ///    build; the ladder's determinism, bounds, and BIP125 validity are proved by
+    ///    focused vault-node tests instead (`channel::duress::fee_bump`).
     fn authorize_signed(
         &self,
         spend: &Psbt,
@@ -1160,6 +1175,7 @@ impl Vault {
                 pin: pin.to_string().into(),
                 psbt: spend.to_string(),
                 escape_psbt: escape.to_string(),
+                escape_bumps: Vec::new(),
                 nonce: String::new(),
                 expiry,
                 policy_version: POLICY_VERSION,

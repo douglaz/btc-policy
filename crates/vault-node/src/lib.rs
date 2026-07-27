@@ -42,7 +42,7 @@ pub use pin::{
     argon2id_duress_phc, argon2id_duress_phc_at, argon2id_normal_phc, argon2id_normal_phc_at,
 };
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -693,16 +693,29 @@ fn default_delivery_horizon_secs() -> u64 {
     60
 }
 
+/// ADR-0013 §6's default escape coverage threshold (95%). A `pub const` because it
+/// is a federation-uniform selector input sealed into the manifest preimage (see
+/// [`channel::base_manifest_bytes`]): the ceremony that seals it and the
+/// configs it is sealed alongside must share ONE source or the manifest a node
+/// computes would not match the sealed one.
+pub const DEFAULT_ESCAPE_COVERAGE_PCT: u8 = 95;
+
+/// A minimal default panic feerate floor (sats/vB). A real per-vault deployment
+/// sets this to a value that reliably confirms under stress; the floor only has to
+/// be a static, cross-node-deterministic sweep-admissibility check. `pub const` for
+/// the same manifest-preimage reason as [`DEFAULT_ESCAPE_COVERAGE_PCT`].
+pub const DEFAULT_ESCAPE_FEERATE_FLOOR: u64 = 1;
+
 /// ADR-0013 §6's default escape coverage threshold (95%).
 fn default_escape_coverage_pct() -> u8 {
-    95
+    DEFAULT_ESCAPE_COVERAGE_PCT
 }
 
 /// A minimal default panic feerate floor (sats/vB). A real per-vault deployment
 /// sets this to a value that reliably confirms under stress; the floor only has to
 /// be a static, cross-node-deterministic sweep-admissibility check.
 fn default_escape_feerate_floor() -> u64 {
-    1
+    DEFAULT_ESCAPE_FEERATE_FLOOR
 }
 
 /// The per-node pin-attempt budget config (ADR-0013 §7). Every field defaults so a
@@ -1687,6 +1700,11 @@ impl Node {
                     &hot_allowlist,
                     &escape_canonical,
                     config.max_derivation_index,
+                    // The two federation-uniform fire-time selector inputs (bead
+                    // btc-policy-9y5.7): sealed into the manifest so a node whose
+                    // floor/coverage differs from the federation's fails startup.
+                    config.escape_feerate_floor,
+                    config.escape_coverage_pct,
                     Arc::clone(&alerts),
                 )
             })
@@ -2484,44 +2502,44 @@ async fn fire_tick_with_clock(
     let preflight_node = Arc::clone(&node);
     let preflight_backend = Arc::clone(&backend);
     let preflight_due = due.clone();
-    let release_eligible = match tokio::task::spawn_blocking(move || {
+    let sweep_contexts = match tokio::task::spawn_blocking(move || {
         let channel = preflight_node
             .channel
             .as_ref()
             .expect("fire preflight only runs in channel mode");
         preflight_due
             .into_iter()
-            .filter(|commitment_id| {
-                if !channel.is_armed_escape(commitment_id) {
-                    return false;
+            .filter_map(|commitment_id| {
+                if !channel.is_armed_escape(&commitment_id) {
+                    return None;
                 }
                 match escape_sweep_pre_release_admissible(
                     &preflight_node,
                     preflight_backend.as_ref(),
                     channel,
-                    commitment_id,
+                    &commitment_id,
                 ) {
-                    Ok(()) => true,
+                    Ok(context) => Some((commitment_id, context)),
                     Err(reason) => {
                         eprintln!(
                             "fire: escape sweep {commitment_id} is INADMISSIBLE before share \
                              release (funds frozen → recovery; Lockdown already entered at T): \
                              {reason}"
                         );
-                        false
+                        None
                     }
                 }
             })
-            .collect::<HashSet<_>>()
+            .collect::<HashMap<_, _>>()
     })
     .await
     {
-        Ok(eligible) => eligible,
+        Ok(contexts) => contexts,
         Err(join_error) => {
             // Fail closed for armed escapes. Normal candidates keep the unchanged
             // V0-8b release path below; only the duress preflight task failed.
             eprintln!("fire: escape pre-release admissibility task panicked: {join_error}");
-            HashSet::new()
+            HashMap::new()
         }
     };
     // TEST-ONLY poison-injection rendezvous, at the pending-poll -> guard seam where
@@ -2552,7 +2570,8 @@ async fn fire_tick_with_clock(
         let release_now = clock();
         for commitment_id in &due {
             require_sign_state_guard_before_release(&node, &release_guard);
-            if channel.is_armed_escape(commitment_id) && !release_eligible.contains(commitment_id) {
+            if channel.is_armed_escape(commitment_id) && !sweep_contexts.contains_key(commitment_id)
+            {
                 continue;
             }
             // THE GATE. `release_partials` returns `None` unless this candidate's
@@ -2582,9 +2601,13 @@ async fn fire_tick_with_clock(
     let combine_node = Arc::clone(&node);
     let combine_clock = Arc::clone(&clock);
     match tokio::task::spawn_blocking(move || {
-        combine_and_broadcast_with_clock(&combine_node, backend.as_ref(), &due, move || {
-            combine_clock()
-        })
+        combine_and_broadcast_with_contexts(
+            &combine_node,
+            backend.as_ref(),
+            &due,
+            &sweep_contexts,
+            move || combine_clock(),
+        )
     })
     .await
     {
@@ -2672,10 +2695,26 @@ pub(crate) fn combine_and_broadcast(
     combine_and_broadcast_with_clock(node, backend, due, move || now)
 }
 
+#[cfg(test)]
 fn combine_and_broadcast_with_clock(
     node: &Node,
     backend: &dyn ChainBackend,
     due: &[String],
+    clock: impl Fn() -> u64,
+) -> usize {
+    combine_and_broadcast_with_contexts(node, backend, due, &HashMap::new(), clock)
+}
+
+/// The combine half of one fire tick. Production supplies the armed escape's
+/// already-computed pre-release context so the same tick never repeats its mempool
+/// ladder scan or chain-derived coverage environment. Direct unit tests that call
+/// [`combine_and_broadcast`] bypass the release half, so they compute that one
+/// context lazily here.
+fn combine_and_broadcast_with_contexts(
+    node: &Node,
+    backend: &dyn ChainBackend,
+    due: &[String],
+    sweep_contexts: &HashMap<String, EscapeSweepTickContext>,
     clock: impl Fn() -> u64,
 ) -> usize {
     let Some(channel) = node.channel.as_ref() else {
@@ -2692,45 +2731,61 @@ fn combine_and_broadcast_with_clock(
             continue;
         };
         // The ARMED ESCAPE follows ADR-0012's Firing row — "combine + re-broadcast
-        // until CONFIRMED (fixed panic-fee)". A non-RBF panic-fee escape can be evicted
-        // from the mempool, so — unlike a normal spend — mere mempool presence is NOT
-        // terminal for it: only a CONFIRMATION clears it, and while it is confirmed-
-        // absent it stays resident (unlatched) so an evicted copy is re-broadcast on the
-        // next tick. The re-broadcast loop is requirement-7-bounded by the escape's
+        // until CONFIRMED", with 9y5.7 replacing "fixed panic-fee" by the bounded
+        // deterministic fee ladder. A panic-fee escape can be evicted from the mempool,
+        // so — unlike a normal spend — mere mempool presence is NOT terminal for it:
+        // only a CONFIRMATION clears it, and while it is confirmed-absent it stays
+        // resident (unlatched) so an evicted copy is re-broadcast on the next tick. The
+        // re-broadcast loop is requirement-7-bounded by the escape's
         // `[T, T + combine_slack_secs]` window (`prune` clears the escape once the
         // window closes), so the Firing job stays finite and never spins for the node's
         // lifetime.
         let armed_escape = channel.is_armed_escape(commitment_id);
+        let sweep_context = sweep_contexts.get(commitment_id);
         if armed_escape {
-            match transaction_is_settled(backend, &candidate_txid) {
-                // On the network. A confirmation clears the paired hot spend's pending
+            // A laddered escape can settle as ANY rung — the rungs conflict by
+            // construction, so at most one of them can ever be on the network, but
+            // which one depends on how far the federation bumped. Reading only rung 0
+            // would leave a confirmed BUMP looking permanently unsettled.
+            let rung_txids = channel
+                .candidate_rung_txids(commitment_id)
+                .unwrap_or_else(|| vec![candidate_txid]);
+            match armed_escape_network_state(
+                backend,
+                &rung_txids,
+                channel.escape_rung(commitment_id).unwrap_or(0),
+                sweep_context.and_then(|context| context.resident_rung.as_ref()),
+            ) {
+                // Confirmed. The confirmation clears the paired hot spend's pending
                 // Hold, but the already-authorized escape candidate itself remains
                 // resident until the finite fire window closes. If a reorg removes that
                 // confirmation inside the window, the next tick therefore reaches the
-                // `Ok(false)` arm and re-broadcasts the exact same transaction. A copy
-                // merely resting in the mempool needs no action — re-running
-                // admissibility now would read the escape's own inputs as
-                // spent-by-mempool.
-                Ok(true) => {
-                    if matches!(backend.transaction_confirmed(&candidate_txid), Ok(true)) {
-                        let paired = channel.pairing(commitment_id).map(|(_, sibling)| sibling);
-                        let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
-                        let mut first_confirmation = state.pending.remove(commitment_id);
-                        if let Some(paired) = paired {
-                            first_confirmation |= state.pending.remove(&paired);
-                        }
-                        drop(state);
-                        if first_confirmation {
-                            println!(
-                                "fire: armed escape {commitment_id} confirmed on-chain \
-                                 ({candidate_txid}); retaining it through the fire window for \
-                                 in-window reorg recovery"
-                            );
-                        }
+                // `Absent` arm and re-broadcasts at the SAME latched rung.
+                Ok(ArmedEscapeState::Confirmed(txid)) => {
+                    let paired = channel.pairing(commitment_id).map(|(_, sibling)| sibling);
+                    let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
+                    let mut first_confirmation = state.pending.remove(commitment_id);
+                    if let Some(paired) = paired {
+                        first_confirmation |= state.pending.remove(&paired);
+                    }
+                    drop(state);
+                    if first_confirmation {
+                        println!(
+                            "fire: armed escape {commitment_id} confirmed on-chain ({txid}); \
+                             retaining it through the fire window for in-window reorg recovery"
+                        );
                     }
                     continue;
                 }
-                Ok(false) => {}
+                // A copy at or above the latched rung is already resting in the
+                // mempool: nothing to do, and re-running admissibility now would read
+                // the escape's own inputs as spent-by-mempool.
+                Ok(ArmedEscapeState::InMempoolAtOrAboveLatch) => continue,
+                // Either nothing is on the network, or only a rung BELOW the latch is —
+                // which is precisely the fee-bump case. Fall through to combine and
+                // broadcast the latched rung; being RBF-signalling, it replaces the
+                // lower copy instead of being rejected as a conflict.
+                Ok(ArmedEscapeState::Absent) => {}
                 Err(e) => {
                     eprintln!(
                         "fire: cannot check settlement for armed escape {commitment_id}: {e}"
@@ -2756,6 +2811,32 @@ fn combine_and_broadcast_with_clock(
             }
         }
 
+        // Production normally supplies the pre-release context. A direct unit test can
+        // enter at combine, and a production preflight can fail because a just-confirmed
+        // escape's prevouts are now spent. Settlement MUST be checked first: confirmation
+        // is terminal for this pass and retains the candidate for reorg recovery without
+        // requiring those spent prevouts to remain admissible. Only a still-unsettled
+        // escape needs the fallback context before it can combine or broadcast.
+        let owned_sweep_context;
+        let sweep_context = if let Some(context) = sweep_context {
+            Some(context)
+        } else if armed_escape {
+            owned_sweep_context =
+                match escape_sweep_pre_release_admissible(node, backend, channel, commitment_id) {
+                    Ok(context) => context,
+                    Err(reason) => {
+                        eprintln!(
+                            "fire: escape sweep {commitment_id} is INADMISSIBLE before combine \
+                             (funds frozen → recovery; Lockdown already entered at T): {reason}"
+                        );
+                        continue;
+                    }
+                };
+            Some(&owned_sweep_context)
+        } else {
+            None
+        };
+
         // `None` is the ordinary "still collecting" case, not an error. For the armed
         // escape this is where the `t distinct escape signers per input` requirement is
         // enforced — quorum on the ESCAPE's own commitment_id IS cross-node agreement on
@@ -2771,9 +2852,19 @@ fn combine_and_broadcast_with_clock(
         // failure means the sweep does not fire — Lockdown at T already happened
         // unconditionally (above), so funds stay frozen → recovery, never theft.
         if armed_escape {
-            if let Err(reason) =
-                escape_sweep_admissible(node, backend, channel, commitment_id, &finalized.tx)
-            {
+            let Some(context) = sweep_context else {
+                eprintln!(
+                    "fire: escape sweep {commitment_id} has no preflight context, not firing \
+                     (funds frozen → recovery; Lockdown already entered at T)"
+                );
+                continue;
+            };
+            if let Err(reason) = sweep_rung_admissible(
+                node,
+                &context.env,
+                &finalized.tx,
+                finalized.tx.vsize() as u64,
+            ) {
                 eprintln!(
                     "fire: escape sweep {commitment_id} is INADMISSIBLE, not firing (funds frozen \
                      → recovery; Lockdown already entered at T): {reason}"
@@ -2786,15 +2877,25 @@ fn combine_and_broadcast_with_clock(
             backend,
             channel,
             commitment_id,
-            &finalized.tx,
-            finalized.deadline,
+            &finalized,
+            sweep_context.and_then(|context| context.resident_rung.as_ref()),
             &clock,
         ) {
             Ok(outcome) => {
                 match outcome {
                     BroadcastOutcome::Sent(txid) => {
                         broadcast += 1;
-                        println!("fire: broadcast {txid} for candidate {commitment_id}");
+                        // Name the rung. For a laddered escape this is the only place
+                        // an operator can see that the sweep went out at a BUMPED fee
+                        // rather than its base one, and which replacement is now the
+                        // live transaction.
+                        match finalized.rung {
+                            0 => println!("fire: broadcast {txid} for candidate {commitment_id}"),
+                            rung => println!(
+                                "fire: broadcast {txid} for candidate {commitment_id} at \
+                                 fee-bump rung {rung}"
+                            ),
+                        }
                     }
                     // A peer beat this node to it (redundant-broadcast race).
                     BroadcastOutcome::AlreadySettled(txid) => println!(
@@ -2862,10 +2963,12 @@ fn broadcast_package(
     backend: &dyn ChainBackend,
     channel: &channel::ChannelState,
     commitment_id: &str,
-    tx: &bitcoin::Transaction,
-    deadline: u64,
+    finalized: &channel::FinalizedCandidate,
+    resident_escape_rung: Option<&bitcoin::Transaction>,
     clock: &impl Fn() -> u64,
 ) -> Result<BroadcastOutcome, Error> {
+    let tx = &finalized.tx;
+    let deadline = finalized.deadline;
     let txid = tx.compute_txid();
     // A peer may already have broadcast this exact transaction — redundant
     // broadcast is the designed steady state, since each node fires on its own
@@ -2883,7 +2986,11 @@ fn broadcast_package(
         .lock()
         .expect("authorized lock poisoned")
         .clone();
-    let package = chain::assemble_package(backend, tx, &authorized)?;
+    let package = if channel.is_armed_escape(commitment_id) {
+        assemble_escape_package(backend, tx, resident_escape_rung, &authorized)?
+    } else {
+        chain::assemble_package(backend, tx, &authorized)?
+    };
     match backend.test_package_accept(&package)? {
         chain::PackageVerdict::Accepted => {}
         chain::PackageVerdict::Rejected(reason) => {
@@ -2930,6 +3037,103 @@ fn transaction_is_settled(backend: &dyn ChainBackend, txid: &Txid) -> Result<boo
     Ok(backend.mempool_transaction(txid)?.is_some() || backend.transaction_confirmed(txid)?)
 }
 
+/// Where the armed escape stands on this node's chain view, across its whole fee
+/// ladder.
+enum ArmedEscapeState {
+    /// Some rung is confirmed. Only one ever can be — the rungs conflict.
+    Confirmed(Txid),
+    /// No rung is confirmed, but a rung at or above the latch is in the mempool, so
+    /// the sweep is already riding at (or past) the fee this node would pay.
+    InMempoolAtOrAboveLatch,
+    /// Nothing is on the network, or only a rung strictly BELOW the latch is — the
+    /// eviction case and the fee-bump case respectively. Both want a broadcast of the
+    /// latched rung.
+    Absent,
+}
+
+/// Classify the armed escape's ladder against this node's mempool and chain.
+///
+/// The "only a lower rung is in the mempool" case is what makes a bump actually
+/// happen: the pre-9y5.7 rule ("anything of ours on the network ⇒ nothing to do")
+/// would see the stale low-fee copy and never send the replacement.
+fn armed_escape_network_state(
+    backend: &dyn ChainBackend,
+    rung_txids: &[Txid],
+    latched: usize,
+    resident_rung: Option<&bitcoin::Transaction>,
+) -> Result<ArmedEscapeState, Error> {
+    for txid in rung_txids {
+        if backend.transaction_confirmed(txid)? {
+            return Ok(ArmedEscapeState::Confirmed(*txid));
+        }
+    }
+    if let Some(resident) = resident_rung {
+        let resident_txid = resident.compute_txid();
+        if rung_txids
+            .iter()
+            .position(|txid| *txid == resident_txid)
+            .is_some_and(|rung| rung >= latched)
+        {
+            return Ok(ArmedEscapeState::InMempoolAtOrAboveLatch);
+        }
+    }
+    Ok(ArmedEscapeState::Absent)
+}
+
+/// The exact authorized escape-ladder rung, if any, currently resident in this
+/// node's mempool.
+///
+/// A resident rung is more than a settlement hint: Core hides the outpoints it
+/// spends from `gettxout(..., include_mempool=true)`. Recognizing the exact txid and
+/// parsing the backend's returned bytes lets the replacement path distinguish that
+/// authorized conflict from an unrelated spender without trusting arrival order or
+/// any local fee estimate.
+fn mempool_escape_rung(
+    backend: &dyn ChainBackend,
+    channel: &channel::ChannelState,
+    commitment_id: &str,
+) -> Result<Option<bitcoin::Transaction>, Error> {
+    let Some(rungs) = channel.candidate_rung_txs(commitment_id) else {
+        return Ok(None);
+    };
+    for rung in rungs {
+        let expected = rung.compute_txid();
+        let Some(raw) = backend.mempool_transaction(&expected)? else {
+            continue;
+        };
+        let resident: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)
+            .map_err(|e| format!("mempool escape rung {expected} is malformed: {e}"))?;
+        if resident.compute_txid() != expected {
+            return Err(format!(
+                "mempool lookup for escape rung {expected} returned transaction {}",
+                resident.compute_txid()
+            )
+            .into());
+        }
+        return Ok(Some(resident));
+    }
+    Ok(None)
+}
+
+/// Validate the candidate's ancestry either from ordinary unspent prevouts or,
+/// during a bump, from the exact lower ladder rung already spending them in this
+/// node's mempool.
+fn assemble_escape_package(
+    backend: &dyn ChainBackend,
+    tx: &bitcoin::Transaction,
+    resident_rung: Option<&bitcoin::Transaction>,
+    authorized: &HashSet<Txid>,
+) -> Result<Vec<Vec<u8>>, Error> {
+    match resident_rung {
+        // Also covers "the exact candidate is already resident" (a peer broadcast it
+        // first): the two input sets are then trivially equal and the ancestry walk
+        // runs over the resident bytes, so the authorized-ancestry guard keeps
+        // running instead of being waved through as already-validated.
+        Some(resident) => chain::assemble_replacement_package(backend, tx, resident, authorized),
+        None => chain::assemble_package(backend, tx, authorized),
+    }
+}
+
 /// Pre-release portion of fire-time escape admissibility.
 ///
 /// This runs at `T`, never at arm/ingress. It deliberately precedes partial release:
@@ -2949,115 +3153,377 @@ fn escape_sweep_pre_release_admissible(
     backend: &dyn ChainBackend,
     channel: &channel::ChannelState,
     commitment_id: &str,
-) -> Result<(), String> {
-    let candidate = channel
-        .candidate_coverage_context(commitment_id)
+) -> Result<EscapeSweepTickContext, String> {
+    let rungs = channel
+        .candidate_rung_txs(commitment_id)
+        .filter(|rungs| !rungs.is_empty())
         .ok_or_else(|| "armed escape candidate context is unavailable".to_string())?;
-    let input_count = u64::try_from(candidate.tx.input.len())
-        .map_err(|_| "escape input count does not fit u64".to_string())?;
-    // `max_weight_to_satisfy` is the per-input delta from an EMPTY witness, whose
-    // stack-count varint itself weighs 1 WU. The unsigned transaction serializes no
-    // witnesses at all, so restore that 1 WU per input as well as the segwit
-    // marker+flag (2 WU). Round weight up to vbytes, as `Transaction::vsize` does.
-    let maximum_witness_weight = node
-        .max_vault_satisfaction_weight
-        .checked_add(1)
-        .ok_or_else(|| "escape maximum witness weight overflow".to_string())?
-        .checked_mul(input_count)
-        .ok_or_else(|| "escape maximum satisfaction weight overflow".to_string())?;
-    let maximum_weight = candidate
-        .tx
-        .weight()
-        .to_wu()
-        .checked_add(2)
-        .and_then(|weight| weight.checked_add(maximum_witness_weight))
-        .ok_or_else(|| "escape maximum finalized weight overflow".to_string())?;
-    let maximum_vsize = maximum_weight
-        .checked_add(3)
-        .ok_or_else(|| "escape maximum finalized vsize overflow".to_string())?
-        / 4;
-    escape_sweep_policy_admissible(
+    let resident_rung = mempool_escape_rung(backend, channel, commitment_id)
+        .map_err(|e| format!("cannot inspect the escape ladder in the mempool: {e}"))?;
+    let env = sweep_env(
         node,
         backend,
         channel,
         commitment_id,
-        &candidate.tx,
-        maximum_vsize,
+        rungs.len() > 1,
+        resident_rung.as_ref(),
     )?;
-
+    // Per rung, the vsize the transaction can reach once the missing federation
+    // signatures are added. Using the MAXIMUM means a rung that clears the floor (or
+    // the bump target) here still clears it as the exact finalized transaction.
+    let maximum_vsizes = rungs
+        .iter()
+        .map(|tx| maximum_finalized_vsize(node, tx))
+        .collect::<Result<Vec<u64>, String>>()?;
+    let admissible: Vec<Result<(), String>> = rungs
+        .iter()
+        .zip(&maximum_vsizes)
+        .map(|(tx, vsize)| sweep_rung_admissible(node, &env, tx, *vsize))
+        .collect();
+    let ladder = ScoredLadder {
+        rungs: &rungs,
+        maximum_vsizes: &maximum_vsizes,
+        admissible: &admissible,
+        total_in: env.total_in,
+    };
+    let old_latch = channel.escape_rung(commitment_id).unwrap_or(0);
+    let (selected, target, required) =
+        select_escape_rung(node, backend, channel, commitment_id, &ladder)?;
     // Validate every unconfirmed ancestor before releasing the share. This proves
     // each input is confirmed or descends only from vault-authorized mempool parents;
     // an external unconfirmed deposit (toxic/replaceable parent) fails closed here.
     // The returned singleton bytes are intentionally not submitted yet: an unsigned
-    // witness cannot pass Core's script checks.
+    // witness cannot pass Core's script checks. Every rung spends the same inputs, so
+    // one check over the selected rung covers the whole ladder's ancestry.
     let authorized = node
         .authorized
         .lock()
         .expect("authorized lock poisoned")
         .clone();
-    chain::assemble_package(backend, &candidate.tx, &authorized)
-        .map(|_| ())
-        .map_err(|e| format!("escape package ancestry is inadmissible before release: {e}"))
-}
+    assemble_escape_package(
+        backend,
+        &rungs[selected],
+        resident_rung.as_ref(),
+        &authorized,
+    )
+    .map_err(|e| format!("escape package ancestry is inadmissible before release: {e}"))?;
 
-/// Fire-time escape-sweep admissibility (ADR-0012 / ADR-0013 §6) on the exact,
-/// finalized transaction. Evaluated ONLY by the Firing job for the armed escape,
-/// NEVER as an arm gate. Every failure returns `Err` so the sweep does not fire;
-/// Lockdown at `T` has already happened UNCONDITIONALLY, so failure leaves funds
-/// frozen → recovery, never theft.
-///
-/// The `t distinct escape signers per input` requirement is enforced by `try_finalize`
-/// before this (quorum on the escape's OWN commitment_id is cross-node agreement on one
-/// escape); the `every input confirmed OR vault-authorized-unconfirmed parent` +
-/// full-package `testmempoolaccept` requirements by [`broadcast_package`] after it. This
-/// function adds the remaining fire-time checks:
-///  - **final `nLockTime` + non-relative `nSequence`**: every input's `nSequence ==
-///    0xffffffff`, which also makes E non-RBF-signaling so the fixed-panic-fee
-///    rebroadcast loop is sound;
-///  - **feerate ≥ the static panic floor** (sats/vB);
-///  - **coverage ≥ `escape_coverage_pct`**, measured on OUTPUT value paying the escape
-///    descriptor (implicitly capping the escape fee at `(100 − pct)%`) as a fraction of
-///    this node's complete confirmed + vault-authorized-unconfirmed vault balance;
-///  - **class-aware**: for an escape-class *completed* spend the residual escape's
-///    inputs must be DISJOINT from it (so the two cannot conflict and coverage is over
-///    their union); a hot-class frozen spend is simply superseded by the escape.
-///
-/// The backend enumerates the exact vault UTXO denominator at fire-time. Confirmed
-/// outputs always count; unconfirmed outputs count only when their parent txid is in
-/// this node's validated-and-policy-accepted set, so an external toxic deposit never
-/// enters the denominator or the escape package. For an already-completed escape-class
-/// spend, its exact input values and escape-wallet outputs are unioned with the current
-/// residual balance/output after enforcing disjoint inputs.
-fn escape_sweep_admissible(
-    node: &Node,
-    backend: &dyn ChainBackend,
-    channel: &channel::ChannelState,
-    commitment_id: &str,
-    tx: &bitcoin::Transaction,
-) -> Result<(), String> {
-    escape_sweep_policy_admissible(node, backend, channel, commitment_id, tx, tx.vsize() as u64)
-}
-
-fn escape_sweep_policy_admissible(
-    node: &Node,
-    backend: &dyn ChainBackend,
-    channel: &channel::ChannelState,
-    commitment_id: &str,
-    tx: &bitcoin::Transaction,
-    feerate_vsize: u64,
-) -> Result<(), String> {
-    // Final nLockTime + non-relative nSequence on EVERY input (broadcastable-at-T).
-    for (i, input) in tx.input.iter().enumerate() {
-        if input.sequence != bitcoin::Sequence::MAX {
-            return Err(format!(
-                "escape input {i} nSequence {:#010x} is not 0xffffffff — a non-final / \
-                 relative-locking or RBF-signaling escape is not broadcastable-at-T",
-                input.sequence.to_consensus_u32()
-            ));
-        }
+    // Commit the monotone rung only AFTER every fallible pre-release check above.
+    // A transient ancestry/backend failure therefore releases no share and leaves the
+    // old latch intact; the next pass can retry at the same fee rather than burning a
+    // higher rung that was never actually authorized for release.
+    //
+    // The same commit carries the LOWEST rung this pass found admissible. Release is a
+    // prefix, and a rung refused here — in practice a base rung under the panic
+    // feerate floor — must not travel to peers who could combine it into the very
+    // under-fee escape this node declined to fire.
+    let lowest_admissible = admissible
+        .iter()
+        .position(Result::is_ok)
+        .unwrap_or(selected)
+        .min(selected);
+    let latched = channel
+        .latch_escape_rung(commitment_id, selected, lowest_admissible)
+        .ok_or_else(|| "armed escape disappeared while latching its fee rung".to_string())?;
+    if latched > old_latch {
+        println!(
+            "fire: armed escape {commitment_id} is at fee-bump rung {latched} of {} (required \
+             {required} sat/vB: target {target}, floor {})",
+            rungs.len().saturating_sub(1),
+            node.escape_feerate_floor
+        );
     }
-    // The swept value: Σ prevout value over the escape's inputs. A prevout this node
-    // cannot see (spent or unknown) means the escape is not spendable now.
+    Ok(EscapeSweepTickContext { resident_rung, env })
+}
+
+/// The vsize `tx` can reach once every missing federation signature is added.
+///
+/// `max_weight_to_satisfy` is the per-input delta from an EMPTY witness, whose
+/// stack-count varint itself weighs 1 WU. The unsigned transaction serializes no
+/// witnesses at all, so restore that 1 WU per input as well as the segwit
+/// marker+flag (2 WU). Round weight up to vbytes, as `Transaction::vsize` does.
+fn maximum_finalized_vsize(node: &Node, tx: &bitcoin::Transaction) -> Result<u64, String> {
+    maximum_finalized_vsize_for(node.max_vault_satisfaction_weight, tx)
+}
+
+/// The maximum finalized (witness-complete) vsize of an escape or bump `tx`, in vB,
+/// as a PURE function of the vault's per-input satisfaction-weight bound and the
+/// unsigned transaction — the node-independent core of [`maximum_finalized_vsize`].
+///
+/// Exposed so the coordinator that composes the fee-bump ladder (vault-cli's
+/// `fed::escape_fee_ladder`) measures each rung's replacement size with the EXACT
+/// bound the node enforces at ingress ([`ensure_escape_ladder`]): the two
+/// must not drift, or the coordinator could offer a rung whose fee delta the node
+/// then rejects — taking the whole spend, including a duress carrier, with it (bead
+/// btc-policy-9y5.7). `max_vault_satisfaction_weight` is
+/// `descriptor.max_weight_to_satisfy().to_wu()`, which the coordinator derives from
+/// the same vault descriptor the node parses.
+pub fn maximum_finalized_vsize_for(
+    max_vault_satisfaction_weight: u64,
+    tx: &bitcoin::Transaction,
+) -> Result<u64, String> {
+    let input_count = u64::try_from(tx.input.len())
+        .map_err(|_| "escape input count does not fit u64".to_string())?;
+    let maximum_witness_weight = max_vault_satisfaction_weight
+        .checked_add(1)
+        .ok_or_else(|| "escape maximum witness weight overflow".to_string())?
+        .checked_mul(input_count)
+        .ok_or_else(|| "escape maximum satisfaction weight overflow".to_string())?;
+    let maximum_weight = tx
+        .weight()
+        .to_wu()
+        .checked_add(2)
+        .and_then(|weight| weight.checked_add(maximum_witness_weight))
+        .ok_or_else(|| "escape maximum finalized weight overflow".to_string())?;
+    Ok(maximum_weight
+        .checked_add(3)
+        .ok_or_else(|| "escape maximum finalized vsize overflow".to_string())?
+        / 4)
+}
+
+/// The minimum absolute fee increase (sat) a replacement of `tx` must pay over the
+/// transaction it replaces to clear this build's incremental-relay bound — the exact
+/// per-rung quantity [`ensure_escape_ladder`] enforces
+/// (`maximum_finalized_vsize · ESCAPE_RBF_INCREMENTAL_RELAY_SAT_VB`).
+///
+/// The coordinator composing a ladder calls this so it never offers a rung whose
+/// delta falls below the node's minimum: such a rung is refused at ingress and takes
+/// the entire spend with it (bead btc-policy-9y5.7). Because every rung shares the
+/// escape's inputs and output scripts, this size — and hence this minimum — is
+/// identical for the base and every bump, so one call bounds the whole ladder.
+pub fn escape_replacement_min_fee_delta(
+    max_vault_satisfaction_weight: u64,
+    tx: &bitcoin::Transaction,
+) -> Result<u64, String> {
+    Ok(
+        maximum_finalized_vsize_for(max_vault_satisfaction_weight, tx)?
+            .saturating_mul(ESCAPE_RBF_INCREMENTAL_RELAY_SAT_VB),
+    )
+}
+
+/// How many blocks the bump target's anchor height is quantized to.
+///
+/// Two honest nodes can hold tips one block apart at the instant they fire, and a
+/// target read straight off each node's own tip would then differ between them.
+/// Anchoring on `tip − (tip mod 6)` collapses that: within a six-block span every
+/// node reads the SAME block, so a disagreement is possible only in the moment the
+/// tip crosses a multiple of six — and even then the prefix release
+/// ([`channel::ChannelState::release_partials`]) keeps the sweep combinable.
+const FEE_ANCHOR_QUANTUM: u32 = 6;
+
+/// The sat/vB step the observed feerate is quantized to.
+///
+/// The second half of the same determinism argument: two nodes that do read
+/// different anchor blocks still land on the same target unless those blocks differ
+/// by a whole step. It also stops a one-sat wobble in the chain's median from
+/// walking the latch up a rung for nothing.
+///
+/// Quantized DOWN, not up. Rounding up would make ANY block with a median of at
+/// least 1 sat/vB demand a whole step, so an escape already composed at (or just
+/// under) the chain's own median would be bumped a full 4× rung for fee pressure
+/// that does not exist — money the user did not have to spend. Giving up the
+/// sub-step remainder cannot cost a rung the pressure genuinely needed: the ladder's
+/// rungs are 4× apart, an order of magnitude coarser than this step, and the sealed
+/// panic floor still sets the minimum the sweep must pay.
+const FEE_TARGET_STEP_SAT_VB: u64 = 5;
+
+/// **The deterministic bump target**, in sat/vB: the median feerate of the block at
+/// the quantized anchor height, quantized down to [`FEE_TARGET_STEP_SAT_VB`].
+///
+/// Every input is consensus-observable — a height and a confirmed block's contents —
+/// so every honest node on the same chain computes the SAME number. That is not a
+/// nicety: nodes that disagreed here would release partials over different
+/// transactions, no rung would reach `t` signatures, and the sweep would fail at the
+/// exact moment it is needed. Nothing from this node's own mempool, wall clock, or
+/// arrival order may enter this function.
+///
+/// `Ok(None)` means the node has no reading (no such block, or a backend that does
+/// not report fee statistics) and is treated as no observed pressure — the escape
+/// stays on its base rung, which is the pre-ladder behaviour.
+fn escape_bump_target_feerate(backend: &dyn ChainBackend) -> Result<Option<u64>, String> {
+    let tip = backend
+        .tip_height()
+        .map_err(|e| format!("cannot read the tip height for the escape bump target: {e}"))?;
+    let anchor = tip - (tip % FEE_ANCHOR_QUANTUM);
+    let Some(median) = backend
+        .block_median_feerate(anchor)
+        .map_err(|e| format!("cannot read the anchor block's feerate: {e}"))?
+    else {
+        return Ok(None);
+    };
+    // Quantize DOWN to the step: the target never exceeds the observed median, so
+    // the ladder cannot charge for pressure the chain is not showing.
+    Ok(Some(
+        median / FEE_TARGET_STEP_SAT_VB * FEE_TARGET_STEP_SAT_VB,
+    ))
+}
+
+/// **Pick the fee-ladder rung this sweep should fire at.**
+///
+/// The rule, in order:
+///
+///  1. The required feerate is `max(deterministic bump target, the static panic
+///     floor)`. Both are federation-uniform: the floor is config sealed into the
+///     manifest, the target is a pure function of the confirmed chain.
+///  2. `needed` is the CHEAPEST rung whose guaranteed feerate reaches it — cheapest,
+///     because a bump that overshoots burns the user's own money. If no rung reaches
+///     it, the ladder simply tops out.
+///  3. The choice is clamped to the rungs that are ADMISSIBLE, which is where the
+///     coverage guard bites: a rung whose fee would push delivered value below
+///     `escape_coverage_pct` of the protected balance is not selectable at any
+///     target. This is the "never bump past the cap" rule, and it is why an
+///     above-cap spike ends at the recovery path instead of at an overpaying sweep.
+///  4. The result is raised to the monotone latch, so a bump is never walked back.
+///     The caller commits that result only after ancestry validation succeeds.
+///
+/// `Err` means no rung may fire at all this pass: the sweep does not broadcast,
+/// Lockdown at `T` has already happened unconditionally, and the funds exit through
+/// the Recovery path. That is the designed fail-safe, not a new failure mode.
+fn select_escape_rung(
+    node: &Node,
+    backend: &dyn ChainBackend,
+    channel: &channel::ChannelState,
+    commitment_id: &str,
+    ladder: &ScoredLadder,
+) -> Result<(usize, u64, u64), String> {
+    let count = ladder.rungs.len();
+    // No ladder, no choice — and no reason to read the chain for a target. An escape
+    // submitted without bumps takes exactly the pre-9y5.7 path, including its failure
+    // modes: it must not newly depend on a `getblockcount`/`getblockstats` pair that
+    // could fail and suppress a sweep the old code would have fired.
+    if count <= 1 {
+        return match ladder.admissible.first() {
+            Some(Ok(())) => Ok((0, 0, node.escape_feerate_floor)),
+            Some(Err(reason)) => Err(reason.clone()),
+            None => Err("the armed escape has no candidate transaction".to_string()),
+        };
+    }
+    let target = match escape_bump_target_feerate(backend) {
+        Ok(reading) => reading.unwrap_or(0),
+        Err(error) => {
+            // Fee pressure is an optional deterministic signal, not new liveness
+            // authority. A backend that cannot provide it falls back to the sealed
+            // panic floor, preserving the pre-ladder sweep instead of suppressing it.
+            eprintln!("fire: {error}; using the static escape feerate floor");
+            0
+        }
+    };
+    let required = target.max(node.escape_feerate_floor);
+    let needed = (0..count)
+        .find(|rung| ladder.reaches(*rung, required))
+        .unwrap_or(count.saturating_sub(1));
+    let ok = |rung: &usize| ladder.admissible.get(*rung).is_some_and(Result::is_ok);
+    // The cheapest admissible rung that meets the target; failing that, the most
+    // expensive admissible rung — the cap — and never anything above it.
+    let choice = (0..count)
+        .filter(ok)
+        .find(|rung| *rung >= needed)
+        .or_else(|| (0..count).rfind(ok));
+    let Some(choice) = choice else {
+        // Rung 0's own reason is the honest one to report: with no admissible rung
+        // there is nothing to fire, and the base escape's failure is what an operator
+        // needs to see.
+        return Err(match ladder.admissible.first() {
+            Some(Err(reason)) => reason.clone(),
+            _ => "no escape ladder rung is admissible".to_string(),
+        });
+    };
+    let selected = choice.max(channel.escape_rung(commitment_id).unwrap_or(0));
+    if let Some(Err(reason)) = ladder.admissible.get(selected) {
+        return Err(format!(
+            "escape ladder rung {selected} is already latched but no longer admissible, and a \
+             lower rung cannot replace a higher one that may already be in the mempool: {reason}"
+        ));
+    }
+    Ok((selected, target, required))
+}
+
+/// A fee ladder with every rung already scored against the shared [`SweepEnv`]:
+/// the transactions, the vsize each rung's feerate is measured over, whether each
+/// rung is admissible, and the swept value they all share.
+struct ScoredLadder<'a> {
+    rungs: &'a [bitcoin::Transaction],
+    maximum_vsizes: &'a [u64],
+    admissible: &'a [Result<(), String>],
+    total_in: u64,
+}
+
+impl ScoredLadder<'_> {
+    /// Whether rung `rung` pays at least `required` sat/vB even at its maximum
+    /// finalized vsize. Compared in `u128` against `required · vsize` rather than as
+    /// a truncated integer feerate, exactly as the panic-floor check does.
+    fn reaches(&self, rung: usize, required: u64) -> bool {
+        let (Some(tx), Some(vsize)) = (self.rungs.get(rung), self.maximum_vsizes.get(rung)) else {
+            return false;
+        };
+        // Every rung spends the same inputs, so one swept total serves them all.
+        let fee = self.total_in.saturating_sub(
+            tx.output
+                .iter()
+                .fold(0u64, |total, out| total.saturating_add(out.value.to_sat())),
+        );
+        u128::from(fee) >= u128::from(required).saturating_mul(u128::from(*vsize))
+    }
+}
+
+/// One armed escape's shared fire-time state for a single driver tick.
+///
+/// The mempool rung and rung-independent [`SweepEnv`] are read once before release,
+/// then reused by settlement classification, exact finalized admissibility, and
+/// replacement-package assembly. A ladder therefore costs one mempool scan, one
+/// `prevouts` batch, and one `vault_unspent` scan per tick rather than repeating
+/// those blocking reads inside the tight `[T, T + combine_slack]` window.
+struct EscapeSweepTickContext {
+    /// The one authorized rung in this node's mempool when the tick began, if any.
+    /// Reused by settlement classification and replacement-package assembly.
+    resident_rung: Option<bitcoin::Transaction>,
+    /// The chain-derived, rung-independent coverage and fee environment.
+    env: SweepEnv,
+}
+
+/// The rung-INDEPENDENT half of fire-time escape admissibility: everything that
+/// comes from the chain and from the paired spend, and is therefore identical for
+/// every rung of a fee ladder.
+///
+/// The rungs share one input set by construction ([`ensure_escape_ladder`]), so
+/// they share one swept total, one protected balance, and one class-aware union
+/// with the paired spend; only the outputs — and hence the fee and delivered value
+/// — differ.
+struct SweepEnv {
+    /// Σ prevout value over the escape's inputs: the swept value.
+    total_in: u64,
+    /// The coverage DENOMINATOR: this node's complete confirmed +
+    /// vault-authorized-unconfirmed vault balance, plus (for a completed escape-class
+    /// spend) the value that already departed the vault in it.
+    protected_value: u64,
+    /// The part of the coverage NUMERATOR that does not come from the rung: the
+    /// escape-wallet outputs of an already-confirmed, disjoint escape-class spend.
+    /// Zero in the ordinary hot-class case.
+    paired_delivered: u64,
+    /// Whether this escape carries a fee-bump ladder, which decides the `nSequence`
+    /// its rungs must show.
+    laddered: bool,
+}
+
+fn sweep_env(
+    node: &Node,
+    backend: &dyn ChainBackend,
+    channel: &channel::ChannelState,
+    commitment_id: &str,
+    laddered: bool,
+    resident_rung: Option<&bitcoin::Transaction>,
+) -> Result<SweepEnv, String> {
+    let candidate = channel
+        .candidate_coverage_context(commitment_id)
+        .ok_or_else(|| "armed escape candidate context is unavailable".to_string())?;
+    let tx = &candidate.tx;
+    // The swept value: Σ prevout value over the escape's inputs. Ordinarily a prevout
+    // this node cannot see means the escape is not spendable now. The one exception is
+    // an exact authorized ladder rung already in this node's mempool: Core deliberately
+    // hides the outpoints that rung spends, while its mempool admission proves the
+    // ingress-validated witness amounts were the real amounts used by script
+    // verification. Those stored amounts remain the shared ground truth for its
+    // replacement.
     let mut total_in: u64 = 0;
     let escape_outpoints: Vec<OutPoint> =
         tx.input.iter().map(|input| input.previous_output).collect();
@@ -3071,55 +3537,31 @@ fn escape_sweep_policy_admissible(
             escape_outpoints.len()
         ));
     }
-    for (outpoint, prevout) in escape_outpoints.iter().zip(escape_prevouts) {
-        let prevout = prevout.ok_or_else(|| {
-            format!(
-                "escape prevout {} is unknown to this node (spent or missing)",
-                outpoint
-            )
-        })?;
-        total_in = total_in.saturating_add(prevout.txout.value.to_sat());
-    }
-    let total_out: u64 = tx
-        .output
+    for ((outpoint, prevout), (stored_outpoint, stored_value)) in escape_outpoints
         .iter()
-        .fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
-    let fee = total_in.saturating_sub(total_out);
-
-    // Feerate ≥ the static panic floor. Compare fee against floor·vsize in u128 (no
-    // truncated integer feerate, mirroring the refresh-fee-cap comparison).
-    let vsize = feerate_vsize;
-    if vsize == 0 {
-        return Err("escape has zero vsize".into());
+        .zip(escape_prevouts)
+        .zip(&candidate.inputs)
+    {
+        if outpoint != stored_outpoint {
+            return Err("armed escape input context does not match its transaction".into());
+        }
+        let value = match prevout {
+            Some(prevout) => prevout.txout.value.to_sat(),
+            None if resident_rung.is_some() => *stored_value,
+            None => {
+                return Err(format!(
+                    "escape prevout {} is unknown to this node (spent or missing)",
+                    outpoint
+                ))
+            }
+        };
+        total_in = total_in.saturating_add(value);
     }
-    let floor_sats = u128::from(node.escape_feerate_floor).saturating_mul(u128::from(vsize));
-    if u128::from(fee) < floor_sats {
-        return Err(format!(
-            "escape feerate below the panic floor: {fee} sat over {vsize} vB is under {} sat/vB \
-             ({floor_sats} sat)",
-            node.escape_feerate_floor
-        ));
-    }
-
-    // Coverage numerator: Σ output value paying the escape descriptor. The denominator
-    // is the node's COMPLETE confirmed + vault-authorized-unconfirmed vault balance,
-    // obtained below — never merely the inputs the coordinator chose for this escape.
     let escape_desc = node
         .check_params
         .escape
         .as_ref()
         .ok_or("no escape descriptor configured")?;
-    let escape_out: u64 = tx
-        .output
-        .iter()
-        .filter(|o| {
-            policy_core::derives_within(
-                escape_desc,
-                o.script_pubkey.as_script(),
-                node.check_params.max_derivation_index,
-            )
-        })
-        .fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
     let authorized = node
         .authorized
         .lock()
@@ -3128,13 +3570,39 @@ fn escape_sweep_policy_admissible(
     let vault_unspent = backend
         .vault_unspent(&node.vault_scripts(), &authorized)
         .map_err(|e| format!("cannot enumerate the protected vault balance: {e}"))?;
-    let mut protected_value = vault_unspent.iter().fold(0u64, |total, (_, prevout)| {
-        total.saturating_add(prevout.txout.value.to_sat())
-    });
+    // A resident rung is authorized, so `vault_unspent` counts any vault-change
+    // output it created. That change is a DERIVATIVE of the escape inputs restored
+    // just below — counting both would inflate the denominator by the change and
+    // make a near-threshold escape spuriously inadmissible on the very tick it
+    // wants to bump or re-broadcast. The escape's own inputs are the canonical,
+    // rung-independent view of that value, so drop the rung's outputs and restore
+    // the inputs.
+    let resident_txid = resident_rung.map(bitcoin::Transaction::compute_txid);
+    let mut protected_value = vault_unspent
+        .iter()
+        .filter(|(outpoint, _)| Some(outpoint.txid) != resident_txid)
+        .fold(0u64, |total, (_, prevout)| {
+            total.saturating_add(prevout.txout.value.to_sat())
+        });
+    if resident_rung.is_some() {
+        // `vault_unspent` uses the same include-mempool view as `prevout`, so the
+        // resident rung also hides the vault coins from the coverage denominator.
+        // Restore exactly those canonical escape inputs, without double-counting a
+        // backend that still returned one.
+        let visible: HashSet<OutPoint> = vault_unspent
+            .iter()
+            .map(|(outpoint, _)| *outpoint)
+            .collect();
+        for (outpoint, value) in &candidate.inputs {
+            if !visible.contains(outpoint) {
+                protected_value = protected_value.saturating_add(*value);
+            }
+        }
+    }
     if protected_value == 0 {
         return Err("protected confirmed + authorized-unconfirmed vault balance is empty".into());
     }
-    let mut delivered_value = escape_out;
+    let mut paired_delivered = 0u64;
 
     // Class-aware: hot-class is frozen and superseded by E. Escape-class must have
     // completed first; its inputs must be disjoint from the residual, and coverage is
@@ -3194,7 +3662,7 @@ fn escape_sweep_policy_admissible(
                     .to_string()
             })?;
         protected_value = protected_value.saturating_add(departed_value);
-        delivered_value = paired
+        paired_delivered = paired
             .tx
             .output
             .iter()
@@ -3205,49 +3673,181 @@ fn escape_sweep_policy_admissible(
                     node.check_params.max_derivation_index,
                 )
             })
-            .fold(delivered_value, |total, output| {
+            .fold(0u64, |total, output| {
                 total.saturating_add(output.value.to_sat())
             });
     }
+    Ok(SweepEnv {
+        total_in,
+        protected_value,
+        paired_delivered,
+        laddered,
+    })
+}
+
+/// Fire-time escape-sweep admissibility (ADR-0012 / ADR-0013 §6) on one rung,
+/// evaluated against the shared [`SweepEnv`]. It runs ONLY in the armed escape's
+/// Firing job, NEVER as an arm gate. Every failure returns `Err` so the sweep does
+/// not fire; Lockdown at `T` has already happened UNCONDITIONALLY, so failure leaves
+/// funds frozen → recovery, never theft.
+///
+/// The `t` distinct escape signers per input are enforced by `try_finalize` before
+/// this. Authorized ancestry and full-package `testmempoolaccept` are enforced by
+/// [`assemble_escape_package`] before release and [`broadcast_package`] after
+/// combine. This function enforces the remaining rung-dependent checks:
+///
+/// - final `nLockTime` + the exact non-relative `nSequence` for the ladder shape;
+/// - feerate at or above the static panic floor;
+/// - output coverage at or above `escape_coverage_pct`, which caps the fee;
+/// - class-aware union coverage for a completed, disjoint escape-class spend.
+///
+/// The backend-derived denominator contains confirmed plus
+/// vault-authorized-unconfirmed value only; external toxic deposits never enter it.
+///
+/// Pure apart from the node's config, so the whole ladder can be scored in one pass
+/// and the selector can ask "which rungs may fire?" without repeating chain I/O.
+/// `feerate_vsize` is the vsize the feerate is measured over — the MAXIMUM finalized
+/// vsize before release (so a rung that clears the floor here still clears it when
+/// the missing signatures land) and the exact vsize once finalized.
+fn sweep_rung_admissible(
+    node: &Node,
+    env: &SweepEnv,
+    tx: &bitcoin::Transaction,
+    feerate_vsize: u64,
+) -> Result<(), String> {
+    // Final nLockTime + non-relative nSequence on EVERY input (broadcastable-at-T).
+    // See [`ESCAPE_RBF_SEQUENCE`] for why a LADDERED escape carries `0xfffffffd`
+    // instead, and where its finality then comes from.
+    let expected_sequence = expected_escape_sequence(env.laddered);
+    for (i, input) in tx.input.iter().enumerate() {
+        if input.sequence != expected_sequence {
+            return Err(format!(
+                "escape input {i} nSequence {:#010x} is not {:#010x} — a non-final / \
+                 relative-locking escape, or one whose replaceability does not match its \
+                 fee-bump ladder, is not broadcastable-at-T",
+                input.sequence.to_consensus_u32(),
+                expected_sequence.to_consensus_u32()
+            ));
+        }
+    }
+    let total_out: u64 = tx
+        .output
+        .iter()
+        .fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
+    let fee = env.total_in.saturating_sub(total_out);
+
+    // Feerate ≥ the static panic floor. Compare fee against floor·vsize in u128 (no
+    // truncated integer feerate, mirroring the refresh-fee-cap comparison).
+    let vsize = feerate_vsize;
+    if vsize == 0 {
+        return Err("escape has zero vsize".into());
+    }
+    let floor_sats = u128::from(node.escape_feerate_floor).saturating_mul(u128::from(vsize));
+    if u128::from(fee) < floor_sats {
+        return Err(format!(
+            "escape feerate below the panic floor: {fee} sat over {vsize} vB is under {} sat/vB \
+             ({floor_sats} sat)",
+            node.escape_feerate_floor
+        ));
+    }
+
+    // Coverage numerator: Σ output value paying the escape descriptor, plus whatever a
+    // completed disjoint escape-class spend already delivered. Measuring on OUTPUTS is
+    // what caps the escape's fee at `(100 − pct)%` of the protected value — and it is
+    // therefore also the cap a fee BUMP runs into: raising the fee lowers this
+    // numerator, so a rung that would overpay simply fails here and is never selected.
+    let escape_desc = node
+        .check_params
+        .escape
+        .as_ref()
+        .ok_or("no escape descriptor configured")?;
+    let delivered_value = tx
+        .output
+        .iter()
+        .filter(|o| {
+            policy_core::derives_within(
+                escape_desc,
+                o.script_pubkey.as_script(),
+                node.check_params.max_derivation_index,
+            )
+        })
+        .fold(env.paired_delivered, |acc, o| {
+            acc.saturating_add(o.value.to_sat())
+        });
     if u128::from(delivered_value).saturating_mul(100)
-        < u128::from(protected_value).saturating_mul(u128::from(node.escape_coverage_pct))
+        < u128::from(env.protected_value).saturating_mul(u128::from(node.escape_coverage_pct))
     {
         return Err(format!(
             "escape coverage below {}%: {delivered_value} sat to the escape wallet over \
-             {protected_value} sat of protected confirmed + authorized-unconfirmed vault value",
-            node.escape_coverage_pct
+             {} sat of protected confirmed + authorized-unconfirmed vault value",
+            node.escape_coverage_pct, env.protected_value
         ));
     }
     Ok(())
 }
 
-/// Spawn one detached send per (peer × message). Detached on purpose: each send
-/// retries with backoff until its own deadline, so awaiting them would let one
-/// dead peer hold up the fire pass — and every other candidate with it.
+/// Spawn one detached send task PER PEER, each sending that peer's messages in
+/// order. Detached on purpose: each send retries with backoff until its own
+/// deadline, so awaiting the tasks would let one dead peer hold up the fire pass —
+/// and every other candidate with it. Peers are independent tasks (a dead peer
+/// costs only its own redundancy); within a peer the messages are serialized so the
+/// cheapest-rung-first order the payloads already carry becomes the delivery order
+/// (see the base-first rationale in the body).
 fn spawn_fan_out(node: &Arc<Node>, messages: Vec<channel::Outbound>) {
     let Some(channel) = node.channel.as_ref() else {
         return;
     };
+    // One task PER PEER, sending that peer's messages IN ORDER, rather than one task
+    // per (peer, message) racing them concurrently. The release payloads are already
+    // ordered cheapest-rung-first (`release_partials` emits `[release_floor ..=
+    // authorized]`), so per-peer ordering makes each recipient charge the common base
+    // rung to this node's quota BEFORE any higher rung OF THE SAME RELEASE. That is
+    // what keeps the sweep convergent under a tight `per_peer_quota_per_min`: if higher
+    // rungs could win the quota race first, the base rung — the one rung every honest
+    // node's prefix shares — could be rate-limited at some peers, and the honest shares
+    // would scatter across rungs with none reaching quorum before the combine window
+    // closes (codex 9y5.7 review). Base-first delivery makes that the guarantee, so the
+    // quota rung-cap in `release_partials` is now only a best-effort "don't send rungs
+    // that won't fit" bound, not the thing convergence depends on. (The ordering is
+    // within ONE release: a later tick that raises the latch fans out again, and those
+    // higher-rung messages can race a still-rate-limited base retry from the earlier
+    // release — a contrived schedule that, like everything here, degrades to Recovery,
+    // never theft.) Peers are still fanned out concurrently; only messages to the SAME
+    // peer are serialized. The request propagation path sends a single-message vec, so
+    // its behaviour is unchanged.
+    //
+    // Share the message list across the per-peer tasks through an `Arc` rather than
+    // deep-cloning it (and its `Zeroizing` payload bytes) once per peer.
+    let messages = Arc::new(messages);
     for peer in channel.peer_ids() {
-        for message in &messages {
-            let node = Arc::clone(node);
-            let msg_type = message.msg_type;
-            let payload = message.payload.clone();
-            let deadline = message.deadline;
-            tokio::spawn(async move {
-                let channel = node
-                    .channel
-                    .as_ref()
-                    .expect("fan-out only spawns in channel mode");
-                if let Err(e) =
-                    channel::retry_message_until(channel, msg_type, peer, &payload, deadline).await
+        let node = Arc::clone(node);
+        let messages = Arc::clone(&messages);
+        tokio::spawn(async move {
+            let channel = node
+                .channel
+                .as_ref()
+                .expect("fan-out only spawns in channel mode");
+            for message in messages.iter() {
+                if let Err(e) = channel::retry_message_until(
+                    channel,
+                    message.msg_type,
+                    peer,
+                    &message.payload,
+                    message.deadline,
+                )
+                .await
                 {
-                    // A peer that never accepts costs redundancy, never safety:
-                    // the combine simply proceeds with whoever answered.
-                    eprintln!("channel: cannot deliver {msg_type} to node {peer}: {e}");
+                    // A peer that never accepts costs redundancy, never safety: the
+                    // combine simply proceeds with whoever answered. Keep sending this
+                    // peer's remaining rungs — a rate-limit on one need not abandon the
+                    // rest once the window frees up.
+                    eprintln!(
+                        "channel: cannot deliver {} to node {peer}: {e}",
+                        message.msg_type
+                    );
                 }
-            });
-        }
+            }
+        });
     }
 }
 
@@ -4028,6 +4628,26 @@ fn handle_sign_after_lock(
     //    force lockdown-only").
     let mut spend = decode_psbt(&request.psbt, "spend")?;
     let mut escape = decode_psbt(&request.escape_psbt, "escape")?;
+    // The escape's fee-bump ladder (bead btc-policy-9y5.7). Bounded BEFORE decoding so
+    // an oversized ladder costs one length comparison rather than N base64+PSBT
+    // decodes, and decoded here — beside the escape — because every rung is validated,
+    // signed, and registered on exactly the same pin-independent path the escape is.
+    if request.escape_bumps.len() > MAX_ESCAPE_BUMPS {
+        return Ok(refusal(
+            RefusalCode::PsbtInconsistent,
+            "escape:bump_ladder",
+            format!(
+                "the escape fee-bump ladder has {} rungs, more than the {MAX_ESCAPE_BUMPS} a \
+                 request may authorize",
+                request.escape_bumps.len()
+            ),
+        ));
+    }
+    let mut escape_bumps = request
+        .escape_bumps
+        .iter()
+        .map(|bump| decode_psbt(bump, "escape_bump"))
+        .collect::<Result<Vec<Psbt>, _>>()?;
 
     // 3. Bind this decision to the exact transactions. The commitments carry
     //    this node's OWN baked `policy_version` (from config, not the request):
@@ -4045,8 +4665,26 @@ fn handle_sign_after_lock(
     // the conflict before validation/registration. The request-pair key includes
     // both exact ingress PSBTs; PIN/auth transmission fields stay outside because
     // coordinator auth and the PIN are processed before this lookup by design.
-    let accepted_replay_key =
-        acceptance_replay_key(&[(&commitment_id, &spend), (&escape_commitment_id, &escape)]);
+    // The ladder is part of the accepted pair's identity: two requests that agree on
+    // the spend and the escape but authorize different bumps authorize different
+    // replacements, and an acceptance cached across that difference would let a
+    // coordinator hand peers different ladders behind one cache hit.
+    let accepted_replay_key = {
+        // Scoped so the borrows of the PSBTs end here — they are taken mutably
+        // further down, for this node's own ingress signatures.
+        let mut labels: Vec<(String, &Psbt)> = vec![
+            (commitment_id.clone(), &spend),
+            (escape_commitment_id.clone(), &escape),
+        ];
+        for (index, bump) in escape_bumps.iter().enumerate() {
+            labels.push((format!("escape_bump:{index}"), bump));
+        }
+        let entries: Vec<(&str, &Psbt)> = labels
+            .iter()
+            .map(|(id, psbt)| (id.as_str(), *psbt))
+            .collect();
+        acceptance_replay_key(&entries)
+    };
     // The two ids must remain distinct for an escape-class request: its spend completes
     // immediately, while the mandatory escape is the disjoint residual swept at T.
     // The structural equality check sits after both node validations below, and it is
@@ -4261,6 +4899,40 @@ fn handle_sign_after_lock(
         unwind_hot_reservation();
         return Ok(refused);
     }
+    // 7b. Validate the escape's fee-bump ladder (bead btc-policy-9y5.7): every rung is
+    //     an escape in its own right (user-signed, vault inputs, escape-class), and the
+    //     ladder as a whole changes ONLY the fee. Pin-independent, exactly like the
+    //     escape validation above, and never an arm gate — a bad ladder refuses the
+    //     request under both PINs identically.
+    //
+    //     The ladder's SHAPE is checked FIRST, before the per-rung escape validation.
+    //     `compare_prevouts_against_chain` matches a PSBT's inputs against a
+    //     pre-fetched prevout batch POSITIONALLY, and the batch below is the escape's;
+    //     reusing it for a rung is only ground truth once "same inputs, same order" is
+    //     established. Establishing it first means the reuse is sound on its own terms
+    //     rather than by appeal to a check further down. (The shape check reads
+    //     coordinator-supplied `witness_utxo` values, but only to order the rungs by
+    //     fee, and all rungs share one input set — so the ordering turns on the
+    //     outputs, which are consensus data. The values themselves are then verified
+    //     against the chain for every rung by the loop that follows.)
+    if let Err(refused) = ensure_escape_ladder(
+        node,
+        &escape,
+        &escape_bumps,
+        escape_commitment_id == commitment_id,
+    ) {
+        unwind_hot_reservation();
+        return Ok(refused);
+    }
+    for bump in &escape_bumps {
+        // The rungs spend the same inputs in the same order as the escape, so the
+        // escape's already-fetched prevouts are the exact ground truth for each rung
+        // and no extra RPC is needed.
+        if let Err(refused) = verify_escape(node, bump, escape_prevouts.as_ref()) {
+            unwind_hot_reservation();
+            return Ok(refused);
+        }
+    }
     if class == policy_core::TxClass::Escape && escape_commitment_id == commitment_id {
         // VACUOUS, and deliberately so: this branch requires `class == Escape` while
         // `hot_reservation` is only ever set inside the `class == Hot` block above, so
@@ -4340,6 +5012,16 @@ fn handle_sign_after_lock(
         unwind_hot_reservation();
         return Ok(refusal(RefusalCode::PsbtInconsistent, "signing", detail));
     }
+    // Every rung too, at ingress and under both PINs. A rung signed later — say, only
+    // once a bump is selected at `T` — would put a signing operation on the duress
+    // side of the fire path and make the node's work pin-dependent; it would also be
+    // too late, since Lockdown blocks new signing from `T` onward.
+    for bump in &mut escape_bumps {
+        if let Err(detail) = add_node_signatures(node, bump) {
+            unwind_hot_reservation();
+            return Ok(refusal(RefusalCode::PsbtInconsistent, "signing", detail));
+        }
+    }
 
     // The pair is now fully validated. Stage the same coordinator-signed carrier
     // under BOTH matching pins before candidate admission, so a full store cannot
@@ -4367,6 +5049,7 @@ fn handle_sign_after_lock(
             // another carrier for the same exact pair) reaches the t-holder decision.
             confirmation_required: true,
             escape: &escape,
+            escape_bumps: &escape_bumps,
             escape_commitment_id: &escape_commitment_id,
             fire: channel::FireWindow {
                 fire_at,
@@ -4397,10 +5080,20 @@ fn handle_sign_after_lock(
     //     watchtower and both may serve as unconfirmed parents. A REFUSED request
     //     never reaches here, which is exactly the property the recognition fix
     //     needs — a theft fanned to honest nodes must still alert.
+    //
+    //     Every fee-bump rung counts too, and for both halves of that. A bumped
+    //     rung is the sweep: it was validated and accepted at this same ingress, so
+    //     the node's watchtower must not alarm on the federation's own successful
+    //     escape — precisely during the incident where an alert has to mean
+    //     something. And a rung sitting unconfirmed in the mempool is as
+    //     authorized a parent as the base escape is.
     {
         let mut authorized = node.authorized.lock().expect("authorized lock poisoned");
         authorized.insert(spend.unsigned_tx.compute_txid());
         authorized.insert(escape.unsigned_tx.compute_txid());
+        for bump in &escape_bumps {
+            authorized.insert(bump.unsigned_tx.compute_txid());
+        }
     }
 
     // 12. The Hold timer, for hot-class only. It is what "a refresh is subordinate
@@ -4610,6 +5303,8 @@ fn handle_refresh_after_lock(
             // field is not optional, so it names itself rather than inventing an
             // absent-sibling case for one variant.
             escape: &refresh,
+            // A refresh has no escape at all, so nothing to fee-bump.
+            escape_bumps: &[],
             escape_commitment_id: &commitment_id,
             fire,
             expiry: request.expiry,
@@ -4744,6 +5439,11 @@ struct RegisterPair<'a> {
     /// only for the pin-less refresh variant, which has no arm carrier.
     confirmation_required: bool,
     escape: &'a Psbt,
+    /// The escape's validated fee-bump ladder (bead btc-policy-9y5.7), ascending by
+    /// fee; empty when the request authorized no bump. A self-paired request (its
+    /// escape IS its spend) always passes an empty slice — [`ensure_escape_ladder`]
+    /// refuses a ladder there, so the collapsed single candidate never carries one.
+    escape_bumps: &'a [Psbt],
     escape_commitment_id: &'a str,
     /// The SPEND's fire window. The escape's delayed slot is installed atomically
     /// by [`channel::ChannelState::register_candidates`].
@@ -4789,6 +5489,9 @@ fn register_pair(node: &Node, pair: RegisterPair) -> Result<(), SignResponse> {
     let specs = [
         Some(channel::CandidateSpec {
             psbt: pair.spend,
+            // The ladder belongs to the ESCAPE, never to the spend. The spend is what
+            // a duress arm freezes; bumping it is neither wanted nor authorized.
+            escape_bumps: &[],
             commitment_id: pair.spend_commitment_id,
             paired_commitment_id: pair.escape_commitment_id,
             holder_quorum_reached: !pair.confirmation_required,
@@ -4812,6 +5515,7 @@ fn register_pair(node: &Node, pair: RegisterPair) -> Result<(), SignResponse> {
         // escape spec when its commitment id actually differs from the spend's.
         (pair.escape_commitment_id != pair.spend_commitment_id).then_some(channel::CandidateSpec {
             psbt: pair.escape,
+            escape_bumps: pair.escape_bumps,
             commitment_id: pair.escape_commitment_id,
             paired_commitment_id: pair.spend_commitment_id,
             holder_quorum_reached: !pair.confirmation_required,
@@ -5541,6 +6245,262 @@ fn verify_escape(
         )),
         Err(v) => Err(escape_refusal(map_policy_code(v.code), v.check, v.detail)),
     }
+}
+
+/// The maximum number of pre-signed fee-bump rungs one request may authorize
+/// (bead btc-policy-9y5.7). Three bumps span roughly two orders of magnitude of
+/// feerate at 4× steps, which is more than a real spike moves inside one
+/// commitment's life. It is also what makes "bounded number of bumps" structural
+/// rather than a policy: the latch is monotone, so the sweep can be bumped at most
+/// this many times, ever.
+///
+/// Taken from `vault-proto`, not restated: the coordinator composes the ladder this
+/// bound refuses, so a second copy of the number would be a comment-enforced
+/// contract between two crates that already share a wire-types crate.
+const MAX_ESCAPE_BUMPS: usize = vault_proto::MAX_ESCAPE_BUMPS;
+
+/// The `nSequence` every input of a LADDERED escape must carry
+/// ([`vault_proto::ESCAPE_RBF_SEQUENCE`], the same shared definition).
+///
+/// `0xfffffffd` is below `0xfffffffe`, so the transaction opts in to BIP125
+/// replacement — which is the whole point: a bump is a mempool replacement of a
+/// lower rung, and a replacement of a non-signalling parent is simply not relayed
+/// by the network, so the escalation would die at the first peer that still held
+/// the earlier rung. Bit 31 (`0x80000000`) is still SET, so BIP68 relative
+/// timelocks stay disabled exactly as they are under `0xffffffff`, and the ladder
+/// keeps the "no relative lock can delay the sweep" half of broadcastable-at-T.
+/// The other half — finality — no longer comes free from `nSequence`, so
+/// [`ensure_escape_ladder`] requires `nLockTime == 0` alongside it.
+const ESCAPE_RBF_SEQUENCE: u32 = vault_proto::ESCAPE_RBF_SEQUENCE;
+
+/// The maximum Bitcoin Core incremental relay fee this build permits, in sat/vB.
+///
+/// BIP125 replacement requires the absolute fee increase to pay for relaying the
+/// replacement at this rate. Production startup verifies Core's live
+/// `incrementalfee` does not exceed the shared bound, so a ladder accepted here is
+/// relayable by the configured backend rather than only by a default Core node.
+const ESCAPE_RBF_INCREMENTAL_RELAY_SAT_VB: u64 =
+    chain::MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB / 1_000;
+
+/// The `nSequence` an escape's inputs must carry, given whether it has a ladder.
+/// One function so the ingress rule and the fire-time re-check cannot drift.
+fn expected_escape_sequence(laddered: bool) -> bitcoin::Sequence {
+    if laddered {
+        bitcoin::Sequence::from_consensus(ESCAPE_RBF_SEQUENCE)
+    } else {
+        bitcoin::Sequence::MAX
+    }
+}
+
+/// Σ `witness_utxo` value − Σ output value, saturating. `None` when an input has
+/// no `witness_utxo` — which `verify_escape` has already refused before any caller
+/// here reaches it.
+fn psbt_fee(psbt: &Psbt) -> Option<u64> {
+    let total_in = psbt.inputs.iter().try_fold(0u64, |total, input| {
+        Some(total.saturating_add(input.witness_utxo.as_ref()?.value.to_sat()))
+    })?;
+    let total_out = psbt.unsigned_tx.output.iter().fold(0u64, |total, output| {
+        total.saturating_add(output.value.to_sat())
+    });
+    Some(total_in.saturating_sub(total_out))
+}
+
+/// **The escape fee-bump ladder's structural contract** (bead btc-policy-9y5.7),
+/// checked at ingress against the bytes as provided, identically under both PINs.
+///
+/// Each rung has already passed [`verify_escape`] — user-signed over its exact
+/// bytes, vault inputs, escape-class outputs, fee under the policy cap. What is
+/// left is the ladder's own shape, and every clause of it is load-bearing:
+///
+///  - **Same inputs, same order.** A rung is a REPLACEMENT of the escape, and two
+///    transactions only conflict — hence only replace — when they spend the same
+///    coins. It also means the rungs share one prevout ground truth and one swept
+///    value, so `Σ in` drops out of the comparison below and the ladder cannot
+///    smuggle in a coin the escape never swept.
+///  - **Same outputs, same scripts, same order.** The bump changes the FEE and
+///    nothing else. This is what makes "a bump must not change WHAT is swept" a
+///    checked property rather than a convention, and it also pins the serialized
+///    size, so a strictly higher fee is necessarily a strictly higher FEERATE
+///    (BIP125 rule 4, not just rule 3).
+///  - **A relay-sized fee increase.** Ascending order is what lets the fire-time
+///    selector treat the ladder as monotone in both feerate and coverage. Each step
+///    also pays at least the replacement's maximum finalized vsize times Core's
+///    default incremental relay rate, so a one-satoshi increase cannot pass ingress
+///    only to fail BIP125 replacement policy.
+///  - **RBF-signalling with `nLockTime == 0`,** for the whole ladder including the
+///    base — see [`ESCAPE_RBF_SEQUENCE`]. A ladder whose base cannot be replaced
+///    could never escalate past its first broadcast.
+///  - **Not on a self-paired request.** An escape-class spend IS its own escape and
+///    completes immediately at ingress; there is no delayed sweep to bump, and the
+///    collapsed single candidate has no escape role to hang a ladder on.
+///
+/// A ladder-less request is untouched: the escape keeps `Sequence::MAX`, which is
+/// non-signalling and final, exactly as before this bead.
+fn ensure_escape_ladder(
+    node: &Node,
+    escape: &Psbt,
+    bumps: &[Psbt],
+    self_paired: bool,
+) -> Result<(), SignResponse> {
+    let bad = |detail: String| {
+        Err(refusal(
+            RefusalCode::PsbtInconsistent,
+            "escape:bump_ladder",
+            detail,
+        ))
+    };
+    if bumps.is_empty() {
+        return Ok(());
+    }
+    if self_paired {
+        return bad(
+            "an escape-class spend is its own escape and completes at ingress, so it has no \
+             delayed sweep to fee-bump"
+                .into(),
+        );
+    }
+    let base_version = escape.unsigned_tx.version;
+    let expected_sequence = expected_escape_sequence(true);
+    for (rung, psbt) in std::iter::once(escape).chain(bumps).enumerate() {
+        if psbt.unsigned_tx.version != base_version {
+            return bad(format!(
+                "escape ladder rung {rung} has transaction version {}, but every rung must keep \
+                 the base escape's version {}: a fee bump may change only output values",
+                psbt.unsigned_tx.version.0, base_version.0
+            ));
+        }
+        if psbt.unsigned_tx.lock_time != bitcoin::absolute::LockTime::ZERO {
+            return bad(format!(
+                "escape ladder rung {rung} has nLockTime {}, but a replaceable escape must be \
+                 final at T (nLockTime 0): with RBF-signalling nSequence, nSequence no longer \
+                 makes it final",
+                psbt.unsigned_tx.lock_time
+            ));
+        }
+        for (index, input) in psbt.unsigned_tx.input.iter().enumerate() {
+            if input.sequence != expected_sequence {
+                return bad(format!(
+                    "escape ladder rung {rung} input {index} nSequence {:#010x} is not \
+                     {ESCAPE_RBF_SEQUENCE:#010x}: every rung of a ladder must signal BIP125 \
+                     replacement, or a bump cannot replace the rung below it",
+                    input.sequence.to_consensus_u32()
+                ));
+            }
+        }
+    }
+    let base_inputs: Vec<bitcoin::OutPoint> = escape
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect();
+    let base_scripts: Vec<&bitcoin::ScriptBuf> = escape
+        .unsigned_tx
+        .output
+        .iter()
+        .map(|output| &output.script_pubkey)
+        .collect();
+    let mut previous_fee = psbt_fee(escape).ok_or_else(|| {
+        refusal(
+            RefusalCode::PsbtInconsistent,
+            "escape:bump_ladder",
+            "the escape has an input without a witness_utxo, so its fee is unknown".into(),
+        )
+    })?;
+    // Per-output values of the rung below (the base to start): a bump may only LOWER
+    // an output to pay its higher fee, never RAISE one. Without this, a rung could move
+    // value from vault-change into the escape output (same scripts, higher fee) so its
+    // escape coverage RISES above a lower rung's — breaking the assumption that the
+    // coverage-admissible set is downward-closed. The prefix release
+    // (`release_partials` sends `[floor ..= latch]`) would then hand a t-1 compromised
+    // set this node's honest share for an INTERMEDIATE rung that fails the ≥95% coverage
+    // guard, which they could combine and broadcast (codex 9y5.7 pass-2). Monotone
+    // non-increasing per-output values keep every rung's escape value ≤ the one below
+    // it, so coverage is monotone and the admissible prefix carries no failing rung.
+    let mut previous_values: Vec<u64> = escape
+        .unsigned_tx
+        .output
+        .iter()
+        .map(|output| output.value.to_sat())
+        .collect();
+    for (index, bump) in bumps.iter().enumerate() {
+        let rung = index + 1;
+        let inputs: Vec<bitcoin::OutPoint> = bump
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect();
+        if inputs != base_inputs {
+            return bad(format!(
+                "escape ladder rung {rung} spends a different input set than the escape, so it \
+                 could never replace it"
+            ));
+        }
+        let scripts: Vec<&bitcoin::ScriptBuf> = bump
+            .unsigned_tx
+            .output
+            .iter()
+            .map(|output| &output.script_pubkey)
+            .collect();
+        if scripts != base_scripts {
+            return bad(format!(
+                "escape ladder rung {rung} pays a different set of output scripts than the \
+                 escape: a fee bump may change the fee, never what is swept"
+            ));
+        }
+        let values: Vec<u64> = bump
+            .unsigned_tx
+            .output
+            .iter()
+            .map(|output| output.value.to_sat())
+            .collect();
+        if values
+            .iter()
+            .zip(&previous_values)
+            .any(|(value, previous)| value > previous)
+        {
+            return bad(format!(
+                "escape ladder rung {rung} raises an output value above the rung below it: a bump \
+                 may only lower an output to pay a higher fee, never move value between outputs — \
+                 otherwise an intermediate rung's escape coverage could dip below the lower rungs' \
+                 and the prefix release would hand a t-1 set a share for an under-coverage escape"
+            ));
+        }
+        previous_values = values;
+        let fee = psbt_fee(bump).ok_or_else(|| {
+            refusal(
+                RefusalCode::PsbtInconsistent,
+                "escape:bump_ladder",
+                format!("escape ladder rung {rung} has an input without a witness_utxo"),
+            )
+        })?;
+        let replacement_vsize =
+            maximum_finalized_vsize(node, &bump.unsigned_tx).map_err(|detail| {
+                refusal(
+                    RefusalCode::PsbtInconsistent,
+                    "escape:bump_ladder",
+                    format!("cannot bound escape ladder rung {rung}'s finalized size: {detail}"),
+                )
+            })?;
+        let minimum_delta = replacement_vsize.saturating_mul(ESCAPE_RBF_INCREMENTAL_RELAY_SAT_VB);
+        let Some(delta) = fee.checked_sub(previous_fee) else {
+            return bad(format!(
+                "escape ladder rung {rung} pays {fee} sat, not more than the {previous_fee} sat \
+                 of the rung below it: a replacement must pay a strictly higher fee (BIP125 \
+                 rule 3) and the ladder must ascend"
+            ));
+        };
+        if delta < minimum_delta {
+            return bad(format!(
+                "escape ladder rung {rung} raises the fee by only {delta} sat, below the \
+                 {minimum_delta} sat needed to relay its at-most-{replacement_vsize}-vB \
+                 replacement at {ESCAPE_RBF_INCREMENTAL_RELAY_SAT_VB} sat/vB"
+            ));
+        }
+        previous_fee = fee;
+    }
+    Ok(())
 }
 
 /// Whether `verdict` may be recorded in the anti-replay log for idempotent
@@ -6827,6 +7787,7 @@ pub(crate) mod test_support {
         let mut request = SignRequest {
             psbt: spend.to_string(),
             escape_psbt: escape_psbt.to_string(),
+            escape_bumps: Vec::new(),
             pin: "1234".into(),
             nonce: String::new(),
             expiry: now + 3_600,

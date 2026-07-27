@@ -153,6 +153,11 @@ pub(crate) struct PolicyParams {
     pub(crate) max_commitment_age_secs: u64,
     pub(crate) policy_version: u32,
     pub(crate) escape_feerate_floor: u64,
+    /// The fire-time escape coverage threshold (ADR-0013 §6). Federation-uniform and
+    /// sealed into the manifest beside `escape_feerate_floor` (bead btc-policy-9y5.7):
+    /// the ceremony hashes it and `node_config_toml` emits it, so every node's
+    /// configured value is provably the one sealed, or that node fails startup.
+    pub(crate) escape_coverage_pct: u8,
     pub(crate) hot_max_per_tx: u64,
     pub(crate) hot_max_per_window: u64,
     pub(crate) hot_window_secs: u64,
@@ -227,6 +232,7 @@ pub(crate) fn node_config_toml(config: &NodeConfig) -> String {
          max_commitment_age_secs = {}\n\
          policy_version = {}\n\
          escape_feerate_floor = {}\n\
+         escape_coverage_pct = {}\n\
          pin_normal_hash = \"{}\"\n\
          pin_duress_hash = \"{}\"\n\
          coordinator_auth_pubkey = \"{}\"\n",
@@ -249,6 +255,7 @@ pub(crate) fn node_config_toml(config: &NodeConfig) -> String {
         p.max_commitment_age_secs,
         p.policy_version,
         p.escape_feerate_floor,
+        p.escape_coverage_pct,
         config.pin_normal_hash,
         config.pin_duress_hash,
         config.coordinator_auth_pubkey,
@@ -811,6 +818,8 @@ pub(crate) fn assemble(
         hot_descriptors,
         escape_descriptor,
         policy.max_derivation_index,
+        policy.escape_feerate_floor,
+        policy.escape_coverage_pct,
     )?;
 
     let nodes = ceremony_nodes
@@ -1553,6 +1562,8 @@ fn finalize_cmd(args: &Args) -> Result<(), Error> {
         std::slice::from_ref(&state.hot_descriptor),
         &state.escape_descriptor,
         state.policy.max_derivation_index,
+        state.policy.escape_feerate_floor,
+        state.policy.escape_coverage_pct,
     )?
     .to_lower_hex_string();
     if recomputed_manifest_hash != state.manifest_hash {
@@ -1628,6 +1639,13 @@ fn finalize_cmd(args: &Args) -> Result<(), Error> {
         "hot_allowlist": [state.hot_descriptor],
         "escape_descriptor": state.escape_descriptor,
         "max_derivation_index": state.policy.max_derivation_index,
+        // The two fire-time selector inputs are hash-bound (bead btc-policy-9y5.7), so
+        // the backup artifact must record them too or an operator could not recompute
+        // `manifest_hash` from `manifest.json` alone (the documented backup set omits
+        // `ceremony-state.json` and the node configs). Emit them beside the other
+        // preimage fields, in preimage order.
+        "escape_feerate_floor": state.policy.escape_feerate_floor,
+        "escape_coverage_pct": state.policy.escape_coverage_pct,
         "nodes": state.nodes.iter().map(|node| serde_json::json!({
             "node_id": node.node_id,
             "signing_pubkey": node.signing_pubkey,
@@ -1945,6 +1963,7 @@ mod tests {
             max_commitment_age_secs: 172_800,
             policy_version: 1,
             escape_feerate_floor: 1,
+            escape_coverage_pct: vault_node::DEFAULT_ESCAPE_COVERAGE_PCT,
             hot_max_per_tx: 1_000_000,
             hot_max_per_window: 1_000_000,
             hot_window_secs: 172_800,

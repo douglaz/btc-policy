@@ -70,10 +70,10 @@ use vault_proto::{RefusalCode, SignRequest, SignResponse};
 
 use crate::bitcoind::Bitcoind;
 use crate::fed::{
-    build_spend, build_spend_n, commitment_expiry, free_ports, locate_btc_vault, locate_vault_node,
-    p2wpkh_spk, sign_all_inputs, summarize, unix_now, utxo_paying, wallet_id, Actor,
-    CeremonyParams, Coordinator, Manifest, NodeDevice, NodeParams, NodeProcess, NodeSpawn, TempDir,
-    Utxo, Wallet,
+    build_spend, build_spend_n, commitment_expiry, escape_fee_ladder, free_ports, locate_btc_vault,
+    locate_vault_node, p2wpkh_spk, sign_all_inputs, summarize, unix_now, utxo_paying, wallet_id,
+    Actor, CeremonyParams, Coordinator, Manifest, NodeDevice, NodeParams, NodeProcess, NodeSpawn,
+    TempDir, Utxo, Wallet,
 };
 use crate::http::Error;
 
@@ -456,12 +456,28 @@ impl Federation {
             .authorize(&self.secp, &self.wallet_id(), body)
     }
 
-    /// User-sign both halves, then coordinator-authenticate the pair.
+    /// User-sign both halves — and the escape's fee-bump ladder — then
+    /// coordinator-authenticate the pair.
+    ///
+    /// A self-paired request (an escape-class spend, whose escape IS its spend) gets
+    /// no ladder: it completes at ingress, so there is no delayed sweep to bump, and
+    /// the node refuses a ladder there.
     fn request(&self, spend: &Psbt, escape: &Psbt, pin: &str) -> Result<SignRequest, Error> {
         let mut spend = spend.clone();
-        let mut escape = escape.clone();
+        let self_paired = spend.unsigned_tx == escape.unsigned_tx;
+        let (mut escape, mut bumps) = if self_paired {
+            (escape.clone(), Vec::new())
+        } else {
+            // The coordinator sizes each rung's relay-delta with the SAME satisfaction
+            // weight the node derives from this descriptor (bead btc-policy-9y5.7), so it
+            // never composes a rung the node would refuse at ingress.
+            escape_fee_ladder(escape, self.descriptor.max_weight_to_satisfy()?.to_wu())?
+        };
         self.user_signs(&mut spend, &mut escape)?;
-        self.authorize(body(&spend, &escape, pin)?)
+        for bump in &mut bumps {
+            sign_all_inputs(&self.secp, bump, &self.user, &self.witness_script)?;
+        }
+        self.authorize(body(&spend, &escape, &bumps, pin)?)
     }
 
     /// Relay to every node, re-authenticating per node with a FRESH nonce.
@@ -562,11 +578,13 @@ impl Federation {
     }
 }
 
-/// The unauthenticated request body over two ALREADY user-signed transactions.
-fn body(spend: &Psbt, escape: &Psbt, pin: &str) -> Result<SignRequest, Error> {
+/// The unauthenticated request body over ALREADY user-signed transactions: the
+/// spend, its mandatory escape, and the escape's fee-bump ladder.
+fn body(spend: &Psbt, escape: &Psbt, bumps: &[Psbt], pin: &str) -> Result<SignRequest, Error> {
     Ok(SignRequest {
         psbt: spend.to_string(),
         escape_psbt: escape.to_string(),
+        escape_bumps: bumps.iter().map(Psbt::to_string).collect(),
         pin: pin.into(),
         nonce: String::new(),
         expiry: commitment_expiry(COMMITMENT_TTL_SECS)?,
@@ -627,7 +645,9 @@ fn first_light_act_one(fed: &Federation) -> Result<Transaction, Error> {
         &[(fed.escape_spk.clone(), sweep)],
     )?;
     fed.user_signs(&mut honest, &mut escape)?;
-    let body = body(&honest, &escape, NORMAL_PIN)?;
+    // This act probes the coordinator-auth root with a hand-built body, so it needs
+    // no fee-bump ladder: nothing here ever reaches the fire path.
+    let body = body(&honest, &escape, &[], NORMAL_PIN)?;
 
     // Before the honest relay: the trust root itself. This same, otherwise
     // PERFECTLY valid spend — allowlisted destination, real user signature, real
