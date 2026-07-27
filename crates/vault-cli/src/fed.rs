@@ -883,7 +883,15 @@ impl NodeProcess {
     /// never started or from an unrelated process that recycled the port — the same
     /// distinction `restart_must_be_refused` relies on for the opposite conclusion.
     pub(crate) fn wait_ready(&mut self) -> Result<(), Error> {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // 15s covers a regtest boot with room to spare. On a real chain the startup
+        // vault-unspent warm is a full `scantxoutset` (~10s on a 72M-UTXO signet), so
+        // the signet driver raises this via `VAULT_NODE_READY_TIMEOUT_SECS`; the demos
+        // leave it unset and keep the fast default.
+        let secs = std::env::var("VAULT_NODE_READY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15);
+        let deadline = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < deadline {
             if let Some(status) = self.child.try_wait()? {
                 return Err(format!(
