@@ -3016,12 +3016,16 @@ mod tests {
                 .find(|(_, bundle)| bundle.signing_pubkey == node.signing_pubkey)
                 .expect("every sealed node is one of the published bundles");
             let seckey = nodekey::derive(preimage, &bundle.kdf().expect("kdf")).expect("derive");
+            // Sign over the DEVICE's own endpoint copy, exactly as `node-endorse` does
+            // (it reads the bundle on that host and never sees ceremony-state.json).
+            // Signing over the state's copy instead would quietly assume the two agree,
+            // which is part of what the endorsement exists to establish.
             let endorsement = vault_node::channel::ceremony::endorse(
                 &seckey,
                 &wallet_id,
                 &manifest_hash,
                 node.node_id,
-                &node.endpoints,
+                &bundle.endpoints,
             );
             std::fs::write(
                 ceremony
@@ -3099,17 +3103,41 @@ mod tests {
                 serde_json::json!(policy().escape_coverage_pct),
             ),
             (
+                "coordinator_auth_pubkey",
+                serde_json::json!(state.coordinator_auth_pubkey),
+            ),
+            (
+                "hot_allowlist",
+                serde_json::json!([state.hot_descriptor.clone()]),
+            ),
+            (
                 "escape_descriptor",
                 serde_json::json!(state.escape_descriptor),
             ),
         ] {
             assert_eq!(manifest[field], expected, "manifest.json field {field}");
         }
+        // Each node entry carries its FULL identity, not just an endorsement: the node
+        // list is part of the hash preimage, so a manifest that dropped a pubkey or an
+        // endpoint could not reproduce `manifest_hash` either.
         let nodes = manifest["nodes"].as_array().expect("nodes array");
         assert_eq!(nodes.len(), 5);
-        for node in nodes {
+        for (entry, sealed) in nodes.iter().zip(&state.nodes) {
+            assert_eq!(entry["node_id"], serde_json::json!(sealed.node_id));
+            assert_eq!(
+                entry["signing_pubkey"],
+                serde_json::json!(sealed.signing_pubkey)
+            );
+            assert_eq!(
+                entry["channel_pubkey"],
+                serde_json::json!(sealed.channel_pubkey)
+            );
+            assert_eq!(
+                entry["transport_endpoints"],
+                serde_json::json!(sealed.endpoints)
+            );
             assert!(
-                node["channel_endorsement"]
+                entry["channel_endorsement"]
                     .as_str()
                     .is_some_and(|e| !e.is_empty()),
                 "each node's endorsement rides ALONGSIDE the manifest, never inside the hash"
@@ -3145,17 +3173,85 @@ mod tests {
             )));
         }
 
-        // 3. The backup is REGENERATED from the just-verified state, not blind-copied.
+        // 3. The backup exists. That it is REGENERATED rather than blind-copied is a
+        //    separate property and needs a corrupted sibling to prove — see
+        //    `the_backup_is_regenerated_from_verified_state_not_copied_from_siblings`.
         for name in ["descriptor.txt", "wallet-id.txt", "manifest-hash.txt"] {
             let path = ceremony.dir.join("backup").join(name);
             assert!(path.exists(), "backup/{name} must be written");
         }
-        assert_eq!(
-            std::fs::read_to_string(ceremony.dir.join("backup").join("descriptor.txt"))
-                .expect("backup descriptor")
-                .trim(),
-            state.descriptor,
-            "the backup descriptor is the one that passed the wallet_id recompute"
+    }
+
+    /// The backup is REGENERATED from the just-verified state, never blind-copied from
+    /// the working-directory siblings `assemble` left behind.
+    ///
+    /// Asserting `backup/descriptor.txt == state.descriptor` on a clean run proves
+    /// nothing: `assemble` writes a byte-identical sibling, so a `std::fs::copy`
+    /// regression passes (Fable nsw review, verified by mutation). Corrupting the
+    /// siblings first is what separates the two implementations — and it is exactly the
+    /// scenario the production comment exists for: a corrupted `descriptor.txt` copied
+    /// unchecked into the backup surfaces years later at recovery, when the coins cannot
+    /// be located. finalize does not READ these siblings, so it must still succeed and
+    /// still write the verified values.
+    #[test]
+    fn the_backup_is_regenerated_from_verified_state_not_copied_from_siblings() {
+        let ceremony = ceremony_through_endorse(5, 3);
+        let state = ceremony.state();
+        for name in ["descriptor.txt", "wallet-id.txt", "manifest-hash.txt"] {
+            std::fs::write(ceremony.dir.join(name), "corrupted-by-a-stray-edit\n")
+                .expect("corrupt sibling");
+        }
+        ceremony
+            .finalize()
+            .expect("the siblings are not finalize inputs, so it still seals");
+        for (name, expected) in [
+            ("descriptor.txt", &state.descriptor),
+            ("wallet-id.txt", &state.wallet_id),
+            ("manifest-hash.txt", &state.manifest_hash),
+        ] {
+            let backed_up = std::fs::read_to_string(ceremony.dir.join("backup").join(name))
+                .expect("backup file");
+            assert_eq!(
+                backed_up.trim(),
+                expected,
+                "backup/{name} must be regenerated from the VERIFIED state, not copied \
+                 from the corrupted sibling"
+            );
+        }
+    }
+
+    /// The bind port comes from the ENDORSED endpoints, never from a redundant stored
+    /// field that could drift.
+    ///
+    /// `listen_port` is not hash-bound, so an edited copy would keep the manifest and
+    /// every endorsement verifying while the emitted config pinned a port no longer
+    /// matching its endpoint — and `ChannelState::build` would reject the node at
+    /// startup, after the hosts were sealed. `StateNode` deliberately has no such field;
+    /// injecting one (serde ignores unknown fields, so finalize still runs) and asserting
+    /// the sealed config ignores it is what pins that decision against a regression that
+    /// reintroduces and trusts it (Fable nsw review, verified by mutation).
+    #[test]
+    fn the_sealed_bind_port_comes_from_the_endorsed_endpoint_not_a_stored_field() {
+        let ceremony = ceremony_through_endorse(5, 3);
+        ceremony.edit_state(|state| {
+            state["nodes"][0]["listen_port"] = serde_json::json!(12345);
+        });
+        ceremony.finalize().expect("an unknown field is ignored");
+        let state = ceremony.state();
+        let node = &state.nodes[0];
+        let config =
+            std::fs::read_to_string(ceremony.dir.join(format!("node-{}.toml", node.node_id)))
+                .expect("config");
+        let endorsed_port =
+            loopback_port(&node.endpoints, node.node_id).expect("endorsed endpoint");
+        assert_ne!(endorsed_port, 12345, "the fixture's ports must not collide");
+        assert!(
+            config.contains(&format!("listen_port = {endorsed_port}")),
+            "the config must bind the ENDORSED endpoint's port"
+        );
+        assert!(
+            !config.contains("listen_port = 12345"),
+            "a stored listen_port must never be trusted over the endorsed endpoint"
         );
     }
 
@@ -3180,15 +3276,9 @@ mod tests {
                 }),
                 "wallet_id",
             ),
-            (
-                "an edited wallet_id",
-                Box::new(|ceremony: &Ceremony| {
-                    ceremony.edit_state(|state| {
-                        state["wallet_id"] = serde_json::json!([0x11u8; 32].to_lower_hex_string());
-                    });
-                }),
-                "wallet_id",
-            ),
+            // (No separate "edited wallet_id" case: it terminates at the SAME production
+            // branch as the edited-descriptor case above, which is strictly stronger — a
+            // parsing, on-template descriptor that only the recompute can catch.)
             (
                 "an edited manifest_hash",
                 Box::new(|ceremony: &Ceremony| {
