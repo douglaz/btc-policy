@@ -8,6 +8,7 @@ mod fed;
 mod http;
 mod recovery;
 mod setup;
+mod signet;
 
 use std::process::ExitCode;
 
@@ -42,6 +43,16 @@ fn main() -> ExitCode {
         // demos drive these same functions, with the node-side steps in their own
         // processes, so what the acceptance runs is the real provisioning path.
         ["setup", rest @ ..] => setup::run(rest),
+        // Real-signet spend driver (bead btc-policy-9y5.8 deliverable 1): the same
+        // federation as the demos, but against a live external signet node with a
+        // real Hold and real block timing. Funds out of band from a signet faucet.
+        ["signet", "spend"] => match signet::run_signet_spend() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("signet spend FAILED: {e}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
             eprintln!(
                 "usage: btc-vault demo <first-light|theft-refused|recovery-drill>\n\
