@@ -42,7 +42,7 @@ consolidated architecture.
 | A4 | **Coercion / wrench attack** | The user, under duress, plus everything they know | The **duress PIN** (ADR-0008): a spend ceremony that looks and sounds identical to the attacker, but silently arms an escape sweep at `T` and locks the federation down unconditionally. This is the design's centrepiece. |
 | A5 | **Compromise of `c < t` nodes** | Up to 2 of 5 federation keys | Cannot reach quorum alone. ADR-0009 requires no correlation class (host, OS, location, operator) reach `t`. The Hot budget's routing bound is stated for `c < t` explicitly (ADR-0014). |
 | A6 | **Compromise of `≥ t` nodes** | 3+ federation keys **and** the user key | **Out of scope — this breaks the vault.** The federation threshold is the security boundary; nothing below it recovers from `t` honest-key compromise combined with the user key. |
-| A7 | **Coordinator-auth-key thief** | User key + PIN + coordinator auth key | Can feed one node directly and rely on propagation to arm the federation. Loss is still bounded by allowlist/Hot budget/Hold, but **the user has no surface today that shows the pending spend** — see §7 Residual risk R1 (tracked as `btc-policy-k0t`). |
+| A7 | **Coordinator-auth-key thief** | User key + PIN + coordinator auth key | Can feed one node directly and rely on propagation to arm the federation. Loss is bounded by allowlist/Hot budget/Hold, and every node's pin-uniform `GET /pending` projection makes the accepted candidate visible without relying on the coordinator relay. |
 | A8 | **Chain-level adversary** | Miners, mempool, fee market | Cannot steal. Can *delay*: fee spikes, censorship, and reorgs are handled by the RBF escape ladder, the re-broadcast path, and reorg-aware settlement — and every failure degrades to "funds frozen → recovery", never to theft. |
 | A9 | **Supply chain** | A dependency, or the build | Bounded by a deliberately small dependency set and a policy that every dependency must beat writing it (`docs/SBOM-AND-DEPENDENCY-POLICY.md`). **Weakly defended — see R4.** |
 
@@ -70,7 +70,7 @@ These are what a reviewer should try hardest to break. Each is enforced in code,
 
 | Invariant | What it means | Break it and… |
 |---|---|---|
-| **SILENCE** | Every observable — response bytes, timing class, `/events`, peer effects — is identical under the normal and duress PINs. | The wrench attacker learns the duress PIN was used and simply escalates. This is the invariant most easily lost to an innocuous-looking new field or endpoint. |
+| **SILENCE** | Every observable — response bytes, timing class, `/events`, `/healthz`, `/pending`, peer effects — is identical under the normal and duress PINs. | The wrench attacker learns the duress PIN was used and simply escalates. This is the invariant most easily lost to an innocuous-looking new field or endpoint. |
 | **Signer/partial COUPLING + RELEASE-GATE** | A partial is finalizable authority the moment `t−1` compromised peers hold it, so every fire-time check runs BEFORE release; `release_partials` is the sole egress. | A `t−1` set combines a transaction the honest node had refused. |
 | **Unconditional Lockdown at T** | Once armed, Lockdown happens at `T` regardless of whether the sweep succeeded, the chain was readable, or anything else. | Duress becomes survivable for the attacker: the vault keeps signing after coercion. |
 | **Determinism across the honest set** | Every honest node derives the same verdicts, and the same fee-bump rung, from the same chain state. | Partials cover different transactions, no rung reaches `t`, and the escape fails exactly when it is needed. |
@@ -84,21 +84,20 @@ These are what a reviewer should try hardest to break. Each is enforced in code,
 |---|---|---|
 | `POST /sign` | The main gate | Coord-auth → freshness/nonce → PIN (two Argon2id evaluations, constant-time compare) → user signature → class/allowlist → Hot budget → chain preflight → register. The nonce is consumed atomically under the sign lock; the slow chain I/O is deliberately *outside* it so no RPC can delay Lockdown-at-T. |
 | `POST /channel` | Peer transport | Manifest-pinned endpoints and endorsed channel keys; per-peer rate quota; size bound is manifest-uniform. |
-| `GET /events` | Watchtower alerts + one channel diagnostic | Carries on-chain watchtower alerts (`RECOVERY_PATH_SPEND`, `UNRECOGNIZED_SPEND`) plus `CHANNEL_FRESHNESS_REJECT`, which names a peer whose clock is off. It carries nothing about pending or armed state — which is why R1 exists. A reviewer should confirm the freshness diagnostic is genuinely pin-independent, since it is the one `/events` entry not derived from the chain. |
+| `GET /events` | Watchtower alerts + one channel diagnostic | Carries on-chain watchtower alerts (`RECOVERY_PATH_SPEND`, `UNRECOGNIZED_SPEND`) plus `CHANNEL_FRESHNESS_REJECT`, which names a peer whose clock is off. It carries nothing about pending or armed state. A reviewer should confirm the freshness diagnostic is genuinely pin-independent, since it is the one `/events` entry not derived from the chain. |
 | `GET /healthz` | Liveness | Three atomic loads; must stay free of duress-dependent content. |
+| `GET /pending` | Accepted hot-candidate ids | Sorted opaque commitment ids only. No arm state, transaction, amount, destination, signature material, or explicit timing field. The complete body must stay byte-identical across normal/duress and armed/idle twins. One short `sign_state` snapshot is allowed; concurrent snapshots are shed before entering the blocking pool. The SILENCE row above is asserted here on the response **bytes**: this is the one read surface that waits on `sign_state`, and while every holder of that lock does pin-uniform work (`/sign`'s two Argon2id evaluations under either PIN; settlement bookkeeping for public chain events), the arm-dependent release/combine work lives under the *channel store*, which this route never takes. The latency residual is therefore the co-residency one `/healthz` already states, not a lock this route shares with anything arm-dependent — see `docs/DESIGN.md`. |
 | Chain backend RPC | Per-node bitcoind | Requires `-txindex=1`. Node fails closed if unreadable. |
 | Setup ceremony | One-time | The highest-consequence surface: it fixes keys, PINs, policy caps, and the manifest hash. See `docs/SETUP-CEREMONY.md`; `finalize` refuses to seal an edited state. |
 | Node config + preimage | At rest on each host | The signing key is derived from an operator-supplied preimage at start, not stored. ADR-0007 assumes tmpfs so a reboot kills the node. |
 
 ## 7. Residual risks — stated plainly
 
-**R1 — A coordinator-auth-key thief's pending spend is invisible to the user.**
-`GET /events` carries on-chain alerts plus a peer-clock diagnostic — nothing about pending
-candidates — and nodes expose no pending-candidate query, so adversary A7's directly-fed request
-arms the federation with nothing for the user to watch. Loss
-is still bounded (allowlist, Hot budget, Hold, and the duress path if the user learns of it by
-other means), and `demo theft-refused` prints an honest caveat rather than implying coverage.
-Tracked as `btc-policy-k0t`. **This is a real gap, not a theoretical one.**
+**R1 — The pending projection is pull-only.**
+The coordinator-auth-key visibility gap is closed by `GET /pending`, but there is no paging or
+push notification. Someone must poll every node and compare the opaque ids with the user's
+authorized spends. Polling also bounds when an id appeared and disappeared; that timing is
+pin-uniform, but observable. The route deliberately exposes no transaction details or deadline.
 
 **R2 — `t` compromised nodes plus the user key is unrecoverable.** By construction (A6). The
 mitigation is operational — ADR-0009's correlation-class rule — not cryptographic.
@@ -130,8 +129,8 @@ not be read as evidence that it has.
 Ranked by "most damaging if wrong":
 
 1. **SILENCE.** Diff every observable between the two PIN classes: response bytes, timing,
-   `/events`, `/healthz`, peer nonce effects, and anything newly added. A length-preserving
-   difference is the shape to hunt.
+   `/events`, `/healthz`, `/pending`, peer nonce effects, and anything newly added. A
+   length-preserving difference is the shape to hunt.
 2. **The release gate.** Find any path where a partial leaves a node before every fire-time
    check has passed, or any second egress besides `release_partials`.
 3. **Determinism.** Find two honest nodes that, on the same chain state, could disagree about a

@@ -102,7 +102,12 @@ impl ReplayLog {
 ///
 /// It stores no PSBT and never has: nothing recorded here can be replayed into a
 /// signature, because it decides only *whether a spend is outstanding*, never
-/// *what* gets signed.
+/// *what* gets signed. That property became load-bearing a second time in bead
+/// btc-policy-k0t, which projects this log — and ONLY this log — onto the read-only
+/// `GET /pending` surface: see [`crate::PendingProjection`] for why an
+/// `id -> expiry` map written on `class == Hot` alone, cleared only by an
+/// on-the-network settlement (including a conflicting implicit-cancel transaction)
+/// or commitment expiry, cannot carry a pin class.
 #[derive(Default)]
 pub(crate) struct PendingLog {
     /// `commitment_id -> expiry` (unix seconds); the prune horizon, exactly as
@@ -138,9 +143,13 @@ impl PendingLog {
         self.entries.values().any(|expiry| *expiry >= now)
     }
 
-    /// Live pending commitment ids. The fire driver uses these after a combine
-    /// window closes solely to notice that a peer settled the exact spend and to
-    /// release refresh subordination; it never reopens release or broadcast.
+    /// Live pending commitment ids. Two readers, neither of which can act on the
+    /// result: the fire driver uses these after a combine window closes solely to
+    /// notice that a peer settled the exact spend and to release refresh
+    /// subordination — it never reopens release or broadcast — and
+    /// [`crate::Node::pending_projection`] serves the read-only `GET /pending`
+    /// surface from them. Adding a reader that MUTATED on the strength of this list
+    /// would be a different thing entirely; both of these only observe.
     pub(crate) fn ids(&self, now: u64) -> Vec<String> {
         self.entries
             .iter()

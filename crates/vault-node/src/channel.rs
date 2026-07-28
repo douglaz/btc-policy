@@ -4340,6 +4340,19 @@ impl ChannelState {
             .map(|candidate| candidate.base.unsigned_txid)
     }
 
+    /// Whether a resident candidate is latched broadcast — the exact flag
+    /// [`Self::due_for_fire`] gates on, so `Some(true)` means no later tick can
+    /// schedule it. Test-only: production reads it through the due set.
+    #[cfg(test)]
+    pub(crate) fn candidate_is_broadcast(&self, commitment_id: &str) -> Option<bool> {
+        self.store
+            .lock()
+            .expect("store lock poisoned")
+            .candidates
+            .get(commitment_id)
+            .map(|candidate| candidate.broadcast)
+    }
+
     /// Every rung's txid for a resident candidate, rung 0 first. A laddered escape
     /// settles when ANY rung of it does: the rungs conflict by construction (one
     /// input set), so exactly one can ever confirm, and treating only rung 0 as "the"
@@ -4417,7 +4430,34 @@ impl ChannelState {
     }
 
     /// Mark `commitment_id` broadcast so later ticks skip it (the `else` branch —
-    /// the only path production reaches).
+    /// the only path production reaches), TERMINALIZE every other resident hot
+    /// candidate the transaction invalidated by spending one of its inputs, and return
+    /// those ids.
+    ///
+    /// The ids are derived from the candidate PSBTs already in this store; no conflict
+    /// index or second source of truth is kept. Settlement uses them to clear
+    /// `PendingLog`: an escape-class clawback is the protocol's implicit cancel, so a
+    /// hot spend whose input is now spent must not remain projected as pending or keep
+    /// refreshes subordinated until its otherwise-unrelated expiry.
+    ///
+    /// Clearing the pending entry is NOT enough on its own, and the `broadcast = true`
+    /// below is the half that makes it safe. `broadcast` is what [`Self::due_for_fire`]
+    /// reads, so a defeated candidate left unmarked would stay release-authorized and
+    /// still combine at its Hold expiry — and if the conflicting transaction were later
+    /// evicted from the mempool, it would then broadcast successfully while `/pending`
+    /// reported nothing. That is precisely the theft the projection exists to keep
+    /// visible, so the two states must move together: one settlement, one decision,
+    /// under one lock. The direction is also the fail-safe one — a defeated spend that
+    /// a mempool eviction later reprieves does not fire, and the coins simply stay in
+    /// the vault until the owner resubmits.
+    ///
+    /// The marking runs AFTER the branch below, so the armed branch's own removal and
+    /// its unexposed-Hot-budget refund (which reads `!broadcast`) keep their existing
+    /// semantics; only candidates still resident afterwards are marked. A defeated
+    /// candidate that never released its share does then hold its Hot reservation to
+    /// age-out instead of getting it back at [`Self::prune`], exactly as a broadcast
+    /// spend does — the same fail-safe direction the whole ledger takes, since it can
+    /// only ever refuse a later hot spend, never admit an over-budget one.
     ///
     /// The `armed_escape` branch below — removing the escape and its paired context
     /// immediately to release candidate-count and byte capacity — is NOT reached in
@@ -4427,8 +4467,33 @@ impl ChannelState {
     /// released at fire-complete by [`Self::prune`], not here. The branch is retained
     /// (and exercised by its direct test callers) as the defensive semantics for any
     /// path that DOES settle an armed escape immediately.
-    pub(crate) fn mark_broadcast(&self, commitment_id: &str) {
+    pub(crate) fn mark_broadcast(&self, commitment_id: &str) -> Vec<String> {
         let mut store = self.store.lock().expect("store lock poisoned");
+        let spent_inputs: HashSet<OutPoint> = store
+            .candidates
+            .get(commitment_id)
+            .into_iter()
+            .flat_map(|candidate| &candidate.base.psbt.unsigned_tx.input)
+            .map(|input| input.previous_output)
+            .collect();
+        // `commitment_id` itself is excluded: it is settled, not defeated, and the
+        // branch below already decides what happens to it.
+        let invalidated_hot: Vec<String> = store
+            .candidates
+            .iter()
+            .filter(|(id, candidate)| {
+                id.as_str() != commitment_id
+                    && candidate.hot
+                    && candidate
+                        .base
+                        .psbt
+                        .unsigned_tx
+                        .input
+                        .iter()
+                        .any(|input| spent_inputs.contains(&input.previous_output))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
         let armed_escape = store.armed.active
             && store.armed.sweep_active
             && store.armed.escape_commitment_id == commitment_id;
@@ -4456,6 +4521,15 @@ impl ChannelState {
         } else if let Some(candidate) = store.candidates.get_mut(commitment_id) {
             candidate.broadcast = true;
         }
+        // The defeated candidates are done here too: their input is spent by a
+        // transaction this node just observed on the network, so they must not remain
+        // in the due set that `PendingLog` no longer reports.
+        for id in &invalidated_hot {
+            if let Some(candidate) = store.candidates.get_mut(id) {
+                candidate.broadcast = true;
+            }
+        }
+        invalidated_hot
     }
 
     /// A registered candidate's role and the commitment id of its sibling — §4's
@@ -8483,6 +8557,20 @@ mod net {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        let propagated_projection: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{p1}/pending"))
+            .send()
+            .await
+            .expect("pending send")
+            .json()
+            .await
+            .expect("pending body");
+        assert_eq!(
+            propagated_projection,
+            serde_json::json!({ "pending": [cid.clone()] }),
+            "a candidate delivered to node0 must appear on node1's user-visible projection \
+             through propagation alone"
+        );
         // It did not merely record it — it ran its OWN gates and signed at ingress,
         // which is what makes it useful to the combine.
         assert!(

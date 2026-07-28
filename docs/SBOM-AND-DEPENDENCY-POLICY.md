@@ -65,7 +65,7 @@ drop).
 | `bitcoin`, `miniscript` | consensus + descriptors | as above |
 | `serde`, `serde_json`, `toml` | config and JSON-RPC | config is operator-authored; parsing is a trust boundary |
 | `tokio` | async runtime | needed for the deadline driver and the peer channel |
-| `axum` | HTTP server (`/sign`, `/channel`, `/healthz`, `/events`) | `default-features = false` |
+| `axum` | HTTP server (`/sign`, `/channel`, `/healthz`, `/events`, `/pending`) | `default-features = false` |
 | `reqwest` | HTTP client for bitcoind JSON-RPC and peer sends | `default-features = false`; proxies explicitly disabled and redirects refused at the call site (a redirect could otherwise exfiltrate a partial) |
 | `argon2` | PIN hashing | with `zeroize` |
 | `subtle` | constant-time comparison | the duress-PIN compare must not leak through timing |
