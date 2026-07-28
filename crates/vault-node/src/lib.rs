@@ -117,6 +117,81 @@ pub struct Health {
     pub generation_claimed: bool,
 }
 
+/// The `GET /pending` projection (bead btc-policy-k0t): the commitment ids of the
+/// spends this node has ACCEPTED and has not yet seen settle — the Hold-window view a
+/// user can read straight off a node, without the coordinator relay.
+///
+/// **Why it exists.** `demo theft-refused`'s "the user notices the pending spend" step
+/// was faithful only because the MODELLED attacker (stolen user key + PIN, but NOT the
+/// coordinator auth key) has to relay through the user's OWN coordinator, which
+/// surfaces the `/sign` acknowledgements. A strictly stronger thief who ALSO holds the
+/// coordinator auth key can feed ONE node directly — §3 request propagation then
+/// reaches the rest of the federation — and nothing the user watches would have shown
+/// it: `GET /events` carries only on-chain watchtower alerts, and no node answered
+/// "what have you accepted?". This is that answer.
+///
+/// **Why it is not a duress oracle.** It is a function of [`replay::PendingLog`]
+/// ALONE — `commitment_id -> expiry`, and nothing else — so the read NEVER touches the
+/// channel store, which is where every piece of duress state lives (arm intents, `T`,
+/// Armed-vs-Scheduled, the sweep and its ladder). That is structural rather than a
+/// promise about which fields got picked. The log has exactly three writers, and the
+/// pin class reaches none of them:
+///
+/// - **record**, at ingress ([`handle_sign_after_lock`]) — gated on
+///   `class == TxClass::Hot` and on nothing else. A duress-pin spend and a normal-pin
+///   spend of the same transaction record the SAME id under the SAME expiry.
+/// - **remove** — only once a candidate has been observed ON THE NETWORK: a normal
+///   spend in the mempool or the chain ([`settle_candidate`], which drops the hot
+///   spends that transaction defeated by spending their inputs along with it), or a
+///   CONFIRMED armed escape clearing its paired hot spend. Both are public events, and
+///   a defeated candidate is terminalized in the same settlement, so an id this stops
+///   reporting is one no later fire tick can broadcast.
+/// - **prune**, at commitment expiry — the coordinator's own `expiry` field, which is
+///   the same byte under either pin.
+///
+/// So at any instant, a duress-carrying node's projection can differ from the
+/// equivalent normal-pin node's only AFTER a transaction the whole world can see has
+/// settled. The dynamic-`T` rule corroborates that from the other side: `T <= earliest
+/// pending hot Hold-expiry - epsilon_secs` (ADR-0012), so an armed node has already
+/// latched the PUBLIC Lockdown — `/healthz`'s `locked_down`, plus `FRAUD_SUSPECTED` on
+/// every spend — strictly before the spend it froze could have settled on the normal
+/// path.
+///
+/// **What is deliberately absent.** [`Health`]'s rule applies unchanged ("if a pre-`T`
+/// duress carrier can change a field, the field does not belong here"), and a second
+/// one applies on top of it: every byte exposed here is also visible to the thief, so
+/// expose only what closes the gap. Hence no fire time, `T`, Hold remainder or
+/// deadline FIELD — the fire schedule is precisely what arming rewrites; no arm or
+/// Armed/Scheduled state; no txid, PSBT, sighash, partial signature, amount,
+/// destination or fee — the crown jewels and everything derivable from them; no escape,
+/// ladder rung or bump; no count of refusals, since a refused request is never pending
+/// and a refusal count would be a policy oracle; no timestamp, which would make two
+/// honest nodes' bodies differ for no reason at all. Not even `expiry`, which is
+/// pin-uniform and would have been safe: the id alone is what lets a user say "I did
+/// not authorize that", so the expiry would be a byte handed to the attacker for
+/// nothing.
+///
+/// **What this gives the modelled attacker.** They hold the user key, the PIN and the
+/// coordinator auth key. For candidates THEY submitted this is strictly less than
+/// `/sign` already handed them — `Accepted` carries this same `commitment_id` plus
+/// `first_seen` and `remaining_secs`. What is genuinely new is that a coordinator-auth
+/// key thief who is not also the running coordinator can now see that the USER has a
+/// spend in flight: an opaque SHA-256 id with no explicit amount, destination or
+/// deadline in the body, for a transaction that broadcasts publicly at the end of its
+/// Hold regardless. Repeated polling can still bound when an id appeared and when it
+/// disappeared through settlement or expiry; that timing is pin-uniform, but it is
+/// observable and is part of the price of the surface.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PendingProjection {
+    /// Live accepted-but-unsettled spend commitment ids, sorted.
+    ///
+    /// The order is imposed here because `HashMap` iteration order is unspecified and
+    /// varies per process. Without it, one node polled twice — never mind two nodes in
+    /// the same state — would emit different bytes, and the byte-for-byte
+    /// pin-uniformity this whole type rests on could not be asserted at all.
+    pub pending: Vec<String>,
+}
+
 // Lifecycle markers are extended attributes on the already-open config inode,
 // rather than sibling files derived from the caller's pathname. Symlinks and
 // hardlinks therefore resolve to the SAME one-shot generation gate and Lockdown
@@ -2003,6 +2078,47 @@ impl Node {
         }
     }
 
+    /// The `GET /pending` projection ([`PendingProjection`]) as of `now`.
+    ///
+    /// Read-only in the strongest sense: it takes `sign_state` for ONE `HashMap` scan
+    /// and copy, releases it before sorting or serializing anything, mutates nothing —
+    /// not even a prune — and performs no I/O of any kind under the guard. The last
+    /// part is load-bearing, not tidiness: the fire driver and Lockdown-at-`T` contend
+    /// for this exact lock, and bead btc-policy-9y5.3 had to hoist chain I/O out of it
+    /// for that reason. A poll of this surface must never be the thing that postpones
+    /// `T`. (`/sign` holds the same lock across Argon2, so the marginal contention a
+    /// scan adds is not a new class of delay either.)
+    ///
+    /// `now` is filtered through the nonce log's rollback-guarded lower bound — the
+    /// same clock [`replay::PendingLog::prune`] and [`replay::PendingLog::has_any`] run
+    /// on — so this reports precisely what the log itself considers live, rather than
+    /// becoming a second opinion about which spends are outstanding.
+    pub fn pending_projection(&self, now: u64) -> PendingProjection {
+        self.pending_projection_with(move || now)
+    }
+
+    /// [`Node::pending_projection`] on this node's own clock — the production entry.
+    pub fn pending_projection_now(&self) -> PendingProjection {
+        self.pending_projection_with(unix_now)
+    }
+
+    /// The shared body. `clock` is read INSIDE the guard, so the production entry
+    /// filters on the time the snapshot is actually taken rather than on the time the
+    /// request arrived: a poll that waited behind a long `/sign` across a commitment
+    /// expiry would otherwise answer with a stale horizon and report an id the log no
+    /// longer considers live. A clock read is not I/O and adds no lock-held work of
+    /// the kind bead btc-policy-9y5.3 hoisted out. The explicit-time entry above keeps
+    /// tests deterministic.
+    fn pending_projection_with(&self, clock: impl FnOnce() -> u64) -> PendingProjection {
+        let mut pending = {
+            let state = self.sign_state.lock().expect("sign_state lock poisoned");
+            let effective_now = state.coord_nonces.effective_now(clock());
+            state.pending.ids(effective_now)
+        };
+        pending.sort_unstable();
+        PendingProjection { pending }
+    }
+
     /// Fire the duress arm-hook (the ADR-0012 "internal fire bit"). V0-4a only
     /// counts firings — the observable seam V0-4b's arm/freeze/sweep machine hangs
     /// off. Invisible on the wire, so it does not break pin-independent ingress.
@@ -2921,18 +3037,28 @@ fn combine_and_broadcast_with_contexts(
 }
 
 /// Mark an exact non-armed candidate settled locally and release refresh
-/// subordination for BOTH it and its paired sibling. Armed escapes use the
-/// confirmation branch above instead: it clears the same pending entries but
-/// deliberately retains the candidate through the fire window so an in-window
-/// reorg can re-broadcast it. Read the pairing BEFORE `mark_broadcast`, which may
-/// remove candidate context. Every pending removal is idempotent.
+/// subordination for it, its paired sibling, and every hot candidate whose inputs
+/// the settled transaction conflicts with. The last set is what makes an independent
+/// escape-class clawback the implicit cancel ADR-0004 promises: its public spend must
+/// not leave the defeated hot spend projected until expiry. [`ChannelState::mark_broadcast`]
+/// terminalizes those same candidates under the store lock before returning them, so
+/// the pending removal here never outruns the fire path: an id this drops is an id
+/// [`ChannelState::due_for_fire`] will not schedule.
+///
+/// Armed escapes use the confirmation branch above instead: it clears the same paired
+/// pending entries but deliberately retains the candidate through the fire window so
+/// an in-window reorg can re-broadcast it. Read the pairing BEFORE `mark_broadcast`,
+/// which may remove candidate context. Every pending removal is idempotent.
 fn settle_candidate(node: &Node, channel: &channel::ChannelState, commitment_id: &str) {
     let paired = channel.pairing(commitment_id).map(|(_, sibling)| sibling);
-    channel.mark_broadcast(commitment_id);
+    let invalidated_hot = channel.mark_broadcast(commitment_id);
     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
     state.pending.remove(commitment_id);
     if let Some(paired) = paired {
         state.pending.remove(&paired);
+    }
+    for invalidated in invalidated_hot {
+        state.pending.remove(&invalidated);
     }
 }
 

@@ -1,6 +1,6 @@
 //! Minimal HTTP/1.1 client over std::net (`Connection: close`).
 //! Talks to two loopback servers only — vault-node (`/sign`, `/events`,
-//! `/channel`) and bitcoind's JSON-RPC — which does not buy an HTTP crate its
+//! `/pending`, `/channel`) and bitcoind's JSON-RPC — which does not buy an HTTP crate its
 //! keep.
 
 use std::io::{Read, Write};

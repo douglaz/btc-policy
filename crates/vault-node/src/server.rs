@@ -1,7 +1,9 @@
 //! The vault-node HTTP surface on axum/tokio. Every connection is its own task.
 //! `/sign` and `/events` retain their coordinator-consumed JSON contract;
 //! undecodable signs remain 400 errors and absent/unparseable cursors read 0.
-//! `/healthz` is the read-only operations liveness surface ([`crate::Health`]).
+//! `/healthz` is the read-only operations liveness surface ([`crate::Health`]) and
+//! `/pending` the read-only accepted-but-unsettled spend projection
+//! ([`crate::PendingProjection`]).
 //! Edge statuses use axum defaults: oversized body 413, wrong method 405, and
 //! unknown route 404.
 
@@ -16,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use bytes::BytesMut;
+use tokio::sync::Semaphore;
 use vault_proto::TaggedRequest;
 use zeroize::Zeroize;
 
@@ -127,6 +130,12 @@ async fn read_secret_body(
 /// required). A complete envelope (≤ `max_msg_bytes`) over a healthy transport
 /// arrives well within this; a body that does not is a stalled peer we shed.
 const CHANNEL_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// `/pending` performs one short `sign_state` snapshot, but an unbounded number of
+/// concurrent snapshots could all occupy Tokio blocking-pool workers while `/sign`
+/// holds that lock for its memory-hard PIN work. One in-flight read is sufficient for
+/// this polling surface and bounds that contention without adding a timeout that would
+/// detach the still-blocked job and admit another one.
+const PENDING_MAX_CONCURRENCY: usize = 1;
 
 /// The deadline is state so the no-cancel test can force its path.
 #[derive(Clone)]
@@ -136,8 +145,11 @@ struct AppState {
     /// Deadline for buffering a `/channel` body while its pre-auth permit is held
     /// (see [`CHANNEL_BODY_READ_TIMEOUT`]). State so a test can force the path fast.
     channel_body_timeout: Duration,
+    pending_concurrency: Arc<Semaphore>,
     #[cfg(test)]
     sign_entered: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    pending_entered: Option<std::sync::mpsc::Sender<()>>,
 }
 
 /// Re-check for a poisoned critical lock on a handler's outer `JoinError` arm and, if
@@ -170,7 +182,8 @@ where
     outcome
 }
 
-/// Serve the one axum app (`/sign` + `/events` + `/healthz`) over `listener`.
+/// Serve the one axum app (`/sign` + `/events` + `/healthz` + `/pending`) over
+/// `listener`.
 ///
 /// `listener` is already bound, so this is the last production startup boundary
 /// before any request can arm or register a candidate. Claim the config inode's
@@ -209,8 +222,11 @@ pub(crate) fn app_with_timeout(node: Arc<Node>, handler_timeout: Duration) -> Ro
         node,
         handler_timeout,
         channel_body_timeout: CHANNEL_BODY_READ_TIMEOUT,
+        pending_concurrency: Arc::new(Semaphore::new(PENDING_MAX_CONCURRENCY)),
         #[cfg(test)]
         sign_entered: None,
+        #[cfg(test)]
+        pending_entered: None,
     })
 }
 
@@ -225,7 +241,9 @@ pub(crate) fn app_with_channel_body_timeout(
         node,
         handler_timeout: HANDLER_TIMEOUT,
         channel_body_timeout,
+        pending_concurrency: Arc::new(Semaphore::new(PENDING_MAX_CONCURRENCY)),
         sign_entered: None,
+        pending_entered: None,
     })
 }
 
@@ -238,7 +256,10 @@ fn router(state: AppState) -> Router {
         // Not a claim that a channel-less daemon is an observable state — `Node::load`
         // and `serve` both reject one (`require_channel_mode`, line 182 above), so
         // every node that ever answers this route is a channel-mode node.
-        .route("/healthz", get(healthz));
+        .route("/healthz", get(healthz))
+        // Unconditional for the same reason `/healthz` is: what it projects lives in
+        // `SignState`, which every node has in both channel and absent-channel mode.
+        .route("/pending", get(pending));
     // `/channel` is mounted ONLY in channel mode (absent `[channel]` ⇒ the route
     // does not exist, so a request 404s and the node behaves exactly as today).
     // The handler enforces its OWN `max_msg_bytes` cap and answers a TAGGED
@@ -255,7 +276,21 @@ fn app_with_sign_entry(node: Arc<Node>, sign_entered: std::sync::mpsc::Sender<()
         node,
         handler_timeout: HANDLER_TIMEOUT,
         channel_body_timeout: CHANNEL_BODY_READ_TIMEOUT,
+        pending_concurrency: Arc::new(Semaphore::new(PENDING_MAX_CONCURRENCY)),
         sign_entered: Some(sign_entered),
+        pending_entered: None,
+    })
+}
+
+#[cfg(test)]
+fn app_with_pending_entry(node: Arc<Node>, pending_entered: std::sync::mpsc::Sender<()>) -> Router {
+    router(AppState {
+        node,
+        handler_timeout: HANDLER_TIMEOUT,
+        channel_body_timeout: CHANNEL_BODY_READ_TIMEOUT,
+        pending_concurrency: Arc::new(Semaphore::new(PENDING_MAX_CONCURRENCY)),
+        sign_entered: None,
+        pending_entered: Some(pending_entered),
     })
 }
 
@@ -401,6 +436,74 @@ async fn healthz(State(state): State<AppState>) -> Response {
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("cannot encode health: {e}"),
+        ),
+    }
+}
+
+/// `GET /pending`: the node's read-only projection of the spends it has ACCEPTED and
+/// not yet seen settle ([`crate::PendingProjection`]) — the Hold-window surface that
+/// makes a coordinator-auth-key theft visible WITHOUT relying on the coordinator relay
+/// (bead btc-policy-k0t). That type's doc carries the argument for why it is not a
+/// duress oracle, and the full list of what it deliberately does not report.
+///
+/// A PROJECTION, NOT A CONTROL PLANE. `GET` only, so there is no new way to cancel,
+/// accelerate, or otherwise influence a candidate. The projection read itself mutates
+/// nothing. Its shared panic net can only latch the already-required fail-closed
+/// Lockdown after observing a poisoned crown-jewel lock; that is fault recovery, not a
+/// candidate action.
+///
+/// Unlike `/healthz` this one DOES take `sign_state`, so it goes through
+/// `spawn_blocking` rather than parking a runtime worker on a `std` mutex — the same
+/// discipline every other lock-touching path here follows. The guarded section is one
+/// `HashMap` scan with no I/O inside it ([`crate::Node::pending_projection`]).
+///
+/// LOCKDOWN — the deliberate answer: a locked-down node answers this exactly like any
+/// other node. Same route, same shape, no branch. Lockdown is ALREADY public
+/// (`/healthz` reports `locked_down`, and every `/sign` answers `FRAUD_SUSPECTED`), so
+/// a Lockdown-shaped branch here would introduce a duress-correlated code path while
+/// disclosing nothing that is not already disclosed — and the user needs the record of
+/// what this node accepted MOST during the incident that locked it down. Emptying or
+/// refusing post-`T` would delete exactly the evidence the endpoint exists to provide.
+async fn pending(State(state): State<AppState>) -> Response {
+    let Ok(permit) = Arc::clone(&state.pending_concurrency).try_acquire_owned() else {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "pending query already in progress",
+        );
+    };
+    #[cfg(test)]
+    if let Some(pending_entered) = &state.pending_entered {
+        let _ = pending_entered.send(());
+    }
+    let node = Arc::clone(&state.node);
+    let read = blocking_with_lockdown_net(Arc::clone(&state.node), move || {
+        // Hold the permit until the snapshot actually finishes — move it INTO the
+        // job, not just the handler future, exactly as `/channel` does with its
+        // pre-auth permit. `spawn_blocking` detaches: a poller that disconnects
+        // while this job is parked on `sign_state` cancels the handler future, and
+        // a permit tied to that future would be released while the job stays
+        // parked. Connect-and-drop in a loop would then queue unbounded blocking
+        // workers behind `/sign`'s memory-hard PIN work — the exact contention
+        // `PENDING_MAX_CONCURRENCY` exists to bound, and the one that could put
+        // observational work in front of the fire path.
+        let _permit = permit;
+        node.pending_projection_now()
+    })
+    .await;
+    match read {
+        Ok(projection) => match serde_json::to_string(&projection) {
+            Ok(json) => json_response(StatusCode::OK, json),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("cannot encode pending: {e}"),
+            ),
+        },
+        // The only way this read unwinds is a `sign_state` already poisoned by some
+        // other critical section — which the panic nets have latched Lockdown for.
+        // Answer 500 rather than a body a poller could mistake for "nothing pending".
+        Err(_join_error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pending task failed unexpectedly",
         ),
     }
 }
@@ -1279,6 +1382,602 @@ mod tests {
         holder.join().expect("holder thread");
         assert!(!deadline_waiter.await.expect("deadline waiter"));
         fire_waiter.await.expect("fire waiter");
+    }
+
+    // -- `/pending`: the accepted-but-unsettled projection (bead btc-policy-k0t) ---
+
+    /// Re-`pin` and re-coord-sign `base` under a fresh `nonce`, exactly as the pin
+    /// tests do: the PIN is inside the coordinator signature's preimage, so changing
+    /// it invalidates the old signature. Nothing here touches the COMMITMENT preimage
+    /// (`wallet_id`, the transaction, the fee, the expiry, the policy version), so both
+    /// results still commit to the identical spend under the identical id — which is
+    /// what makes a pin-uniformity comparison meaningful rather than trivially true.
+    fn repin(base: &SignRequest, node: &Node, pin: &str, nonce: &str) -> SignRequest {
+        let mut request = base.clone();
+        request.pin = pin.into();
+        crate::test_support::coord_sign(&mut request, &node.wallet_id, nonce);
+        request
+    }
+
+    fn pending_ids(body: &str) -> Vec<String> {
+        serde_json::from_str::<serde_json::Value>(body).expect("pending json")["pending"]
+            .as_array()
+            .expect("pending array")
+            .iter()
+            .map(|id| id.as_str().expect("commitment id string").to_owned())
+            .collect()
+    }
+
+    /// A fresh node has accepted nothing, and the empty answer is the full shape — the
+    /// wire contract an operator and the coordinator relay read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_is_empty_on_a_fresh_node() {
+        let (node, _request) = node_and_valid_request();
+        let addr = spawn_app(app(Arc::new(node))).await;
+        let (status, body) = spawn_blocking(move || get(addr, "/pending"))
+            .await
+            .expect("client task");
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("pending json"),
+            serde_json::json!({ "pending": [] })
+        );
+    }
+
+    /// THE REASON THE ENDPOINT EXISTS: a spend the user never authorized, fed STRAIGHT
+    /// to one node by someone holding the coordinator auth key, is visible on that
+    /// node during its Hold — no coordinator relay in the loop.
+    ///
+    /// The POST below is precisely that thief's move: a coordinator-authenticated
+    /// `/sign` the user's own coordinator never composed and never sees. Before this
+    /// projection, the acceptance left no surface the user watches (`GET /events`
+    /// carries on-chain watchtower alerts only), which is the gap
+    /// `demo theft-refused` used to disclose as a printed caveat.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_reports_a_candidate_the_user_never_authorized() {
+        let (node, request) = node_and_valid_request();
+        let node = Arc::new(node);
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+
+        let body = spend_body(&request);
+        let (status, accepted) = spawn_blocking(move || post(addr, "/sign", &body))
+            .await
+            .expect("thief client");
+        assert_eq!(status, 200);
+        let commitment_id = match serde_json::from_str::<SignResponse>(&accepted).expect("decode") {
+            SignResponse::Accepted(accepted) => accepted.commitment_id,
+            other => panic!("the direct feed must be accepted to be pending: {other:?}"),
+        };
+
+        let (status, body) = spawn_blocking(move || get(addr, "/pending"))
+            .await
+            .expect("client task");
+        assert_eq!(status, 200);
+        assert_eq!(
+            pending_ids(&body),
+            vec![commitment_id],
+            "a candidate accepted straight from the wire must be visible during its Hold"
+        );
+    }
+
+    /// THE LOAD-BEARING TEST: `/pending` must not become a duress oracle.
+    ///
+    /// Two nodes built from the identical config are fed the IDENTICAL spend — one
+    /// under the enrolled normal PIN, one under the enrolled duress PIN — and must
+    /// answer BYTE-IDENTICALLY. One request object is re-pinned rather than two being
+    /// built, so the commitment (and therefore everything downstream of it) is the same
+    /// by construction and the pin is genuinely the only variable.
+    ///
+    /// The comparison is on the COMPLETE body, never a chosen field or its length: a
+    /// leak added later would most plausibly arrive as a field nobody thought to name
+    /// here, or as a same-width value substituted into one that was, and either would
+    /// sail straight past a field-by-field check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_is_byte_identical_under_the_normal_and_duress_pins() {
+        // The SAME fixture twice: two nodes whose only difference is the pin below.
+        let (normal_node, base) = node_and_valid_request();
+        let (duress_node, _) = node_and_valid_request();
+        let normal_node = Arc::new(normal_node);
+        let duress_node = Arc::new(duress_node);
+        let normal_request = repin(&base, &normal_node, "1234", "silence-normal");
+        let duress_request = repin(&base, &duress_node, "9999", "silence-duress");
+
+        let normal_addr = spawn_app(app(Arc::clone(&normal_node))).await;
+        let duress_addr = spawn_app(app(Arc::clone(&duress_node))).await;
+        for (addr, request) in [
+            (normal_addr, &normal_request),
+            (duress_addr, &duress_request),
+        ] {
+            let body = spend_body(request);
+            let (status, response) = spawn_blocking(move || post(addr, "/sign", &body))
+                .await
+                .expect("sign client");
+            assert_eq!(status, 200);
+            assert!(
+                matches!(
+                    serde_json::from_str::<SignResponse>(&response).expect("decode"),
+                    SignResponse::Accepted(_)
+                ),
+                "both pins must be ACCEPTED (ADR-0012 SILENCE), or this compares two \
+                 different states: {response}"
+            );
+        }
+
+        let (normal_status, normal_body) = spawn_blocking(move || get(normal_addr, "/pending"))
+            .await
+            .expect("normal client");
+        let (duress_status, duress_body) = spawn_blocking(move || get(duress_addr, "/pending"))
+            .await
+            .expect("duress client");
+        assert_eq!((normal_status, duress_status), (200, 200));
+        assert_eq!(
+            normal_body, duress_body,
+            "DURESS ORACLE: /pending differs between a normal-pin and a duress-pin spend"
+        );
+        // The control that makes the equality mean something: both really did register
+        // a pending candidate. Without it this would pass just as happily against an
+        // endpoint that reports nothing at all.
+        assert_eq!(
+            pending_ids(&normal_body).len(),
+            1,
+            "the compared bodies must actually carry the candidate"
+        );
+        assert_eq!(
+            duress_node.duress_arm_count(),
+            1,
+            "the duress node must really have seen a valid duress pin"
+        );
+        assert_eq!(normal_node.duress_arm_count(), 0);
+    }
+
+    /// The same claim against a node that has genuinely ARMED through the production
+    /// confirmation path, pre-`T` — the state a hostile coordinator most wants to read,
+    /// and the whole content of the hostage window (ADR-0012 SILENCE). The pin-level
+    /// test above cannot reach it: an absent-channel node records the duress intent but
+    /// has no store to arm.
+    ///
+    /// Both nodes are fed the identical hot spend under the identical NORMAL pin, so
+    /// their pending logs start equal by construction and the arm is the only variable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_is_byte_identical_on_an_armed_pre_t_node() {
+        const DURESS_DELAY: u64 = 600;
+        // The Hold has to outlast `T`, or there is no pre-`T` window to compare in:
+        // `T = min(first_seen + duress_delay, earliest hot fire_at - epsilon)`, so a
+        // zero Hold would collapse `T` onto `now` and Lock the node down immediately.
+        const HOLD: u64 = 3_600;
+
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let armed = Arc::new(
+            crate::test_support::load_node(&fx.config(0, HOLD, "")).expect("channel fixture node"),
+        );
+        let idle = Arc::new(
+            crate::test_support::load_node(&fx.config(0, HOLD, "")).expect("channel fixture node"),
+        );
+        let now = crate::unix_now();
+        let spend = fx.spend_psbt(&fx.hot_spk, 0);
+        let expiry = now + 7_200;
+        for (index, node) in [&armed, &idle].into_iter().enumerate() {
+            let request = fx.spend_request(&spend, expiry, &format!("k0t-arm-{index}"));
+            assert!(
+                matches!(
+                    crate::handle_sign(node, &request, now).expect("decodable"),
+                    SignResponse::Accepted(_)
+                ),
+                "both nodes must hold the same pending candidate before the arm"
+            );
+        }
+
+        assert!(
+            armed
+                .channel
+                .as_ref()
+                .expect("channel")
+                .arm_via_confirmation(
+                    "duress-carrier",
+                    "",
+                    armed.threshold,
+                    now,
+                    crate::channel::DuressTiming {
+                        duress_delay_secs: DURESS_DELAY,
+                        epsilon_secs: 1,
+                        combine_slack_secs: 60,
+                    },
+                ),
+            "the arm must commit, or this test compares two idle nodes and proves nothing"
+        );
+        // Pre-`T`, and it must stay that way across the comparison: after `T` the
+        // Lockdown difference is legitimate and public, so a comparison that drifted
+        // past it would be asserting the wrong thing.
+        assert!(!crate::lockdown_tick(&armed, now), "the arm is pre-T");
+        assert!(!armed.is_locked_down());
+
+        let armed_addr = spawn_app(app(Arc::clone(&armed))).await;
+        let idle_addr = spawn_app(app(Arc::clone(&idle))).await;
+        let (armed_status, armed_body) = spawn_blocking(move || get(armed_addr, "/pending"))
+            .await
+            .expect("armed client");
+        let (idle_status, idle_body) = spawn_blocking(move || get(idle_addr, "/pending"))
+            .await
+            .expect("idle client");
+        assert_eq!((armed_status, idle_status), (200, 200));
+        assert_eq!(
+            armed_body, idle_body,
+            "DURESS ORACLE: /pending differs between an armed pre-T node and an idle one"
+        );
+        assert_eq!(
+            pending_ids(&armed_body).len(),
+            1,
+            "the compared bodies must actually carry the candidate"
+        );
+        // The control: this node really is armed, and its Lockdown really does land at
+        // `T` — so the equality above is measuring an armed node, not a failed arm.
+        assert!(armed
+            .channel
+            .as_ref()
+            .expect("channel")
+            .armed_snapshot()
+            .is_some());
+        assert!(
+            crate::lockdown_tick(&armed, now + DURESS_DELAY),
+            "the armed node must Lock Down at T"
+        );
+    }
+
+    /// A locked-down node answers exactly like any other node — the documented
+    /// Lockdown behaviour (see the [`pending`] handler). The body is compared against
+    /// the pre-Lockdown one so the claim is "unchanged", not merely "still 200":
+    /// emptying or refusing here would delete the record of what the node accepted at
+    /// precisely the moment the user needs it, and would do so to hide state
+    /// `/healthz` and `/sign` already publish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_answers_unchanged_on_a_locked_down_node() {
+        let (node, request) = node_and_valid_request();
+        let node = Arc::new(node);
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+        let body = spend_body(&request);
+        let (status, _) = spawn_blocking(move || post(addr, "/sign", &body))
+            .await
+            .expect("sign client");
+        assert_eq!(status, 200);
+        let (_status, before) = spawn_blocking(move || get(addr, "/pending"))
+            .await
+            .expect("client task");
+        assert_eq!(pending_ids(&before).len(), 1);
+
+        node.enter_lockdown();
+        assert!(node.is_locked_down());
+        let (status, after) = spawn_blocking(move || get(addr, "/pending"))
+            .await
+            .expect("client task");
+        assert_eq!(
+            status, 200,
+            "Lockdown must not take the projection off the air"
+        );
+        assert_eq!(
+            after, before,
+            "a locked-down node must answer /pending unchanged: the evidence of what it \
+             accepted is what the user needs during the incident that locked it down"
+        );
+    }
+
+    /// The candidate DISAPPEARS on both terminal paths, and on nothing else.
+    ///
+    /// Settlement first, through the production removal ([`crate::settle_candidate`],
+    /// what one fire tick calls once a normal spend is on the network); then commitment
+    /// expiry, which is why the projection filters rather than trusting the sweep. Both
+    /// are the same pin-independent events for every node in the federation — which is
+    /// exactly why the projection's disappearance cannot signal a pin class.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_clears_when_a_candidate_settles_or_expires() {
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let node = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 0, "")).expect("channel fixture node"),
+        );
+        let now = crate::unix_now();
+        let expiry = now + 3_600;
+        let request = fx.spend_request(&fx.spend_psbt(&fx.hot_spk, 0), expiry, "k0t-settle");
+        let commitment_id = match crate::handle_sign(&node, &request, now).expect("decodable") {
+            SignResponse::Accepted(accepted) => accepted.commitment_id,
+            other => panic!("the fixture spend must be accepted: {other:?}"),
+        };
+
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+        let (_status, body) = spawn_blocking(move || get(addr, "/pending"))
+            .await
+            .expect("client task");
+        assert_eq!(pending_ids(&body), vec![commitment_id.clone()]);
+
+        // Expiry: the entry stays live through its final authorized second (the same
+        // boundary refresh subordination uses) and is gone the second after.
+        assert_eq!(
+            node.pending_projection(expiry).pending,
+            vec![commitment_id.clone()],
+            "a candidate is still pending in its final fire second"
+        );
+        assert!(
+            node.pending_projection(expiry + 1).pending.is_empty(),
+            "past commitment expiry the candidate is no longer pending"
+        );
+
+        // Settlement: the exact call one fire tick makes after a normal spend reaches
+        // the mempool or the chain.
+        crate::settle_candidate(
+            &node,
+            node.channel.as_ref().expect("channel"),
+            &commitment_id,
+        );
+        let (status, body) = spawn_blocking(move || get(addr, "/pending"))
+            .await
+            .expect("client task");
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("pending json"),
+            serde_json::json!({ "pending": [] }),
+            "a settled candidate must leave the projection"
+        );
+    }
+
+    /// An escape-class clawback is an implicit cancel even when it came from a
+    /// separate request. Once that public conflicting transaction settles, retaining
+    /// the defeated hot id would tell the user an unspendable candidate is still live
+    /// and would keep refreshes subordinated until an unrelated commitment expiry.
+    ///
+    /// And the projection must not run AHEAD of the fire path: the defeated candidate
+    /// leaves the due set in the same settlement, so an id `/pending` stops reporting
+    /// is an id no later tick can still broadcast. Without that half, a mempool
+    /// eviction of the clawback would let the defeated spend fire at its Hold expiry
+    /// with nothing left on the surface that exists to show it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_clears_after_an_independent_conflicting_clawback_settles() {
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let node = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 3_600, "")).expect("channel fixture node"),
+        );
+        let now = crate::unix_now();
+        let expiry = now + 7_200;
+
+        let hot = fx.spend_psbt(&fx.hot_spk, 7);
+        let mut hot_request = fx.spend_request(&hot, expiry, "k0t-conflicted-hot");
+        // Match the demo: the pending hot request's mandatory escape sweeps both
+        // vault coins, so it is distinct from the later one-input clawback.
+        hot_request.escape_psbt = fx.two_input_spend_psbt(&fx.escape_spk).to_string();
+        fx.coord_sign(&mut hot_request, "k0t-conflicted-hot");
+        let hot_id = match crate::handle_sign(&node, &hot_request, now).expect("decodable") {
+            SignResponse::Accepted(accepted) => accepted.commitment_id,
+            other => panic!("the hot spend must be pending: {other:?}"),
+        };
+
+        // A distinct escape-class request spends the hot candidate's input and carries
+        // a disjoint residual, matching `demo theft-refused`'s clawback shape.
+        let clawback = fx.spend_psbt(&fx.escape_spk, 7);
+        let residual = fx.spend_psbt(&fx.escape_spk, 8);
+        let mut clawback_request = fx.spend_request(&clawback, expiry, "k0t-independent-clawback");
+        clawback_request.escape_psbt = residual.to_string();
+        fx.coord_sign(&mut clawback_request, "k0t-independent-clawback");
+        let clawback_id =
+            match crate::handle_sign(&node, &clawback_request, now).expect("decodable") {
+                SignResponse::Accepted(accepted) => accepted.commitment_id,
+                other => panic!("the escape-class clawback must be accepted: {other:?}"),
+            };
+        assert_eq!(
+            node.pending_projection(now).pending,
+            vec![hot_id.clone()],
+            "escape-class candidates themselves are never pending"
+        );
+        // The control for the claim below: before the clawback settles, the defeated
+        // candidate is unlatched, i.e. one a later tick could still combine and send.
+        let channel = node.channel.as_ref().expect("channel");
+        assert_eq!(
+            channel.candidate_is_broadcast(&hot_id),
+            Some(false),
+            "the hot candidate must be unlatched before the clawback settles, or the \
+             assertion after it proves nothing"
+        );
+
+        crate::settle_candidate(&node, channel, &clawback_id);
+        assert!(
+            node.pending_projection(now).pending.is_empty(),
+            "a settled conflicting clawback must remove the hot candidate it invalidated"
+        );
+        assert_eq!(
+            channel.candidate_is_broadcast(&hot_id),
+            Some(true),
+            "a candidate dropped from /pending must also leave the due set (`due_for_fire` \
+             gates on this flag): otherwise an evicted clawback lets the defeated spend \
+             fire at its Hold expiry with nothing on the surface that exists to show it"
+        );
+    }
+
+    /// THE STRUCTURAL GUARANTEE, made a test: the projection never reads the channel
+    /// store. That store is where EVERY piece of duress state lives — arm intents, `T`,
+    /// Armed-vs-Scheduled, the sweep and its ladder — so a handler that cannot touch it
+    /// cannot leak it, whatever fields a later edit adds. Answering while the store is
+    /// held is how that is observable from outside.
+    ///
+    /// Same three-worker production shape as
+    /// [`healthz_answers_while_the_channel_store_is_held`]: the deadline and fire
+    /// driver prologues occupy two workers on the held store, leaving one to poll the
+    /// listener and this handler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn pending_answers_while_the_channel_store_is_held() {
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let node = Arc::new(
+            crate::test_support::load_node(&fx.config(0, 0, "")).expect("channel fixture node"),
+        );
+        let addr = spawn_app(app(Arc::clone(&node))).await;
+
+        let gate = Arc::clone(&node);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            gate.channel
+                .as_ref()
+                .expect("channel")
+                .hold_store_until(&held_tx, &release_rx);
+        });
+        held_rx.recv().expect("store held");
+
+        let deadline_node = Arc::clone(&node);
+        let (deadline_entered_tx, deadline_entered_rx) = tokio::sync::oneshot::channel();
+        let deadline_waiter = tokio::spawn(async move {
+            let _ = deadline_entered_tx.send(());
+            deadline_node
+                .channel
+                .as_ref()
+                .expect("channel")
+                .lockdown_due(0)
+        });
+        let fire_node = Arc::clone(&node);
+        let (fire_entered_tx, fire_entered_rx) = tokio::sync::oneshot::channel();
+        let fire_waiter = tokio::spawn(async move {
+            let _ = fire_entered_tx.send(());
+            fire_node.channel.as_ref().expect("channel").prune_store(0);
+        });
+        deadline_entered_rx.await.expect("deadline task entered");
+        fire_entered_rx.await.expect("fire task entered");
+        tokio::task::yield_now().await;
+
+        let probe = std::thread::spawn(move || {
+            let result = get_with_timeout(addr, "/pending", Duration::from_secs(2))
+                .map_err(|e| format!("/pending blocked behind a held channel store: {e}"));
+            let _ = release_tx.send(());
+            result
+        });
+        let (status, body) = spawn_blocking(move || probe.join().expect("probe thread"))
+            .await
+            .expect("probe task")
+            .expect("/pending store isolation");
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("pending json"),
+            serde_json::json!({ "pending": [] })
+        );
+        holder.join().expect("holder thread");
+        assert!(!deadline_waiter.await.expect("deadline waiter"));
+        fire_waiter.await.expect("fire waiter");
+    }
+
+    /// At most one `/pending` snapshot may wait behind `sign_state`. Without this
+    /// pre-lock bound, a local poll flood during `/sign`'s memory-hard PIN work could
+    /// occupy the whole blocking pool and queue the fire path behind observational work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_sheds_concurrent_reads_before_the_sign_lock() {
+        let (node, _request) = node_and_valid_request();
+        let node = Arc::new(node);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let addr = spawn_app(app_with_pending_entry(Arc::clone(&node), entered_tx)).await;
+
+        let gate = Arc::clone(&node);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = gate.sign_state.lock().expect("sign_state lock");
+            held_tx.send(()).expect("held signal");
+            release_rx.recv().expect("release signal");
+        });
+        held_rx.recv().expect("sign_state held");
+
+        let first =
+            std::thread::spawn(move || get_with_timeout(addr, "/pending", Duration::from_secs(5)));
+        spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("entry waiter")
+            .expect("first pending entered");
+
+        let started = Instant::now();
+        let (status, _) =
+            spawn_blocking(move || get_with_timeout(addr, "/pending", Duration::from_secs(2)))
+                .await
+                .expect("second client task")
+                .expect("second pending response");
+        assert_eq!(status, 429);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the second read queued behind sign_state instead of being shed"
+        );
+
+        release_tx.send(()).expect("release sign_state");
+        holder.join().expect("holder thread");
+        assert_eq!(
+            first
+                .join()
+                .expect("first client thread")
+                .expect("first pending response")
+                .0,
+            200
+        );
+    }
+
+    /// The shed bound above survives CANCELLATION, which is the only way it is worth
+    /// anything: `spawn_blocking` detaches, so a permit released with the handler
+    /// future would let a poller connect-and-drop in a loop and park an unbounded
+    /// number of blocking workers on `sign_state` — the contention the bound exists to
+    /// keep off the fire path.
+    ///
+    /// Driven at the future level rather than over a socket, because that makes the
+    /// cancellation exact instead of a race with the runtime noticing a closed
+    /// connection: one poll leaves the job in flight, and dropping the future is
+    /// precisely what axum does when the client disconnects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_holds_its_permit_when_the_client_disconnects() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let (node, _request) = node_and_valid_request();
+        let node = Arc::new(node);
+        let permits = Arc::new(Semaphore::new(PENDING_MAX_CONCURRENCY));
+        let state = AppState {
+            node: Arc::clone(&node),
+            handler_timeout: HANDLER_TIMEOUT,
+            channel_body_timeout: CHANNEL_BODY_READ_TIMEOUT,
+            pending_concurrency: Arc::clone(&permits),
+            sign_entered: None,
+            pending_entered: None,
+        };
+
+        let gate = Arc::clone(&node);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = gate.sign_state.lock().expect("sign_state lock");
+            held_tx.send(()).expect("held signal");
+            release_rx.recv().expect("release signal");
+        });
+        held_rx.recv().expect("sign_state held");
+
+        let mut handler = Box::pin(pending(State(state)));
+        std::future::poll_fn(|cx| {
+            assert!(
+                handler.as_mut().poll(cx).is_pending(),
+                "the snapshot must still be parked on the held sign_state"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(permits.available_permits(), 0, "the read took the permit");
+        // The disconnect.
+        drop(handler);
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "a cancelled /pending released its permit while its blocking job stayed \
+             parked on sign_state: the shed bound is bypassable by connect-and-drop"
+        );
+
+        release_tx.send(()).expect("release sign_state");
+        holder.join().expect("holder thread");
+    }
+
+    /// `/pending` is a projection, not a control surface: `GET`-only, so it adds no way
+    /// to cancel, accelerate, or otherwise influence a candidate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_is_read_only() {
+        let (node, _request) = node_and_valid_request();
+        let addr = spawn_app(app(Arc::new(node))).await;
+        let (status, _) = spawn_blocking(move || post(addr, "/pending", "{}"))
+            .await
+            .expect("client task");
+        assert_eq!(status, 405, "/pending must not accept a mutating verb");
     }
 
     /// Send a `Connection: close` request and read its full response. Oversized

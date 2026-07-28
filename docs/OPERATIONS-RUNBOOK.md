@@ -22,11 +22,16 @@ Everything else in this document is secondary to that.
 |---|---|---|
 | Each node is serving | `GET /healthz` on every node | `{"serving": true, "locked_down": false, ...}` |
 | The deadline driver is alive | `last_deadline_tick` in `/healthz` | advancing; a stale value means the driver stopped and Lockdown-at-T may not fire |
+| No unexpected pending spend | `GET /pending` on every node | `{"pending":[]}`, or only ids matching spends you authorized |
 | No unexpected on-chain activity | `GET /events` on any node | empty, or only alerts you can explain |
 | Enough nodes are up | count of serving nodes | **≥ 3 of 5**. At 3 you have no margin — fix it before anything else. |
 
 `/healthz` is deliberately three atomic loads and nothing else, so polling it costs nothing and
-cannot interfere with signing.
+cannot interfere with signing. `/pending` takes one bounded snapshot of the node's accepted hot
+candidate ids; poll it at an interval appropriate to the Hold, and compare every id with the
+spends you authorized. It serves one snapshot at a time: a `429` means another read is already in
+flight, so retry it — that is a shed read, not a down node, and above all not an empty
+projection.
 
 ## 2. Reading `/events`
 
@@ -93,13 +98,27 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 3. The old vault is finished. Stand up a new one (`docs/UPGRADE-AND-ROTATION-POLICY.md` §3).
 
 ### An unauthorized spend is pending and the Hold has not expired
-This is what the Hold is for. Submit the **duress PIN** ceremony: it freezes the pending spend
-and sweeps the coins to the escape wallet. `demo theft-refused` is exactly this scenario, end to
-end.
+This is what the Hold is for.
 
-**Caveat, stated honestly:** you can only act on a pending spend you can *see*. If an attacker
-holds the coordinator auth key, they can feed a node directly and no surface currently shows you
-the pending candidate (`docs/THREAT-MODEL.md` R1, tracked as `btc-policy-k0t`).
+1. Read `GET /pending` from every node. An id you did not receive for a spend you authorized is
+   evidence that the node accepted an unauthorized candidate, including one fed directly by a
+   coordinator-auth-key thief.
+2. Answer inside the Hold, and pick the answer by your own situation:
+   - **If you are free to act**, submit an escape-class spend of the threatened coins under the
+     **normal PIN**. Escape-class fires immediately (`remaining_secs: 0`), so the conflicting
+     transaction defeats the pending spend well before its Hold expires, and the vault keeps
+     working afterwards. This is the clawback `demo theft-refused` act two performs end to end.
+   - **If you are under coercion**, submit the **duress PIN** ceremony instead (above): it arms
+     the escape sweep at `T` and locks the federation down unconditionally, and the ceremony is
+     indistinguishable to the attacker. The vault is finished afterwards — that is the trade.
+     This path is exercised by the `attack all` duress scenarios, not by the demo.
+3. Keep polling. The id remains visible through Lockdown, and leaves the projection once this
+   node observes the conflicting transaction on the network or the commitment expires. A node
+   that drops an id has also stopped scheduling it, so a dropped id cannot fire later.
+
+The projection is intentionally minimal: it gives commitment ids, not transaction details,
+amounts, destinations, or deadlines. There is no push notification; if nobody polls it, nobody
+sees it.
 
 ### The normal path is bricked (coordinator auth key lost)
 No request can be authenticated ever again — the manifest pins that pubkey and is immutable. The
@@ -134,8 +153,8 @@ Test a restore. A backup you have never restored from is a hypothesis.
 
 ## 8. What this runbook does not cover
 
-- **Monitoring/alerting integration.** There is no paging integration; `/healthz` and `/events`
-  are pull surfaces and someone has to actually pull them.
+- **Monitoring/alerting integration.** There is no paging integration; `/healthz`, `/events`, and
+  `/pending` are pull surfaces and someone has to actually pull them.
 - **Key ceremony logistics** (who holds what, where, in which jurisdiction) — that is deployment
   policy, and ADR-0009's correlation-class rule is the constraint it has to satisfy.
 - **Anything about running at scale.** This is a single-user vault; the `scantxoutset` cost

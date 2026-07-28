@@ -1223,6 +1223,40 @@ impl NodeProcess {
         }
         Ok(serde_json::from_str(&response.body)?)
     }
+
+    /// `GET /pending` — the node's own projection of the spends it has ACCEPTED and
+    /// not yet seen settle (bead btc-policy-k0t). Unlike the `/sign` acknowledgements,
+    /// this is readable straight off each node, so a candidate fed directly to ONE node
+    /// by a coordinator-auth-key thief is still visible during its Hold.
+    pub(crate) fn pending(&self) -> Result<Vec<String>, Error> {
+        let response = http::get_json(self.addr(), "/pending", Duration::from_secs(30))?;
+        if response.status != 200 {
+            return Err(format!(
+                "node {} answered HTTP {} on /pending: {}",
+                self.number(),
+                response.status,
+                response.body
+            )
+            .into());
+        }
+        let projection: serde_json::Value = serde_json::from_str(&response.body)?;
+        projection["pending"]
+            .as_array()
+            .ok_or_else(|| {
+                format!(
+                    "node {} answered /pending without a `pending` array: {}",
+                    self.number(),
+                    response.body
+                )
+            })?
+            .iter()
+            .map(|id| {
+                id.as_str().map(str::to_owned).ok_or_else(|| {
+                    format!("node {} reported a non-string commitment id", self.number()).into()
+                })
+            })
+            .collect()
+    }
 }
 
 /// Launch a vault-node daemon. `preimage_path` is the node host's own operator

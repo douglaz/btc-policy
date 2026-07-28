@@ -105,6 +105,10 @@ const FIRE_OBSERVATION_MARGIN_SECS: u64 = 15;
 /// relative to the node's 1s fire interval, so a timeout means the nodes genuinely
 /// failed to combine rather than that we were impatient.
 const NODE_BROADCAST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a `/pending` read may keep being shed (429) before the demo calls the node
+/// unreadable. The endpoint permits ONE in-flight snapshot and sheds concurrent ones by
+/// design, so a transient shed is expected; only a node that never answers is a failure.
+const PENDING_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// The baked policy identifier every commitment carries (policy never changes).
 const POLICY_VERSION: u32 = 1;
 /// Node-enforced cap on coordinator-proposed expiry (DESIGN.md config schema).
@@ -1105,23 +1109,66 @@ fn theft_refused_act_two(fed: &Federation) -> Result<String, Error> {
     // it is still `u64::MAX` and every "before it could fire" claim below would be
     // vacuously true.
     let pending_id = pending_id.ok_or("no node acknowledged the attacker's spend")?;
-    // The user SEES this pending spend because the modeled attacker (stolen user key + PIN,
-    // but NOT the coordinator auth key) must relay through the user's OWN coordinator, which
-    // surfaces the acknowledgements. A strictly stronger attacker who also stole the
-    // coordinator auth key could feed a node directly and arm the federation via request
-    // propagation, and no surface the user watches today would show it (GET /events carries
-    // only on-chain watchtower alerts; there is no pending-candidate query). The Hold window
-    // and the clawback below are demonstrated GENUINELY either way; only this "user notices"
-    // step rests on the relay path. A node-side pending projection is future work (Fable review).
+    // The modeled attacker (stolen user key + PIN, but NOT the coordinator auth key) has to
+    // relay through the user's OWN coordinator, so the acknowledgements above surface the
+    // theft. That step used to be the ONLY one, which left a strictly stronger thief — one
+    // who also stole the coordinator auth key, and can therefore feed a single node directly
+    // and let §3 request propagation reach the rest — invisible to every surface the user
+    // watches (`GET /events` carries on-chain watchtower alerts only). Bead btc-policy-k0t
+    // closed that: each node now answers `GET /pending` with the commitment ids it has
+    // accepted and not yet seen settle, so the check below does not go through the relay at
+    // all. Read it as the node-side confirmation of the coordinator-side line above.
     println!(
         "  the coordinator now shows a PENDING spend the user never authorized: {} paying {} to \
          the hot wallet ({theft_txid})",
         &pending_id[..16],
         HOT_SPEND,
     );
+    for node in &fed.nodes {
+        // `/pending` deliberately SHEDS a concurrent snapshot with 429 rather than queueing
+        // blocking-pool workers behind `sign_state`, so a transient shed is expected
+        // behaviour, not a failure — treating it as one would make this demo flaky for a
+        // reason the endpoint documents (codex k0t review). Retry briefly; the
+        // post-clawback check below already does the same. A node that never answers
+        // still fails, which is the property under test.
+        let pending;
+        let deadline = Instant::now() + PENDING_READ_TIMEOUT;
+        loop {
+            match node.pending() {
+                Ok(read) => {
+                    pending = read;
+                    break;
+                }
+                Err(e) if Instant::now() < deadline => {
+                    let _ = e;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "node {} never answered GET /pending within {}s: {e}",
+                        node.number(),
+                        PENDING_READ_TIMEOUT.as_secs()
+                    )
+                    .into())
+                }
+            }
+        }
+        if !pending.contains(&pending_id) {
+            return Err(format!(
+                "node {} does not report the attacker's accepted spend {} on GET /pending \
+                 (it reports {pending:?}); without it, a thief who also held the coordinator \
+                 auth key could feed one node directly and stay invisible for the whole Hold",
+                node.number(),
+                &pending_id[..16],
+            )
+            .into());
+        }
+    }
     println!(
-        "  (the user sees it because this attacker relays through the user's own coordinator; a \
-         coordinator-auth-key thief would need a node-side pending projection — future work)"
+        "  and the user does not have to trust the relay for that: all {} nodes answer GET \
+         /pending with this same commitment id, so a thief who ALSO stole the coordinator auth \
+         key and fed one node directly is still visible for the whole Hold",
+        fed.nodes.len(),
     );
 
     // The claw-back, inside the Hold.
@@ -1203,6 +1250,45 @@ fn theft_refused_act_two(fed: &Federation) -> Result<String, Error> {
     println!(
         "  a NODE broadcast the escape sweep {sweep_txid} and it confirmed — {lead}s before the \
          attacker's spend could fire"
+    );
+    // The public conflicting transaction is the protocol's implicit cancel. Every
+    // node must now stop projecting the defeated hot candidate; otherwise `/pending`
+    // would keep reporting an unspendable theft until its unrelated request expiry.
+    let projection_deadline = Instant::now() + NODE_BROADCAST_TIMEOUT;
+    loop {
+        let mut still_pending: Vec<usize> = Vec::new();
+        // A read that never landed (node down, or a shed 429) says NOTHING about what
+        // that node projects. Keep waiting on it, but never let it be reported as the
+        // node still naming the defeated spend — that would diagnose the wrong failure.
+        let mut unreadable: Vec<String> = Vec::new();
+        for node in &fed.nodes {
+            match node.pending() {
+                Ok(pending) if !pending.contains(&pending_id) => {}
+                Ok(_) => still_pending.push(node.number()),
+                Err(e) => unreadable.push(format!("node {}: {e}", node.number())),
+            }
+        }
+        if still_pending.is_empty() && unreadable.is_empty() {
+            break;
+        }
+        if Instant::now() >= projection_deadline {
+            let unread = if unreadable.is_empty() {
+                String::new()
+            } else {
+                format!("; GET /pending never answered at {unreadable:?}")
+            };
+            return Err(format!(
+                "the confirmed clawback left the defeated spend {} projected as pending at node(s) \
+                 {still_pending:?}{unread}",
+                &pending_id[..16],
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!(
+        "  all {} nodes removed the defeated spend from GET /pending after the public clawback",
+        fed.nodes.len()
     );
 
     // The attacker's spend is now unspendable: its input belongs to the escape. Wait

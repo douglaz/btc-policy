@@ -3889,10 +3889,11 @@ fn normalize_request_dependent(value: &mut Value) {
 /// constant-observable: identical operations in identical order under both pins,
 /// with the pin choosing only the contents of a same-shaped schedule record.
 ///
-/// The probe compares the full observable surface — the COMPLETE response body,
-/// its size, latency, and the `/events` projection — under the normal and duress
-/// pins, and includes the Hot-budget refusal path, which is amount-based and
-/// therefore pin-independent.
+/// The probe compares the complete ingress acknowledgement body, its size, latency,
+/// and the `/events` projection under the normal and duress pins, and includes the
+/// Hot-budget refusal path, which is amount-based and therefore pin-independent.
+/// `/pending` is request-varying, so its stronger whole-body equality checks live in
+/// the deterministic node tests that hold every input except pin/arm state equal.
 ///
 /// Every accepted-path timing request is a FRESH candidate pair, never a
 /// resubmission. The amount-refusal samples intentionally reuse one over-cap pair
