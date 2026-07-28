@@ -6288,14 +6288,24 @@ fn node_local_prevout_fetch_failure(
     if let Some(Err(refused)) = spend_prevouts {
         return Some(refused.clone());
     }
-    if let Some(Err(SignResponse::Refusal(refused))) = escape_prevouts {
-        // This early path runs before `verify_escape`, so add the same attribution
-        // that function would have supplied around `run_prevout_check`.
-        return Some(refusal(
-            refused.code,
-            &format!("escape:{}", refused.check),
-            refused.detail.clone(),
-        ));
+    if let Some(Err(escape_failure)) = escape_prevouts {
+        // This early path runs before `verify_escape`, so add the same attribution that
+        // function would have supplied around `run_prevout_check`.
+        //
+        // EXHAUSTIVE on purpose. The spend arm above forwards ANY `Err`, and this arm must
+        // not be narrower: `fetch_prevouts` only ever constructs refusals today, so the
+        // fallback is unreachable — but an `if let` matching only `Refusal` would SILENTLY
+        // DROP the escape forward if a future variant appeared, which is precisely the
+        // swallow this fetch-failure forwarding exists to prevent (Fable f91 review).
+        // Forwarding it unattributed beats not forwarding it at all.
+        return Some(match escape_failure {
+            SignResponse::Refusal(refused) => refusal(
+                refused.code,
+                &format!("escape:{}", refused.check),
+                refused.detail.clone(),
+            ),
+            other => other.clone(),
+        });
     }
     None
 }

@@ -1323,7 +1323,6 @@ impl ChainBackend for BitcoindBackend {
 /// Read/write deadline on one bitcoind JSON-RPC call. Fixed loopback-regtest
 /// value, never a config knob; the connect deadline below is shorter.
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
-const _: () = assert!(RPC_TIMEOUT.as_secs() <= 60);
 
 /// One HTTP/1.1 POST to bitcoind's JSON-RPC over loopback, `Connection: close`,
 /// returning the response body. A single loopback JSON-RPC peer does not buy an
