@@ -1323,6 +1323,7 @@ impl ChainBackend for BitcoindBackend {
 /// Read/write deadline on one bitcoind JSON-RPC call. Fixed loopback-regtest
 /// value, never a config knob; the connect deadline below is shorter.
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+const _: () = assert!(RPC_TIMEOUT.as_secs() <= 60);
 
 /// One HTTP/1.1 POST to bitcoind's JSON-RPC over loopback, `Connection: close`,
 /// returning the response body. A single loopback JSON-RPC peer does not buy an
@@ -1439,6 +1440,13 @@ pub(crate) mod mock {
         /// Every `prevout` lookup, in order, so the preflight tests can prove a
         /// backend failure aborts rather than multiplying one timeout per input.
         pub prevout_lookups: Mutex<Vec<OutPoint>>,
+        /// The SIZE of every `prevouts` BATCH, in order. `prevout_lookups` counts
+        /// individual outpoints and so cannot tell one batch of five from five batches
+        /// of one; this records the grouping the real backend actually issues as HTTP
+        /// requests. Bead f91 (B) reads it to pin that `/sign`'s out-of-lock preflight
+        /// costs exactly two batch RPCs no matter how many inputs a request declares —
+        /// the property that stops a hostile coordinator multiplying the fan-out stall.
+        pub prevout_batches: Mutex<Vec<usize>>,
         /// Optional failure injected after recording a `prevout` lookup.
         pub prevout_error: Option<String>,
         /// Optional one-shot pause on the first prevout lookup. Handler-level tests
@@ -1610,6 +1618,22 @@ pub(crate) mod mock {
                 spends: result,
                 blocks,
             })
+        }
+
+        /// Records the batch's SIZE, then behaves exactly like the trait default (map
+        /// `prevout` over the outpoints, aborting on the first error). The override
+        /// exists only to make the grouping observable — the real backend answers a
+        /// batch in ONE HTTP request, and `prevout_lookups` alone cannot distinguish
+        /// that from one request per input.
+        fn prevouts(&self, outpoints: &[OutPoint]) -> Result<Vec<Option<Prevout>>, Error> {
+            self.prevout_batches
+                .lock()
+                .expect("prevout_batches lock")
+                .push(outpoints.len());
+            outpoints
+                .iter()
+                .map(|outpoint| self.prevout(outpoint))
+                .collect()
         }
 
         fn prevout(&self, outpoint: &OutPoint) -> Result<Option<Prevout>, Error> {

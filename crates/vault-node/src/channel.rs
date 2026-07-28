@@ -10736,6 +10736,111 @@ mod duress {
         (node, escape, escape_cid)
     }
 
+    /// Bead f91 (B): the arming consequence of `/sign` staging its carrier only AFTER
+    /// the out-of-lock chain preflight. A node whose backend stalls cannot fan the
+    /// carrier out or claim its own holder slot until the stall clears, so its arm is
+    /// DELAYED — and this pins that it is delayed and not lost: nothing is armed while
+    /// the backend is parked, and the very same carrier arms at `t` once it returns.
+    ///
+    /// That is the bounded-stall outcome the bead accepts. Staging the full request
+    /// BEFORE validation is invariant-blocked (it would propagate federation-uniform
+    /// refusals), and a reduced pre-validation "safety-only" signal cannot exist: peers
+    /// authenticate a carrier by the coordinator signature over the request's exact
+    /// canonical bytes, so anything verifiable IS the full request and anything smaller
+    /// is forgeable into a holder receipt by one compromised peer.
+    #[test]
+    fn a_stalled_preflight_delays_the_arm_but_never_loses_it() {
+        let fx = Fixture::new(3, 5);
+        let mut node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let escape = default_escape(&fx);
+        let request = duress_request(&fx, &spend, &escape, "f91-stalled-arm");
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let proceed = Arc::new(std::sync::Barrier::new(2));
+        let mut backend = backend_for(&spend);
+        backend.prevout_fetch_entered = Some(Arc::clone(&entered));
+        backend.prevout_fetch_continue = Some(Arc::clone(&proceed));
+        node.set_chain_backend(Arc::new(backend));
+
+        let node = Arc::new(node);
+        let worker_node = Arc::clone(&node);
+        let worker_request = request.clone();
+        let worker = std::thread::spawn(move || {
+            crate::handle_sign(&worker_node, &worker_request, NOW).expect("decodable")
+        });
+
+        entered.wait();
+        let channel = node.channel.as_ref().expect("channel");
+        assert!(
+            channel.armed_snapshot().is_none(),
+            "ingress alone never arms, and a parked backend cannot change that"
+        );
+        assert!(
+            node.outbox.lock().expect("outbox").is_empty(),
+            "the stall is exactly a fan-out deferral — this is the cost being bounded"
+        );
+        proceed.wait();
+
+        assert!(matches!(
+            worker.join().expect("sign worker"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(
+            node.outbox.lock().expect("outbox").len(),
+            1,
+            "the deferred fan-out still happens once the preflight returns"
+        );
+        assert!(
+            confirm_to_quorum(&node, &request),
+            "the same carrier must still arm at t — the stall delayed the arm, not lost it"
+        );
+        assert!(channel.armed_snapshot().is_some());
+    }
+
+    /// Bead f91 (C): the node-local prevout FETCH failure must SELF-HOLD, not just
+    /// refuse. The arm hook already recorded this node's duress intent before the
+    /// preflight; without a holder claim that intent is hollow — `confirm_carrier` can
+    /// never reach `t` even with every peer receipt — so one node with a dead bitcoind
+    /// would silently swallow a selectively-delivered duress carrier and never Lockdown
+    /// off its OWN request.
+    #[test]
+    fn a_node_local_fetch_failure_self_holds_so_the_arm_still_commits() {
+        let fx = Fixture::new(3, 5);
+        let mut node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let escape = default_escape(&fx);
+        let request = duress_request(&fx, &spend, &escape, "f91-fetch-failure-arm");
+        node.set_chain_backend(Arc::new(MockBackend {
+            prevout_error: Some("backend unavailable".into()),
+            ..Default::default()
+        }));
+
+        let response = crate::handle_sign(&node, &request, NOW).expect("decodable");
+        assert!(
+            matches!(&response, SignResponse::Refusal(r)
+                if r.code == vault_proto::RefusalCode::PsbtInconsistent),
+            "a dead backend still refuses fail-closed: {response:?}"
+        );
+        assert_eq!(
+            node.outbox.lock().expect("outbox").len(),
+            1,
+            "a NODE-LOCAL refusal fans the carrier out so peers can process it"
+        );
+        // Self + peers 1 and 2 = the 3-of-5 holder quorum. Without the self-hold this
+        // would stop at 2 and never arm, however many peers relayed.
+        assert!(
+            confirm_to_quorum(&node, &request),
+            "the refusing node must still count ITSELF, or its recorded intent is hollow"
+        );
+        assert!(node
+            .channel
+            .as_ref()
+            .expect("channel")
+            .armed_snapshot()
+            .is_some());
+    }
+
     /// Round-4 P0 regression: a channel-mode refresh self-pairs (escape == spend,
     /// ADR-0013 §2 gives a refresh no escape), so `register_pair` must collapse it to
     /// ONE candidate. Building both a Spend and an Escape row under the same commitment
