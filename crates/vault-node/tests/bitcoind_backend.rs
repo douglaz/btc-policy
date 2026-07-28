@@ -118,6 +118,31 @@ fn run() -> Result<(), Error> {
         backend.mempool_transaction(&spend_txid)?.is_some(),
         "the higher replacement rung is now resident"
     );
+    // The BATCHED residency read (bead btc-policy-nvr) against live Core — the one path
+    // the unit tests cannot cover, because the mock deliberately answers per txid rather
+    // than composing one `getrawmempool` snapshot with one `getrawtransaction`. Asked for
+    // the whole ladder cheapest-first, it must skip the replaced base and return the
+    // resident higher rung with its real bytes.
+    assert_eq!(
+        backend.mempool_resident(&[base_txid, spend_txid])?,
+        Some((spend_txid, replacement_bytes.clone())),
+        "the batched read skips the replaced base and returns the resident rung"
+    );
+    assert_eq!(
+        backend.mempool_resident(&[spend_txid])?,
+        Some((spend_txid, replacement_bytes.clone())),
+        "a single-element batch behaves like the per-txid lookup"
+    );
+    assert_eq!(
+        backend.mempool_resident(&[base_txid])?,
+        None,
+        "a batch of only non-resident txids is an ordinary absence, not an error"
+    );
+    assert_eq!(
+        backend.mempool_resident(&[])?,
+        None,
+        "an empty batch reads nothing and answers None"
+    );
     assert!(
         !backend.transaction_confirmed(&spend_txid)?,
         "mempool admission is not confirmation"

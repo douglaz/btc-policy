@@ -3107,6 +3107,19 @@ fn mempool_escape_rung(
     let Some((expected, raw)) = backend.mempool_resident(&txids)? else {
         return Ok(None);
     };
+    // The answer must be one of the txids WE asked for. The per-rung loop got this by
+    // construction — it compared the backend's bytes against a locally computed
+    // `rung.compute_txid()` — and the batched call must not downgrade it to trust in the
+    // backend's own claim. Distinguishing an authorized rung from an unrelated spender of
+    // the same vault inputs is exactly what this function exists to do (see above): a
+    // backend returning a foreign conflicting spend would otherwise pass the byte check
+    // below and have its ancestry walked as if it were a rung.
+    if !txids.contains(&expected) {
+        return Err(format!(
+            "mempool lookup returned {expected}, which is not a rung of this escape's ladder"
+        )
+        .into());
+    }
     let resident: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)
         .map_err(|e| format!("mempool escape rung {expected} is malformed: {e}"))?;
     if resident.compute_txid() != expected {
