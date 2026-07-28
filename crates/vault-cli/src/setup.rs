@@ -2862,4 +2862,545 @@ mod tests {
         assert!(!config.contains(preimage.to_hex().as_str()));
         assert!(config.contains(&format!("node_key_salt = \"{}\"", kdf.salt_hex())));
     }
+
+    // -----------------------------------------------------------------------
+    // The finalize round trip (bead btc-policy-nsw)
+    //
+    // `finalize_cmd` is the REAL production seal path, and until this suite it had no
+    // coverage at all: the regtest harness (`fed.rs`) calls `assemble` + `node_config_toml`
+    // directly and never goes through it. That gap is why the 9y5.5 review found finalize
+    // bugs across four consecutive passes (wallet_id/manifest_hash recompute, the
+    // coordinator-secret verify, listen-port-from-endpoints, the complete typed
+    // manifest.json, backup regeneration). These tests drive the ACTUAL commands —
+    // `assemble_cmd` → per-device `ceremony::endorse` → `finalize_cmd` — over real files.
+
+    /// A ceremony working directory carried with its `TempDir`, so the directory
+    /// outlives the assertions and is removed afterwards.
+    struct Ceremony {
+        _temp: crate::fed::TempDir,
+        dir: PathBuf,
+        devices: Vec<(Preimage, NodeBundle)>,
+    }
+
+    impl Ceremony {
+        fn state(&self) -> CeremonyState {
+            serde_json::from_str(
+                &std::fs::read_to_string(self.dir.join("ceremony-state.json")).expect("state"),
+            )
+            .expect("parse state")
+        }
+
+        /// Rewrite `ceremony-state.json` after `edit` mutates the parsed state.
+        fn edit_state(&self, edit: impl FnOnce(&mut serde_json::Value)) {
+            let mut value: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(self.dir.join("ceremony-state.json")).expect("state"),
+            )
+            .expect("parse state");
+            edit(&mut value);
+            std::fs::write(
+                self.dir.join("ceremony-state.json"),
+                serde_json::to_string_pretty(&value).expect("serialize"),
+            )
+            .expect("write state");
+        }
+
+        fn finalize(&self) -> Result<(), Error> {
+            finalize_cmd(&Args::parse(&[
+                "--dir",
+                self.dir.to_str().expect("utf-8 dir"),
+            ]))
+        }
+    }
+
+    /// Run the ceremony up to (but not including) `finalize`: publish `n` device
+    /// bundles, run the real `assemble_cmd` over a `ceremony-input.json`, then have
+    /// each device endorse the sealed anchor with the key its OWN preimage derives —
+    /// exactly what `setup node-endorse` does on each host.
+    fn ceremony_through_endorse(n: usize, threshold: usize) -> Ceremony {
+        let temp = crate::fed::TempDir::new("setup-finalize").expect("temp dir");
+        let dir = temp.path.join("ceremony");
+        std::fs::create_dir_all(&dir).expect("ceremony dir");
+        let devices = devices(n);
+
+        let mut node_bundles = Vec::new();
+        for (index, (_, bundle)) in devices.iter().enumerate() {
+            let path = dir.join(format!("node-bundle-{index}.json"));
+            std::fs::write(&path, serde_json::to_string(bundle).expect("bundle")).expect("write");
+            node_bundles.push(path.to_str().expect("utf-8").to_string());
+        }
+        let write_key_bundle = |name: &str, bundle: &KeyBundle| -> String {
+            let path = dir.join(name);
+            std::fs::write(&path, serde_json::to_string(bundle).expect("key bundle"))
+                .expect("write");
+            path.to_str().expect("utf-8").to_string()
+        };
+        let user_bundle = write_key_bundle(
+            "user-bundle.json",
+            &KeyBundle {
+                role: "user".into(),
+                descriptor: None,
+                pubkey: Some(keypair(1).1.to_string()),
+                master_fingerprint: None,
+            },
+        );
+        let recovery_bundles: Vec<String> = (0x30u8..=0x32)
+            .map(|seed| {
+                write_key_bundle(
+                    &format!("recovery-bundle-{seed}.json"),
+                    &KeyBundle {
+                        role: "recovery".into(),
+                        descriptor: None,
+                        pubkey: Some(keypair(seed).1.to_string()),
+                        master_fingerprint: None,
+                    },
+                )
+            })
+            .collect();
+        let escape_bundle = write_key_bundle(
+            "escape-bundle.json",
+            &KeyBundle {
+                role: "escape".into(),
+                descriptor: Some(wallet(0xE0).to_string()),
+                pubkey: None,
+                master_fingerprint: None,
+            },
+        );
+
+        // `CeremonyInput` is deserialize-only (it is an operator-authored file), so the
+        // test authors the same JSON an operator would rather than serializing the type.
+        let input = serde_json::json!({
+            "threshold": threshold,
+            "node_bundles": node_bundles,
+            "user_bundle": user_bundle,
+            "recovery_bundles": recovery_bundles,
+            "escape_bundle": escape_bundle,
+            "hot_descriptor": wallet(0xA0).to_string(),
+            "policy": policy(),
+            // Real PHC strings at the fixture's Argon2 cost: `Node::load` validates the
+            // shape and DISTINCT salts, so a placeholder would seal a vault no node boots.
+            "pin_normal_hash": vault_node::argon2id_normal_phc_at("1234", MEM_KIB),
+            "pin_duress_hash": vault_node::argon2id_duress_phc_at("9999", MEM_KIB),
+            "chain_backend_rpc_addr": "127.0.0.1:18443",
+            "chain_backend_auth": "dGVzdDp0ZXN0",
+        });
+        let input_path = dir.join("ceremony-input.json");
+        std::fs::write(
+            &input_path,
+            serde_json::to_string_pretty(&input).expect("input"),
+        )
+        .expect("write input");
+
+        assemble_cmd(&Args::parse(&[
+            "--input",
+            input_path.to_str().expect("utf-8"),
+            "--out",
+            dir.to_str().expect("utf-8"),
+        ]))
+        .expect("assemble");
+
+        // Round two, on each device: endorse the sealed anchor with the key this
+        // device's own preimage derives. `node-endorse` does exactly this, and writing
+        // the file here is what that command writes.
+        let ceremony = Ceremony {
+            _temp: temp,
+            dir,
+            devices,
+        };
+        let state = ceremony.state();
+        let wallet_id = hex32(&state.wallet_id, "wallet_id").expect("wallet_id");
+        let manifest_hash = hex32(&state.manifest_hash, "manifest_hash").expect("manifest_hash");
+        for node in &state.nodes {
+            let (preimage, bundle) = ceremony
+                .devices
+                .iter()
+                .find(|(_, bundle)| bundle.signing_pubkey == node.signing_pubkey)
+                .expect("every sealed node is one of the published bundles");
+            let seckey = nodekey::derive(preimage, &bundle.kdf().expect("kdf")).expect("derive");
+            // Sign over the DEVICE's own endpoint copy, exactly as `node-endorse` does
+            // (it reads the bundle on that host and never sees ceremony-state.json).
+            // Signing over the state's copy instead would quietly assume the two agree,
+            // which is part of what the endorsement exists to establish.
+            let endorsement = vault_node::channel::ceremony::endorse(
+                &seckey,
+                &wallet_id,
+                &manifest_hash,
+                node.node_id,
+                &bundle.endpoints,
+            );
+            std::fs::write(
+                ceremony
+                    .dir
+                    .join(format!("endorsement-{}.txt", node.node_id)),
+                format!("{endorsement}\n"),
+            )
+            .expect("write endorsement");
+        }
+        ceremony
+    }
+
+    /// The headline round trip: assemble → endorse → finalize seals a COMPLETE typed
+    /// manifest, owner-only node configs whose bind port comes from the endorsed
+    /// endpoint, and a backup regenerated from the verified state.
+    #[test]
+    fn the_finalize_round_trip_seals_a_complete_manifest_and_owner_only_configs() {
+        let ceremony = ceremony_through_endorse(5, 3);
+        ceremony.finalize().expect("finalize");
+        let state = ceremony.state();
+
+        // 1. manifest.json is the complete typed BaseManifest (ADR-0013 §4), not a
+        //    partial echo: every field an operator needs to reconstruct the vault —
+        //    including the ones the hash preimage does NOT carry (t/n/recovery_timelock/
+        //    policy_version) and the ones it does.
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ceremony.dir.join("manifest.json")).expect("manifest.json"),
+        )
+        .expect("parse manifest");
+        assert_eq!(
+            manifest["protocol_version"],
+            serde_json::json!(vault_node::channel::PROTOCOL_VERSION_V0),
+            "protocol_version is the hashed u32, not a \"v0\" label"
+        );
+        assert_eq!(manifest["t"], serde_json::json!(3));
+        assert_eq!(manifest["n"], serde_json::json!(5));
+        assert_eq!(
+            manifest["recovery_timelock"],
+            serde_json::json!(policy_core::RECOVERY_TIMELOCK_NSEQUENCE),
+            "the recovery timelock is read back from the descriptor"
+        );
+        assert_eq!(manifest["wallet_id"], serde_json::json!(state.wallet_id));
+        assert_eq!(
+            manifest["manifest_hash"],
+            serde_json::json!(state.manifest_hash)
+        );
+        assert_eq!(
+            manifest["vault_descriptor"],
+            serde_json::json!(state.descriptor)
+        );
+        // Every hash-preimage field, so `manifest_hash` is recomputable from this
+        // artifact alone (the documented backup set carries no ceremony-state.json).
+        for (field, expected) in [
+            ("policy_version", serde_json::json!(policy().policy_version)),
+            ("max_msg_bytes", serde_json::json!(policy().max_msg_bytes)),
+            ("hot_max_per_tx", serde_json::json!(policy().hot_max_per_tx)),
+            (
+                "hot_max_per_window",
+                serde_json::json!(policy().hot_max_per_window),
+            ),
+            (
+                "hot_window_secs",
+                serde_json::json!(policy().hot_window_secs),
+            ),
+            (
+                "max_derivation_index",
+                serde_json::json!(policy().max_derivation_index),
+            ),
+            (
+                "escape_feerate_floor",
+                serde_json::json!(policy().escape_feerate_floor),
+            ),
+            (
+                "escape_coverage_pct",
+                serde_json::json!(policy().escape_coverage_pct),
+            ),
+            (
+                "coordinator_auth_pubkey",
+                serde_json::json!(state.coordinator_auth_pubkey),
+            ),
+            (
+                "hot_allowlist",
+                serde_json::json!([state.hot_descriptor.clone()]),
+            ),
+            (
+                "escape_descriptor",
+                serde_json::json!(state.escape_descriptor),
+            ),
+        ] {
+            assert_eq!(manifest[field], expected, "manifest.json field {field}");
+        }
+        // Each node entry carries its FULL identity, not just an endorsement: the node
+        // list is part of the hash preimage, so a manifest that dropped a pubkey or an
+        // endpoint could not reproduce `manifest_hash` either.
+        let nodes = manifest["nodes"].as_array().expect("nodes array");
+        assert_eq!(nodes.len(), 5);
+        for (entry, sealed) in nodes.iter().zip(&state.nodes) {
+            assert_eq!(entry["node_id"], serde_json::json!(sealed.node_id));
+            assert_eq!(
+                entry["signing_pubkey"],
+                serde_json::json!(sealed.signing_pubkey)
+            );
+            assert_eq!(
+                entry["channel_pubkey"],
+                serde_json::json!(sealed.channel_pubkey)
+            );
+            assert_eq!(
+                entry["transport_endpoints"],
+                serde_json::json!(sealed.endpoints)
+            );
+            assert!(
+                entry["channel_endorsement"]
+                    .as_str()
+                    .is_some_and(|e| !e.is_empty()),
+                "each node's endorsement rides ALONGSIDE the manifest, never inside the hash"
+            );
+        }
+
+        // 2. Each node-<id>.toml is owner-only (it carries both PIN digests and the
+        //    chain-backend credential) and binds the port from its ENDORSED endpoint.
+        for node in &state.nodes {
+            use std::os::unix::fs::PermissionsExt;
+            let path = ceremony.dir.join(format!("node-{}.toml", node.node_id));
+            let mode = std::fs::metadata(&path)
+                .expect("config metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "node-{}.toml carries PIN digests + the RPC credential",
+                node.node_id
+            );
+            let config = std::fs::read_to_string(&path).expect("config");
+            let expected_port =
+                loopback_port(&node.endpoints, node.node_id).expect("endorsed endpoint");
+            assert!(
+                config.contains(&format!("listen_port = {expected_port}")),
+                "node {} must bind the port its endorsed endpoint names",
+                node.node_id
+            );
+            assert!(config.contains(&format!(
+                "expected_manifest_hash = \"{}\"",
+                state.manifest_hash
+            )));
+        }
+
+        // 3. The backup exists. That it is REGENERATED rather than blind-copied is a
+        //    separate property and needs a corrupted sibling to prove — see
+        //    `the_backup_is_regenerated_from_verified_state_not_copied_from_siblings`.
+        for name in ["descriptor.txt", "wallet-id.txt", "manifest-hash.txt"] {
+            let path = ceremony.dir.join("backup").join(name);
+            assert!(path.exists(), "backup/{name} must be written");
+        }
+    }
+
+    /// The backup is REGENERATED from the just-verified state, never blind-copied from
+    /// the working-directory siblings `assemble` left behind.
+    ///
+    /// Asserting `backup/descriptor.txt == state.descriptor` on a clean run proves
+    /// nothing: `assemble` writes a byte-identical sibling, so a `std::fs::copy`
+    /// regression passes (Fable nsw review, verified by mutation). Corrupting the
+    /// siblings first is what separates the two implementations — and it is exactly the
+    /// scenario the production comment exists for: a corrupted `descriptor.txt` copied
+    /// unchecked into the backup surfaces years later at recovery, when the coins cannot
+    /// be located. finalize does not READ these siblings, so it must still succeed and
+    /// still write the verified values.
+    #[test]
+    fn the_backup_is_regenerated_from_verified_state_not_copied_from_siblings() {
+        let ceremony = ceremony_through_endorse(5, 3);
+        let state = ceremony.state();
+        for name in ["descriptor.txt", "wallet-id.txt", "manifest-hash.txt"] {
+            std::fs::write(ceremony.dir.join(name), "corrupted-by-a-stray-edit\n")
+                .expect("corrupt sibling");
+        }
+        ceremony
+            .finalize()
+            .expect("the siblings are not finalize inputs, so it still seals");
+        for (name, expected) in [
+            ("descriptor.txt", &state.descriptor),
+            ("wallet-id.txt", &state.wallet_id),
+            ("manifest-hash.txt", &state.manifest_hash),
+        ] {
+            let backed_up = std::fs::read_to_string(ceremony.dir.join("backup").join(name))
+                .expect("backup file");
+            assert_eq!(
+                backed_up.trim(),
+                expected,
+                "backup/{name} must be regenerated from the VERIFIED state, not copied \
+                 from the corrupted sibling"
+            );
+        }
+    }
+
+    /// The bind port comes from the ENDORSED endpoints, never from a redundant stored
+    /// field that could drift.
+    ///
+    /// `listen_port` is not hash-bound, so an edited copy would keep the manifest and
+    /// every endorsement verifying while the emitted config pinned a port no longer
+    /// matching its endpoint — and `ChannelState::build` would reject the node at
+    /// startup, after the hosts were sealed. `StateNode` deliberately has no such field;
+    /// injecting one (serde ignores unknown fields, so finalize still runs) and asserting
+    /// the sealed config ignores it is what pins that decision against a regression that
+    /// reintroduces and trusts it (Fable nsw review, verified by mutation).
+    #[test]
+    fn the_sealed_bind_port_comes_from_the_endorsed_endpoint_not_a_stored_field() {
+        let ceremony = ceremony_through_endorse(5, 3);
+        ceremony.edit_state(|state| {
+            state["nodes"][0]["listen_port"] = serde_json::json!(12345);
+        });
+        ceremony.finalize().expect("an unknown field is ignored");
+        let state = ceremony.state();
+        let node = &state.nodes[0];
+        let config =
+            std::fs::read_to_string(ceremony.dir.join(format!("node-{}.toml", node.node_id)))
+                .expect("config");
+        let endorsed_port =
+            loopback_port(&node.endpoints, node.node_id).expect("endorsed endpoint");
+        assert_ne!(endorsed_port, 12345, "the fixture's ports must not collide");
+        assert!(
+            config.contains(&format!("listen_port = {endorsed_port}")),
+            "the config must bind the ENDORSED endpoint's port"
+        );
+        assert!(
+            !config.contains("listen_port = 12345"),
+            "a stored listen_port must never be trusted over the endorsed endpoint"
+        );
+    }
+
+    /// Every finalize consistency check fires BEFORE anything is sealed. Each case
+    /// edits one field of an otherwise-valid ceremony and asserts finalize refuses AND
+    /// leaves no artifact behind — the whole point of catching it here rather than at
+    /// node startup, after the hosts are sealed.
+    #[test]
+    fn finalize_refuses_an_edited_ceremony_before_sealing_anything() {
+        // (label, mutation, the substring the operator must see)
+        type Edit = Box<dyn Fn(&Ceremony)>;
+        let cases: Vec<(&str, Edit, &str)> = vec![
+            (
+                "an edited descriptor",
+                Box::new(|ceremony: &Ceremony| {
+                    // A different but VALID on-template descriptor: it parses, so only
+                    // the wallet_id recompute can catch it.
+                    let other = ceremony_through_endorse(5, 3).state().descriptor;
+                    ceremony.edit_state(|state| {
+                        state["descriptor"] = serde_json::json!(other);
+                    });
+                }),
+                "wallet_id",
+            ),
+            // (No separate "edited wallet_id" case: it terminates at the SAME production
+            // branch as the edited-descriptor case above, which is strictly stronger — a
+            // parsing, on-template descriptor that only the recompute can catch.)
+            (
+                "an edited manifest_hash",
+                Box::new(|ceremony: &Ceremony| {
+                    ceremony.edit_state(|state| {
+                        state["manifest_hash"] =
+                            serde_json::json!([0x22u8; 32].to_lower_hex_string());
+                    });
+                }),
+                "manifest_hash",
+            ),
+            (
+                "a manifest-bound policy cap edited after assembly",
+                Box::new(|ceremony: &Ceremony| {
+                    ceremony.edit_state(|state| {
+                        state["policy"]["max_msg_bytes"] = serde_json::json!(4096);
+                    });
+                }),
+                "manifest_hash",
+            ),
+            (
+                "an endpoint edited after assembly (the bind port's only source)",
+                Box::new(|ceremony: &Ceremony| {
+                    ceremony.edit_state(|state| {
+                        state["nodes"][0]["endpoints"] = serde_json::json!(["127.0.0.1:9999"]);
+                    });
+                }),
+                "manifest_hash",
+            ),
+            (
+                "the wrong coordinator secret beside the state",
+                Box::new(|ceremony: &Ceremony| {
+                    // A valid key, just not the one the manifest pins — the stale/
+                    // wrong-ceremony copy that would BRICK the normal path.
+                    std::fs::write(
+                        ceremony.dir.join("coordinator-auth.secret"),
+                        format!("{}\n", keypair(0xDD).0.display_secret()),
+                    )
+                    .expect("write secret");
+                }),
+                "coordinator-auth.secret",
+            ),
+        ];
+
+        for (label, edit, expected) in cases {
+            let ceremony = ceremony_through_endorse(5, 3);
+            edit(&ceremony);
+            let error = match ceremony.finalize() {
+                Err(error) => error.to_string(),
+                Ok(()) => panic!("{label} must not finalize"),
+            };
+            assert!(
+                error.contains(expected),
+                "{label}: the refusal must name {expected}, got: {error}"
+            );
+            // Nothing sealed: the operator re-runs `assemble` against a clean state
+            // rather than shipping half-written artifacts to the hosts.
+            assert!(
+                !ceremony.dir.join("manifest.json").exists(),
+                "{label}: finalize must refuse BEFORE writing the manifest"
+            );
+            assert!(
+                !ceremony.dir.join("node-0.toml").exists(),
+                "{label}: finalize must refuse BEFORE writing any node config"
+            );
+        }
+    }
+
+    /// A missing or corrupted round-two endorsement is refused too: the manifest is
+    /// only trustworthy because every node vouched for its own channel key, so
+    /// finalize cannot seal a vault one host never endorsed.
+    #[test]
+    fn finalize_refuses_a_missing_or_forged_endorsement() {
+        let ceremony = ceremony_through_endorse(5, 3);
+        let missing = ceremony.dir.join("endorsement-2.txt");
+        std::fs::remove_file(&missing).expect("remove endorsement");
+        let error = match ceremony.finalize() {
+            Err(error) => error.to_string(),
+            Ok(()) => panic!("a missing endorsement must not finalize"),
+        };
+        assert!(
+            error.contains("endorsement"),
+            "the refusal must name the missing endorsement: {error}"
+        );
+
+        // A syntactically fine endorsement signed by the WRONG device is refused by
+        // `verify_endorsement`, not merely a parse error.
+        let ceremony = ceremony_through_endorse(5, 3);
+        let state = ceremony.state();
+        let wallet_id = hex32(&state.wallet_id, "wallet_id").expect("wallet_id");
+        let manifest_hash = hex32(&state.manifest_hash, "manifest_hash").expect("manifest_hash");
+        let victim = &state.nodes[2];
+        // A device that is genuinely NOT the victim: `state.nodes` is in canonical
+        // lexicographic key order while `devices` is in provisioning order, so the
+        // wrong signer has to be selected by key, never by index.
+        let (other_preimage, other_bundle) = ceremony
+            .devices
+            .iter()
+            .find(|(_, bundle)| bundle.signing_pubkey != victim.signing_pubkey)
+            .expect("another device exists in a 5-node federation");
+        let wrong_key =
+            nodekey::derive(other_preimage, &other_bundle.kdf().expect("kdf")).expect("derive");
+        let forged = vault_node::channel::ceremony::endorse(
+            &wrong_key,
+            &wallet_id,
+            &manifest_hash,
+            victim.node_id,
+            &victim.endpoints,
+        );
+        std::fs::write(
+            ceremony
+                .dir
+                .join(format!("endorsement-{}.txt", victim.node_id)),
+            format!("{forged}\n"),
+        )
+        .expect("write forged");
+        assert!(
+            ceremony.finalize().is_err(),
+            "an endorsement from another device's key must not finalize"
+        );
+        assert!(
+            !ceremony.dir.join("manifest.json").exists(),
+            "a forged endorsement must be caught before sealing"
+        );
+    }
 }
