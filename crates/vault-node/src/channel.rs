@@ -4524,9 +4524,24 @@ impl ChannelState {
         // The defeated candidates are done here too: their input is spent by a
         // transaction this node just observed on the network, so they must not remain
         // in the due set that `PendingLog` no longer reports.
+        //
+        // Give the Hot budget back FIRST, then mark. `is_unexposed_hot` is
+        // `hot && !released && !broadcast`, so setting `broadcast` before releasing makes
+        // the release a silent no-op and strands the reservation until the velocity
+        // window ages out (codex k0t review). That matters concretely: an unauthorized
+        // spend that consumed `hot_max_per_window` would keep blocking legitimate hot
+        // spends even after the user's clawback defeated it — the vault would penalize
+        // the victim for the theft it just refused. A candidate whose share already LEFT
+        // this node stays metered, because a peer may still broadcast the conflicting
+        // spend later; that is exactly what `release_if_unexposed` checks.
         for id in &invalidated_hot {
-            if let Some(candidate) = store.candidates.get_mut(id) {
+            // Take it out to release, then reinsert: `release_if_unexposed` needs the
+            // candidate and `&mut store.hot_budget` at the same time, which the borrow
+            // checker will not grant while it is still inside `store.candidates`.
+            if let Some(mut candidate) = store.candidates.remove(id) {
+                PartialStore::release_if_unexposed(&mut store.hot_budget, &candidate);
                 candidate.broadcast = true;
+                store.candidates.insert(id.clone(), candidate);
             }
         }
         invalidated_hot

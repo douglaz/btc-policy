@@ -105,6 +105,10 @@ const FIRE_OBSERVATION_MARGIN_SECS: u64 = 15;
 /// relative to the node's 1s fire interval, so a timeout means the nodes genuinely
 /// failed to combine rather than that we were impatient.
 const NODE_BROADCAST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a `/pending` read may keep being shed (429) before the demo calls the node
+/// unreadable. The endpoint permits ONE in-flight snapshot and sheds concurrent ones by
+/// design, so a transient shed is expected; only a node that never answers is a failure.
+const PENDING_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// The baked policy identifier every commitment carries (policy never changes).
 const POLICY_VERSION: u32 = 1;
 /// Node-enforced cap on coordinator-proposed expiry (DESIGN.md config schema).
@@ -1121,7 +1125,34 @@ fn theft_refused_act_two(fed: &Federation) -> Result<String, Error> {
         HOT_SPEND,
     );
     for node in &fed.nodes {
-        let pending = node.pending()?;
+        // `/pending` deliberately SHEDS a concurrent snapshot with 429 rather than queueing
+        // blocking-pool workers behind `sign_state`, so a transient shed is expected
+        // behaviour, not a failure — treating it as one would make this demo flaky for a
+        // reason the endpoint documents (codex k0t review). Retry briefly; the
+        // post-clawback check below already does the same. A node that never answers
+        // still fails, which is the property under test.
+        let pending;
+        let deadline = Instant::now() + PENDING_READ_TIMEOUT;
+        loop {
+            match node.pending() {
+                Ok(read) => {
+                    pending = read;
+                    break;
+                }
+                Err(e) if Instant::now() < deadline => {
+                    let _ = e;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "node {} never answered GET /pending within {}s: {e}",
+                        node.number(),
+                        PENDING_READ_TIMEOUT.as_secs()
+                    )
+                    .into())
+                }
+            }
+        }
         if !pending.contains(&pending_id) {
             return Err(format!(
                 "node {} does not report the attacker's accepted spend {} on GET /pending \
