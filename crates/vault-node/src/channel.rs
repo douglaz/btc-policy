@@ -15768,6 +15768,50 @@ mod duress {
             );
         }
 
+        /// **One mempool read per tick, for the whole ladder** (bead btc-policy-nvr).
+        ///
+        /// The Core backend answers a membership question by pulling the ENTIRE
+        /// `getrawmempool` set, so asking per rung would parse the whole mempool up to
+        /// `MAX_ESCAPE_BUMPS + 1` times on every 1 Hz fire tick — worst exactly under the
+        /// congestion that makes the combine window tightest, and pointless because one
+        /// snapshot answers for every rung. The residency check therefore issues ONE
+        /// batched read carrying the whole ladder, cheapest rung first (the order the
+        /// replacement path needs, since the resident rung is what its ancestry proof is
+        /// built against). A regression back to a per-rung loop shows up here as N
+        /// single-txid batches instead of one.
+        #[tokio::test]
+        async fn the_ladder_residency_check_reads_the_mempool_once_for_the_whole_ladder() {
+            let fx = Fixture::new(3, 5);
+            let node = node_at(&fx, 0);
+            let (base, bumps, _escape_cid) =
+                arm_laddered(&node, &fx, 0, &LADDER_OUTS, "ladder-one-mempool-read");
+            let backend = Arc::new(backend_for(&base));
+            let node = Arc::new(node);
+            assert_eq!(
+                crate::fire_tick(node, backend.clone(), NOW + DELAY).await,
+                1,
+                "the sweep fires"
+            );
+            let batches = backend
+                .mempool_resident_batches
+                .lock()
+                .expect("mempool_resident_batches")
+                .clone();
+            assert_eq!(
+                batches.len(),
+                1,
+                "the whole ladder must be one batched mempool read, not one per rung"
+            );
+            let expected: Vec<bitcoin::Txid> = std::iter::once(&base)
+                .chain(&bumps)
+                .map(|psbt| psbt.unsigned_tx.compute_txid())
+                .collect();
+            assert_eq!(
+                batches[0], expected,
+                "the batch carries every rung, cheapest first"
+            );
+        }
+
         /// **Coverage counts the swept coins once.** With a rung resident in this
         /// node's mempool, Core hides the vault coins it spends, so the fire-time
         /// environment restores them from the candidate's stored inputs — while that

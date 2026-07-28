@@ -96,6 +96,26 @@ pub enum PackageVerdict {
     Rejected(String),
 }
 
+/// The per-txid fallback shape of [`ChainBackend::mempool_resident`]: the first of
+/// `txids`, in order, that `lookup` answers for.
+///
+/// A free function rather than an inherent method because Rust offers no way to call a
+/// shadowed default implementation: the trait default and the test mock would otherwise
+/// each carry their own copy of this loop, and a later change to the pick semantics would
+/// silently apply to only one of them — leaving every mock-based test proving the OLD
+/// contract (Fable nvr review).
+fn first_resident_by_lookup(
+    txids: &[Txid],
+    mut lookup: impl FnMut(&Txid) -> Result<Option<Vec<u8>>, Error>,
+) -> Result<Option<(Txid, Vec<u8>)>, Error> {
+    for txid in txids {
+        if let Some(raw) = lookup(txid)? {
+            return Ok(Some((*txid, raw)));
+        }
+    }
+    Ok(None)
+}
+
 /// A node's own view of the chain (DESIGN.md, "Per-node chain backend"). Serves
 /// broadcast, the watchtower scan (ADR-0001), and V0-8b's package-gated combine.
 /// Kept small on purpose so unit tests substitute a mock.
@@ -199,6 +219,25 @@ pub trait ChainBackend {
     /// the mempool distinguishes another unconfirmed ancestor from a confirmed
     /// parent without requiring `-txindex`.
     fn mempool_transaction(&self, txid: &Txid) -> Result<Option<Vec<u8>>, Error>;
+
+    /// The FIRST of `txids`, in the caller's order, that is in this node's mempool,
+    /// with its raw consensus bytes — one batched membership read instead of one per
+    /// candidate (bead btc-policy-nvr).
+    ///
+    /// [`ChainBackend::mempool_transaction`] answers for ONE txid, and the Core backend
+    /// implements it by pulling the ENTIRE `getrawmempool` set on every call. A fee-bump
+    /// ladder asks about up to `MAX_ESCAPE_BUMPS + 1` rungs on the escape's fire path, so
+    /// a per-rung loop parses the whole mempool up to four times per tick — worst exactly
+    /// under the congestion that makes the combine window tight, and pointless because a
+    /// single snapshot answers for every rung. Order matters: rungs are asked
+    /// cheapest-first, and the resident rung is the one the replacement path builds its
+    /// ancestry proof against.
+    ///
+    /// The default implementation keeps the old per-txid behaviour, so mocks and any
+    /// future backend stay correct without opting in; the Core backend overrides it.
+    fn mempool_resident(&self, txids: &[Txid]) -> Result<Option<(Txid, Vec<u8>)>, Error> {
+        first_resident_by_lookup(txids, |txid| self.mempool_transaction(txid))
+    }
 
     /// Whether `txid` is confirmed in this node's active chain. A candidate may
     /// move from the mempool into a block before this node's redundant fire pass;
@@ -1191,6 +1230,41 @@ impl ChainBackend for BitcoindBackend {
         self.raw_transaction_if_available(txid)
     }
 
+    /// ONE `getrawmempool` for the whole batch, then at most one
+    /// `getrawtransaction` for the rung that is actually resident (bead
+    /// btc-policy-nvr). The default implementation would call
+    /// [`Self::mempool_transaction`] per txid, and each of those pulls the entire
+    /// mempool — four full snapshots per fire tick for a full ladder, precisely when
+    /// the mempool is largest and the combine window tightest.
+    ///
+    /// Membership is resolved against a SINGLE snapshot, which is also more coherent
+    /// than the per-call version: every rung is judged against one instant of the
+    /// mempool rather than against up to four successive ones.
+    fn mempool_resident(&self, txids: &[Txid]) -> Result<Option<(Txid, Vec<u8>)>, Error> {
+        if txids.is_empty() {
+            return Ok(None);
+        }
+        let resident = self.mempool_txids()?;
+        let Some(found) = txids.iter().find(|txid| resident.contains(*txid)) else {
+            return Ok(None);
+        };
+        // A txid that was in the snapshot can still be gone by the time this reads it (a
+        // block arrived — though `-txindex` still answers for a just-mined rung — or it
+        // was evicted by a peer's higher rung). Absence then answers `None` for the WHOLE
+        // batch rather than falling through to the remaining txids against a fresh
+        // snapshot, which the per-rung loop would have done. That is deliberate and
+        // fail-closed: a `None` while a rung is in fact resident makes the fire pass find
+        // Core hiding the prevouts that rung spends, so coverage/package assembly errors
+        // out, no share is released, and the latch (committed only after the fallible
+        // checks) is untouched — the next 1 Hz tick simply reads the newer snapshot. The
+        // per-rung loop reached the same terminal state whenever the race hit the last
+        // rung it checked, so this widens a benign existing window rather than opening a
+        // new class of failure.
+        Ok(self
+            .raw_transaction_if_available(found)?
+            .map(|raw| (*found, raw)))
+    }
+
     fn transaction_confirmed(&self, txid: &Txid) -> Result<bool, Error> {
         // Production startup verifies a fully-synced `-txindex=1`, so this can
         // distinguish a mined transaction from one that is merely absent.
@@ -1374,6 +1448,11 @@ pub(crate) mod mock {
         pub prevout_fetch_continue: Option<Arc<Barrier>>,
         pub prevout_fetch_paused: AtomicBool,
         pub raw_txs: HashMap<Txid, Vec<u8>>,
+        /// Every `mempool_resident` BATCH, in order, so a test can prove the escape's
+        /// ladder residency check issues ONE batched read for the whole ladder rather
+        /// than one lookup per rung (bead btc-policy-nvr). The Core backend answers a
+        /// batch with a single `getrawmempool`, so the batch count IS the snapshot count.
+        pub mempool_resident_batches: Mutex<Vec<Vec<Txid>>>,
         /// When true, model Core's `gettxout(..., include_mempool=true)` semantics:
         /// an outpoint spent by any transaction in `raw_txs` is absent from both
         /// `prevout` and `vault_unspent`.
@@ -1596,6 +1675,18 @@ pub(crate) mod mock {
 
         fn mempool_transaction(&self, txid: &Txid) -> Result<Option<Vec<u8>>, Error> {
             Ok(self.raw_txs.get(txid).cloned())
+        }
+
+        /// Record the batch, then answer through the SAME helper the trait default uses,
+        /// so this mock cannot drift from the contract it is standing in for. Recording
+        /// is the whole point: the caller's batching is what this mock observes, while
+        /// the Core backend's one-snapshot-per-batch is its own concern.
+        fn mempool_resident(&self, txids: &[Txid]) -> Result<Option<(Txid, Vec<u8>)>, Error> {
+            self.mempool_resident_batches
+                .lock()
+                .expect("mempool_resident_batches lock")
+                .push(txids.to_vec());
+            super::first_resident_by_lookup(txids, |txid| self.mempool_transaction(txid))
         }
 
         fn transaction_confirmed(&self, txid: &Txid) -> Result<bool, Error> {
