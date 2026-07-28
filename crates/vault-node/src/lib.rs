@@ -48,7 +48,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -910,6 +910,33 @@ pub struct Node {
     /// pin-independent ingress); V0-4b builds the arm/freeze/sweep state machine on
     /// this same seam.
     duress_arm: AtomicU64,
+    /// How many `/sign` requests are currently inside the OUT-OF-LOCK chain preflight
+    /// — the in-flight half of refresh subordination (bead btc-policy-f91).
+    ///
+    /// Refresh subordination (ADR-0012: "while any normal-path spend is pending, a
+    /// refresh is queued behind it") reads [`replay::PendingLog`], and a spend only
+    /// lands there in phase 2, AFTER its preflight. Across the preflight window the
+    /// spend is therefore invisible to that rule, so a concurrent `RefreshRequest`
+    /// could complete its own (shorter) preflight, re-acquire `sign_state`, see no
+    /// pending spend, and register an immediately-fireable refresh. If that refresh
+    /// consumed an input the spend's MANDATORY ESCAPE needs, the escape could no
+    /// longer cover and the T-time sweep would fail → funds frozen → recovery. This
+    /// counter closes that window: the spend claims it under the lock in phase 1 and
+    /// releases it only after phase 2 has finished, so `has_any`-plus-this is true
+    /// continuously from ingress to registration.
+    ///
+    /// It is an ATOMIC on `Node` rather than a field of [`replay::SignState`] for one
+    /// reason: it is released by an RAII guard ([`SpendPreflightGuard`]) so no early
+    /// return, `?`, or panic can leak it, and a guard whose `Drop` had to take
+    /// `sign_state` would either deadlock against the phase-2 hold or panic during
+    /// unwind on a poisoned lock. A counter (not a flag) is what makes it idempotent
+    /// under concurrent replays: each in-flight request owns exactly one unit.
+    ///
+    /// PIN-UNIFORM by construction: it is claimed after the pin verdict exists but
+    /// before that verdict can branch any observable, on the one code path both
+    /// matching pin classes take, and released identically. A refresh refusal caused
+    /// by it is the byte-identical `REFRESH_SUBORDINATED` a pending spend produces.
+    spend_preflight: AtomicUsize,
     /// The SAFETY deadline driver's liveness heartbeat (bead btc-policy-9y5.6): the
     /// coarse wall-clock bucket of the last absolute-schedule deadline pass this
     /// process began, or `0` before the first pass. `0` reads as "no pass yet"
@@ -1816,6 +1843,7 @@ impl Node {
             // deployment's Lockdown survives a process restart.
             lifecycle_file: None,
             duress_arm: AtomicU64::new(0),
+            spend_preflight: AtomicUsize::new(0),
             last_deadline_tick: AtomicU64::new(0),
             // Path-less construction claims no generation (there is no config inode
             // to claim it on), so `/healthz` on a unit-test node honestly reports
@@ -2172,6 +2200,38 @@ impl Node {
         }
     }
 
+    /// Claim one in-flight-spend slot for the duration of the out-of-lock chain
+    /// preflight (bead btc-policy-f91). MUST be called while `sign_state` is still
+    /// held in phase 1: the claim has to become visible to every refresh that later
+    /// acquires that lock, and only the lock orders it against a refresh already
+    /// inside its own phase 2. The returned guard releases the slot on EVERY exit —
+    /// early return, `?`, or panic — so the marker cannot leak.
+    ///
+    /// The claim itself is a single lock-free atomic increment, so it adds nothing to
+    /// the time the lock is held and nothing to the preflight window (LOAD-BEARING:
+    /// the preflight stays OUT of `sign_state`, or a hung backend delays the deadline
+    /// driver's unconditional Lockdown-at-T — the round-2 P0).
+    fn enter_spend_preflight(&self) -> SpendPreflightGuard<'_> {
+        self.spend_preflight.fetch_add(1, Ordering::SeqCst);
+        SpendPreflightGuard { node: self }
+    }
+
+    /// Whether any `/sign` request is currently between its phase-1 claim and its
+    /// phase-2 completion — the in-flight half of the refresh-subordination predicate
+    /// (the other half is [`replay::PendingLog::has_any`]).
+    ///
+    /// Read under `sign_state`, which is what makes it sound: the claim is published
+    /// under that lock, so a refresh holding it sees every spend that entered its
+    /// preflight first. The RELEASE is deliberately outside the lock (it happens when
+    /// the guard drops, after phase 2 has already released it), so this can read
+    /// `true` for a moment after a spend finished. That direction is safe — it
+    /// subordinates a refresh very slightly longer than strictly necessary, which the
+    /// coordinator resolves by retrying — while the opposite direction would be the
+    /// escape-invalidation race this exists to close.
+    fn spend_preflight_in_flight(&self) -> bool {
+        self.spend_preflight.load(Ordering::SeqCst) > 0
+    }
+
     /// The §0 confirmation receipt: a peer's propagation of `carrier` proves that peer
     /// holds it. Counts the sender and commits the holder decision when the holder set
     /// reaches `t`, arming the SAFETY track if this node's own verdict for the carrier
@@ -2250,6 +2310,31 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn carrier_derivation_count(&self) -> usize {
         self.carrier_kdf.total_derivations()
+    }
+}
+
+/// The RAII half of [`Node::enter_spend_preflight`] (bead btc-policy-f91): holds one
+/// in-flight-spend slot for the out-of-lock chain preflight and gives it back when it
+/// drops.
+///
+/// A guard rather than a paired `-= 1` because `handle_sign_after_lock`'s phase 2 has
+/// a dozen early returns and every one of them must release the slot; a leaked slot
+/// would subordinate every refresh on this node until it died, which is denial. `Drop`
+/// runs on unwind too, so a panic between the two phases cannot strand it either.
+///
+/// `Drop` takes NO lock. That is deliberate and load-bearing: phase 2 holds
+/// `sign_state` across its returns, and locals drop in reverse declaration order, so a
+/// guard that re-took that lock would deadlock (std mutexes are not reentrant) or —
+/// worse — panic while unwinding past a poisoned one. Releasing after the lock is
+/// already gone is also the SAFE order: the slot outlives the phase-2 registration it
+/// protects rather than being handed back a moment early.
+struct SpendPreflightGuard<'a> {
+    node: &'a Node,
+}
+
+impl Drop for SpendPreflightGuard<'_> {
+    fn drop(&mut self) {
+        self.node.spend_preflight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -4407,7 +4492,9 @@ pub(crate) fn handle_sign_now(
 /// a minimum refresh interval and a tight refresh fee cap
 /// ([`ConfigFile::refresh_min_interval_secs`], [`ConfigFile::refresh_max_feerate`],
 /// ADR-0013 §6), plus refresh **subordination** — any pending spend blocks every
-/// refresh, so a refresh can never race a spend that is waiting out its Hold.
+/// refresh, so a refresh can never race a spend that is waiting out its Hold, nor
+/// one still inside its out-of-lock chain preflight
+/// ([`Node::spend_preflight_in_flight`]).
 ///
 /// A refresh arrives ONLY through this handler. The tagged union (ADR-0013 §2)
 /// is what makes that true: a pure self-spend submitted as a PIN-carrying
@@ -4687,6 +4774,62 @@ fn handle_sign_after_lock(
     // Re-acquire before any replay/pending mutation and re-sample time: an RPC that
     // outlasts the request's expiry or delivery horizon must not register a stale
     // candidate using the phase-1 timestamp.
+    //
+    // Claim the in-flight-spend slot FIRST, while the lock is still held (bead
+    // btc-policy-f91). This spend does not enter `state.pending` until phase 2, so
+    // without the claim it is invisible to refresh subordination for the whole
+    // preflight, and a `RefreshRequest` racing it could finish its own shorter
+    // preflight, see no pending spend, and register an immediately-fireable refresh
+    // over an input this request's MANDATORY ESCAPE needs — the escape then fails
+    // coverage at `T` and the sweep dies. Degrades to frozen funds → recovery, never
+    // theft, but it is honest-reachable, so it is closed rather than accepted. The
+    // guard releases the slot on every exit path including a panic; see
+    // [`SpendPreflightGuard`].
+    // The class is not derived until phase 2, so this conservatively covers an
+    // escape-class SpendRequest during preflight too; once accepted it releases the
+    // claim without entering `pending`, preserving ADR-0012's steady-state exception.
+    //
+    // WHAT THIS WINDOW STILL COSTS, and why that is the accepted answer (f91 (B)).
+    // `stage_spend_carrier` — the peer fan-out that lets a selectively-delivered
+    // carrier reach `t` holders and arm the federation — first becomes possible only
+    // AFTER the preflight. A node whose backend is slow therefore contributes that
+    // stall to its fan-out delay. The OUT-OF-LOCK PREFLIGHT component is a bounded
+    // DELAY, not a MISS, and each clause below is load-bearing:
+    //
+    //  - the safety INTENT is already chain-independent and already recorded — the
+    //    arm hook ran above, before any of this;
+    //  - the fan-out is not conditional on this node being able to SIGN: every
+    //    NODE-LOCAL refusal below stages the carrier too (expiry, horizon, backward
+    //    clock, EXPIRY_TOO_SHORT, the Hot budget, and the fetch failure at 4b). The
+    //    federation-uniform refusals deliberately do not stage — but a peer reaches
+    //    those independently, which is exactly why they need no forward;
+    //  - the preflight is exactly TWO batch RPCs regardless of the request — one for
+    //    the spend, one for the escape, the ladder reusing the escape's — each a
+    //    single loopback HTTP request under [`chain::RPC_TIMEOUT`]. That INVARIANCE is
+    //    the part a hostile coordinator could otherwise exploit: it cannot multiply
+    //    this preflight component by declaring more inputs. (A wall-clock ceiling rests on this
+    //    node's OWN bitcoind, which is inside its trust boundary already — a backend
+    //    that lies or trickles bytes is a dead node, i.e. the accepted censorship
+    //    residual, not a new vector.); and
+    //  - the fully-hung case degrades into the node-local `CommitmentExpired` forward
+    //    just below, which stages as well.
+    //
+    // Fanning the request out BEFORE validation is INVARIANT-BLOCKED, not merely
+    // unimplemented: the staged item is the full `TaggedRequest`, and staging it
+    // pre-validation would propagate federation-uniform policy and prevout-MISMATCH
+    // refusals that every honest node reaches independently — breaking theft
+    // recognition and silence. A reduced "safety-only" signal is no better: peers
+    // authenticate a carrier by the coordinator signature over the request's exact
+    // canonical bytes, so anything they can verify IS the full request, and anything
+    // smaller would be forgeable by a single compromised peer into a holder receipt.
+    // Hence the preflight bound is made explicit and tested here rather than
+    // engineered away. It is deliberately NOT a bound on total ingress-to-fan-out
+    // latency: after the I/O returns, this request must wait to re-acquire
+    // `sign_state`, then performs phase-2 validation and signing before the accepted
+    // path stages at step 9. That additional lock-wait/work term can grow under
+    // concurrent authenticated coordinator traffic; it is separate from the
+    // request-shape-controlled preflight term this bead closes.
+    let _preflight = node.enter_spend_preflight();
     drop(state);
     let (spend_prevouts, escape_prevouts) = prefetch_spend_escape_prevouts(node, request);
     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
@@ -4754,17 +4897,6 @@ fn handle_sign_after_lock(
         stage_spend_carrier(node, propagated_request, &carrier);
         return Ok(refused);
     }
-    // A NODE-LOCAL prevout FETCH failure (this node's backend errored / hung) surfaces
-    // later in `verify_spend`/`verify_escape` via the pre-fetched `Err`, AFTER the
-    // accepted-replay lookup — so a retry of an already-accepted request honours its cached
-    // verdict instead of being overridden by a transient backend failure. Forwarding that
-    // node-local refusal so peers still process the carrier (Fable pass-1 "same shape")
-    // requires the SAME accepted-replay ordering + node-local-vs-federation-uniform split as
-    // the rest of the out-of-lock preflight; that is deferred to follow-up bead f91 (an
-    // earlier attempt to fan it out HERE, before the accepted-replay lookup, let a backend
-    // failure override an accepted verdict on retry — codex pass-5 P1). The hung-backend
-    // case is already covered above: a stall pushes `now` past expiry, hitting the
-    // node-local CommitmentExpired forward.
     // 2. Decode BOTH PSBTs; undecodable input is a 400, not a refusal. The escape
     //    is mandatory (ADR-0012: "a request missing the escape is invalid and
     //    rejected outright, so a hostile coordinator cannot strip the escape to
@@ -4876,6 +5008,43 @@ fn handle_sign_after_lock(
         // Escape-derived refusals are deliberately NOT cached under the spend id
         // (see `verify_escape` below), so a corrupt escape cannot poison this entry.
         return Ok(recorded);
+    }
+    // 4b. A NODE-LOCAL prevout FETCH failure: this node's own backend errored, so it
+    //     has no chain ground truth and cannot evaluate ANY of this request. Refuse
+    //     fail-closed (as before — policy-core must never see attacker-supplied
+    //     `witness_utxo` values once the chain view is gone) but FORWARD the carrier,
+    //     exactly like the node-local expiry and delivery-horizon refusals above.
+    //     Otherwise one node with a down bitcoind silently swallows a selectively
+    //     delivered duress carrier: it recorded the intent at the arm hook, so without
+    //     a holder claim that intent is hollow, `confirm_carrier` never reaches `t`,
+    //     and the node can never arm or Lockdown off its OWN carrier (bead f91 (C)).
+    //
+    //     Two orderings decide whether this is a fix or a regression, and BOTH were
+    //     violated by earlier attempts:
+    //
+    //      - it runs AFTER the accepted-replay lookup, so a retry of an ALREADY
+    //        ACCEPTED request returns its cached ACCEPTED verdict rather than being
+    //        overridden by a transient backend failure (codex 9y5.3 pass-5 P1). It
+    //        runs after the commitment-keyed refusal lookup for the same reason.
+    //      - it fires ONLY on a FETCH failure, never on a value MISMATCH. A fetch
+    //        failure is NODE-LOCAL — it is this node's backend that is down, and a
+    //        healthy peer reaches a different verdict — so peers must hear the
+    //        carrier. A `witness_utxo`-vs-chain mismatch is FEDERATION-UNIFORM: every
+    //        honest node computes it alike from the same consensus data, so
+    //        propagating it would leak a theft-recognition signal. The split is
+    //        STRUCTURAL, not a string match on the refusal: `Err` on the pre-fetch is
+    //        the fetch failure, and the mismatch lives inside
+    //        `compare_prevouts_against_chain`, which only runs on `Ok`.
+    //
+    //     Pin-uniform: the fetch outcome is a pure function of the backend and the
+    //     PSBTs, never of the pin, so both matching pin classes take this branch
+    //     identically. This costs a hostile coordinator nothing it did not already
+    //     have — staging still requires a valid coordinator signature and a fresh
+    //     nonce, and arming still requires a valid duress pin plus `t`-of-`n`
+    //     confirmation — and it only ever adds the fail-safe direction.
+    if let Some(refused) = node_local_prevout_fetch_failure(&spend_prevouts, &escape_prevouts) {
+        stage_spend_carrier(node, propagated_request, &carrier);
+        return Ok(refused);
     }
     state.pending.prune(now);
     state.refreshes.prune(now, node.refresh_min_interval_secs);
@@ -5384,7 +5553,24 @@ fn handle_refresh_after_lock(
     // It is silent, which is why it can be unconditional: the refresh is deferred
     // for a reason the attacker can already see — their own visible pending spend
     // — and it behaves identically under both PINs and in ordinary operation.
-    if state.pending.has_any(now) {
+    //
+    // The predicate has TWO halves, and the second one is what makes the first
+    // airtight (bead btc-policy-f91). `pending` holds spends this node has already
+    // REGISTERED, which happens in `/sign`'s phase 2; a spend inside its out-of-lock
+    // chain preflight has not reached that point yet and is invisible here. Since a
+    // refresh's own preflight is shorter (one PSBT, one batch, versus the spend's
+    // two), a refresh submitted while a spend is mid-preflight would otherwise
+    // overtake it, find `pending` empty, and register as immediately fireable — and
+    // if it spent an input the racing spend's mandatory escape needs, the escape
+    // would no longer cover at `T`, the sweep would fail, and the vault would exit
+    // through recovery. `spend_preflight_in_flight` covers exactly that gap; the two
+    // halves overlap (the claim is released only after phase 2 has registered), so
+    // there is no instant at which an in-flight spend is invisible to this rule.
+    //
+    // Both halves produce the SAME refusal bytes, deliberately: an attacker must not
+    // be able to tell which one deferred them, and neither half depends on the racing
+    // spend's PIN class (the claim is taken on the one path both matching pins take).
+    if state.pending.has_any(now) || node.spend_preflight_in_flight() {
         return Ok(refusal(
             RefusalCode::RefreshSubordinated,
             "refresh_subordination",
@@ -6199,6 +6385,55 @@ fn compare_prevouts_against_chain(
         }
     }
     Ok(())
+}
+
+/// The NODE-LOCAL half of the prevout preflight's two failure modes (bead f91 (C)):
+/// the pre-fetched refusal iff the out-of-lock batch RPC itself failed, for the spend
+/// or for its mandatory escape.
+///
+/// This is the whole node-local-vs-federation-uniform split, and it is deliberately
+/// structural rather than a match on the refusal's code or `check` string — both
+/// failure modes share `PSBT_INCONSISTENT`/`prevout_ground_truth`, so a text test would
+/// silently reclassify one as the other the first time a message is edited:
+///
+///  - **`Err` here — NODE-LOCAL.** [`fetch_prevouts`] failed: this node's backend
+///    errored, or returned the wrong number of results. A healthy peer asking the same
+///    question gets an answer, so peers must still receive the carrier; the caller
+///    forwards it.
+///  - **A value MISMATCH — FEDERATION-UNIFORM.** That verdict is produced by
+///    [`compare_prevouts_against_chain`], which runs only on `Ok`, comparing the PSBT's
+///    declared `witness_utxo` against consensus data every honest node reads alike.
+///    It must NOT propagate, and it cannot reach this function.
+///
+/// `None` for a PSBT that was never fetched (no backend, or it did not decode) is not a
+/// failure: a backend-less deterministic test simply runs no preflight.
+fn node_local_prevout_fetch_failure(
+    spend_prevouts: &Option<PrevoutFetch>,
+    escape_prevouts: &Option<PrevoutFetch>,
+) -> Option<SignResponse> {
+    if let Some(Err(refused)) = spend_prevouts {
+        return Some(refused.clone());
+    }
+    if let Some(Err(escape_failure)) = escape_prevouts {
+        // This early path runs before `verify_escape`, so add the same attribution that
+        // function would have supplied around `run_prevout_check`.
+        //
+        // EXHAUSTIVE on purpose. The spend arm above forwards ANY `Err`, and this arm must
+        // not be narrower: `fetch_prevouts` only ever constructs refusals today, so the
+        // fallback is unreachable — but an `if let` matching only `Refusal` would SILENTLY
+        // DROP the escape forward if a future variant appeared, which is precisely the
+        // swallow this fetch-failure forwarding exists to prevent (Fable f91 review).
+        // Forwarding it unattributed beats not forwarding it at all.
+        return Some(match escape_failure {
+            SignResponse::Refusal(refused) => refusal(
+                refused.code,
+                &format!("escape:{}", refused.check),
+                refused.detail.clone(),
+            ),
+            other => other.clone(),
+        });
+    }
+    None
 }
 
 /// Fetch + compare in one call — the standalone form kept for the unit tests that
@@ -7547,11 +7782,10 @@ mod prevout_preflight {
     }
 
     /// A coordinator reaches one honest node whose bitcoind is down: its prevout preflight
-    /// fails and the node refuses fail-closed (registers no candidate). Forwarding that
-    /// node-local refusal so peers still arm is deferred to f91 (it needs the accepted-replay
-    /// ordering to avoid overriding an accepted verdict on retry — codex pass-5 P1); the
-    /// hung-backend case is covered by the node-local CommitmentExpired forward. Here we
-    /// only pin the fail-closed refusal.
+    /// fails and the node refuses fail-closed, registering no candidate. Bead f91 (C) adds
+    /// the other half — that NODE-LOCAL refusal now also forwards the carrier, so a
+    /// selectively-delivered duress request is not swallowed by one node's dead backend.
+    /// The forward's ordering and its self-hold are pinned in `preflight_concurrency`.
     #[test]
     fn a_prevout_fetch_failure_refuses_fail_closed() {
         let (mut node, request) = node_and_valid_request();
@@ -7564,6 +7798,11 @@ mod prevout_preflight {
         assert!(
             matches!(&response, SignResponse::Refusal(r) if r.code == RefusalCode::PsbtInconsistent),
             "a node whose backend is down refuses fail-closed: {response:?}"
+        );
+        assert_eq!(
+            node.sign_state.lock().expect("sign state").pending.len(),
+            0,
+            "a fail-closed preflight refusal must register no candidate"
         );
     }
 
@@ -7616,6 +7855,463 @@ mod prevout_preflight {
                 .len(),
             first_lookups,
             "freshness rejection must precede both prevout batches"
+        );
+    }
+}
+
+#[cfg(test)]
+mod preflight_concurrency {
+    //! Bead btc-policy-f91: the concurrency window `/sign` opens by running its chain
+    //! preflight OUTSIDE `sign_state`.
+    //!
+    //! That hoist is itself load-bearing (a round-2 P0: chain I/O under the lock let a
+    //! hung bitcoind delay the deadline driver's unconditional Lockdown-at-`T`), so the
+    //! preflight STAYS out of the lock and these tests pin the consequences instead:
+    //!
+    //!  - **(A)** a spend inside that window subordinates concurrent refreshes, and the
+    //!    marker that does it cannot leak on any exit path;
+    //!  - **(B)** the peer fan-out is deferred by the preflight, and that deferral is a
+    //!    bounded DELAY (two batch RPCs, each under one [`chain::RPC_TIMEOUT`]) rather
+    //!    than a miss;
+    //!  - **(C)** a node-local prevout FETCH failure forwards the carrier, without
+    //!    overriding an already-accepted verdict and without turning the
+    //!    federation-uniform value MISMATCH into a propagating refusal.
+    //!
+    //! Every race here is driven by the mock backend's one-shot preflight barrier, never
+    //! by sleeps: the spend thread parks INSIDE the preflight until the test releases it.
+
+    use std::str::FromStr;
+    use std::sync::{Arc, Barrier};
+
+    use bitcoin::{Amount, Psbt};
+
+    use crate::chain::mock::MockBackend;
+    use crate::chain::Prevout;
+    use crate::test_support::{
+        coord_sign, node_and_valid_request, theft_request, valid_refresh_request,
+    };
+    use vault_proto::{RefusalCode, SignRequest, SignResponse};
+
+    /// A backend whose chain view confirms every prevout the fixture spend and its
+    /// mandatory escape declare (both spend outpoint `7:0`), optionally parking the
+    /// FIRST lookup on `entered`/`proceed` so a test can hold a `/sign` call inside its
+    /// out-of-lock preflight.
+    fn fixture_backend(
+        request: &SignRequest,
+        pause: Option<(Arc<Barrier>, Arc<Barrier>)>,
+    ) -> MockBackend {
+        let psbt = Psbt::from_str(&request.psbt).expect("fixture spend");
+        let (entered, proceed) = match pause {
+            Some((entered, proceed)) => (Some(entered), Some(proceed)),
+            None => (None, None),
+        };
+        MockBackend {
+            prevouts: [(
+                psbt.unsigned_tx.input[0].previous_output,
+                Prevout {
+                    txout: psbt.inputs[0]
+                        .witness_utxo
+                        .clone()
+                        .expect("fixture witness_utxo"),
+                    confirmed: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            prevout_fetch_entered: entered,
+            prevout_fetch_continue: proceed,
+            ..Default::default()
+        }
+    }
+
+    /// Drive a spend with `pin` into its out-of-lock preflight, submit a refresh over
+    /// the input that spend's mandatory escape needs, and return
+    /// `(refresh response, spend response)`.
+    ///
+    /// The refresh runs while the spend is parked in the backend, which is precisely the
+    /// window `state.pending` does not cover — the test asserts that emptiness itself, so
+    /// a pass here cannot be earned by the pre-existing registered-spend rule.
+    fn race_a_refresh_against_a_spend_preflight(pin: &str) -> (SignResponse, SignResponse) {
+        let (mut node, mut request) = node_and_valid_request();
+        request.pin = pin.into();
+        coord_sign(&mut request, &node.wallet_id, "f91-race-spend");
+        let refresh = valid_refresh_request(&node, &request, "f91-race-refresh");
+
+        let entered = Arc::new(Barrier::new(2));
+        let proceed = Arc::new(Barrier::new(2));
+        node.set_chain_backend(Arc::new(fixture_backend(
+            &request,
+            Some((Arc::clone(&entered), Arc::clone(&proceed))),
+        )));
+        let now = request.expiry - 100;
+        let node = Arc::new(node);
+
+        let spend_node = Arc::clone(&node);
+        let spend = std::thread::spawn(move || {
+            crate::handle_sign(&spend_node, &request, now).expect("decodable spend")
+        });
+
+        // The spend is now parked inside its preflight: past the arm hook, before
+        // candidate registration.
+        entered.wait();
+        assert_eq!(
+            node.sign_state.lock().expect("sign state").pending.len(),
+            0,
+            "the racing spend must NOT be registered yet — otherwise this test would be \
+             passing on the old registered-spend rule instead of the in-flight marker"
+        );
+        assert!(
+            node.spend_preflight_in_flight(),
+            "a spend inside its out-of-lock preflight must hold an in-flight slot"
+        );
+
+        let refreshed = crate::handle_refresh(&node, &refresh, now).expect("decodable refresh");
+        proceed.wait();
+        (refreshed, spend.join().expect("spend worker"))
+    }
+
+    /// (A) The honest-reachable race. A refresh that overtakes a spend's out-of-lock
+    /// preflight must NOT be able to consume an input that spend's MANDATORY ESCAPE
+    /// needs: if it did, the escape could no longer cover at `T`, the best-effort sweep
+    /// would fail, and the vault would exit through recovery — funds frozen, not stolen,
+    /// but avoidably so.
+    ///
+    /// The fixture refresh spends outpoint `7:0`, which is exactly the input the racing
+    /// spend's escape sweeps, so this is the invalidating refresh and not a bystander.
+    #[test]
+    fn a_refresh_racing_an_in_flight_spend_is_subordinated() {
+        let (refreshed, spend) = race_a_refresh_against_a_spend_preflight("1234");
+        assert!(
+            matches!(&refreshed, SignResponse::Refusal(r)
+                if r.code == RefusalCode::RefreshSubordinated),
+            "a refresh over the in-flight spend's escape input must be subordinated: \
+             {refreshed:?}"
+        );
+        assert!(
+            matches!(spend, SignResponse::Accepted(_)),
+            "the spend itself still completes once its preflight returns: {spend:?}"
+        );
+    }
+
+    /// (A) SILENCE. The in-flight claim is taken on the one code path both matching pin
+    /// classes take, before the verdict can branch any observable, so a refresh
+    /// subordinated by a DURESS spend's preflight must be byte-identical to one
+    /// subordinated by a NORMAL spend's. Compared on the serialized wire form, which is
+    /// what the coordinator actually sees.
+    #[test]
+    fn the_in_flight_subordination_refusal_is_identical_under_both_pin_classes() {
+        let (normal, _) = race_a_refresh_against_a_spend_preflight("1234");
+        let (duress, _) = race_a_refresh_against_a_spend_preflight("9999");
+        assert_eq!(
+            serde_json::to_string(&normal).expect("encode normal refusal"),
+            serde_json::to_string(&duress).expect("encode duress refusal"),
+            "the racing spend's pin class must not be readable from the refresh refusal"
+        );
+        assert!(matches!(&normal, SignResponse::Refusal(r)
+            if r.code == RefusalCode::RefreshSubordinated));
+    }
+
+    /// (A) The marker is an RAII claim, so no exit can leak it — a leaked claim would
+    /// subordinate every refresh on this node until it died. Three structurally distinct
+    /// exits from the preflight window: the accepted path, a federation-uniform policy
+    /// refusal, and a phase-2 early return that never reaches validation at all.
+    #[test]
+    fn the_in_flight_marker_is_released_on_every_exit_path() {
+        // 1. ACCEPTED.
+        let (mut node, request) = node_and_valid_request();
+        node.set_chain_backend(Arc::new(fixture_backend(&request, None)));
+        let now = request.expiry - 100;
+        assert!(matches!(
+            crate::handle_sign(&node, &request, now).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(
+            !node.spend_preflight_in_flight(),
+            "the accepted path must release its in-flight slot"
+        );
+
+        // 2. A POLICY REFUSAL (`DEST_NOT_ALLOWED`), which returns from the middle of
+        //    phase 2. The refused theft registers nothing, so once the slot is released
+        //    a refresh must be servable again — the end-to-end form of "not leaked".
+        let (mut node, request) = node_and_valid_request();
+        node.set_chain_backend(Arc::new(fixture_backend(&request, None)));
+        let theft = theft_request(&node, &request);
+        let refresh = valid_refresh_request(&node, &request, "f91-release-refresh");
+        let now = request.expiry - 100;
+        assert!(
+            matches!(crate::handle_sign(&node, &theft, now).expect("decodable"),
+                SignResponse::Refusal(r) if r.code == RefusalCode::DestNotAllowed)
+        );
+        assert!(
+            !node.spend_preflight_in_flight(),
+            "a policy refusal must release its in-flight slot"
+        );
+        assert!(
+            matches!(
+                crate::handle_refresh(&node, &refresh, now).expect("decodable refresh"),
+                SignResponse::Accepted(_)
+            ),
+            "with the slot released and nothing pending, a refresh is servable again"
+        );
+
+        // 3. AN EARLY RETURN that never reaches validation: the node-local prevout FETCH
+        //    failure, which returns as soon as the preflight result is inspected.
+        let (mut node, request) = node_and_valid_request();
+        node.set_chain_backend(Arc::new(MockBackend {
+            prevout_error: Some("backend unavailable".into()),
+            ..Default::default()
+        }));
+        let now = request.expiry - 100;
+        assert!(matches!(
+            crate::handle_sign(&node, &request, now).expect("decodable"),
+            SignResponse::Refusal(_)
+        ));
+        assert!(
+            !node.spend_preflight_in_flight(),
+            "a phase-2 early return must release its in-flight slot too"
+        );
+    }
+
+    /// (B) The fan-out cost of keeping the preflight out of the lock, made explicit.
+    ///
+    /// `stage_spend_carrier` first becomes possible only AFTER the preflight, so a node
+    /// with a stalled backend adds that stall to peer fan-out latency. This pins that
+    /// the OUT-OF-LOCK PREFLIGHT component is BOUNDED and that the fan-out is DELAYED,
+    /// never dropped:
+    ///
+    ///  - the safety INTENT is already recorded while the backend is still parked (it is
+    ///    chain-independent, and the arm hook runs before the preflight);
+    ///  - the preflight issues exactly TWO batch RPCs — one for the spend, one for the
+    ///    escape, the ladder reusing the escape's — each a single loopback HTTP request
+    ///    under one [`chain::RPC_TIMEOUT`]. The COUNT is what this pins, and it is the
+    ///    half a hostile coordinator could otherwise attack: this component does not
+    ///    scale with the number of inputs or ladder rungs it declares; and
+    ///  - the carrier IS staged once the preflight returns.
+    ///
+    /// Total ingress-to-fan-out latency also contains the phase-2 `sign_state` wait and
+    /// validation/signing before staging. That separate term can grow under concurrent
+    /// authenticated traffic and is deliberately outside this two-RPC preflight bound.
+    ///
+    /// The alternative — fanning the request out BEFORE validation — is invariant-blocked
+    /// (it would propagate federation-uniform policy and MISMATCH refusals), so the bound
+    /// is the accepted answer and this test is what keeps it honest.
+    #[test]
+    fn the_preflight_defers_fan_out_by_a_bounded_stall_and_never_drops_it() {
+        let (mut node, mut request) = node_and_valid_request();
+        request.pin = "9999".into();
+        coord_sign(&mut request, &node.wallet_id, "f91-bounded-stall");
+        let entered = Arc::new(Barrier::new(2));
+        let proceed = Arc::new(Barrier::new(2));
+        let backend = Arc::new(fixture_backend(
+            &request,
+            Some((Arc::clone(&entered), Arc::clone(&proceed))),
+        ));
+        node.set_chain_backend(backend.clone());
+        let now = request.expiry - 100;
+        let node = Arc::new(node);
+
+        let spend_node = Arc::clone(&node);
+        let spend = std::thread::spawn(move || {
+            crate::handle_sign(&spend_node, &request, now).expect("decodable spend")
+        });
+
+        entered.wait();
+        assert_eq!(
+            node.duress_arm_count(),
+            1,
+            "the safety intent is chain-independent and exists before the stall"
+        );
+        assert!(
+            node.outbox.lock().expect("outbox").is_empty(),
+            "fan-out is what the stall defers — this is the cost being bounded, not a bug"
+        );
+        proceed.wait();
+
+        assert!(matches!(
+            spend.join().expect("spend worker"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(
+            node.outbox.lock().expect("outbox").len(),
+            1,
+            "the deferred fan-out must still happen: a DELAY, not a MISS"
+        );
+        assert_eq!(
+            *backend.prevout_batches.lock().expect("batches"),
+            vec![1, 1],
+            "the preflight is exactly two batch RPCs — the spend's and the escape's"
+        );
+    }
+
+    /// (B), the half that is exactly true rather than merely typical: the preflight
+    /// component does not SCALE with either input count or ladder length. A hostile
+    /// coordinator cannot lengthen it by declaring more inputs because each PSBT is one
+    /// batch, and fee-bump rungs reuse the base escape's fetched ground truth. Two inputs
+    /// per PSBT plus one real bump rung must still be exactly two batches.
+    #[test]
+    fn the_preflight_stall_does_not_scale_with_the_request() {
+        let (mut node, mut request) = crate::test_support::node_and_valid_multi_request();
+        let mut escape = Psbt::from_str(&request.escape_psbt).expect("fixture escape");
+        for input in &mut escape.unsigned_tx.input {
+            input.sequence = bitcoin::Sequence::from_consensus(crate::ESCAPE_RBF_SEQUENCE);
+        }
+        crate::test_support::user_sign_all(&node, &mut escape);
+        let mut bump = escape.clone();
+        let bumped_value = bump.unsigned_tx.output[0].value.to_sat() - 1_000_000;
+        bump.unsigned_tx.output[0].value = Amount::from_sat(bumped_value);
+        crate::test_support::user_sign_all(&node, &mut bump);
+        request.escape_psbt = escape.to_string();
+        request.escape_bumps = vec![bump.to_string()];
+        coord_sign(&mut request, &node.wallet_id, "f91-multi-with-bump");
+
+        let backend = Arc::new(MockBackend::default());
+        node.set_chain_backend(backend.clone());
+        let now = request.expiry - 100;
+        assert!(matches!(
+            crate::handle_sign(&node, &request, now).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(
+            *backend.prevout_batches.lock().expect("batches"),
+            vec![2, 2],
+            "two inputs per PSBT and a bump rung must still cost exactly two batch RPCs"
+        );
+    }
+
+    /// (C) A node whose own backend is down cannot evaluate the request, but it must not
+    /// swallow the carrier: it refuses fail-closed AND forwards, exactly like the
+    /// node-local expiry and delivery-horizon refusals. Otherwise a coordinator that
+    /// selectively delivers a duress request to a node with a dead bitcoind gets a node
+    /// that recorded an intent it can never confirm.
+    #[test]
+    fn a_node_local_prevout_fetch_failure_forwards_the_carrier() {
+        let (mut node, mut request) = node_and_valid_request();
+        request.pin = "9999".into();
+        coord_sign(&mut request, &node.wallet_id, "f91-fetch-failure");
+        node.set_chain_backend(Arc::new(MockBackend {
+            prevout_error: Some("backend unavailable".into()),
+            ..Default::default()
+        }));
+        let now = request.expiry - 100;
+
+        let response = crate::handle_sign(&node, &request, now).expect("decodable");
+        assert!(
+            matches!(&response, SignResponse::Refusal(r)
+                if r.code == RefusalCode::PsbtInconsistent),
+            "a dead backend still refuses fail-closed: {response:?}"
+        );
+        assert_eq!(
+            node.outbox.lock().expect("outbox").len(),
+            1,
+            "a NODE-LOCAL refusal must still fan the carrier out to peers"
+        );
+    }
+
+    /// (C) The early fetch-failure branch runs before `verify_escape`, so it must add
+    /// the same `escape:` attribution itself when only the mandatory escape's batch
+    /// fails. Without this, operators cannot tell which half of the pair lost its chain
+    /// view.
+    #[test]
+    fn an_escape_only_prevout_fetch_failure_keeps_escape_attribution() {
+        let (mut node, mut request) = node_and_valid_request();
+        // Make the spend's batch empty and therefore infallible; the backend's first
+        // actual lookup is then the escape, isolating the escape-only failure path.
+        let mut spend = Psbt::from_str(&request.psbt).expect("fixture spend");
+        spend.unsigned_tx.input.clear();
+        spend.inputs.clear();
+        request.psbt = spend.to_string();
+        coord_sign(&mut request, &node.wallet_id, "f91-escape-fetch-failure");
+        node.set_chain_backend(Arc::new(MockBackend {
+            prevout_error: Some("backend unavailable".into()),
+            ..Default::default()
+        }));
+        let now = request.expiry - 100;
+
+        let response = crate::handle_sign(&node, &request, now).expect("decodable");
+        assert!(
+            matches!(&response, SignResponse::Refusal(r)
+                if r.code == RefusalCode::PsbtInconsistent
+                    && r.check == "escape:prevout_ground_truth"),
+            "the early escape fetch failure must remain attributable: {response:?}"
+        );
+        assert_eq!(
+            node.outbox.lock().expect("outbox").len(),
+            1,
+            "an escape fetch failure is still node-local and must forward"
+        );
+    }
+
+    /// (C) The ordering that made two earlier attempts a regression (codex 9y5.3 pass-5
+    /// P1): the forward must sit AFTER the accepted-replay lookup. A coordinator retrying
+    /// an ALREADY-ACCEPTED request while this node's backend happens to be down must get
+    /// its cached ACCEPTED verdict back — a transient local failure cannot retract an
+    /// acceptance the node already made and registered.
+    #[test]
+    fn a_fetch_failure_does_not_override_an_already_accepted_replay() {
+        let (mut node, mut request) = node_and_valid_request();
+        node.set_chain_backend(Arc::new(fixture_backend(&request, None)));
+        let now = request.expiry - 100;
+        assert!(matches!(
+            crate::handle_sign(&node, &request, now).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        // The backend dies, and the coordinator retries the SAME pair with a fresh
+        // nonce (the nonce is single-use per transmission; idempotency lives on the pair).
+        node.set_chain_backend(Arc::new(MockBackend {
+            prevout_error: Some("backend unavailable".into()),
+            ..Default::default()
+        }));
+        coord_sign(&mut request, &node.wallet_id, "f91-accepted-retry");
+        let replayed = crate::handle_sign(&node, &request, now).expect("decodable");
+        assert!(
+            matches!(replayed, SignResponse::Accepted(_)),
+            "the cached ACCEPTED verdict must win over a transient backend failure: \
+             {replayed:?}"
+        );
+    }
+
+    /// (C) The other half of the split. A `witness_utxo`-vs-chain MISMATCH is
+    /// FEDERATION-UNIFORM — every honest node derives it from the same consensus data —
+    /// so propagating it would hand an attacker a theft-recognition signal. It must
+    /// refuse WITHOUT forwarding, while the fetch failure above forwards.
+    #[test]
+    fn a_prevout_value_mismatch_still_does_not_propagate() {
+        let (mut node, mut request) = node_and_valid_request();
+        request.pin = "9999".into();
+        coord_sign(&mut request, &node.wallet_id, "f91-mismatch");
+        let psbt = Psbt::from_str(&request.psbt).expect("fixture spend");
+        let declared = psbt.inputs[0]
+            .witness_utxo
+            .clone()
+            .expect("fixture witness_utxo");
+        let mut on_chain = declared.clone();
+        on_chain.value = Amount::from_sat(declared.value.to_sat() - 1);
+        node.set_chain_backend(Arc::new(MockBackend {
+            prevouts: [(
+                psbt.unsigned_tx.input[0].previous_output,
+                Prevout {
+                    txout: on_chain,
+                    confirmed: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        let now = request.expiry - 100;
+
+        let response = crate::handle_sign(&node, &request, now).expect("decodable");
+        assert!(
+            matches!(&response, SignResponse::Refusal(r)
+                if r.code == RefusalCode::PsbtInconsistent
+                    && r.check == "prevout_ground_truth"),
+            "a forged witness_utxo is refused: {response:?}"
+        );
+        assert!(
+            node.outbox.lock().expect("outbox").is_empty(),
+            "a FEDERATION-UNIFORM refusal must never propagate — every honest node reaches \
+             it alone, and forwarding it would leak theft recognition"
         );
     }
 }
@@ -7793,7 +8489,7 @@ pub(crate) mod test_support {
         sha256::Hash::hash(descriptor.to_string().as_bytes()).to_byte_array()
     }
 
-    fn user_sign_all(node: &Node, psbt: &mut Psbt) {
+    pub(crate) fn user_sign_all(node: &Node, psbt: &mut Psbt) {
         let unsigned = psbt.unsigned_tx.clone();
         let mut cache = SighashCache::new(&unsigned);
         for (index, input) in psbt.inputs.iter_mut().enumerate() {

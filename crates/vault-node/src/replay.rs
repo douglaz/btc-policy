@@ -135,10 +135,16 @@ impl PendingLog {
         self.entries.retain(|_, expiry| *expiry >= now);
     }
 
-    /// Whether ANY spend is pending at `now` — the refresh-subordination predicate
-    /// (ADR-0012). Deliberately a bare existence question, not "which coins does it
-    /// touch?": the rule is coarse on purpose, because an input-overlap-granular
-    /// version reopens the disjoint-refresh escape invalidation.
+    /// Whether ANY spend is pending at `now` — the REGISTERED half of the
+    /// refresh-subordination predicate (ADR-0012). Deliberately a bare existence
+    /// question, not "which coins does it touch?": the rule is coarse on purpose,
+    /// because an input-overlap-granular version reopens the disjoint-refresh escape
+    /// invalidation.
+    ///
+    /// A spend only lands here in `/sign`'s phase 2, so this alone does not cover one
+    /// still inside its out-of-lock chain preflight; `Node::spend_preflight_in_flight`
+    /// is the other half, and the refresh handler consults both (bead
+    /// btc-policy-f91).
     pub(crate) fn has_any(&self, now: u64) -> bool {
         self.entries.values().any(|expiry| *expiry >= now)
     }
