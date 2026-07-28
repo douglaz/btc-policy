@@ -3096,23 +3096,27 @@ fn mempool_escape_rung(
     let Some(rungs) = channel.candidate_rung_txs(commitment_id) else {
         return Ok(None);
     };
-    for rung in rungs {
-        let expected = rung.compute_txid();
-        let Some(raw) = backend.mempool_transaction(&expected)? else {
-            continue;
-        };
-        let resident: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)
-            .map_err(|e| format!("mempool escape rung {expected} is malformed: {e}"))?;
-        if resident.compute_txid() != expected {
-            return Err(format!(
-                "mempool lookup for escape rung {expected} returned transaction {}",
-                resident.compute_txid()
-            )
-            .into());
-        }
-        return Ok(Some(resident));
+    // ONE batched membership read for the whole ladder, cheapest rung first. Asking per
+    // rung would make the Core backend pull the entire mempool once per rung — up to
+    // four full `getrawmempool` snapshots per 1 Hz fire tick, worst exactly under the
+    // congestion that makes the combine window tightest (bead btc-policy-nvr).
+    let txids: Vec<Txid> = rungs
+        .iter()
+        .map(bitcoin::Transaction::compute_txid)
+        .collect();
+    let Some((expected, raw)) = backend.mempool_resident(&txids)? else {
+        return Ok(None);
+    };
+    let resident: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)
+        .map_err(|e| format!("mempool escape rung {expected} is malformed: {e}"))?;
+    if resident.compute_txid() != expected {
+        return Err(format!(
+            "mempool lookup for escape rung {expected} returned transaction {}",
+            resident.compute_txid()
+        )
+        .into());
     }
-    Ok(None)
+    Ok(Some(resident))
 }
 
 /// Validate the candidate's ancestry either from ordinary unspent prevouts or,
