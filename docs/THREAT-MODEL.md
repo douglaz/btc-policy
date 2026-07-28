@@ -86,18 +86,29 @@ These are what a reviewer should try hardest to break. Each is enforced in code,
 | `POST /channel` | Peer transport | Manifest-pinned endpoints and endorsed channel keys; per-peer rate quota; size bound is manifest-uniform. |
 | `GET /events` | Watchtower alerts + one channel diagnostic | Carries on-chain watchtower alerts (`RECOVERY_PATH_SPEND`, `UNRECOGNIZED_SPEND`) plus `CHANNEL_FRESHNESS_REJECT`, which names a peer whose clock is off. It carries nothing about pending or armed state. A reviewer should confirm the freshness diagnostic is genuinely pin-independent, since it is the one `/events` entry not derived from the chain. |
 | `GET /healthz` | Liveness | Three atomic loads; must stay free of duress-dependent content. |
-| `GET /pending` | Accepted hot-candidate ids | Sorted opaque commitment ids only. No arm state, transaction, amount, destination, signature material, or explicit timing field. The complete body must stay byte-identical across normal/duress and armed/idle twins. One short `sign_state` snapshot is allowed; concurrent snapshots are shed before entering the blocking pool. The SILENCE row above is asserted here on the response **bytes**: this is the one read surface that waits on `sign_state`, and while every holder of that lock does pin-uniform work (`/sign`'s two Argon2id evaluations under either PIN; settlement bookkeeping for public chain events), the arm-dependent release/combine work lives under the *channel store*, which this route never takes. The latency residual is therefore the co-residency one `/healthz` already states, not a lock this route shares with anything arm-dependent — see `docs/DESIGN.md`. |
+| `GET /pending` | Accepted hot-candidate ids | Sorted opaque commitment ids only. No arm state, transaction, amount, destination, signature material, or explicit timing field. The complete body must stay byte-identical across normal/duress and armed/idle twins. One short `sign_state` snapshot is allowed; concurrent snapshots are shed before entering the blocking pool. The SILENCE row above is asserted here on the response **bytes**. This is the one read surface that waits on `sign_state`, and it is **not** structurally isolated from arm-dependent work: the fire pass's release/combine loop holds `sign_state` too (it must — the release gate is fail-closed under that guard). What makes the channel pin-uniform is scheduling, not isolation: dynamic-`T` puts `T` at or before the earliest pending hot Hold expiry minus `epsilon_secs`, so **pre-`T` the due set is empty on an armed node and an idle twin alike** and the guarded section does no arm-dependent work on either; the arm-dependent duration difference is confined to the post-`T` window, by which point Lockdown is already public. A separate, weaker residual remains and is not co-residency: because the route is unauthenticated and waits on this lock, any network observer can poll it and infer *that* a `/sign` was being processed — including one that was REFUSED and therefore never appears in the projection. That is a spend-activity timing channel, not a duress oracle. |
 | Chain backend RPC | Per-node bitcoind | Requires `-txindex=1`. Node fails closed if unreadable. |
 | Setup ceremony | One-time | The highest-consequence surface: it fixes keys, PINs, policy caps, and the manifest hash. See `docs/SETUP-CEREMONY.md`; `finalize` refuses to seal an edited state. |
 | Node config + preimage | At rest on each host | The signing key is derived from an operator-supplied preimage at start, not stored. ADR-0007 assumes tmpfs so a reboot kills the node. |
 
 ## 7. Residual risks — stated plainly
 
-**R1 — The pending projection is pull-only.**
+**R1 — The pending projection is pull-only, and it is an unauthenticated timing surface.**
 The coordinator-auth-key visibility gap is closed by `GET /pending`, but there is no paging or
 push notification. Someone must poll every node and compare the opaque ids with the user's
 authorized spends. Polling also bounds when an id appeared and disappeared; that timing is
 pin-uniform, but observable. The route deliberately exposes no transaction details or deadline.
+
+Two residuals a reviewer should weigh rather than take as closed. First, the route is
+**unauthenticated** (matching `/healthz` and `/events`) and it is the one read surface that waits
+on `sign_state`, so any network peer — holding no keys at all — can poll it and infer that a
+`/sign` was being processed, **including a spend that was refused** and therefore never appears
+in the projection. That is a spend-activity timing channel, not a duress oracle, and it is not
+the co-residency residual documented for `/healthz`: it needs no co-tenancy. Second, the
+pin-uniformity of that channel rests on dynamic-`T` keeping the fire pass's due set empty pre-`T`
+on armed and idle nodes alike — **not** on lock isolation, since the release/combine pass holds
+`sign_state` as well. If dynamic-`T` ever stopped guaranteeing an empty pre-`T` due set, this
+would need re-analysis.
 
 **R2 — `t` compromised nodes plus the user key is unrecoverable.** By construction (A6). The
 mitigation is operational — ADR-0009's correlation-class rule — not cryptographic.
