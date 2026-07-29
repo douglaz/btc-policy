@@ -904,7 +904,40 @@ impl BitcoindBackend {
         scripts: &[ScriptBuf],
         cold_scan: &ColdScan,
     ) -> Result<(), Error> {
+        // The birthday MUST come from the same branch the cold scan ran against, and
+        // `block_time_at` reads whatever block occupies that height on the CURRENTLY
+        // active chain (codex hn8 review, P1). If a reorg replaces the block at
+        // `oldest_unspent_height` between the scan and this call, the timestamp is the
+        // replacement branch's — and if it is more than Core's two-hour import grace
+        // window LATER, the descriptor rescan begins after the scan branch's actual
+        // oldest output. The marker written below still records the SCAN branch, so after
+        // a restart that wallet verifies happily while permanently omitting that UTXO.
+        //
+        // That is not merely a stale cache. The vault balance is the DENOMINATOR of the
+        // fire-time escape coverage guard, so understating it INFLATES apparent coverage:
+        // an escape that should have been refused looks admissible. It is precisely the
+        // inversion this bead was constrained against.
+        //
+        // Bracket the read with the scan's own anchor. A block hash commits to its entire
+        // ancestry, so if `cache.bestblock` still sits at `cache.height` on the active
+        // chain, the block at `oldest_unspent_height` — an ancestor of it — is the one the
+        // scan saw, and the timestamp is from the right branch. If the anchor has moved,
+        // the scan is stale: fail here and let the caller re-scan rather than import
+        // against a birthday we cannot vouch for. Failing is safe; importing is not.
         let timestamp = self.block_time_at(cold_scan.oldest_unspent_height)?;
+        let anchor_still_active = self
+            .block_hash_at(cold_scan.cache.height)?
+            .is_some_and(|hash| hash == cold_scan.cache.bestblock);
+        if !anchor_still_active {
+            return Err(format!(
+                "the cold scan's anchor {} at height {} left the active chain before its \
+                 birthday could be imported: the descriptor birthday would come from a \
+                 different branch, so a vault output could be left permanently unwatched \
+                 and the coverage denominator understated. Re-scan.",
+                cold_scan.cache.bestblock, cold_scan.cache.height
+            )
+            .into());
+        }
         let mut requests = Vec::with_capacity(scripts.len());
         for script in scripts {
             requests.push(json!({
@@ -4232,6 +4265,70 @@ mod tests {
         );
     }
 
+    /// **A reorg between the cold scan and its import is REFUSED, not imported**
+    /// (codex hn8 review, P1).
+    ///
+    /// `block_time_at` reads whatever block occupies the birthday height on the
+    /// CURRENTLY active chain. If a reorg replaces that block after `scantxoutset`
+    /// returned, the birthday comes from the replacement branch while the completion
+    /// marker still records the scan branch — and if that timestamp is more than Core's
+    /// two-hour import grace window later, the descriptor rescan begins AFTER the scan
+    /// branch's oldest output. That output is then never watched, yet the marker verifies
+    /// on every later restart, so the omission is PERMANENT and silent.
+    ///
+    /// It matters because the vault balance is the DENOMINATOR of the fire-time escape
+    /// coverage guard: understating it inflates apparent coverage, so an escape that
+    /// should have been refused looks admissible.
+    ///
+    /// Driven against `import_vault_descriptors` directly rather than through a full
+    /// refresh, because the scripted RPC server accepts exactly one connection per
+    /// scripted reply: a test that scripts the calls the UNGUARDED path would make would
+    /// hang on `join` once the guard correctly stops early. Asserting on the refusal's
+    /// own words is what makes this bite — delete the guard and the failure becomes a
+    /// transport error from the exhausted script instead, with a different message.
+    #[test]
+    fn a_reorg_between_the_cold_scan_and_its_import_refuses_to_seed_the_wallet() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let scan_tip = BlockHash::from_byte_array([0xcd; 32]);
+        // The chain moved: the scan's anchor height now holds a DIFFERENT block.
+        let reorged_at_scan_height = BlockHash::from_byte_array([0xee; 32]);
+        let cold_scan = ColdScan {
+            cache: VaultUnspentCache {
+                bestblock: scan_tip,
+                height: 12,
+                scripts: vec![script.clone()],
+                candidates: HashSet::new(),
+            },
+            oldest_unspent_height: 9,
+        };
+        let replies = vec![
+            // The birthday read: block hash at the oldest unspent's height, then its time.
+            ("getblockhash", serde_json::json!("07".repeat(32))),
+            (
+                "getblockheader",
+                serde_json::json!({"time": 1_700_000_000u64}),
+            ),
+            // The anchor re-verify: a DIFFERENT hash now sits at the scan's height.
+            (
+                "getblockhash",
+                serde_json::json!(reorged_at_scan_height.to_string()),
+            ),
+        ];
+        let (addr, server, _requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        let error = backend
+            .import_vault_descriptors("vaultnode", std::slice::from_ref(&script), &cold_scan)
+            .expect_err("a birthday the scan anchor no longer certifies must not be imported")
+            .to_string();
+        server.join().expect("scripted RPC completed");
+
+        assert!(
+            error.contains("left the active chain"),
+            "the refusal must name the stale anchor rather than fail incidentally: {error}"
+        );
+    }
+
     /// Cold start on a fresh backend: the scan runs once, and the wallet it seeds is
     /// rescanned from the OLDEST unspent's block — not from genesis, and not from the
     /// tip (which would miss the coins the vault already holds). The completion marker
@@ -4264,6 +4361,8 @@ mod tests {
                 "getblockheader",
                 serde_json::json!({"time": 1_700_000_000u64}),
             ),
+            // The post-birthday anchor re-verify: the scan tip is still active.
+            ("getblockhash", serde_json::json!(tip.clone())),
             (
                 "getdescriptorinfo",
                 serde_json::json!({"descriptor": format!("raw({script_hex})#abcdefgh")}),
@@ -4501,6 +4600,8 @@ mod tests {
                 "getblockheader",
                 serde_json::json!({"time": 1_700_000_000u64}),
             ),
+            // The post-birthday anchor re-verify: the scan tip is still active.
+            ("getblockhash", serde_json::json!(new_tip.clone())),
             (
                 "getdescriptorinfo",
                 serde_json::json!({"descriptor": vault_desc}),
@@ -4574,6 +4675,8 @@ mod tests {
                 "getblockheader",
                 serde_json::json!({"time": 1_700_000_000u64}),
             ),
+            // The post-birthday anchor re-verify: the scan tip is still active.
+            ("getblockhash", serde_json::json!(new_tip.clone())),
             (
                 "getdescriptorinfo",
                 serde_json::json!({"descriptor": vault_desc.clone()}),
@@ -4701,6 +4804,8 @@ mod tests {
                 "getblockheader",
                 serde_json::json!({"time": 1_700_000_000u64}),
             ),
+            // The post-birthday anchor re-verify: the scan tip is still active.
+            ("getblockhash", serde_json::json!(reorged_tip.clone())),
             (
                 "getdescriptorinfo",
                 serde_json::json!({"descriptor": vault_desc}),
@@ -4922,6 +5027,8 @@ mod tests {
                     "getblockheader",
                     serde_json::json!({"time": 1_700_000_000u64}),
                 ),
+                // The post-birthday anchor re-verify: the scan tip is still active.
+                ("getblockhash", serde_json::json!(reorged_tip.clone())),
                 (
                     "getdescriptorinfo",
                     serde_json::json!({"descriptor": vault_desc.clone()}),
@@ -5054,6 +5161,8 @@ mod tests {
                 "getblockheader",
                 serde_json::json!({"time": 1_700_000_000u64}),
             ),
+            // The post-birthday anchor re-verify: the scan tip is still active.
+            ("getblockhash", serde_json::json!(fixture.tip.clone())),
             (
                 "getdescriptorinfo",
                 serde_json::json!({"descriptor": vault_desc}),
@@ -5542,6 +5651,8 @@ mod tests {
                 "getblockheader",
                 serde_json::json!({"time": 1_700_000_000u64}),
             ),
+            // The post-birthday anchor re-verify: the scan tip is still active.
+            ("getblockhash", serde_json::json!(new_tip.clone())),
             (
                 "getdescriptorinfo",
                 serde_json::json!({"descriptor": vault_desc}),

@@ -2434,6 +2434,16 @@ pub fn spawn_drivers(node: &Arc<Node>) {
     // docs/SIGNET-SPEND-RECORD.md recorded. Only the first bring-up against a fresh
     // backend still pays a `scantxoutset`, and it is that scan which supplies the
     // wallet's birthday.
+    //
+    // ORDERING DEPENDENCY, named because this bead made it load-bearing (Fable hn8
+    // review). This warmup is SYNCHRONOUS and runs BEFORE the Lockdown deadline driver
+    // spawns. That ordering is unchanged from before this bead, but the window it
+    // tolerates grew roughly a hundredfold: the previous worst case was one ~10 s scan,
+    // whereas a first bring-up here can pay a `loadwallet` catch-up plus two
+    // `importdescriptors` calls, each under a 600 s budget. It is safe ONLY because
+    // reboot-death (ADR-0007) guarantees a fresh process carries no armed schedule, so
+    // there is no `T` this startup could be late for. Anyone weakening reboot-death must
+    // revisit THIS line first — it is where that assumption quietly pays for itself.
     if let Err(e) = backend.refresh_vault_unspent_cache(&node.vault_scripts()) {
         eprintln!("initial vault scan cache warmup failed (will retry): {e}");
     }
