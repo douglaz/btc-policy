@@ -15,9 +15,36 @@ and bound the exposure instead of reordering.
 federation provisioned under this waiver is a *laboratory*, never a custody deployment, whatever
 network it runs on.
 
-**2. Every mainnet rung is capped at a dust-level amount** — an amount whose total loss is
-operationally irrelevant. Reaching a mainnet rung is **not** authorisation to move meaningful
-savings. Value-at-risk is a separate axis from network, and it moves last.
+**2. Every mainnet rung is capped, and the cap must be a NUMBER WITH AN OBSERVER before any mainnet
+rung is funded.** "An amount whose total loss is operationally irrelevant" is an intention, not a
+control — an operator negotiates that with themselves at funding time. So:
+
+- `btc-policy-cod` sets the per-stage figure and **blocks `4wx`**: stage 3 cannot be funded before a
+  cap exists in writing.
+- The cap must be **observable by the machinery that already watches the vault**. Inflow is
+  permissionless — anyone can deposit, and no code knows "this is a stage-3 vault" — and the manifest
+  pins *outflow* (ADR-0014), never balance. Nodes already maintain a vault-unspent cache, so a
+  manifest-pinned stage balance ceiling with a watchtower alert on breach makes the cap enforceable
+  by the same path that raises every other alert. Without that, the void-clause below is undetectable.
+- Reaching a mainnet rung is **not** authorisation to move meaningful savings. Value-at-risk is a
+  separate axis, and it moves last.
+
+**2a. The cap fights the purpose of the rungs it protects, and the answer is pre-committed here.**
+Stages 3 and 5 exist for earlier exposure to real fee and relay behaviour. At true dust, fees dominate
+the outputs and the RBF escape ladder, ancestor pressure and relay evidence are all unrepresentative
+— so the honest experimenter's conclusion at stage 3 will be "we need slightly more to get real
+data." That pressure is built into the rung's own justification. **The pre-committed answer: accept
+unrepresentative fee data at stages 3 and 5.** Representative fee behaviour is acquired at stage 8's
+soak, under provider diversity and sealing, where the topology no longer violates ADR-0009. Anyone
+proposing to raise a waived stage's cap for better fee data is proposing to void this ADR (below),
+not to tune it.
+
+**2b. The waiver expires the TOPOLOGY, and also the SECRETS. Nothing provisioned under the waiver
+crosses stage 6.** A stage-2–5 federation lives entirely inside one provider's console reach, so
+every secret it touched must be treated as exposed to that provider: operator preimages, node keys,
+escape-wallet keys, recovery keys, the coordinator auth key, and the coordinator host itself. Reusing
+any of them in a post-waiver federation leaks the waiver forward past its own expiry and silently
+un-does it. Fresh key material at stage 6, no exceptions; mechanics in `cod`.
 
 **3. `imb`'s deploy-time correlation enforcement gains an explicit test-mode bypass**, and using
 it must be recorded in the stage's artifacts. Without this, `imb` (which promises to *refuse* a

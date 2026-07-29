@@ -82,6 +82,13 @@ the Sacrificial vault rehearses the real incident rather than approximating it. 
 cannot be completed from cold artifacts alone (descriptor + manifest + recovery keys, no live
 federation) has not passed.
 
+**How step 6 has anything left to spend.** A *successful* step-5 sweep moves the coins to the escape
+wallet, leaving the dead vault empty — so Recovery would have nothing to exercise. Step 6 therefore
+runs against a **fresh deposit made to the locked-down vault after Lockdown**, which is also the more
+valuable drill: "coins arrived at a vault that can no longer sign" is a real incident (a straggler
+deposit, a counterparty paying a stale address), and Recovery is its only exit. Do not instead
+arrange a deliberately failed sweep — that tests the escape's failure path, not Recovery's.
+
 ## The recovery timelock is configurable
 
 The 180-day timelock is a **default, not an invariant**. It is chosen per vault at creation, with
@@ -156,8 +163,12 @@ Stage 1 is close to what the repo can already do, but not reachable today:
   sealed vault cannot currently be spent from, refreshed, clawed back, or recovered by any
   command. Steps 1–6 above all need it.
 - **`btc-policy-wdu`** — the configurable timelock, or step 6 takes 180 days.
-- **`btc-policy-bq6`** — hardware signing, if stage 1 is to reflect the design's actual premise
-  rather than a software user key.
+(**`btc-policy-bq6`**, hardware signing, is deliberately NOT on this list — see above and ADR-0015.
+Stage 1 runs on signet with a software user key, and the dust cap carries that risk through the
+capped mainnet rungs. It is required before the caps lift.)
 
 Stages 2+ additionally need **`btc-policy-imb`** (independent hosts, authenticated transport,
-correlation enforcement) and, from stage 4, **`btc-policy-4y3`** (sealed-host build).
+correlation enforcement). From stage 4, the **sealed node image** is `btc-policy-nwd` — NOT `4y3`,
+which is *coordinator* host hardening and is required earlier, by stage 3 (ADR-0015). These are two
+different machines and two different threats; conflating them is an error this document has already
+made once.

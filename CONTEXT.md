@@ -162,7 +162,7 @@ A separate, later milestone: the system is safe to hold meaningful savings. Requ
 _Avoid_: core-proven, v0 done
 
 **Rollout ladder**:
-The ten-stage deployment sequence from five daemons on one machine to public alpha, varying three axes independently — host distribution (one machine → many machines, one provider → many providers), host hardening (open → Sealed host), and network (signet → mainnet). Each rung is a Stage. See `docs/ROLLOUT-PLAN.md`.
+The ten-stage deployment sequence from five daemons on one machine to public alpha, varying FOUR axes — host distribution (one machine → many machines, one provider → many providers), host hardening (open → Sealed host), network (signet → mainnet), and **value-at-risk** (dust → meaningful, which moves LAST and is not implied by reaching mainnet). The axes are not varied one-at-a-time between consecutive rungs; read the ladder as a test matrix with a funding policy. Each rung is a Stage. See `docs/ROLLOUT-PLAN.md` and ADR-0015.
 _Avoid_: roadmap, phases, milestones (alone)
 
 **Stage**:
