@@ -37,8 +37,13 @@ refuses a co-located federation outright. Both reviewers recommended reordering 
 decision was to keep the ordering and bound the exposure. ADR-0015 records what that accepts.
 
 What it does NOT accept, because these are wired as hard blockers of stage 3 (`btc-policy-4wx`)
-rather than left to discipline: hardware signing (`bq6`), coordinator hardening (`4y3`), and the
-fire-path mempool fix (`zzv`).
+rather than left to discipline: coordinator hardening (`4y3`) and the fire-path mempool fix
+(`zzv`).
+
+**Hardware signing (`bq6`) is deliberately deferred past the capped rungs** — the dust cap is the
+mitigation for a software user key on the coordinator — but it gates the stage-9 freeze, because
+the caps cannot be lifted, and an alpha cannot ship, with the user key as a file on the machine
+ADR-0012 already names as the severe residual.
 
 ## The ladder
 
@@ -46,13 +51,13 @@ fire-path mempool fix (`zzv`).
 |---|---|---|---|---|
 | **1** | one machine | open | signet | Path suite on signet for the first time. **Freeze → external review #1 (protocol core).** |
 | **2** | 5 machines, same provider | open | signet | First real network transport; loopback assumptions die here. Waived (ADR-0015). |
-| **3** | 5 machines, same provider | open | **mainnet** | First real funds, **dust cap**. Waived (ADR-0015). Requires `bq6`+`4y3`+`zzv`. |
+| **3** | 5 machines, same provider | open | **mainnet** | First real funds, **dust cap**. Waived (ADR-0015). Requires `4y3`+`zzv`. |
 | **4** | 5 machines, same provider | **sealed** | signet | First sealed hosts. **Begin measuring attrition.** Waived (ADR-0015). |
 | **5** | 5 machines, same provider | sealed | **mainnet** | **Dust cap.** Waived (ADR-0015). Gated on `nju` being decided. |
 | **6** | **many providers** | open | signet | Provider diversity — the ADR-0009 correlation-class requirement. |
 | **7** | many providers | **sealed** | signet | Attrition measurement continues under provider diversity. |
 | **8** | many providers | sealed | **mainnet** | **Run it for a while**, capped. The Survivor vault is the observation subject. |
-| **9** | many providers | sealed | mainnet | Full Path suite on the real configuration. **Freeze → external review #2 (deployed system).** |
+| **9** | many providers | sealed | mainnet | Full Path suite on the real configuration. Requires `bq6` (hardware signing) before the caps lift. **Freeze → external review #2 (deployed system).** |
 | **10** | — | — | — | Public alpha. |
 
 ## Per-stage testing: two vaults

@@ -37,17 +37,27 @@ wrong.
 
 ## What the waiver does NOT cover
 
-By the time stage 3 (first mainnet funds) is reached, these are required — they are wired as
-hard dependencies of `btc-policy-4wx`, not left to discipline:
+By the time stage 3 (first mainnet funds) is reached, these are required — wired as hard
+dependencies of `btc-policy-4wx`, not left to discipline:
 
-- **Hardware signing** (`bq6`). Without it the user key is software on the coordinator host,
-  which merges adversary A3 with residual R8b — the attacker skips the wrench entirely.
 - **Coordinator host hardening** (`4y3`). The one accepted conditional-theft residual.
 - **The fire-path mempool scaling fix** (`zzv`), because mainnet is where congestion is real.
 
+**Hardware signing (`bq6`) is deliberately NOT required for the capped mainnet rungs.** Decided
+2026-07-29. Without it the user key is software on the coordinator host, which merges adversary A3
+with residual R8b — an attacker who owns that host skips the wrench entirely and signs. That is a
+real capability, and the reason it is acceptable here is precisely the dust cap: **the cap is the
+mitigation.** What such an attacker gets at stages 3–8 is dust.
+
+The consequence is that **`bq6` becomes mandatory before the caps are lifted**, and it gates the
+stage-9 freeze (`u5r`) — the last point before an alpha, and the artifact external review #2
+examines. An auditor handed a "deployed system" whose user key is a file on the coordinator will
+say so immediately, and they will be right.
+
 So the residual risk this ADR knowingly accepts at stages 3 and 5 is narrower than "one provider,
-nothing else done": it is **provider-level quorum correlation, unsealed node hosts at stage 3, and
-an unresolved node lifecycle**, bounded by a dust cap.
+nothing else done": it is **provider-level quorum correlation, a software user key on the
+coordinator, unsealed node hosts at stage 3, and an unresolved node lifecycle** — every one of them
+bounded by the dust cap, and none of them permitted past stage 9.
 
 ## Consequences
 
