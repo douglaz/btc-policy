@@ -148,3 +148,39 @@ _Avoid_: covenant vault, trustless vault
 **Descriptor backup**:
 The full vault descriptor (all public keys), backed up promiscuously. Without it even valid Recovery keys cannot locate or spend the coins.
 _Avoid_: wallet backup, seed backup
+
+## Rollout language
+
+Added 2026-07-29 after a state review found two milestones fused under one name.
+
+**Core-proven**:
+The milestone the V0 plan gates ops work behind: full test matrix green, the Path suite driven on signet, and one external review of the **protocol core**. It means the protocol works — NOT that the system is deployable. Reached at Rollout stage 1.
+_Avoid_: v0 done, production-ready, launch-ready
+
+**Production-ready**:
+A separate, later milestone: the system is safe to hold meaningful savings. Requires an independently deployed Federation, a real Operator path, a resolved Node lifecycle, and a reviewed frozen release. Reached no earlier than Rollout stage 9.
+_Avoid_: core-proven, v0 done
+
+**Rollout ladder**:
+The ten-stage deployment sequence from five daemons on one machine to public alpha, varying three axes independently — host distribution (one machine → many machines, one provider → many providers), host hardening (open → Sealed host), and network (signet → mainnet). Each rung is a Stage. See `docs/ROLLOUT-PLAN.md`.
+_Avoid_: roadmap, phases, milestones (alone)
+
+**Stage**:
+One rung of the Rollout ladder. A stage is complete when its Path suite has run against both of its vaults — never when its code merely compiles.
+_Avoid_: phase, milestone, step
+
+**Path suite**:
+The set of vault behaviours a Stage must exercise: honest hot spend, Refresh, theft refusal (destination allowlist and Hot budget), Clawback, and — destructively — a duress arm through Lockdown, then Recovery. Split across two vaults because the last two are terminal.
+_Avoid_: test suite (that is the unit/integration suites), smoke test
+
+**Survivor vault**:
+The Stage vault that exercises only non-destructive paths and stays funded and running afterwards. It is what stage 8's long observation run watches.
+_Avoid_: main vault, primary vault
+
+**Sacrificial vault**:
+The Stage vault deliberately driven to its terminal end: duress arm → Lockdown → Recovery. Ends dead by design, because after Lockdown the Recovery path is the only exit — so the sequence rehearses the real incident rather than simulating it.
+_Avoid_: test vault, throwaway vault
+
+**Sealed host**:
+A node host with ADR-0005 applied in full: SSH uninstalled, no administrative path, no reset, no reconfiguration, no upgrade-in-place; a reboot kills the node (ADR-0007). "Locked" in rollout discussion means this. Consequence: patching a node means Rotating the vault, and node attrition has no remedy — which is precisely what stages 4 and 7 exist to measure before mainnet funds sit behind it.
+_Avoid_: hardened host (weaker claim), locked-down (that is Lockdown, a duress state)
