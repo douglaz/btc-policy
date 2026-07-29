@@ -21,11 +21,24 @@ control — an operator negotiates that with themselves at funding time. So:
 
 - `btc-policy-cod` sets the per-stage figure and **blocks `4wx`**: stage 3 cannot be funded before a
   cap exists in writing.
-- The cap must be **observable by the machinery that already watches the vault**. Inflow is
-  permissionless — anyone can deposit, and no code knows "this is a stage-3 vault" — and the manifest
-  pins *outflow* (ADR-0014), never balance. Nodes already maintain a vault-unspent cache, so a
-  manifest-pinned stage balance ceiling with a watchtower alert on breach makes the cap enforceable
-  by the same path that raises every other alert. Without that, the void-clause below is undetectable.
+- The cap is a **loss budget, not a security invariant** — Bitcoin cannot refuse an incoming deposit,
+  and this plan itself deposits into a locked vault after Lockdown. So it must be *observed*, and the
+  observer must sit **outside both the provider and the coordinator trust domains**. A watchtower
+  alert from the five waived nodes is NOT sufficient: during stages 2–5 one provider reaches all five
+  consoles, so an attacker who owns that provider owns every observer, and with the software user key
+  they already hold a complete authorization path — they can suppress the alert they would trigger.
+  An independent watcher (a separate machine, separate account, watching the descriptor) is the only
+  observation that survives the threat the cap is protecting against.
+- The figure must be an **aggregate across every live stage vault**, not a per-vault field. Both
+  vaults of a stage, plus every earlier Survivor left funded, sum into one exposure.
+- **Stage deposit addresses are retired with the stage.** They outlive it otherwise, and a stale
+  address is a permissionless path to re-fund a vault whose waiver has expired.
+- Breach handling is **mandatory and immediate**: abort or descend the stage and retire the vault.
+  A ceiling with no defined response is a metric.
+- `imb`'s test-mode bypass must be **compiled out** of stage-6+ and alpha binaries, shipped as a
+  separately built, visibly tainted artifact. A runtime "which stage am I" check is operator-controlled
+  and therefore no control at all; the same goes for any evidence produced under the waiver, which must
+  be machine-readably tainted as non-promotable.
 - Reaching a mainnet rung is **not** authorisation to move meaningful savings. Value-at-risk is a
   separate axis, and it moves last.
 
@@ -77,7 +90,7 @@ real capability, and the reason it is acceptable here is precisely the dust cap:
 mitigation.** What such an attacker gets at stages 3–8 is dust.
 
 The consequence is that **`bq6` becomes mandatory before the caps are lifted**, and it gates the
-stage-9 freeze (`u5r`) — the last point before an alpha, and the artifact external review #2
+stage-9 freeze (`yt7`) — the last point before an alpha, and the artifact external review #2
 examines. An auditor handed a "deployed system" whose user key is a file on the coordinator will
 say so immediately, and they will be right.
 

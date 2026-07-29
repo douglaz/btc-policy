@@ -9,7 +9,8 @@ them.
 
 ## What varies, and why it varies separately
 
-Three axes, moved one at a time so a failure is attributable:
+**Four** axes. They are NOT moved one at a time between consecutive rungs — see the correction
+below, which this line used to contradict:
 
 | Axis | From | To |
 |---|---|---|
@@ -101,8 +102,30 @@ This is a deliberate loosening: `parse_vault_template` previously *required* exa
 recovery keys waits hours instead of months), which is what the warning is for. Tracked in
 `btc-policy-wdu`.
 
-**On mainnet, a below-default timelock requires typed confirmation that is RECORDED in the
-ceremony artifacts.** There is deliberately no hard floor — the choice stays the operator's — but it
+**On mainnet, a below-default timelock requires typed confirmation recorded in the ceremony
+artifacts — PLUS independent out-of-band verification, because the confirmation alone cannot defend
+against the threat it is aimed at.** Both reviewers made the same point and it is decisive: the
+prompt, the displayed duration, the encoded `older(...)`, and the recorded confirmation are all
+produced by the setup tool — the exact component R8b says may be compromised pre-wrench. A wrapped
+tool can display 180 days, seal 512 seconds, and record that the operator confirmed, in one motion.
+A record produced by the thing being doubted is not evidence.
+
+So the control has two halves:
+
+1. **Typed confirmation, against MISTAKES** — unit confusion (BIP68 512-second units read as days),
+   scroll-past, a copied signet config. The typed phrase must include the VALUE (type the duration or
+   maturity date, never a fixed word like CONFIRM), or a wrapper pipes the constant and the protection
+   evaporates for automation. The artifact must bind the wallet/manifest hash, the network, the raw
+   `nSequence`, the decoded duration and a fresh nonce, so a `confirmed=true` field cannot be replayed
+   from another ceremony. Below-default mainnet automation **fails closed** without it.
+2. **Independent verification, against a TAMPERED TOOL** — before any mainnet vault is funded, a
+   separate tool (the user's own `cyberkrill`) parses the sealed descriptor and displays the timelock.
+   That is the only check a wrapped setup binary cannot forge, it costs almost nothing, and it is a
+   named step of every mainnet ceremony rather than a test assertion.
+
+Note also that a ceremony-time "maturity date" is indicative only: the relative timelock runs per UTXO
+from each coin's confirmation, so maturity moves with deposits and Refreshes. Display it as
+"earliest maturity for coins confirmed now", not as a fixed date. There is deliberately no hard floor — the choice stays the operator's — but it
 cannot be made by accident or by scrolling past a warning, and an auditor can see afterwards that it
 was chosen deliberately. This answers the reviewers' concrete failure case: confusing BIP68 512-second
 units for days, or copying a signet configuration to mainnet, would otherwise seal a vault whose
