@@ -62,8 +62,11 @@ bounded by the dust cap, and none of them permitted past stage 9.
 ## Consequences
 
 - A provider-account compromise (or a provider acting adversarially, or under legal compulsion)
-  during stages 2–5 yields all five node keys. Combined with the user key — which stage 3 requires
-  to be in hardware — that is theft of whatever the cap allows. The cap is the entire mitigation.
+  during stages 2–5 yields all five node keys. Since hardware signing is deferred past these rungs,
+  the user key is a file on the coordinator host — so an attacker who takes both gets a complete
+  authorization path and none of the off-chain policy (PIN, allowlist, Hold, duress, release gate)
+  applies. **The cap is the entire mitigation, and it is the only one.** That is the trade this ADR
+  exists to record.
 - Provider-account hygiene (strong 2FA, no provider session on the coordinator host) is part of
   the security perimeter for these stages, as ADR-0005 already states.
 - Stages 2–5 produce **no evidence about correlation-class independence.** Any claim of ADR-0009
