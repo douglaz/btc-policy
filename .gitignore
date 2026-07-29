@@ -8,3 +8,6 @@ result
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Local tooling output, not project state
+.gstack/

@@ -70,7 +70,7 @@ These are what a reviewer should try hardest to break. Each is enforced in code,
 
 | Invariant | What it means | Break it and… |
 |---|---|---|
-| **SILENCE** | Every observable — response bytes, timing class, `/events`, `/healthz`, `/pending`, peer effects — is identical under the normal and duress PINs. | The wrench attacker learns the duress PIN was used and simply escalates. This is the invariant most easily lost to an innocuous-looking new field or endpoint. |
+| **SILENCE** (scoped — read the scope) | Across the protocol observables a node emits — response bytes, timing class, `/events`, `/healthz`, `/pending`, peer effects — a duress-PIN ceremony is identical to a normal-PIN one. **It is NOT a claim that no adversary can learn the PIN class.** A compromised NODE sees the submitted PIN in plaintext, and a coordinator compromised BEFORE the wrench can read the normal PIN and substitute it, nullifying duress entirely (ADR-0012 Direction 3, and R8 below). The guarantee is: silence against a coordinator that turns hostile AT the wrench, across the observables listed. | The wrench attacker learns the duress PIN was used and simply escalates. This is the invariant most easily lost to an innocuous-looking new field or endpoint. |
 | **Signer/partial COUPLING + RELEASE-GATE** | A partial is finalizable authority the moment `t−1` compromised peers hold it, so every fire-time check runs BEFORE release; `release_partials` is the sole egress. | A `t−1` set combines a transaction the honest node had refused. |
 | **Unconditional Lockdown at T** | Once armed, Lockdown happens at `T` regardless of whether the sweep succeeded, the chain was readable, or anything else. | Duress becomes survivable for the attacker: the vault keeps signing after coercion. |
 | **Determinism across the honest set** | Every honest node derives the same verdicts, and the same fee-bump rung, from the same chain state. | Partials cover different transactions, no rung reaches `t`, and the escape fails exactly when it is needed. |
@@ -135,6 +135,36 @@ is larger than signet's. Remaining scaling work is tracked as `btc-policy-zzv`.
 **R6 — One honest signet spend is the extent of real-chain evidence.** Duress, claw-back, and
 reorg behaviour are proven on regtest only (`attack all`, the demos). See
 `docs/SIGNET-SPEND-RECORD.md`, which is explicit about this.
+
+**R8 — The two most severe residuals are currently mitigated by documents, not code.**
+Both independent reviews of this repo converged here, and neither found an unknown protocol
+break — the problems are deployment-shaped.
+
+*R8a — the federation is not actually independent.* `docs/SETUP-CEREMONY.md` provisions five
+node processes on ONE host with loopback channel endpoints. ADR-0009 requires that no
+correlation class reach quorum; one host IS a correlation class holding all five keys. Until the
+nodes run on genuinely independent hosts and backends, **3-of-5 is a property of the design, not
+of the deployment**, and the first thing an attacker should do is take that host. The abstract
+design stops "user key plus one compromised node"; the current deployment does not.
+
+*R8b — a pre-wrench coordinator compromise nullifies duress.* ADR-0012 Direction 3 accepts this:
+malware resident on the coordinator before coercion reads the normal PIN and substitutes it, so
+the escape never arms, no node locks down, and — because every observable is pin-uniform by
+design — the user sees exactly what they would have seen if it worked. The stated mitigations
+are a hardened dedicated host and reproducible builds. **Neither exists** (see R4). The user key
+is also software in every current driver and would live on that same host, which merges this
+with adversary A3.
+
+Neither is a new discovery; both are named in ADR-0009/ADR-0012. What is worth stating plainly
+is that they are the top of the risk list and the code has not moved on either.
+
+**R9 — The operator path does not exist yet.**
+`setup finalize` seals a vault, and no command in this repository can then spend from it, refresh
+it, claw back during a Hold, or drive recovery: nothing outside `setup.rs` reads `manifest.json`,
+and every driver (`demo`, `attack`, `signet spend`) builds its own federation in-process with
+ephemeral keys. Sections of `docs/OPERATIONS-RUNBOOK.md` therefore describe actions a user cannot
+currently perform. The runbook flags this inline, but a reader should know it up front: the
+protocol core is considerably more finished than the product around it.
 
 **R7 — No external human security review has happened yet.** This is the open half of the
 core-proven gate. Correlated automated review — including this repo's `codex` + Claude Fable

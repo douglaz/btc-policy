@@ -95,8 +95,16 @@ so a reboot wipes the signing key, the Lockdown latch, and the process-generatio
 node warns at startup that its inode is on a non-volatile filesystem, that assumption does not
 hold on that host — record it, because it changes the threat model (`docs/THREAT-MODEL.md` R3).
 
-**Upgrading.** See `docs/UPGRADE-AND-ROTATION-POLICY.md`. One node at a time; a manifest mismatch
-at startup means you are making a sealed-parameter change and must stop.
+**Upgrading — there is no in-place path.** ADR-0005 seals the host: SSH is uninstalled and no
+administrative access path remains, so a "just restart it with the new binary" procedure is not
+performable on a correctly sealed node, and would be the reset a coercer wants if it were. A
+binary change is a vault MIGRATION (`docs/UPGRADE-AND-ROTATION-POLICY.md` §2-3). Plan for that
+cost before you need it.
+
+**On the preimage and restarts.** The signing key is derived at start and never stored, so any
+start needs the preimage — but on a sealed host there is no supported way to *cause* a restart,
+and ADR-0007 treats a rebooted node as dead. Keep the preimage backed up because ceremony and
+recovery need it, not because routine restarts are a procedure you have.
 
 ## 5. Lockdown
 

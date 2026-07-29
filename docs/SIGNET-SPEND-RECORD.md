@@ -147,6 +147,15 @@ are properties of the vault on a real chain, not incidental setup trouble.
    should read the same ≈10.4 s plus a negligible rescan. **Re-measuring that on signet
    is outstanding.**
 
+## Staleness — this record is about ONE COMMIT, not about `main`
+
+The run recorded here was performed at repo commit `6c04bad` with debug binaries whose hashes are
+listed above. `main` has moved substantially since — including chain-tracking and concurrency work
+that touches the very paths this run exercised. **Nothing here is evidence about current `main`.**
+
+A re-run against a frozen release candidate is what deliverable (2) of `btc-policy-9y5.8` needs,
+and this record should be regenerated at that commit rather than cited as if it travelled forward.
+
 ## Scope — what this record does NOT claim
 
 - It is **one honest spend**. Duress, claw-back, reorg, and refusal behaviour on signet
