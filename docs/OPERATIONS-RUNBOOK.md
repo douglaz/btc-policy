@@ -154,7 +154,7 @@ sees it.
 
 ### The normal path is bricked (coordinator auth key lost)
 No request can be authenticated ever again — the manifest pins that pubkey and is immutable. The
-only exit is the recovery branch after the 180-day relative timelock. `demo recovery-drill`
+only exit is the recovery branch after that vault's configured relative timelock (180 days by default — check the manifest). `demo recovery-drill`
 exercises it. Start the clock immediately; there is no faster path.
 
 ### A node will not boot

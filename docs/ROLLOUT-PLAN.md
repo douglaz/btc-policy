@@ -17,21 +17,41 @@ Three axes, moved one at a time so a failure is attributable:
 | **Host hardening** | open (SSH, admin access) | **Sealed host** (ADR-0005 in full) |
 | **Network** | signet | mainnet |
 
-Moving two at once would make a stage-8 failure unattributable, which is the whole reason the
-ladder is this long.
+**Correction (2026-07-29 plan review):** the "one axis at a time" framing is true only against a
+reference rung, NOT between consecutive ones — 3→4 moves hardening *and* network, and 5→6 moves
+all three. Both reviewers called the attribution argument overstated, and they are right: stage
+7→8 already flips only the network, so a stage-8 failure is attributable whether or not stages 3
+and 5 exist. What stages 3 and 5 actually buy is earlier exposure to mainnet fee/relay reality —
+paid for in real funds on topologies the design itself forbids. Read this table as a test matrix
+with a funding policy, not as a monotonic hardening curve.
+
+**Value-at-risk is a FOURTH axis, and it is not the same as "mainnet".** Mainnet can be exercised
+with dust. Reaching a mainnet rung is **not** authorisation to move meaningful savings; value moves
+last, after stage 9.
+
+**Stages 2-5 run under an explicit test-only waiver of ADR-0009** (ADR-0015). All five nodes sit at
+one provider there — a correlation class holding quorum — and **sealing does not fix that**, because
+ADR-0005 concedes provider console and rescue access survive. Every mainnet rung is therefore
+**capped at dust**, and the waiver expires at stage 6; from there `imb`'s deploy-time enforcement
+refuses a co-located federation outright. Both reviewers recommended reordering instead; the
+decision was to keep the ordering and bound the exposure. ADR-0015 records what that accepts.
+
+What it does NOT accept, because these are wired as hard blockers of stage 3 (`btc-policy-4wx`)
+rather than left to discipline: hardware signing (`bq6`), coordinator hardening (`4y3`), and the
+fire-path mempool fix (`zzv`).
 
 ## The ladder
 
 | Stage | Hosts | Hardening | Network | Notes |
 |---|---|---|---|---|
 | **1** | one machine | open | signet | Path suite on signet for the first time. **Freeze → external review #1 (protocol core).** |
-| **2** | 5 machines, same provider | open | signet | First real network transport; loopback assumptions die here. |
-| **3** | 5 machines, same provider | open | **mainnet** | First real funds. Path suite again. |
-| **4** | 5 machines, same provider | **sealed** | signet | First sealed hosts. **Begin measuring attrition.** |
-| **5** | 5 machines, same provider | sealed | **mainnet** | |
+| **2** | 5 machines, same provider | open | signet | First real network transport; loopback assumptions die here. Waived (ADR-0015). |
+| **3** | 5 machines, same provider | open | **mainnet** | First real funds, **dust cap**. Waived (ADR-0015). Requires `bq6`+`4y3`+`zzv`. |
+| **4** | 5 machines, same provider | **sealed** | signet | First sealed hosts. **Begin measuring attrition.** Waived (ADR-0015). |
+| **5** | 5 machines, same provider | sealed | **mainnet** | **Dust cap.** Waived (ADR-0015). Gated on `nju` being decided. |
 | **6** | **many providers** | open | signet | Provider diversity — the ADR-0009 correlation-class requirement. |
 | **7** | many providers | **sealed** | signet | Attrition measurement continues under provider diversity. |
-| **8** | many providers | sealed | **mainnet** | **Run it for a while.** The Survivor vault is the observation subject. |
+| **8** | many providers | sealed | **mainnet** | **Run it for a while**, capped. The Survivor vault is the observation subject. |
 | **9** | many providers | sealed | mainnet | Full Path suite on the real configuration. **Freeze → external review #2 (deployed system).** |
 | **10** | — | — | — | Public alpha. |
 
@@ -69,10 +89,37 @@ This is a deliberate loosening: `parse_vault_template` previously *required* exa
 recovery keys waits hours instead of months), which is what the warning is for. Tracked in
 `btc-policy-wdu`.
 
+**On mainnet, a below-default timelock requires typed confirmation that is RECORDED in the
+ceremony artifacts.** There is deliberately no hard floor — the choice stays the operator's — but it
+cannot be made by accident or by scrolling past a warning, and an auditor can see afterwards that it
+was chosen deliberately. This answers the reviewers' concrete failure case: confusing BIP68 512-second
+units for days, or copying a signet configuration to mainnet, would otherwise seal a vault whose
+2-of-3 recovery keyset becomes a complete spend path about eight minutes later — unrepairable, since
+the manifest is immutable. Signet and regtest keep warn-only.
+
+**Only the Sacrificial vault may use a short timelock.** Both reviewers independently confirmed
+the interaction: a Survivor vault left deliberately "untouched" at stage 8 runs past its own
+recovery maturity, and the 2-of-3 recovery keyset — which this design distributes to THIRD PARTIES,
+since it doubles as the inheritance mechanism — becomes a complete authorization path for real
+mainnet funds, with no PIN, no user key, no Hold, no allowlist and no federation involved. The
+recovery alert is post-spend: by the time it fires the coins are moving and the normal path cannot
+stop them.
+
+So: **Survivor vaults use the production default timelock**, publish their maturity countdown, and
+Refresh (or migrate) before a mandatory safety margin — which is also more faithful observation,
+since a real long-lived vault is refreshed rather than untouched. **The two vaults must not share
+recovery keys**, because the Sacrificial ceremony deliberately exposes and uses those keys.
+
 ## Sealing, attrition, and the deferred lifecycle decision
 
 "Locked" means **Sealed host**: ADR-0005 in full — no SSH, no administrative path, no
 upgrade-in-place, and a reboot kills the node (ADR-0007).
+
+**Sealing does NOT make one provider safe.** ADR-0005 itself says a VPS "is never fully sealed
+against its *provider*: web console and rescue mode remain." So five sealed nodes at a single
+provider remain a correlation class holding quorum — ADR-0009 is violated by stages 2–5 whether
+or not the hosts are sealed. This is the strongest argument for moving provider diversity earlier
+than this table currently does (see the open ordering question at the end).
 
 The consequence is uncomfortable and deliberate: **patching a node means rotating the vault**, and
 a dead node has no remedy. Whether that is livable is an empirical question, so stages 4 and 7
