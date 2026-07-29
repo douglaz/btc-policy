@@ -125,6 +125,28 @@ are properties of the vault on a real chain, not incidental setup trouble.
    descriptor wallet instead of repeated full-set scans is the real fix, and is filed
    as follow-up work rather than papered over here.
 
+   *Code change since (bead `btc-policy-hn8`) — NOT a new signet measurement.* The node
+   now serves the vault-unspent cache from a node-owned watch-only descriptor wallet
+   named from the node identity and watched scripts. A `scantxoutset` runs only on that
+   node's FIRST bring-up against a fresh backend — and that scan supplies the wallet's
+   birthday, so the import rescans from the oldest live vault output rather than from
+   genesis. Restarts issue no scan at all. The scan remains the fallback for a missing,
+   failed, or unrecognized wallet — and for a reorg below the wallet's own completion
+   anchor, which can un-spend a vault output older than the wallet's birthday and so
+   blind a wallet-only read to it until the descriptors are re-imported. A shallower
+   reorg cannot: while that anchor's block is active nothing at or below it has moved,
+   so every output such a reorg can resurrect was unspent at the anchor and is already
+   watched, and the wallet reconciles it with no scan. Every one of those degrades
+   slow, never to an understated vault balance.
+
+   The numbers above still stand as this record's only signet observations. Nobody has
+   re-run this driver since, so the standing measurement is: 72 273 640 outputs,
+   ≈10.4 s/scan, five scans serialized. What the change is expected to alter is the
+   restart cost, not that first bring-up; on this driver's own flow the wallet's
+   birthday lands at the tip because nodes spawn before `fund_vault`, so first bring-up
+   should read the same ≈10.4 s plus a negligible rescan. **Re-measuring that on signet
+   is outstanding.**
+
 ## Scope — what this record does NOT claim
 
 - It is **one honest spend**. Duress, claw-back, reorg, and refusal behaviour on signet

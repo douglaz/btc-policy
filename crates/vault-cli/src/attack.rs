@@ -929,6 +929,44 @@ impl Vault {
                     self.honest.len()
                 )
             })?;
+        // Mining proves chain state, but each node's 1 Hz fire loop must also observe
+        // the control as terminal before a later arm can use its pending-spend clock.
+        //
+        // Both markers carry the txid as well as the commitment id, exactly as the
+        // node prints them. A bare `for candidate {id}` needle would also match
+        // `fire: cannot check settlement for candidate {id}: …` and `broadcast
+        // authorization closed for candidate {id} …` — both NON-terminal, and both
+        // reachable from a transient backend error — so a node still holding the
+        // control pending would read as settled and defeat this very guard.
+        let settled = format!(
+            "fire: candidate {} already settled on-chain ({txid})",
+            accepted.commitment_id
+        );
+        let broadcast = format!(
+            "fire: broadcast {txid} for candidate {}",
+            accepted.commitment_id
+        );
+        let deadline = Instant::now() + SETTLE;
+        loop {
+            let pending: Vec<u16> = self
+                .honest
+                .iter()
+                .filter(|node| !node.log_contains(&settled) && !node.log_contains(&broadcast))
+                .map(|node| node.node_id)
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "control candidate {} remained locally pending at node_id(s) {pending:?} \
+                     after it confirmed",
+                    accepted.commitment_id
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         Ok((accepted.commitment_id, seen.len()))
     }
 

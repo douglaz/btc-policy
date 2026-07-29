@@ -1934,7 +1934,11 @@ impl Node {
             return Some(Arc::clone(backend));
         }
         let (addr, auth) = self.chain_backend.clone()?;
-        Some(Arc::new(BitcoindBackend::new(addr, auth)))
+        Some(Arc::new(BitcoindBackend::new_for_node(
+            addr,
+            auth,
+            &self.pubkey.to_bytes(),
+        )))
     }
 
     /// Validate production-only backend capabilities before the process-generation
@@ -2392,8 +2396,9 @@ fn arm_carrier_id(node: &Node, request: CoordRequest<'_>) -> String {
 ///    interval, alerting on any vault spend it never validated-and-accepted;
 ///  - the **Lockdown deadline driver** (ADR-0012 SAFETY): observes only the local
 ///    Armed deadline and enters terminal Lockdown at T, independent of backend work;
-///  - the **vault-scan cache refresher**: warms the cold full UTXO scan and advances
-///    it by bounded block deltas outside the fire path;
+///  - the **vault-scan cache refresher**: reads the node-owned watch-only descriptor
+///    wallet — or, as a fallback, warms the cold full UTXO scan and advances it by
+///    bounded block deltas — outside the fire path;
 ///  - the **fire driver** (§1): releases partials at each candidate's authorized
 ///    fire event, then combines + broadcasts once quorum arrives.
 ///
@@ -2418,16 +2423,36 @@ pub fn spawn_drivers(node: &Arc<Node>) {
     }
     // Warm the cache before the daemon begins serving. `main` calls `spawn_drivers`
     // before `server::serve`, and a fresh process cannot carry an armed schedule
-    // (reboot-death), so even a slow cold `scantxoutset` here is startup work rather
-    // than work inside a live fire/combine window. Starting service with an avoidably
-    // cold cache would make an early, otherwise-admissible sweep depend on a race with
-    // the refresher's first task tick.
+    // (reboot-death), so even a slow cold read here is startup work rather than work
+    // inside a live fire/combine window. Starting service with an avoidably cold cache
+    // would make an early, otherwise-admissible sweep depend on a race with the
+    // refresher's first task tick.
+    //
+    // Once this backend holds the node-owned watch-only descriptor wallet (bead
+    // btc-policy-hn8) this pass is one `listunspent`, not a whole-UTXO-set scan — the
+    // measured 10.4 s/scan, serialized process-wide across all five nodes, that
+    // docs/SIGNET-SPEND-RECORD.md recorded. Only the first bring-up against a fresh
+    // backend still pays a `scantxoutset`, and it is that scan which supplies the
+    // wallet's birthday.
+    //
+    // ORDERING DEPENDENCY, named because this bead made it load-bearing (Fable hn8
+    // review). This warmup is SYNCHRONOUS and runs BEFORE the Lockdown deadline driver
+    // spawns. That ordering is unchanged from before this bead, but the window it
+    // tolerates grew roughly a hundredfold: the previous worst case was one ~10 s scan,
+    // whereas a first bring-up here can pay a `loadwallet` catch-up plus two
+    // `importdescriptors` calls, each under a 600 s budget. It is safe ONLY because
+    // reboot-death (ADR-0007) guarantees a fresh process carries no armed schedule, so
+    // there is no `T` this startup could be late for. Anyone weakening reboot-death must
+    // revisit THIS line first — it is where that assumption quietly pays for itself.
     if let Err(e) = backend.refresh_vault_unspent_cache(&node.vault_scripts()) {
         eprintln!("initial vault scan cache warmup failed (will retry): {e}");
     }
     // Keep subsequent whole-UTXO scanning and delta catch-up completely outside the
-    // finite fire/combine window. The first task tick is immediate; each pass is
-    // awaited before scheduling the next, so a slow refresh never overlaps itself.
+    // finite fire/combine window. The first task tick is immediate and cache passes are
+    // awaited before scheduling the next, so scans/deltas never overlap themselves. A
+    // deep-reorg descriptor repair may outlive its pass; exactly one runs in the
+    // background while later passes advance the complete scan-derived cache, so its
+    // ten-minute RPC budget cannot make that cache stale at the first new block.
     // Fire-time coverage consumes only a cache already at the active tip and otherwise
     // fails fast (Lockdown remains unconditional).
     let cache_backend = Arc::clone(&backend);
@@ -2438,8 +2463,10 @@ pub fn spawn_drivers(node: &Arc<Node>) {
             ticker.tick().await;
             let backend = Arc::clone(&cache_backend);
             let scripts = cache_scripts.clone();
-            match tokio::task::spawn_blocking(move || backend.refresh_vault_unspent_cache(&scripts))
-                .await
+            match tokio::task::spawn_blocking(move || {
+                backend.refresh_vault_unspent_cache_live(&scripts)
+            })
+            .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -3083,6 +3110,19 @@ fn combine_and_broadcast_with_contexts(
             &clock,
         ) {
             Ok(outcome) => {
+                // A NORMAL spend is done once it is on the network (mempool or chain):
+                // clear the candidate and lift its pending-Hold refresh subordination
+                // before publishing the terminal log marker. Acceptance harnesses use
+                // that marker as a settlement barrier, so it must describe state that
+                // is already settled rather than state this thread will settle next.
+                //
+                // The ARMED ESCAPE is deliberately NOT latched here: it must re-broadcast
+                // until it CONFIRMS (checked at the top of the next tick), so a later
+                // mempool eviction of the non-RBF escape is still resendable within its
+                // bounded window.
+                if !armed_escape {
+                    settle_candidate(node, channel, commitment_id);
+                }
                 match outcome {
                     BroadcastOutcome::Sent(txid) => {
                         broadcast += 1;
@@ -3102,17 +3142,6 @@ fn combine_and_broadcast_with_contexts(
                     BroadcastOutcome::AlreadySettled(txid) => println!(
                         "fire: candidate {commitment_id} already settled on-chain ({txid})"
                     ),
-                }
-                // A NORMAL spend is done once it is on the network (mempool or chain):
-                // clear the candidate and lift its pending-Hold refresh subordination —
-                // otherwise every node but the race winner keeps a stale pending entry
-                // and wrongly subordinates refreshes to an already-settled spend until
-                // commitment expiry. The ARMED ESCAPE is deliberately NOT latched here:
-                // it must re-broadcast until it CONFIRMS (checked at the top of the next
-                // tick), so a later mempool eviction of the non-RBF escape is still
-                // resendable within its bounded window.
-                if !armed_escape {
-                    settle_candidate(node, channel, commitment_id);
                 }
             }
             Err(e) => eprintln!("fire: cannot broadcast candidate {commitment_id}: {e}"),

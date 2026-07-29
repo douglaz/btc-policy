@@ -121,10 +121,16 @@ the model's premise does not hold.
 **R4 — Supply chain is defended by policy, not tooling.** No `cargo audit` / `cargo deny` runs in
 CI, and there is no reproducible release yet. See `docs/SBOM-AND-DEPENDENCY-POLICY.md`.
 
-**R5 — Full-UTXO-set scanning does not scale.** Measured on live signet: ~10.4 s per
-`scantxoutset` against 72.2M outputs, serialized process-wide by Core. This is availability, not
-theft — but a node that cannot warm its view in time is a node that is not protecting anything.
-Tracked as `btc-policy-hn8` and `btc-policy-zzv`.
+**R5 — Full-UTXO-set scanning does not scale, and it is still the fallback.** Measured on live
+signet: ~10.4 s per `scantxoutset` against 72.2M outputs, serialized process-wide by Core. This
+is availability, not theft — but a node that cannot warm its view in time is a node that is not
+protecting anything. Since `btc-policy-hn8` the steady state no longer pays it: the vault-unspent
+cache is served from a node-owned watch-only descriptor wallet, and restarts read `listunspent`.
+A scan still runs on a node's FIRST bring-up against a backend (it supplies the wallet's
+birthday), whenever the wallet is missing, unreadable, or unrecognized, and after a reorg below
+the wallet's completion anchor — which also re-imports the descriptors, rescanning from the
+vault's oldest live output. Those paths are unmeasured on a real chain, and the mainnet UTXO set
+is larger than signet's. Remaining scaling work is tracked as `btc-policy-zzv`.
 
 **R6 — One honest signet spend is the extent of real-chain evidence.** Duress, claw-back, and
 reorg behaviour are proven on regtest only (`attack all`, the demos). See
