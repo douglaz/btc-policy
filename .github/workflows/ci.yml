@@ -62,6 +62,15 @@ jobs:
             run: nix develop -c cargo clippy --locked --workspace --all-targets -- -D warnings
           - name: test
             run: nix develop -c cargo test --locked --workspace
+          # `cargo test` skips `#[ignore]`d tests, and every test that talks to a REAL
+          # bitcoind is ignored so a bare `cargo test` outside the devShell still works.
+          # That left the backend's live-Core behaviour ungated: the unit suite replays
+          # canned JSON, so it proves the reconciliation logic but not what Core actually
+          # does for `importdescriptors`/`listunspent` over watch-only `raw()` descriptors
+          # — the vault-unspent cache's PRIMARY source since bead btc-policy-hn8, whose
+          # every failure mode is a silent fallback. ~37s, so it belongs in the fast job.
+          - name: regtest-backend
+            run: nix develop -c cargo test --locked -p vault-node --test bitcoind_backend -- --ignored --test-threads=1
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22

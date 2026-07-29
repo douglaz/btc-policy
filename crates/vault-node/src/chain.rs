@@ -18,10 +18,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::hashes::{sha256, Hash, HashEngine};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::{
     consensus, Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Witness,
@@ -207,10 +209,20 @@ pub trait ChainBackend {
     ) -> Result<Vec<(OutPoint, Prevout)>, Error>;
 
     /// Refresh any backend-side confirmed-vault cache outside the fire/combine path.
-    /// The default is a no-op for mocks and indexed backends; the Core backend warms
-    /// a cold `scantxoutset` snapshot and advances it by a bounded block delta.
+    /// The default is a no-op for mocks and indexed backends; the Core backend reads
+    /// its node-owned watch-only descriptor wallet, falling back to a cold
+    /// `scantxoutset` snapshot (advanced by bounded block deltas) whenever that wallet
+    /// is missing, failed, or unrecognized.
     fn refresh_vault_unspent_cache(&self, _scripts: &[ScriptBuf]) -> Result<(), Error> {
         Ok(())
+    }
+
+    /// Periodic live-node form of [`Self::refresh_vault_unspent_cache`]. Backends whose
+    /// reconciliation includes slow maintenance may move that maintenance off the
+    /// single cache-refresher thread; the default keeps the ordinary synchronous
+    /// behavior.
+    fn refresh_vault_unspent_cache_live(&self, scripts: &[ScriptBuf]) -> Result<(), Error> {
+        self.refresh_vault_unspent_cache(scripts)
     }
 
     /// Raw consensus bytes of `txid` iff it is in this node's mempool. This is the
@@ -413,18 +425,36 @@ fn validate_ancestors(
 /// RPC client style (`crates/vault-cli/src/bitcoind.rs`) — no HTTP crate lands in
 /// the node. Talks to an already-running bitcoind; spawning one is the caller's
 /// job (the demo already does, and the opt-in integration test does its own).
+#[derive(Clone)]
 pub struct BitcoindBackend {
     rpc_addr: SocketAddr,
     /// base64 of `<user>:<password>` (or `__cookie__:<pw>`), exactly as the
     /// `Authorization: Basic` header carries it.
     auth: String,
+    /// Node-derived identity; sibling nodes watching one vault get different wallets.
+    wallet_owner: [u8; 32],
     /// Confirmed vault-UTXO cache maintained only by
     /// [`ChainBackend::refresh_vault_unspent_cache`], never by the fire/combine hot
-    /// path. A cold cache is warmed with `scantxoutset` in a dedicated blocking task;
-    /// after that, bounded block deltas advance it. `vault_unspent` either consumes a
-    /// cache at the current tip or fails fast, so no whole-set scan can consume the
-    /// escape's finite combine window.
-    scan_cache: Mutex<Option<VaultUnspentCache>>,
+    /// path. It is served from the node-owned watch-only descriptor wallet
+    /// ([`Self::wallet_confirmed_scan`]), with `scantxoutset` kept as the cold-start
+    /// and reconciliation fallback. `vault_unspent` either consumes a cache at the
+    /// current tip or fails fast, so no whole-set scan can consume the escape's
+    /// finite combine window.
+    scan_cache: Arc<Mutex<Option<VaultUnspentCache>>>,
+    /// The node-owned watch-only wallet after its descriptors are verified.
+    vault_wallet: Arc<Mutex<Option<VaultWallet>>>,
+    /// Keeps a reorg-blind wallet out of use until a cold-scan re-import repairs it.
+    wallet_reimport_pending: Arc<Mutex<bool>>,
+    /// At most one slow descriptor import runs away from the periodic cache refresher.
+    /// While it is set, the scan-derived cache may still advance by bounded block
+    /// deltas, so a new tip does not make coverage unavailable for the whole rescan.
+    wallet_reimport_in_progress: Arc<AtomicBool>,
+    /// Whole-UTXO-set scans this backend has issued, counting one that then failed:
+    /// the cost is the scan slot Core serializes, not the reply. Both sources produce
+    /// the SAME view, so no equality check can tell a wallet-served refresh from one
+    /// that silently fell back — and a fallback nobody notices is this bead's failure
+    /// mode, not a correctness bug. The live-Core regression asserts on this count.
+    full_scans: Arc<AtomicU64>,
 }
 
 /// The cached confirmed vault-UTXO scan (deliverable 9y5.3-c). `candidates` is
@@ -439,6 +469,27 @@ struct VaultUnspentCache {
     candidates: HashSet<OutPoint>,
 }
 
+/// A cold scan and the oldest live output height, used as the wallet birthday.
+/// A reorg can resurrect an older output, so reorg repair re-derives this value.
+#[derive(Clone)]
+struct ColdScan {
+    cache: VaultUnspentCache,
+    oldest_unspent_height: u32,
+}
+
+/// A located-and-verified node-owned watch-only wallet.
+struct VaultWallet {
+    name: String,
+    /// Script set verified for this handle.
+    scripts: Vec<ScriptBuf>,
+    /// The active-chain `(height, hash)` this wallet's history was proved to rest on
+    /// — its completion marker, or the cold anchor a repair imported from. Only a
+    /// reorg that unseats THIS can resurrect an output older than the wallet's
+    /// birthday, so [`ChainBackend::refresh_vault_unspent_cache`] uses it as the reorg
+    /// guard: while it holds, the wallet can see everything a reorg can undo.
+    anchor: (u32, BlockHash),
+}
+
 /// Maximum active-chain blocks one background cache refresh parses. A node that
 /// starts far behind advances over successive passes; until it catches the tip the
 /// fire path fails fast rather than doing unbounded catch-up inside the combine
@@ -446,28 +497,69 @@ struct VaultUnspentCache {
 /// task.
 const MAX_VAULT_SCAN_DELTA_BLOCKS: u32 = 32;
 
+/// Prefix for a name derived from the node identity and watched scripts.
+const VAULT_WALLET_PREFIX: &str = "vaultnode-";
+
+/// Non-daemon identity; the daemon supplies its public key.
+const STANDALONE_WALLET_IDENTITY: &[u8] = b"vault-node-standalone-backend";
+
 impl BitcoindBackend {
-    /// `auth` is the base64 of `<user>:<password>` (regtest cookie auth). The
-    /// caller reads bitcoind's `.cookie` and base64-encodes it.
+    /// Standalone backend; production nodes use [`Self::new_for_node`].
     pub fn new(rpc_addr: SocketAddr, auth: String) -> BitcoindBackend {
+        Self::new_for_node(rpc_addr, auth, STANDALONE_WALLET_IDENTITY)
+    }
+
+    /// Construct a backend with one stable node identity.
+    pub(crate) fn new_for_node(
+        rpc_addr: SocketAddr,
+        auth: String,
+        node_identity: &[u8],
+    ) -> BitcoindBackend {
         BitcoindBackend {
             rpc_addr,
             auth,
-            scan_cache: Mutex::new(None),
+            wallet_owner: sha256::Hash::hash(node_identity).to_byte_array(),
+            scan_cache: Arc::new(Mutex::new(None)),
+            vault_wallet: Arc::new(Mutex::new(None)),
+            wallet_reimport_pending: Arc::new(Mutex::new(false)),
+            wallet_reimport_in_progress: Arc::new(AtomicBool::new(false)),
+            full_scans: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Whole-UTXO-set scans issued so far — the cost bead btc-policy-hn8 exists to
+    /// remove. A wallet-served refresh leaves this unchanged.
+    pub fn full_scan_count(&self) -> u64 {
+        self.full_scans.load(Ordering::Relaxed)
     }
 
     /// One JSON-RPC call with its structured `result`/`error` fields intact.
     /// Most callers use [`Self::call`], while confirmation lookup needs Core's
     /// numeric not-found code to distinguish absence from a backend failure.
     fn call_reply(&self, method: &str, params: Value) -> Result<Value, Error> {
+        self.call_reply_within(method, params, RPC_TIMEOUT)
+    }
+
+    /// Root-endpoint call with an explicit deadline for synchronous wallet catch-up.
+    fn call_reply_within(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, Error> {
         let request = json!({
             "jsonrpc": "1.0",
             "id": "vault-node",
             "method": method,
             "params": params,
         });
-        let body = post_json(self.rpc_addr, &request.to_string(), &self.auth)?;
+        let body = post_json_to(
+            self.rpc_addr,
+            "/",
+            &request.to_string(),
+            &self.auth,
+            timeout,
+        )?;
         serde_json::from_str(&body)
             .map_err(|e| format!("bitcoind {method}: unparseable reply: {e}").into())
     }
@@ -478,6 +570,67 @@ impl BitcoindBackend {
             return Err(format!("bitcoind {method}: {}", reply["error"]).into());
         }
         Ok(reply["result"].clone())
+    }
+
+    /// Call Core's wallet endpoint; generated names need no URL escaping.
+    fn wallet_call(&self, wallet: &str, method: &str, params: Value) -> Result<Value, Error> {
+        self.wallet_call_within(wallet, method, params, RPC_TIMEOUT)
+    }
+
+    /// Wallet call with an explicit deadline for descriptor rescans.
+    fn wallet_call_within(
+        &self,
+        wallet: &str,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, Error> {
+        let request = json!({
+            "jsonrpc": "1.0",
+            "id": "vault-node",
+            "method": method,
+            "params": params,
+        });
+        let body = post_json_to(
+            self.rpc_addr,
+            &format!("/wallet/{wallet}"),
+            &request.to_string(),
+            &self.auth,
+            timeout,
+        )?;
+        let reply: Value = serde_json::from_str(&body)
+            .map_err(|e| format!("bitcoind {method} on wallet {wallet}: unparseable reply: {e}"))?;
+        if !reply["error"].is_null() {
+            return Err(format!("bitcoind {method} on wallet {wallet}: {}", reply["error"]).into());
+        }
+        Ok(reply["result"].clone())
+    }
+
+    fn best_block_hash(&self) -> Result<BlockHash, Error> {
+        let text = self
+            .call("getbestblockhash", json!([]))?
+            .as_str()
+            .ok_or("getbestblockhash: expected a block hash")?
+            .to_string();
+        BlockHash::from_str(&text).map_err(|e| format!("getbestblockhash: bad hash: {e}").into())
+    }
+
+    /// Return the height only if `block` is still active there.
+    fn confirm_active_height(&self, block: BlockHash) -> Result<u32, Error> {
+        let header = self.call("getblockheader", json!([block.to_string(), true]))?;
+        let height = header["height"]
+            .as_u64()
+            .ok_or("getblockheader: no block height")?;
+        let height =
+            u32::try_from(height).map_err(|_| "getblockheader: block height exceeds u32")?;
+        if self.block_hash_at(height)? != Some(block) {
+            return Err(format!(
+                "block {block} is no longer active at height {height}; discarding the vault \
+                 UTXO snapshot anchored to it"
+            )
+            .into());
+        }
+        Ok(height)
     }
 
     fn parse_prevout(result: &Value) -> Result<Option<Prevout>, Error> {
@@ -557,17 +710,13 @@ impl BitcoindBackend {
         Ok(())
     }
 
-    /// Parse one successful whole-UTXO-set scan into a cache anchored to the block
-    /// hash Core says it observed. This is called only by the background refresher.
-    fn full_confirmed_scan(&self, scripts: &[ScriptBuf]) -> Result<VaultUnspentCache, Error> {
+    /// Cold/reconciliation fallback, including a chain-derived wallet birthday.
+    fn full_confirmed_scan(&self, scripts: &[ScriptBuf]) -> Result<ColdScan, Error> {
         let scan_objects: Vec<Value> = scripts
             .iter()
-            .map(|script| {
-                json!({
-                    "desc": format!("raw({})", script.as_bytes().to_lower_hex_string())
-                })
-            })
+            .map(|script| json!({ "desc": raw_descriptor(script) }))
             .collect();
+        self.full_scans.fetch_add(1, Ordering::Relaxed);
         let scan = self.call("scantxoutset", json!(["start", scan_objects]))?;
         if scan["success"].as_bool() != Some(true) {
             return Err("scantxoutset: scan did not complete successfully".into());
@@ -581,6 +730,7 @@ impl BitcoindBackend {
             .as_array()
             .ok_or("scantxoutset: unspents is not an array")?;
         let mut candidates = HashSet::with_capacity(unspents.len());
+        let mut oldest_unspent_height: Option<u32> = None;
         for entry in unspents {
             let txid = entry["txid"]
                 .as_str()
@@ -589,28 +739,524 @@ impl BitcoindBackend {
                 .as_u64()
                 .ok_or("scantxoutset: unspent has no vout")?;
             let vout = u32::try_from(vout).map_err(|_| "scantxoutset: vout exceeds u32")?;
+            let entry_height = entry["height"]
+                .as_u64()
+                .ok_or("scantxoutset: unspent has no height")?;
+            let entry_height =
+                u32::try_from(entry_height).map_err(|_| "scantxoutset: height exceeds u32")?;
+            oldest_unspent_height =
+                Some(oldest_unspent_height.map_or(entry_height, |old: u32| old.min(entry_height)));
             candidates.insert(OutPoint::new(
                 Txid::from_str(txid).map_err(|e| format!("scantxoutset: bad txid: {e}"))?,
                 vout,
             ));
         }
-        let header = self.call("getblockheader", json!([bestblock.to_string(), true]))?;
-        let height = header["height"]
-            .as_u64()
-            .ok_or("getblockheader: no block height")?;
-        let height =
-            u32::try_from(height).map_err(|_| "getblockheader: block height exceeds u32")?;
-        if self.block_hash_at(height)? != Some(bestblock) {
-            return Err(
-                "scantxoutset: best block is no longer active; discarding the cold cache".into(),
+        let height = self.confirm_active_height(bestblock).map_err(|e| {
+            format!("scantxoutset: best block is no longer active, discarding the cold cache: {e}")
+        })?;
+        Ok(ColdScan {
+            // With no live output, the tip is the earliest required birthday.
+            oldest_unspent_height: oldest_unspent_height.unwrap_or(height),
+            cache: VaultUnspentCache {
+                bestblock,
+                height,
+                scripts: scripts.to_vec(),
+                candidates,
+            },
+        })
+    }
+
+    /// Locate and verify this node's wallet, returning its name and the active-chain
+    /// anchor its history was proved against. Only a cold scan may create/repair it;
+    /// wallet-only failure therefore degrades to `scantxoutset`.
+    fn ensure_vault_wallet(
+        &self,
+        scripts: &[ScriptBuf],
+        cold_scan: Option<&ColdScan>,
+    ) -> Result<(String, (u32, BlockHash)), Error> {
+        if let Some(wallet) = self
+            .vault_wallet
+            .lock()
+            .expect("vault wallet lock poisoned")
+            .as_ref()
+            .filter(|wallet| wallet.scripts == scripts)
+        {
+            return Ok((wallet.name.clone(), wallet.anchor));
+        }
+        let name = vault_wallet_name(&self.wallet_owner, scripts);
+        // Loading a wallet that fell behind while bitcoind was offline synchronously
+        // catches it up to the active tip, so it needs the same budget as an import
+        // rescan rather than the ordinary one-minute RPC deadline.
+        let reply =
+            self.call_reply_within("loadwallet", json!([name]), WALLET_BUILD_RPC_TIMEOUT)?;
+        if !reply["error"].is_null() {
+            match reply["error"]["code"].as_i64() {
+                Some(-35) => {}
+                Some(-18) => {
+                    let cold_scan = cold_scan.ok_or(
+                        "this backend has no node-owned vault wallet yet; the scantxoutset \
+                         fallback creates it",
+                    )?;
+                    self.create_vault_wallet(&name, scripts, cold_scan)?;
+                }
+                _ => return Err(format!("bitcoind loadwallet {name}: {}", reply["error"]).into()),
+            }
+        }
+        let anchor = self.verify_vault_wallet(&name, scripts, cold_scan)?;
+        *self
+            .vault_wallet
+            .lock()
+            .expect("vault wallet lock poisoned") = Some(VaultWallet {
+            name: name.clone(),
+            scripts: scripts.to_vec(),
+            anchor,
+        });
+        Ok((name, anchor))
+    }
+
+    /// Build or repair from a proved birthday. Failed repair leaves the latch set,
+    /// preventing a possibly incomplete wallet from under-reporting coverage.
+    fn seed_vault_wallet(&self, scripts: &[ScriptBuf], cold_scan: &ColdScan) -> Result<(), Error> {
+        let (name, _) = self.ensure_vault_wallet(scripts, Some(cold_scan))?;
+        if *self
+            .wallet_reimport_pending
+            .lock()
+            .expect("wallet reimport lock poisoned")
+        {
+            self.import_vault_descriptors(&name, scripts, cold_scan)?;
+            // A repaired wallet rests on the anchor the fresh scan proved, not on the
+            // marker the cached handle was originally verified against.
+            if let Some(wallet) = self
+                .vault_wallet
+                .lock()
+                .expect("vault wallet lock poisoned")
+                .as_mut()
+            {
+                wallet.anchor = (cold_scan.cache.height, cold_scan.cache.bestblock);
+            }
+            *self
+                .wallet_reimport_pending
+                .lock()
+                .expect("wallet reimport lock poisoned") = false;
+        }
+        Ok(())
+    }
+
+    /// Run a slow wallet build/repair without occupying the single periodic cache
+    /// refresher. The scan-derived cache was published before this is called; later
+    /// passes can therefore advance that cache while Core rescans wallet history.
+    fn spawn_vault_wallet_seed(&self, scripts: Vec<ScriptBuf>, cold_scan: ColdScan) {
+        if self
+            .wallet_reimport_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let backend = self.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("vault-wallet-repair".to_string())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    backend.seed_vault_wallet(&scripts, &cold_scan)
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => eprintln!(
+                        "vault descriptor wallet not established, scantxoutset stays in use: {e}"
+                    ),
+                    Err(_) => eprintln!(
+                        "vault descriptor wallet repair panicked; scantxoutset stays in use"
+                    ),
+                }
+                backend
+                    .wallet_reimport_in_progress
+                    .store(false, Ordering::Release);
+            })
+        {
+            self.wallet_reimport_in_progress
+                .store(false, Ordering::Release);
+            eprintln!(
+                "could not start vault descriptor wallet repair, scantxoutset stays in use: {e}"
             );
         }
-        Ok(VaultUnspentCache {
-            bestblock,
-            height,
-            scripts: scripts.to_vec(),
-            candidates,
-        })
+    }
+
+    /// Create a blank watch-only wallet and import the scan's exact raw descriptors.
+    fn create_vault_wallet(
+        &self,
+        name: &str,
+        scripts: &[ScriptBuf],
+        cold_scan: &ColdScan,
+    ) -> Result<(), Error> {
+        // disable_private_keys, blank, descriptors; do not alter Core's startup list.
+        self.call(
+            "createwallet",
+            json!([name, true, true, "", false, true, false]),
+        )?;
+        self.import_vault_descriptors(name, scripts, cold_scan)
+    }
+
+    /// Import from the cold birthday, then record completion and its chain anchor.
+    fn import_vault_descriptors(
+        &self,
+        name: &str,
+        scripts: &[ScriptBuf],
+        cold_scan: &ColdScan,
+    ) -> Result<(), Error> {
+        let timestamp = self.block_time_at(cold_scan.oldest_unspent_height)?;
+        let mut requests = Vec::with_capacity(scripts.len());
+        for script in scripts {
+            requests.push(json!({
+                "desc": self.checksummed_descriptor(&raw_descriptor(script))?,
+                "timestamp": timestamp,
+                "active": false,
+            }));
+        }
+        self.import_descriptors(name, &requests)?;
+        let marker = self.checksummed_descriptor(&vault_wallet_marker(
+            &self.wallet_owner,
+            cold_scan.cache.height,
+            cold_scan.cache.bestblock,
+        ))?;
+        self.import_descriptors(
+            name,
+            &[json!({ "desc": marker, "timestamp": "now", "active": false })],
+        )
+    }
+
+    /// Accept only a watch-only wallet with the exact vault descriptors and a
+    /// node-owned active-chain marker. Repair requires a fresh cold scan. Returns the
+    /// `(height, hash)` this wallet's history is proved to rest on.
+    fn verify_vault_wallet(
+        &self,
+        name: &str,
+        scripts: &[ScriptBuf],
+        cold_scan: Option<&ColdScan>,
+    ) -> Result<(u32, BlockHash), Error> {
+        let info = self.wallet_call(name, "getwalletinfo", json!([]))?;
+        let watch_only = info["private_keys_enabled"].as_bool() == Some(false);
+        let expected: HashSet<String> = scripts.iter().map(raw_descriptor).collect();
+        let found = self.wallet_descriptors(name)?;
+        let scripts_complete = expected.iter().all(|descriptor| found.contains(descriptor));
+        // `Some` only when EVERY descriptor this wallet holds beyond the vault's own
+        // parses as one of this node's markers, which is also what makes it repairable:
+        // repair never imports into a wallet containing a foreign descriptor.
+        let anchors: Option<Vec<(u32, BlockHash)>> = found
+            .iter()
+            .filter(|descriptor| !expected.contains(*descriptor))
+            .map(|descriptor| parse_vault_wallet_marker(&self.wallet_owner, descriptor))
+            .collect();
+        let only_owned_descriptors = anchors.is_some();
+        let mut active_marker = None;
+        if watch_only {
+            for (height, hash) in anchors.unwrap_or_default() {
+                if self.block_hash_at(height)? == Some(hash) {
+                    active_marker = Some((height, hash));
+                    break;
+                }
+            }
+        }
+        if let Some(anchor) = active_marker.filter(|_| scripts_complete && only_owned_descriptors) {
+            return Ok(anchor);
+        }
+        let repairable = watch_only && only_owned_descriptors;
+        let Some(cold_scan) = cold_scan.filter(|_| repairable) else {
+            return Err(format!(
+                "wallet {name} is not a complete node-owned vault wallet (watch-only: \
+                 {watch_only}, vault descriptors complete: {scripts_complete}, active completion \
+                 anchor: {}); refusing to read the vault balance from it",
+                active_marker.is_some()
+            )
+            .into());
+        };
+        self.import_vault_descriptors(name, scripts, cold_scan)?;
+        let repaired = self.wallet_descriptors(name)?;
+        let marker = vault_wallet_marker(
+            &self.wallet_owner,
+            cold_scan.cache.height,
+            cold_scan.cache.bestblock,
+        );
+        if !expected
+            .iter()
+            .all(|descriptor| repaired.contains(descriptor))
+            || !repaired.contains(&marker)
+        {
+            return Err(
+                format!("wallet {name} is still incomplete after finishing its build").into(),
+            );
+        }
+        // `seed_vault_wallet` called us with the same cold scan that just completed
+        // this repair. Clear the latch here so it does not import the same descriptors
+        // a second time after `ensure_vault_wallet` returns.
+        *self
+            .wallet_reimport_pending
+            .lock()
+            .expect("wallet reimport lock poisoned") = false;
+        Ok((cold_scan.cache.height, cold_scan.cache.bestblock))
+    }
+
+    /// Wallet descriptors without Core's appended checksums.
+    fn wallet_descriptors(&self, name: &str) -> Result<HashSet<String>, Error> {
+        let listed = self.wallet_call(name, "listdescriptors", json!([]))?;
+        let entries = listed["descriptors"]
+            .as_array()
+            .ok_or("listdescriptors: descriptors is not an array")?;
+        entries
+            .iter()
+            .map(|entry| {
+                let desc = entry["desc"]
+                    .as_str()
+                    .ok_or("listdescriptors: descriptor is not a string")?;
+                Ok(desc.split('#').next().unwrap_or(desc).to_string())
+            })
+            .collect()
+    }
+
+    /// Require every import and its rescan to complete.
+    fn import_descriptors(&self, wallet: &str, requests: &[Value]) -> Result<(), Error> {
+        let results = self.wallet_call_within(
+            wallet,
+            "importdescriptors",
+            json!([requests]),
+            WALLET_BUILD_RPC_TIMEOUT,
+        )?;
+        let entries = results
+            .as_array()
+            .ok_or("importdescriptors: expected an array")?;
+        if entries.len() != requests.len() {
+            return Err(format!(
+                "importdescriptors into {wallet}: expected {} results, got {}",
+                requests.len(),
+                entries.len()
+            )
+            .into());
+        }
+        for entry in entries {
+            if entry["success"].as_bool() != Some(true) {
+                return Err(format!("importdescriptors into {wallet} failed: {entry}").into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Ask Core for the checksum required by `importdescriptors`.
+    fn checksummed_descriptor(&self, descriptor: &str) -> Result<String, Error> {
+        let info = self.call("getdescriptorinfo", json!([descriptor]))?;
+        info["descriptor"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                format!("getdescriptorinfo {descriptor}: no checksummed descriptor").into()
+            })
+    }
+
+    /// The active-chain anchor the currently held wallet handle was proved against.
+    fn wallet_anchor(&self) -> Option<(u32, BlockHash)> {
+        self.vault_wallet
+            .lock()
+            .expect("vault wallet lock poisoned")
+            .as_ref()
+            .map(|wallet| wallet.anchor)
+    }
+
+    /// Re-prove the active-chain anchor a completed wallet read rests on: the one
+    /// [`Self::verify_vault_wallet`] proved for the handle this read just used, which
+    /// was active before the read. A `false` here means a reorg deep enough to
+    /// invalidate that proof straddled the read, so its result must not be installed.
+    fn wallet_read_anchor_held(&self) -> Result<bool, Error> {
+        // A successful read always leaves a handle; treat its absence as a lost anchor
+        // and repair rather than trusting a read nothing vouches for.
+        let Some((height, hash)) = self.wallet_anchor() else {
+            return Ok(false);
+        };
+        Ok(self.block_hash_at(height)? == Some(hash))
+    }
+
+    /// Convert the chain-derived birthday height to Core's timestamp form.
+    fn block_time_at(&self, height: u32) -> Result<u64, Error> {
+        let hash = self
+            .block_hash_at(height)?
+            .ok_or_else(|| format!("no active block at height {height} for the wallet birthday"))?;
+        let header = self.call("getblockheader", json!([hash.to_string(), true]))?;
+        header["time"]
+            .as_u64()
+            .ok_or_else(|| format!("getblockheader {hash}: no block time").into())
+    }
+
+    /// Produce a scan-equivalent confirmed candidate superset with `listunspent`.
+    /// Reconcile it with wallet history anchored by `listsinceblock.lastblock`:
+    /// Bitcoin Core produces that transaction list and anchor under the same wallet
+    /// lock, so even an A→B→A reorg around `listunspent` cannot hide an A output.
+    /// Downstream `gettxout(include_mempool=true)` removes spent or foreign extras.
+    /// The inputs of CONFIRMED wallet debits are dropped, which is what keeps the
+    /// carried-forward superset from growing with lifetime deposits.
+    fn wallet_confirmed_scan(
+        &self,
+        scripts: &[ScriptBuf],
+        cached: Option<&VaultUnspentCache>,
+    ) -> Result<VaultUnspentCache, Error> {
+        let (wallet, _) = self.ensure_vault_wallet(scripts, None)?;
+        let watched: HashSet<&ScriptBuf> = scripts.iter().collect();
+        // Bracket the wallet snapshot by one unchanged active-chain tip.
+        for attempt in 0..2 {
+            let bestblock = self.best_block_hash()?;
+            let unspents = self.wallet_call(
+                &wallet,
+                "listunspent",
+                json!([1, 9_999_999, [], true, { "include_immature_coinbase": true }]),
+            )?;
+            let mut candidates = HashSet::new();
+            for entry in unspents
+                .as_array()
+                .ok_or("listunspent: expected an array")?
+            {
+                let script_hex = entry["scriptPubKey"]
+                    .as_str()
+                    .ok_or("listunspent: unspent has no scriptPubKey")?;
+                let script = ScriptBuf::from_hex(script_hex)
+                    .map_err(|e| format!("listunspent: bad scriptPubKey: {e}"))?;
+                if !watched.contains(&script) {
+                    continue;
+                }
+                candidates.insert(parse_outpoint(entry, "listunspent")?);
+            }
+            if let Some(cache) = cached {
+                candidates.extend(cache.candidates.iter().copied());
+            }
+            // Add inputs hidden by wallet-known, unconfirmed transactions that DEBIT
+            // the vault. Also add confirmed wallet credits since the cache anchor — or
+            // from all wallet history after a process restart. The latter makes this
+            // transaction list a complete, wallet-anchored candidate source when there
+            // is no in-memory superset to preserve.
+            //
+            // Core reports a debit as a `send` entry. The credit-only categories are
+            // listed here rather than testing for `send`, so an entry carrying any
+            // OTHER category — a future Core, a shape this code does not know — is
+            // both expanded when unconfirmed and treated as a candidate when confirmed:
+            // this can only over-collect (the watched-script check in `vault_unspent`
+            // discards extras), never under-report the coverage denominator. The
+            // confirmed-debit pruning below tests for `send` for the same reason from
+            // the other side: an unrecognized category prunes nothing, which costs
+            // growth rather than completeness.
+            //
+            // Verified against Core v31 on regtest: a third-party deposit lists
+            // `receive` alone, while a spend of a watched output lists `send` — and so
+            // does a spend paying only back to the vault script, because
+            // `importdescriptors` gives the descriptor an address-book entry, which
+            // keeps its outputs out of Core's change class.
+            const CREDIT_ONLY: [&str; 4] = ["receive", "generate", "immature", "orphan"];
+            let since = cached
+                .map(|cache| Value::String(cache.bestblock.to_string()))
+                .unwrap_or(Value::Null);
+            let pending = self.wallet_call(
+                &wallet,
+                "listsinceblock",
+                // `include_change=true` ensures a vault output remains visible even if
+                // Core classifies it as change. `since` may name a block a reorg has
+                // orphaned — Core then answers from the fork point, which is what makes
+                // this read reconcile a reorg the wallet can see through; a reorg below
+                // the WALLET's anchor never reaches this call, being latched out before
+                // it and re-proved after it. Removed-fork entries are unnecessary on top
+                // of that: an output a dropped block's transaction spent comes back
+                // through `listunspent`, or — while that transaction is still wallet-known
+                // but neither confirmed nor resident — through the debit expansion below.
+                json!([since, 1, true, false, true]),
+            )?;
+            let wallet_block_text = pending["lastblock"]
+                .as_str()
+                .ok_or("listsinceblock: lastblock is not a hash")?;
+            let wallet_block = BlockHash::from_str(wallet_block_text)
+                .map_err(|e| format!("listsinceblock: bad lastblock hash: {e}"))?;
+            let mut pending_txids: HashSet<Txid> = HashSet::new();
+            let mut confirmed_debits: HashSet<Txid> = HashSet::new();
+            for entry in pending["transactions"]
+                .as_array()
+                .ok_or("listsinceblock: transactions is not an array")?
+            {
+                let category = entry["category"]
+                    .as_str()
+                    .ok_or("listsinceblock: transaction has no category")?;
+                let confirmations = entry["confirmations"]
+                    .as_i64()
+                    .ok_or("listsinceblock: transaction has no confirmations")?;
+                if confirmations > 0 {
+                    if category == "send" {
+                        confirmed_debits.insert(entry_txid(entry)?);
+                    } else {
+                        candidates.insert(parse_outpoint(entry, "listsinceblock")?);
+                    }
+                    continue;
+                }
+                if CREDIT_ONLY.contains(&category) {
+                    continue;
+                }
+                pending_txids.insert(entry_txid(entry)?);
+            }
+            // One `gettransaction` per wallet transaction whose INPUTS matter, in a
+            // stable order so the read sequence stays deterministic. An unconfirmed
+            // debit's inputs are added: `listunspent` hides them, but the chain may
+            // still hold them (its spender can leave the mempool). A CONFIRMED debit's
+            // inputs are collected to be dropped instead.
+            let mut expand: Vec<(Txid, bool)> = pending_txids
+                .iter()
+                .map(|txid| (*txid, false))
+                .chain(confirmed_debits.iter().map(|txid| (*txid, true)))
+                .collect();
+            expand.sort();
+            let mut spent: HashSet<OutPoint> = HashSet::new();
+            for (txid, confirmed) in &expand {
+                let tx = self.wallet_call(
+                    &wallet,
+                    "gettransaction",
+                    json!([txid.to_string(), true, true]),
+                )?;
+                // Malformed input data must fall back, never silently under-report.
+                let inputs = tx["decoded"]["vin"]
+                    .as_array()
+                    .ok_or_else(|| format!("gettransaction {txid}: decoded.vin is not an array"))?;
+                for vin in inputs {
+                    if vin.get("txid").is_none() {
+                        continue;
+                    }
+                    let outpoint = parse_outpoint(vin, "gettransaction")?;
+                    if *confirmed {
+                        spent.insert(outpoint);
+                    } else {
+                        candidates.insert(outpoint);
+                    }
+                }
+            }
+            // Prune LAST, so a confirmed spend overrides every other source. Without
+            // this the wallet-derived set only grows: `listunspent` stops reporting a
+            // spent output, but the carried-forward cache — and, after a restart, every
+            // confirmed credit in the wallet's whole history — puts it back, and the
+            // fire path's batched `gettxout` would then scale with lifetime deposits
+            // instead of live outputs. Dropping them is safe in both directions: the
+            // active chain has consumed them, so `gettxout` answers null for each, and
+            // a reorg that un-spends one either leaves the wallet's completion anchor
+            // active (so `listunspent`, or the unconfirmed-debit expansion above,
+            // reports it again on the next pass) or unseats that anchor and latches the
+            // wallet out for a full rescan. An output the WALLET does not know — one
+            // only a fallback scan ever saw, below the birthday — is not pruned here,
+            // because its spender is no debit of this wallet.
+            candidates.retain(|outpoint| !spent.contains(outpoint));
+            if self.best_block_hash()? == bestblock {
+                return Ok(VaultUnspentCache {
+                    height: self.confirm_active_height(wallet_block)?,
+                    bestblock: wallet_block,
+                    scripts: scripts.to_vec(),
+                    candidates,
+                });
+            }
+            if attempt == 1 {
+                return Err(
+                    "the chain tip moved again while reading the vault wallet's unspent view"
+                        .into(),
+                );
+            }
+        }
+        unreachable!("the bounded snapshot loop always returns or errors")
     }
 
     /// Advance a warm confirmed-vault cache through at most
@@ -695,18 +1341,12 @@ impl BitcoindBackend {
 
     /// The current confirmed-UTXO membership paying `scripts`, read only from the
     /// background-maintained cache. Cold or stale is an immediate error — never a
-    /// synchronous `scantxoutset` on the fire/combine path.
+    /// synchronous `scantxoutset` or wallet read on the fire/combine path.
     fn confirmed_candidates(
         &self,
         scripts: &[ScriptBuf],
     ) -> Result<(BlockHash, Vec<OutPoint>), Error> {
-        let tip_text = self
-            .call("getbestblockhash", json!([]))?
-            .as_str()
-            .ok_or("getbestblockhash: expected a block hash")?
-            .to_string();
-        let tip = BlockHash::from_str(&tip_text)
-            .map_err(|e| format!("getbestblockhash: bad hash: {e}"))?;
+        let tip = self.best_block_hash()?;
         let cache = self.scan_cache.lock().expect("scan cache lock poisoned");
         let cached = cache
             .as_ref()
@@ -768,6 +1408,149 @@ impl BitcoindBackend {
             })
             .collect::<Result<HashSet<Txid>, Error>>()?;
         Ok((txids, sequence))
+    }
+
+    fn refresh_vault_unspent_cache_mode(
+        &self,
+        scripts: &[ScriptBuf],
+        seed_in_background: bool,
+    ) -> Result<(), Error> {
+        let cached = self
+            .scan_cache
+            .lock()
+            .expect("scan cache lock poisoned")
+            .as_ref()
+            .filter(|cache| cache.scripts == scripts)
+            .cloned();
+        // A reorg can resurrect a vault output created BEFORE the wallet's birthday —
+        // spent in a dropped block by a transaction that paid the vault nothing, so
+        // the wallet neither watched the output nor holds that transaction and no
+        // wallet-only read can ever surface it again. Latch the wallet out until a
+        // cold scan and re-import repair it.
+        //
+        // The boundary for that is the WALLET's own completion anchor, not the last
+        // pass's tip. A block hash commits to its whole ancestry, so while the
+        // anchor's `(height, hash)` is still active no block at or below that height
+        // has moved: every output a higher reorg can resurrect was unspent AT the
+        // anchor, is therefore at or after the birthday that anchor's own import
+        // proved (`ColdScan::oldest_unspent_height`), and is therefore already
+        // watched. Latching on the tip instead would make a routine 1-block reorg pay
+        // a whole-set scan AND an `importdescriptors` rescan of the vault's history,
+        // during which the fire path has no current cache to read — a far wider
+        // outage than the event warrants. A pass holding no handle needs no check
+        // here: [`Self::verify_vault_wallet`] re-proves an active marker before that
+        // wallet may serve.
+        let reorged = match self.wallet_anchor() {
+            Some((height, hash)) => self.block_hash_at(height)? != Some(hash),
+            None => false,
+        };
+        let mut repair_pending = {
+            let mut pending = self
+                .wallet_reimport_pending
+                .lock()
+                .expect("wallet reimport lock poisoned");
+            *pending |= reorged;
+            *pending
+        };
+        let repair_in_progress = self.wallet_reimport_in_progress.load(Ordering::Acquire);
+        // Primary path: one wallet `listunspent`, no whole-set scan on restart. Do
+        // not race a wallet read against a descriptor import this process started.
+        if !repair_pending && !repair_in_progress {
+            match self.wallet_confirmed_scan(scripts, cached.as_ref()) {
+                Ok(cache) => {
+                    // The reorg check above ran BEFORE that read. Re-prove the same
+                    // anchor now that it has finished, because a reorg landing DURING
+                    // the read is not a transient loss: the wallet-blind result would
+                    // be installed and serve the coverage denominator until the next
+                    // pass — a silent understatement, i.e. inflated escape coverage,
+                    // in exactly the window an attacker who can reorg controls.
+                    if self.wallet_read_anchor_held()? {
+                        *self.scan_cache.lock().expect("scan cache lock poisoned") = Some(cache);
+                        return Ok(());
+                    }
+                    *self
+                        .wallet_reimport_pending
+                        .lock()
+                        .expect("wallet reimport lock poisoned") = true;
+                    repair_pending = true;
+                    eprintln!(
+                        "a reorg landed while reading the vault wallet; discarding that read and \
+                         re-importing the descriptors from a fresh scan"
+                    );
+                }
+                // Missing, failed, or unrecognized wallets fall back, never to empty.
+                Err(e) => {
+                    // Drop the verified handle too. bitcoind restarting unloads a wallet
+                    // this node created with `load_on_startup=false`, and a cached name
+                    // would keep every later wallet call failing — pinning the node to
+                    // the fallback until the NODE restarts — instead of re-`loadwallet`ing.
+                    *self
+                        .vault_wallet
+                        .lock()
+                        .expect("vault wallet lock poisoned") = None;
+                    eprintln!(
+                        "vault descriptor-wallet read unavailable, falling back to scantxoutset: {e}"
+                    )
+                }
+            }
+        }
+        // Deltas preserve the candidate superset regardless of its source, but the
+        // walk can only EXTEND an anchor that is still active: a reorg that unseated
+        // the cache's own anchor (shallower than the wallet's, so it does not latch)
+        // leaves nothing for the delta to chain onto, and rescanning is the only way
+        // to reconcile it. Pending repair normally must rescan too, to re-derive the
+        // birthday. Once that cold scan has launched a background repair, however, its
+        // complete scan-derived cache is a safe delta base while the import runs.
+        // This check costs an RPC only on the fallback path — a served wallet read
+        // has already returned above.
+        let delta_base = match cached {
+            Some(cache)
+                if (!repair_pending || repair_in_progress)
+                    && self.block_hash_at(cache.height)? == Some(cache.bestblock) =>
+            {
+                Some(cache)
+            }
+            _ => None,
+        };
+        let refreshed = match delta_base {
+            Some(cache) => self.advance_confirmed_scan(cache)?,
+            None => {
+                let cold = self.full_confirmed_scan(scripts)?;
+                // Publish the complete scan-derived view BEFORE building the wallet.
+                // `importdescriptors` rescans, which this backend budgets minutes for
+                // ([`WALLET_BUILD_RPC_TIMEOUT`]), and withholding the cache for that long
+                // would leave `confirmed_candidates` cold — no escape sweep can run —
+                // exactly when a reorg forced this branch.
+                *self.scan_cache.lock().expect("scan cache lock poisoned") =
+                    Some(cold.cache.clone());
+                // A failed seed leaves that scan-derived cache serving, and which pass
+                // retries it depends on whether the latch is set — the two cases differ:
+                //
+                // - Seeding a wallet this backend never had (no latch). The next pass
+                //   finds a warm cache and a clear latch, so it takes the delta arm above
+                //   and never re-enters this branch; the wallet is re-attempted only on a
+                //   later reorg or a process restart. That is deliberate. This branch
+                //   opens with a whole-set scan, so re-entering it every pass would turn
+                //   one transient failure into the very scan storm this bead removes, and
+                //   the price of not retrying is bounded: the cache stays complete and
+                //   scan-derived, advanced by cheap deltas.
+                // - Repairing after a reorg below the WALLET's completion anchor (latch
+                //   set). Only a successful import clears the latch. A live-node refresh
+                //   moves that slow import off this cache-refresher thread, allowing the
+                //   scan-derived cache to advance by deltas meanwhile; a failed import
+                //   clears the in-progress flag, so the next pass scans and retries.
+                if seed_in_background {
+                    self.spawn_vault_wallet_seed(scripts.to_vec(), cold.clone());
+                } else if let Err(e) = self.seed_vault_wallet(scripts, &cold) {
+                    eprintln!(
+                        "vault descriptor wallet not established, scantxoutset stays in use: {e}"
+                    );
+                }
+                cold.cache
+            }
+        };
+        *self.scan_cache.lock().expect("scan cache lock poisoned") = Some(refreshed);
+        Ok(())
     }
 
     /// Fetch raw transaction bytes without taking another complete mempool
@@ -1105,12 +1888,12 @@ impl ChainBackend for BitcoindBackend {
         // script(s), then re-read each result through `gettxout(..., true)` so an
         // output already spent by a mempool transaction is not double-counted.
         //
-        // SCALING (deliverable 9y5.3-c): the confirmed scan is absent from this hot
-        // path. A dedicated background task warms the cold `scantxoutset` snapshot
-        // and advances it by at most `MAX_VAULT_SCAN_DELTA_BLOCKS` blocks per pass.
-        // Here [`Self::confirmed_candidates`] accepts only a cache already at the
-        // active tip; cold/stale fails immediately (no sweep; Lockdown already
-        // latched) rather than consuming the finite combine window.
+        // SCALING (deliverable 9y5.3-c; bead btc-policy-hn8): no confirmed-set read of
+        // ANY kind happens on this hot path. A dedicated background task maintains the
+        // cache — from the node-owned descriptor wallet, or from the `scantxoutset`
+        // fallback — and here [`Self::confirmed_candidates`] accepts only a cache
+        // already at the active tip; cold/stale fails immediately (no sweep; Lockdown
+        // already latched) rather than consuming the finite combine window.
         let watched: HashSet<&ScriptBuf> = scripts.iter().collect();
         // There is no atomic chain+mempool JSON-RPC snapshot. Take bounded full
         // passes instead, bracketing each with Core's monotonic `mempool_sequence`
@@ -1177,13 +1960,7 @@ impl ChainBackend for BitcoindBackend {
                     }
                 }
             }
-            let tip_after_text = self
-                .call("getbestblockhash", json!([]))?
-                .as_str()
-                .ok_or("getbestblockhash: expected a block hash")?
-                .to_string();
-            let tip_after = BlockHash::from_str(&tip_after_text)
-                .map_err(|e| format!("getbestblockhash: bad hash: {e}"))?;
+            let tip_after = self.best_block_hash()?;
             let (_, sequence_after) = self.mempool_snapshot()?;
             if scan_tip == tip_after && sequence_before == sequence_after {
                 let mut found: Vec<_> = found.into_iter().collect();
@@ -1201,23 +1978,11 @@ impl ChainBackend for BitcoindBackend {
     }
 
     fn refresh_vault_unspent_cache(&self, scripts: &[ScriptBuf]) -> Result<(), Error> {
-        let cached = self
-            .scan_cache
-            .lock()
-            .expect("scan cache lock poisoned")
-            .as_ref()
-            .filter(|cache| cache.scripts == scripts)
-            .cloned();
-        let refreshed = match cached {
-            Some(cache) if self.block_hash_at(cache.height)? == Some(cache.bestblock) => {
-                self.advance_confirmed_scan(cache)?
-            }
-            // Cold start or a reorg below the cache anchor. A full scan is unavoidable,
-            // but this method is called only from the dedicated background task.
-            Some(_) | None => self.full_confirmed_scan(scripts)?,
-        };
-        *self.scan_cache.lock().expect("scan cache lock poisoned") = Some(refreshed);
-        Ok(())
+        self.refresh_vault_unspent_cache_mode(scripts, false)
+    }
+
+    fn refresh_vault_unspent_cache_live(&self, scripts: &[ScriptBuf]) -> Result<(), Error> {
+        self.refresh_vault_unspent_cache_mode(scripts, true)
     }
 
     fn mempool_transaction(&self, txid: &Txid) -> Result<Option<Vec<u8>>, Error> {
@@ -1324,16 +2089,101 @@ impl ChainBackend for BitcoindBackend {
 /// value, never a config knob; the connect deadline below is shorter.
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Wallet loading/catch-up and `importdescriptors` may synchronously scan history.
+const WALLET_BUILD_RPC_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Exact descriptor shared by the wallet and `scantxoutset`.
+fn raw_descriptor(script: &ScriptBuf) -> String {
+    format!("raw({})", script.as_bytes().to_lower_hex_string())
+}
+
+/// Inert completion marker persisting the owner and cold-scan anchor across restarts.
+fn vault_wallet_marker(
+    wallet_owner: &[u8; 32],
+    anchor_height: u32,
+    anchor_hash: BlockHash,
+) -> String {
+    format!(
+        "raw(6a4c44{}{:08x}{})",
+        wallet_owner.to_lower_hex_string(),
+        anchor_height,
+        anchor_hash
+    )
+}
+
+fn parse_vault_wallet_marker(
+    wallet_owner: &[u8; 32],
+    descriptor: &str,
+) -> Option<(u32, BlockHash)> {
+    let prefix = format!("raw(6a4c44{}", wallet_owner.to_lower_hex_string());
+    let payload = descriptor.strip_prefix(&prefix)?.strip_suffix(')')?;
+    if payload.len() != 72 {
+        return None;
+    }
+    let height = u32::from_str_radix(&payload[..8], 16).ok()?;
+    let hash = BlockHash::from_str(&payload[8..]).ok()?;
+    Some((height, hash))
+}
+
+/// Name derived from the stable owner and canonical script set.
+fn vault_wallet_name(wallet_owner: &[u8; 32], scripts: &[ScriptBuf]) -> String {
+    let mut ordered: Vec<&[u8]> = scripts.iter().map(|script| script.as_bytes()).collect();
+    ordered.sort_unstable();
+    ordered.dedup();
+    let mut engine = sha256::Hash::engine();
+    engine.input(wallet_owner);
+    for script in ordered {
+        engine.input(&(script.len() as u64).to_le_bytes());
+        engine.input(script);
+    }
+    let digest = sha256::Hash::from_engine(engine).to_byte_array();
+    format!("{VAULT_WALLET_PREFIX}{}", digest[..8].to_lower_hex_string())
+}
+
+/// Parse an RPC outpoint, retaining its source in errors.
+fn parse_outpoint(entry: &Value, context: &str) -> Result<OutPoint, Error> {
+    let txid = entry["txid"]
+        .as_str()
+        .ok_or_else(|| format!("{context}: entry has no txid"))?;
+    let vout = entry["vout"]
+        .as_u64()
+        .ok_or_else(|| format!("{context}: entry has no vout"))?;
+    Ok(OutPoint::new(
+        Txid::from_str(txid).map_err(|e| format!("{context}: bad txid {txid}: {e}"))?,
+        u32::try_from(vout).map_err(|_| format!("{context}: vout exceeds u32"))?,
+    ))
+}
+
+/// Parse a `listsinceblock` entry's transaction id.
+fn entry_txid(entry: &Value) -> Result<Txid, Error> {
+    let txid = entry["txid"]
+        .as_str()
+        .ok_or("listsinceblock: transaction has no txid")?;
+    Txid::from_str(txid).map_err(|e| format!("listsinceblock: bad txid {txid}: {e}").into())
+}
+
 /// One HTTP/1.1 POST to bitcoind's JSON-RPC over loopback, `Connection: close`,
 /// returning the response body. A single loopback JSON-RPC peer does not buy an
 /// HTTP crate its keep (same reasoning as the /sign server).
 fn post_json(addr: SocketAddr, body: &str, auth: &str) -> Result<String, Error> {
+    post_json_to(addr, "/", body, auth, RPC_TIMEOUT)
+}
+
+/// [`post_json`] to a specific request path and deadline. Core routes wallet RPCs by
+/// path (`/wallet/<name>`); everything else goes to `/`.
+fn post_json_to(
+    addr: SocketAddr,
+    path: &str,
+    body: &str,
+    auth: &str,
+    timeout: Duration,
+) -> Result<String, Error> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|e| format!("connect {addr}: {e}"))?;
-    stream.set_read_timeout(Some(RPC_TIMEOUT))?;
-    stream.set_write_timeout(Some(RPC_TIMEOUT))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let request = format!(
-        "POST / HTTP/1.1\r\n\
+        "POST {path} HTTP/1.1\r\n\
          Host: {addr}\r\n\
          Content-Type: application/json\r\n\
          Authorization: Basic {auth}\r\n\
@@ -1739,8 +2589,9 @@ pub(crate) mod mock {
 mod tests {
     use super::mock::MockBackend;
     use super::{
-        assemble_package, BitcoindBackend, ChainBackend, Prevout, MAX_PACKAGE_ANCESTORS,
-        MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB, MAX_VAULT_SCAN_DELTA_BLOCKS,
+        assemble_package, BitcoindBackend, ChainBackend, ColdScan, Prevout, VaultUnspentCache,
+        MAX_PACKAGE_ANCESTORS, MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB,
+        MAX_VAULT_SCAN_DELTA_BLOCKS,
     };
 
     use bitcoin::absolute::LockTime;
@@ -1754,14 +2605,52 @@ mod tests {
     use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::Ordering;
 
     /// A tiny scripted JSON-RPC peer for exercising the real bitcoind backend's
     /// cross-call snapshot ordering without launching bitcoind.
     fn scripted_rpc(
         replies: Vec<(&'static str, serde_json::Value)>,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let (addr, handle, _) = scripted_rpc_recording(replies);
+        (addr, handle)
+    }
+
+    /// [`scripted_rpc`] that also hands back every JSON-RPC request body it served, so
+    /// a test can assert on the PARAMETERS a call carried and not just its name.
+    #[allow(clippy::type_complexity)]
+    fn scripted_rpc_recording(
+        replies: Vec<(&'static str, serde_json::Value)>,
+    ) -> (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        scripted_rpc_gated(replies, None)
+    }
+
+    /// [`scripted_rpc_recording`] that can also PAUSE mid-script: with
+    /// `Some((method, hit, resume))` it serves normally until the first call to
+    /// `method`, then signals `hit` and blocks on `resume` before answering it. That
+    /// suspends the backend INSIDE that call, which is how a test observes state the
+    /// backend is required to have published before it (no sleeps, no polling).
+    #[allow(clippy::type_complexity)]
+    fn scripted_rpc_gated(
+        replies: Vec<(&'static str, serde_json::Value)>,
+        mut gate: Option<(
+            &'static str,
+            std::sync::mpsc::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    ) -> (
+        std::net::SocketAddr,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted RPC");
         let addr = listener.local_addr().expect("scripted RPC address");
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = std::sync::Arc::clone(&recorded);
         let handle = std::thread::spawn(move || {
             for (expected_method, result) in replies {
                 let (mut stream, _) = listener.accept().expect("accept RPC call");
@@ -1796,6 +2685,20 @@ mod tests {
                 let body: serde_json::Value =
                     serde_json::from_slice(&request[header_end..header_end + content_len])
                         .expect("JSON-RPC request");
+                requests
+                    .lock()
+                    .expect("recorded requests lock")
+                    .push(body.clone());
+                if gate
+                    .as_ref()
+                    .is_some_and(|(method, ..)| body["method"] == *method)
+                {
+                    let (_, hit, resume) = gate.take().expect("the gate was just matched");
+                    hit.send(()).expect("signal the gated call");
+                    resume
+                        .recv()
+                        .expect("wait for the test to release the gate");
+                }
                 let response = if let Some(batch) = body.as_array() {
                     assert!(
                         batch
@@ -1805,6 +2708,31 @@ mod tests {
                     );
                     if let Some(raw) = result.get("__raw_batch") {
                         raw.clone()
+                    } else if let Some(by_outpoint) = result.get("__by_outpoint") {
+                        // Answer a `gettxout` batch per REQUEST, keyed `"<txid>:<vout>"`,
+                        // rather than positionally. An outpoint the script does not name
+                        // reads as null (spent or unknown), so a test states the chain's
+                        // answer for each outpoint and stays valid however many
+                        // candidates the caller batches.
+                        batch
+                            .iter()
+                            .map(|request| {
+                                let key = format!(
+                                    "{}:{}",
+                                    request["params"][0].as_str().unwrap_or_default(),
+                                    request["params"][1]
+                                );
+                                serde_json::json!({
+                                    "result": by_outpoint
+                                        .get(&key)
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null),
+                                    "error": serde_json::Value::Null,
+                                    "id": request["id"],
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                            .into()
                     } else {
                         let results = result.as_array().cloned().unwrap_or_else(|| vec![result]);
                         assert_eq!(
@@ -1827,11 +2755,21 @@ mod tests {
                     }
                 } else {
                     assert_eq!(body["method"], expected_method);
-                    serde_json::json!({
-                        "result": result,
-                        "error": serde_json::Value::Null,
-                        "id": "vault-node",
-                    })
+                    // `{"__error": {...}}` scripts a structured JSON-RPC failure, which
+                    // is how bitcoind reports "no such wallet" (-18), "already loaded"
+                    // (-35) and friends.
+                    match result.get("__error") {
+                        Some(error) => serde_json::json!({
+                            "result": serde_json::Value::Null,
+                            "error": error,
+                            "id": "vault-node",
+                        }),
+                        None => serde_json::json!({
+                            "result": result,
+                            "error": serde_json::Value::Null,
+                            "id": "vault-node",
+                        }),
+                    }
                 }
                 .to_string();
                 write!(
@@ -1843,10 +2781,46 @@ mod tests {
                 .expect("write RPC response");
             }
         });
-        (addr, handle)
+        (addr, handle, recorded)
     }
 
+    /// bitcoind's structured "no such wallet" failure, as `scripted_rpc` scripts it.
+    fn wallet_not_found() -> serde_json::Value {
+        serde_json::json!({"__error": {"code": -18, "message": "Wallet file verification failed"}})
+    }
+
+    fn completion_marker(height: u32, hash: &str) -> String {
+        let owner =
+            bitcoin::hashes::sha256::Hash::hash(super::STANDALONE_WALLET_IDENTITY).to_byte_array();
+        format!(
+            "{}#hgfedcba",
+            super::vault_wallet_marker(
+                &owner,
+                height,
+                hash.parse::<BlockHash>()
+                    .expect("test completion-marker hash"),
+            )
+        )
+    }
+
+    /// One cold refresh against a backend that has NO node-owned vault wallet: the
+    /// wallet read fails closed, the `scantxoutset` fallback runs, and the seeding
+    /// attempt that follows the scan is refused too — so these replies exercise the
+    /// pre-hn8 scan path end to end.
     fn cold_cache_replies(
+        scan: serde_json::Value,
+        bestblock: &str,
+        height: u32,
+    ) -> Vec<(&'static str, serde_json::Value)> {
+        let mut replies = vec![("loadwallet", wallet_not_found())];
+        replies.extend(scan_fallback_replies(scan, bestblock, height));
+        replies
+    }
+
+    /// The `scantxoutset` fallback itself, without the wallet read that precedes it:
+    /// the scan, its anchor check, and a wallet-seeding attempt that bitcoind refuses.
+    /// Tests whose wallet read fails AFTER `loadwallet` (verification, say) start here.
+    fn scan_fallback_replies(
         scan: serde_json::Value,
         bestblock: &str,
         height: u32,
@@ -1855,6 +2829,11 @@ mod tests {
             ("scantxoutset", scan),
             ("getblockheader", serde_json::json!({"height": height})),
             ("getblockhash", serde_json::json!(bestblock)),
+            ("loadwallet", wallet_not_found()),
+            (
+                "createwallet",
+                serde_json::json!({"__error": {"code": -4, "message": "Database already exists"}}),
+            ),
         ]
     }
 
@@ -2125,8 +3104,11 @@ mod tests {
                 serde_json::json!({"txids": [], "mempool_sequence": 1}),
             ),
             ("getbestblockhash", serde_json::json!(new_tip)),
-            // Background delta: anchor is still active, then one new block adds the
-            // watched output and the terminal active-hash re-read commits it.
+            // Background delta: no wallet handle to reorg-check, so the wallet read is
+            // attempted and fails closed again; the cache anchor is then proved still
+            // active (nothing for a delta to chain onto otherwise) and one new block
+            // adds the watched output, which the terminal active-hash re-read commits.
+            ("loadwallet", wallet_not_found()),
             ("getblockhash", serde_json::json!(old_tip)),
             ("getblockcount", serde_json::json!(1)),
             ("getblockhash", serde_json::json!(new_tip)),
@@ -2187,6 +3169,9 @@ mod tests {
         let genesis = hash_at(0);
         let scan = serde_json::json!({"success": true, "bestblock": genesis, "unspents": []});
         let mut replies = cold_cache_replies(scan, &genesis, 0);
+        // The wallet read failing closed again, the cache-anchor check that gates the
+        // delta, then the bounded delta itself.
+        replies.push(("loadwallet", wallet_not_found()));
         replies.push(("getblockhash", serde_json::json!(genesis)));
         replies.push(("getblockcount", serde_json::json!(33)));
         for height in 1..=MAX_VAULT_SCAN_DELTA_BLOCKS {
@@ -2244,7 +3229,7 @@ mod tests {
         let scan = serde_json::json!({
             "success": true,
             "bestblock": tip,
-            "unspents": [{"txid": parent_txid.to_string(), "vout": 0}],
+            "unspents": [{"txid": parent_txid.to_string(), "vout": 0, "height": 1}],
         });
         let confirmed_parent = serde_json::json!({
             "scriptPubKey": {"hex": script_hex},
@@ -2314,7 +3299,7 @@ mod tests {
         let scan = serde_json::json!({
             "success": true,
             "bestblock": tip,
-            "unspents": [{"txid": parent_txid.to_string(), "vout": 0}],
+            "unspents": [{"txid": parent_txid.to_string(), "vout": 0, "height": 1}],
         });
         let confirmed_parent = serde_json::json!({
             "scriptPubKey": {"hex": script_hex},
@@ -2383,7 +3368,7 @@ mod tests {
         let scan = serde_json::json!({
             "success": true,
             "bestblock": tip,
-            "unspents": [{"txid": parent_txid.to_string(), "vout": 0}],
+            "unspents": [{"txid": parent_txid.to_string(), "vout": 0, "height": 1}],
         });
         let confirmed_parent = serde_json::json!({
             "scriptPubKey": {"hex": script_hex},
@@ -2449,7 +3434,7 @@ mod tests {
         let scan = serde_json::json!({
             "success": true,
             "bestblock": tip,
-            "unspents": [{"txid": parent_txid.to_string(), "vout": 0}],
+            "unspents": [{"txid": parent_txid.to_string(), "vout": 0, "height": 1}],
         });
         let confirmed = serde_json::json!({
             "scriptPubKey": {"hex": script_hex},
@@ -2509,14 +3494,17 @@ mod tests {
     #[test]
     fn vault_unspent_rejects_an_incomplete_confirmed_scan() {
         let script = ScriptBuf::from_bytes(vec![0x51]);
-        let (addr, server) = scripted_rpc(vec![(
-            "scantxoutset",
-            serde_json::json!({
-                "success": false,
-                "bestblock": "55".repeat(32),
-                "unspents": [],
-            }),
-        )]);
+        let (addr, server) = scripted_rpc(vec![
+            ("loadwallet", wallet_not_found()),
+            (
+                "scantxoutset",
+                serde_json::json!({
+                    "success": false,
+                    "bestblock": "55".repeat(32),
+                    "unspents": [],
+                }),
+            ),
+        ]);
         let backend = BitcoindBackend::new(addr, String::new());
 
         let error = backend
@@ -2857,6 +3845,2003 @@ mod tests {
                 .expect("broadcasts lock")
                 .is_empty(),
             "a rejected tx is never recorded as broadcast"
+        );
+    }
+
+    // -- the node-owned watch-only descriptor wallet (bead btc-policy-hn8) ---------
+
+    /// The chain+mempool state both vault-unspent sources below are read against:
+    ///
+    ///  - `confirmed` — a confirmed vault output, unspent. In BOTH views.
+    ///  - `mempool_spent` — a confirmed vault output that a mempool transaction
+    ///    (`spender`) spends. `gettxout(..., include_mempool=true)` hides it, so it is
+    ///    in NEITHER view — but the two sources reach that answer differently, which is
+    ///    exactly the divergence this fixture pins down.
+    ///  - `authorized` — an unconfirmed, vault-authorized transaction paying the vault.
+    ///    In BOTH views, as an unconfirmed output.
+    struct VaultViewFixture {
+        script: ScriptBuf,
+        tip: String,
+        confirmed: OutPoint,
+        mempool_spent: OutPoint,
+        evicted_spent: OutPoint,
+        spender: Transaction,
+        evicted: Transaction,
+        authorized: Transaction,
+    }
+
+    impl VaultViewFixture {
+        fn new() -> VaultViewFixture {
+            let script = ScriptBuf::from_bytes(vec![0x51]);
+            // Chosen so the sorted candidate batch is `confirmed`, `mempool_spent`,
+            // `evicted_spent`, then the authorized transaction's own input.
+            let confirmed = OutPoint::new(Txid::from_byte_array([0x11; 32]), 0);
+            let mempool_spent = OutPoint::new(Txid::from_byte_array([0x22; 32]), 0);
+            let evicted_spent = OutPoint::new(Txid::from_byte_array([0x33; 32]), 0);
+            let spender = tx_spending(&[mempool_spent], 90_000, 1);
+            let evicted = tx_spending(&[evicted_spent], 70_000, 3);
+            let mut authorized = tx_spending(
+                &[OutPoint::new(Txid::from_byte_array([0x44; 32]), 7)],
+                80_000,
+                2,
+            );
+            authorized.output[0].script_pubkey = script.clone();
+            VaultViewFixture {
+                script,
+                tip: "ab".repeat(32),
+                confirmed,
+                mempool_spent,
+                evicted_spent,
+                spender,
+                evicted,
+                authorized,
+            }
+        }
+
+        fn script_hex(&self) -> String {
+            self.script.as_bytes().to_lower_hex_string()
+        }
+
+        /// The `vault_unspent` reads themselves — byte-identical for both sources. The
+        /// batched `gettxout` is scripted per outpoint, so it states what the CHAIN
+        /// says about each one and does not care how many candidates a source batched:
+        /// the wallet path also carries an unconfirmed wallet transaction's own inputs,
+        /// and those answer null and are dropped.
+        fn read_replies(&self) -> Vec<(&'static str, serde_json::Value)> {
+            let mempool = serde_json::json!({
+                // `evicted` is deliberately absent: it left this node's mempool.
+                "txids": [
+                    self.spender.compute_txid().to_string(),
+                    self.authorized.compute_txid().to_string(),
+                ],
+                "mempool_sequence": 41,
+            });
+            let vault_output = |confirmations: u64| {
+                serde_json::json!({
+                    "scriptPubKey": {"hex": self.script_hex()},
+                    "value": 0.001,
+                    "confirmations": confirmations,
+                })
+            };
+            vec![
+                ("getrawmempool", mempool.clone()),
+                ("getbestblockhash", serde_json::json!(self.tip)),
+                // Batched re-read of the candidates. `confirmed` survives;
+                // `mempool_spent` is absent, exactly as Core hides it; `evicted_spent`
+                // comes back CONFIRMED, because the transaction that spent it is gone
+                // from the mempool — the case where the wallet's own spent-tracking and
+                // `gettxout` disagree. Anything else reads as null.
+                (
+                    "gettxout",
+                    serde_json::json!({"__by_outpoint": {
+                        format!("{}:{}", self.confirmed.txid, self.confirmed.vout):
+                            vault_output(4),
+                        format!("{}:{}", self.evicted_spent.txid, self.evicted_spent.vout):
+                            vault_output(5),
+                    }}),
+                ),
+                // The authorized-unconfirmed leg: its raw bytes, then its vault output.
+                (
+                    "getrawtransaction",
+                    serde_json::json!(serialize(&self.authorized).to_lower_hex_string()),
+                ),
+                (
+                    "gettxout",
+                    serde_json::json!({
+                        "scriptPubKey": {"hex": self.script_hex()},
+                        "value": 0.0008,
+                        "confirmations": 0,
+                    }),
+                ),
+                ("getbestblockhash", serde_json::json!(self.tip)),
+                ("getrawmempool", mempool),
+            ]
+        }
+
+        /// Refresh replies for the descriptor-wallet source. `listunspent` reports only
+        /// `confirmed`: the wallet knows `spender`, so it hides `mempool_spent` — and it
+        /// still holds `evicted`, so it hides `evicted_spent` too, even though that
+        /// output is unspent again as far as the chain is concerned.
+        ///
+        /// `listsinceblock` carries the confirmed credits from all wallet history plus
+        /// Core's current unconfirmed categories. `spender` and `evicted` DEBIT the
+        /// vault and so are expanded for their prevouts; `authorized` only pays it, so
+        /// it is credit-only and no `gettransaction` is scripted for it — an extra call
+        /// would find no scripted reply and fail this fixture's tests.
+        fn wallet_replies(&self) -> Vec<(&'static str, serde_json::Value)> {
+            let debiting = [&self.spender, &self.evicted];
+            let mut pending: Vec<Txid> = debiting.iter().map(|tx| tx.compute_txid()).collect();
+            pending.sort();
+            let decoded = |txid: Txid| {
+                let tx = debiting
+                    .iter()
+                    .find(|tx| tx.compute_txid() == txid)
+                    .expect("a scripted pending transaction");
+                serde_json::json!({
+                    "decoded": {
+                        "vin": tx.input.iter().map(|input| serde_json::json!({
+                            "txid": input.previous_output.txid.to_string(),
+                            "vout": input.previous_output.vout,
+                        })).collect::<Vec<_>>()
+                    }
+                })
+            };
+            let mut replies = vec![
+                ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+                (
+                    "getwalletinfo",
+                    serde_json::json!({"private_keys_enabled": false}),
+                ),
+                (
+                    "listdescriptors",
+                    serde_json::json!({"descriptors": [
+                        {"desc": format!("raw({})#abcdefgh", self.script_hex())},
+                        {"desc": completion_marker(12, &self.tip)},
+                    ]}),
+                ),
+                ("getblockhash", serde_json::json!(self.tip)),
+                ("getbestblockhash", serde_json::json!(self.tip)),
+                (
+                    "listunspent",
+                    serde_json::json!([{
+                        "txid": self.confirmed.txid.to_string(),
+                        "vout": self.confirmed.vout,
+                        "scriptPubKey": self.script_hex(),
+                    }]),
+                ),
+                (
+                    "listsinceblock",
+                    serde_json::json!({
+                        "transactions": [
+                            {
+                                "txid": self.confirmed.txid.to_string(),
+                                "vout": self.confirmed.vout,
+                                "category": "receive",
+                                "confirmations": 4,
+                            },
+                            {
+                                "txid": self.mempool_spent.txid.to_string(),
+                                "vout": self.mempool_spent.vout,
+                                "category": "receive",
+                                "confirmations": 5,
+                            },
+                            {
+                                "txid": self.evicted_spent.txid.to_string(),
+                                "vout": self.evicted_spent.vout,
+                                "category": "receive",
+                                "confirmations": 6,
+                            },
+                            {
+                                "txid": self.spender.compute_txid().to_string(),
+                                "vout": 0,
+                                "category": "send",
+                                "confirmations": 0,
+                            },
+                            {
+                                "txid": self.evicted.compute_txid().to_string(),
+                                "vout": 0,
+                                "category": "send",
+                                "confirmations": 0,
+                            },
+                            {
+                                "txid": self.authorized.compute_txid().to_string(),
+                                "vout": 0,
+                                "category": "receive",
+                                "confirmations": 0,
+                            },
+                        ],
+                        "lastblock": self.tip,
+                    }),
+                ),
+            ];
+            for txid in pending {
+                replies.push(("gettransaction", decoded(txid)));
+            }
+            replies.extend([
+                ("getbestblockhash", serde_json::json!(self.tip)),
+                ("getblockheader", serde_json::json!({"height": 12})),
+                ("getblockhash", serde_json::json!(self.tip)),
+                // The post-read anchor re-check. This pass has no warm cache, so the
+                // anchor is the completion marker the handle verified against.
+                ("getblockhash", serde_json::json!(self.tip)),
+            ]);
+            replies
+        }
+
+        fn scan(&self) -> serde_json::Value {
+            serde_json::json!({
+                "success": true,
+                "bestblock": self.tip,
+                "unspents": [
+                    {"txid": self.confirmed.txid.to_string(), "vout": self.confirmed.vout, "height": 9},
+                    {"txid": self.mempool_spent.txid.to_string(), "vout": self.mempool_spent.vout, "height": 10},
+                    {"txid": self.evicted_spent.txid.to_string(), "vout": self.evicted_spent.vout, "height": 11},
+                ],
+            })
+        }
+
+        /// Refresh replies for the `scantxoutset` source over the SAME chain state.
+        /// The scan is mempool-agnostic, so it reports all three confirmed outputs.
+        fn scan_replies(&self) -> Vec<(&'static str, serde_json::Value)> {
+            cold_cache_replies(self.scan(), &self.tip, 12)
+        }
+
+        /// The same fallback for a test whose wallet read fails after `loadwallet`.
+        fn scan_fallback_replies(&self) -> Vec<(&'static str, serde_json::Value)> {
+            scan_fallback_replies(self.scan(), &self.tip, 12)
+        }
+
+        fn vault_unspent_through(
+            &self,
+            refresh_replies: Vec<(&'static str, serde_json::Value)>,
+        ) -> Vec<(OutPoint, Prevout)> {
+            let mut replies = refresh_replies;
+            replies.extend(self.read_replies());
+            let (addr, server) = scripted_rpc(replies);
+            let backend = BitcoindBackend::new(addr, String::new());
+            let scripts = std::slice::from_ref(&self.script);
+            backend
+                .refresh_vault_unspent_cache(scripts)
+                .expect("cache refresh");
+            let authorized = HashSet::from([self.authorized.compute_txid()]);
+            let unspent = backend
+                .vault_unspent(scripts, &authorized)
+                .expect("vault unspent");
+            server.join().expect("scripted RPC completed");
+            unspent
+        }
+    }
+
+    /// LOAD-BEARING (bead btc-policy-hn8, constraints 1 and 2): the vault-unspent view
+    /// the descriptor wallet produces must EQUAL the one `scantxoutset` produces for
+    /// the same chain state — confirmed, unconfirmed, and mempool-spent alike.
+    /// Anything less complete understates the coverage denominator and inflates
+    /// apparent escape coverage; anything different splits honest nodes' verdicts.
+    ///
+    /// `evicted_spent` is the case that makes this more than a formality. `listunspent`
+    /// alone would hide it — the wallet still holds the transaction that spent it, even
+    /// though that transaction has left the mempool — while the chain says it is
+    /// unspent and confirmed. Dropping it would understate the protected balance from
+    /// per-node mempool history, so the wallet source adds every unconfirmed wallet
+    /// transaction's inputs back; without that, this test fails on a value mismatch.
+    #[test]
+    fn the_wallet_derived_vault_unspent_view_equals_the_scan_derived_one() {
+        let fixture = VaultViewFixture::new();
+        let from_wallet = fixture.vault_unspent_through(fixture.wallet_replies());
+        let from_scan = fixture.vault_unspent_through(fixture.scan_replies());
+
+        assert_eq!(
+            from_wallet, from_scan,
+            "the wallet-derived and scan-derived vault-unspent views must agree exactly"
+        );
+        // And the agreed view is the RIGHT one, not two matching mistakes: both
+        // confirmed-and-unspent outputs plus the authorized unconfirmed one, never the
+        // output a mempool transaction has already spent.
+        let mut outpoints: Vec<OutPoint> =
+            from_wallet.iter().map(|(outpoint, _)| *outpoint).collect();
+        outpoints.sort();
+        let mut expected = vec![
+            fixture.confirmed,
+            fixture.evicted_spent,
+            OutPoint::new(fixture.authorized.compute_txid(), 0),
+        ];
+        expected.sort();
+        assert_eq!(outpoints, expected);
+        let unconfirmed: Vec<OutPoint> = from_wallet
+            .iter()
+            .filter(|(_, prevout)| !prevout.confirmed)
+            .map(|(outpoint, _)| *outpoint)
+            .collect();
+        assert_eq!(
+            unconfirmed,
+            vec![OutPoint::new(fixture.authorized.compute_txid(), 0)],
+            "only the authorized mempool transaction's output is unconfirmed"
+        );
+    }
+
+    /// A backend with no node-owned wallet must degrade to the scan and report the
+    /// vault's REAL balance. Reporting an empty vault here would read as "everything is
+    /// covered" at fire time, which is precisely the fail-open this bead forbids.
+    #[test]
+    fn a_missing_wallet_falls_back_to_the_scan_rather_than_an_empty_vault() {
+        let fixture = VaultViewFixture::new();
+        let unspent = fixture.vault_unspent_through(fixture.scan_replies());
+        assert!(
+            !unspent.is_empty(),
+            "a wallet-less backend must still see the vault's coins"
+        );
+        assert_eq!(unspent[0].0, fixture.confirmed);
+        assert_eq!(unspent[0].1.txout.value, Amount::from_sat(100_000));
+    }
+
+    /// A wallet sitting at the derived name that is NOT the one this node's creation
+    /// procedure builds is refused outright — the node reads no balance from it and
+    /// never writes to it. Here it holds private keys; the scan serves instead.
+    #[test]
+    fn a_wallet_this_node_did_not_create_is_refused_and_the_scan_serves_instead() {
+        let fixture = VaultViewFixture::new();
+        let mut replies = vec![
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": true}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": format!("raw({})#abcdefgh", fixture.script_hex())},
+                    {"desc": completion_marker(12, &fixture.tip)},
+                ]}),
+            ),
+        ];
+        replies.extend(fixture.scan_fallback_replies());
+        let unspent = fixture.vault_unspent_through(replies);
+        assert_eq!(
+            unspent.len(),
+            3,
+            "the scan fallback must still report the whole vault"
+        );
+        assert_eq!(unspent[0].0, fixture.confirmed);
+    }
+
+    /// A wallet whose descriptor set is not exactly this vault's scripts plus the
+    /// completion marker is refused too — the interrupted-build case, where the wallet
+    /// exists but its history may not reach its birthday.
+    #[test]
+    fn a_wallet_without_the_completion_marker_is_refused() {
+        let fixture = VaultViewFixture::new();
+        let mut replies = vec![
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": format!("raw({})#abcdefgh", fixture.script_hex())},
+                ]}),
+            ),
+        ];
+        replies.extend(fixture.scan_fallback_replies());
+        let unspent = fixture.vault_unspent_through(replies);
+        assert_eq!(
+            unspent.len(),
+            3,
+            "an unmarked wallet must not serve the vault balance; the scan does"
+        );
+    }
+
+    /// Cold start on a fresh backend: the scan runs once, and the wallet it seeds is
+    /// rescanned from the OLDEST unspent's block — not from genesis, and not from the
+    /// tip (which would miss the coins the vault already holds). The completion marker
+    /// is imported last, in its own call.
+    #[test]
+    fn a_cold_start_creates_the_wallet_with_a_birthday_from_the_scan() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let tip = "cd".repeat(32);
+        let birthday_hash = "07".repeat(32);
+        let marker = completion_marker(12, &tip);
+        let scan = serde_json::json!({
+            "success": true,
+            "bestblock": tip,
+            "unspents": [
+                {"txid": Txid::from_byte_array([0x11; 32]).to_string(), "vout": 0, "height": 9},
+                {"txid": Txid::from_byte_array([0x22; 32]).to_string(), "vout": 1, "height": 7},
+            ],
+        });
+        let replies = vec![
+            ("loadwallet", wallet_not_found()),
+            ("scantxoutset", scan),
+            ("getblockheader", serde_json::json!({"height": 12})),
+            ("getblockhash", serde_json::json!(tip)),
+            // Seeding: still absent, so create it and import from the birthday.
+            ("loadwallet", wallet_not_found()),
+            ("createwallet", serde_json::json!({"name": "vaultnode"})),
+            ("getblockhash", serde_json::json!(birthday_hash)),
+            (
+                "getblockheader",
+                serde_json::json!({"time": 1_700_000_000u64}),
+            ),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": format!("raw({script_hex})#abcdefgh")}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": marker.clone()}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": format!("raw({script_hex})#abcdefgh")},
+                    {"desc": marker.clone()},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(tip)),
+        ];
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        backend
+            .refresh_vault_unspent_cache(std::slice::from_ref(&script))
+            .expect("cold start warms the cache and seeds the wallet");
+        server.join().expect("scripted RPC completed");
+
+        let requests = requests.lock().expect("recorded requests lock");
+        let created = requests
+            .iter()
+            .position(|request| request["method"] == "createwallet")
+            .expect("the wallet was created");
+        let birthday_read = requests[created..]
+            .iter()
+            .find(|request| request["method"] == "getblockhash")
+            .expect("the birthday block hash was read");
+        assert_eq!(
+            birthday_read["params"][0], 7,
+            "the rescan must start at the OLDEST unspent's height, not the scan tip"
+        );
+        let imports: Vec<&serde_json::Value> = requests
+            .iter()
+            .filter(|request| request["method"] == "importdescriptors")
+            .collect();
+        assert_eq!(imports.len(), 2, "the vault import, then the marker");
+        assert_eq!(
+            imports[0]["params"][0][0]["desc"],
+            serde_json::json!(format!("raw({script_hex})#abcdefgh"))
+        );
+        assert_eq!(
+            imports[0]["params"][0][0]["timestamp"],
+            serde_json::json!(1_700_000_000u64),
+            "the vault descriptor is imported with the derived birthday"
+        );
+        assert_eq!(
+            imports[1]["params"][0][0]["desc"],
+            serde_json::json!(completion_marker(12, &tip)),
+        );
+        assert_eq!(
+            imports[1]["params"][0][0]["timestamp"],
+            serde_json::json!("now"),
+            "the completion marker is inert and needs no rescan of its own"
+        );
+    }
+
+    /// A second startup against the same backend — a fresh process, so a fresh
+    /// `BitcoindBackend` with no cached wallet handle. It must find the wallet, verify
+    /// it, and serve from it: no `createwallet`, no `importdescriptors` (so no rescan),
+    /// and no `scantxoutset`. `scripted_rpc` asserts the exact method sequence, so any
+    /// of those calls fails this test.
+    #[test]
+    fn a_second_startup_reuses_the_wallet_without_re_creating_or_rescanning_it() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let tip = "ef".repeat(32);
+        let txid = Txid::from_byte_array([0x44; 32]);
+        let replies = vec![
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": format!("raw({script_hex})#abcdefgh")},
+                    {"desc": completion_marker(31, &tip)},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(tip)),
+            ("getbestblockhash", serde_json::json!(tip)),
+            (
+                "listunspent",
+                serde_json::json!([
+                    {"txid": txid.to_string(), "vout": 0, "scriptPubKey": script_hex},
+                ]),
+            ),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": tip}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(tip)),
+            // Post-read anchor re-check: no warm cache this pass, so it re-proves the
+            // completion marker the handle verified against.
+            ("getblockhash", serde_json::json!(tip)),
+            // A SECOND refresh in the same process: the anchor check finds no reorg, so
+            // the wallet still serves — and reuses the verified handle, so there is no
+            // repeat of the locate/verify handshake either.
+            ("getblockhash", serde_json::json!(tip)),
+            ("getbestblockhash", serde_json::json!(tip)),
+            (
+                "listunspent",
+                serde_json::json!([
+                    {"txid": txid.to_string(), "vout": 0, "scriptPubKey": script_hex},
+                ]),
+            ),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": tip}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(tip)),
+            // …and re-proves the warm cache anchor it checked before the read.
+            ("getblockhash", serde_json::json!(tip)),
+            // And the cache it left serves the fire-time read.
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 3}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            (
+                "gettxout",
+                serde_json::json!({
+                    "scriptPubKey": {"hex": script_hex},
+                    "value": 0.001,
+                    "confirmations": 6,
+                }),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            (
+                "getrawmempool",
+                serde_json::json!({"txids": [], "mempool_sequence": 3}),
+            ),
+        ];
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&script);
+
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("a restart against an existing wallet needs no scan");
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("a second pass reuses the verified handle");
+        let unspent = backend
+            .vault_unspent(scripts, &HashSet::new())
+            .expect("vault unspent");
+        server.join().expect("scripted RPC completed");
+
+        assert_eq!(unspent.len(), 1);
+        assert_eq!(unspent[0].0, OutPoint::new(txid, 0));
+        let methods: Vec<String> = requests
+            .lock()
+            .expect("recorded requests lock")
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default().to_string())
+            .collect();
+        for forbidden in ["scantxoutset", "createwallet", "importdescriptors"] {
+            assert!(
+                !methods.iter().any(|method| method == forbidden),
+                "a restart must not {forbidden}; issued {methods:?}"
+            );
+        }
+    }
+
+    /// A process that was offline during a reorg has no in-memory cache anchor to
+    /// compare. The completion marker persists the cold scan's anchor in Core's
+    /// wallet, so the fresh process still detects the stale wallet and takes the
+    /// full-scan fallback before serving it.
+    #[test]
+    fn a_restart_after_an_offline_reorg_falls_back_before_using_the_wallet() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let vault_desc = format!("raw({script_hex})#abcdefgh");
+        let old_tip = "aa".repeat(32);
+        let replacement_at_old_height = "bb".repeat(32);
+        let new_tip = "cc".repeat(32);
+        let old_marker = completion_marker(20, &old_tip);
+        let new_marker = completion_marker(30, &new_tip);
+        let txid = Txid::from_byte_array([0x44; 32]);
+        let old_wallet = serde_json::json!({"descriptors": [
+            {"desc": vault_desc.clone()},
+            {"desc": old_marker.clone()},
+        ]});
+        let repaired_wallet = serde_json::json!({"descriptors": [
+            {"desc": vault_desc.clone()},
+            {"desc": old_marker},
+            {"desc": new_marker.clone()},
+        ]});
+        let watch_only = serde_json::json!({"private_keys_enabled": false});
+        let replies = vec![
+            // Fresh process: the persisted marker's block is no longer active.
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            ("getwalletinfo", watch_only.clone()),
+            ("listdescriptors", old_wallet.clone()),
+            ("getblockhash", serde_json::json!(replacement_at_old_height)),
+            // The wallet is not read. A cold scan finds the resurrected output.
+            (
+                "scantxoutset",
+                serde_json::json!({
+                    "success": true,
+                    "bestblock": new_tip,
+                    "unspents": [{"txid": txid.to_string(), "vout": 0, "height": 4}],
+                }),
+            ),
+            ("getblockheader", serde_json::json!({"height": 30})),
+            ("getblockhash", serde_json::json!(new_tip)),
+            // Seeding recognizes the owned-but-stale wallet and repairs it.
+            (
+                "loadwallet",
+                serde_json::json!({"__error": {"code": -35, "message": "already loaded"}}),
+            ),
+            ("getwalletinfo", watch_only),
+            ("listdescriptors", old_wallet),
+            ("getblockhash", serde_json::json!(replacement_at_old_height)),
+            ("getblockhash", serde_json::json!("04".repeat(32))),
+            (
+                "getblockheader",
+                serde_json::json!({"time": 1_700_000_000u64}),
+            ),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": vault_desc}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": new_marker}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            ("listdescriptors", repaired_wallet),
+        ];
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        backend
+            .refresh_vault_unspent_cache(std::slice::from_ref(&script))
+            .expect("the stale wallet degrades to the scan and is repaired");
+        server.join().expect("scripted RPC completed");
+
+        let requests = requests.lock().expect("recorded requests lock");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "scantxoutset")
+                .count(),
+            1,
+            "the offline reorg must force one reconciliation scan"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request["method"] == "listunspent"),
+            "the stale wallet must not serve before the repair"
+        );
+    }
+
+    /// Re-loading a stale owned wallet during a latched reorg repair must import each
+    /// descriptor set exactly once. `verify_vault_wallet` performs the repair while
+    /// locating the handle; `seed_vault_wallet` must observe that the latch was cleared
+    /// rather than repeating the same potentially long rescan.
+    #[test]
+    fn locating_a_stale_wallet_does_not_repeat_the_same_repair_import() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let vault_desc = format!("raw({script_hex})#abcdefgh");
+        let old_tip = "aa".repeat(32);
+        let replacement = "bb".repeat(32);
+        let new_tip = "cc".repeat(32);
+        let old_marker = completion_marker(20, &old_tip);
+        let new_marker = completion_marker(31, &new_tip);
+        let replies = vec![
+            (
+                "loadwallet",
+                serde_json::json!({"__error": {"code": -35, "message": "already loaded"}}),
+            ),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": vault_desc.clone()},
+                    {"desc": old_marker.clone()},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(replacement)),
+            ("getblockhash", serde_json::json!("04".repeat(32))),
+            (
+                "getblockheader",
+                serde_json::json!({"time": 1_700_000_000u64}),
+            ),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": vault_desc.clone()}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": new_marker.clone()}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": vault_desc},
+                    {"desc": old_marker},
+                    {"desc": new_marker},
+                ]}),
+            ),
+        ];
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        *backend
+            .wallet_reimport_pending
+            .lock()
+            .expect("wallet reimport lock poisoned") = true;
+        let cold = ColdScan {
+            cache: VaultUnspentCache {
+                bestblock: new_tip.parse().expect("new tip"),
+                height: 31,
+                scripts: vec![script.clone()],
+                candidates: HashSet::new(),
+            },
+            oldest_unspent_height: 4,
+        };
+
+        backend
+            .seed_vault_wallet(std::slice::from_ref(&script), &cold)
+            .expect("one repair establishes the wallet");
+        server.join().expect("scripted RPC completed");
+
+        let requests = requests.lock().expect("recorded requests lock");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "importdescriptors")
+                .count(),
+            2,
+            "repair imports the vault descriptor set and completion marker once each"
+        );
+        assert!(
+            !*backend
+                .wallet_reimport_pending
+                .lock()
+                .expect("wallet reimport lock poisoned"),
+            "a completed repair clears the latch before seed_vault_wallet resumes"
+        );
+    }
+
+    /// LOAD-BEARING (bead btc-policy-hn8, constraints 1 and 3): a reorg below the
+    /// WALLET's completion anchor latches the wallet OUT until a re-import repairs it.
+    ///
+    /// A reorg can un-spend a vault output created before the wallet's birthday, in a
+    /// dropped block, by a transaction that paid the vault nothing — so the wallet
+    /// neither watched the output nor holds the transaction, and no wallet-only read
+    /// can ever surface it again. That is a permanent under-report of the coverage
+    /// denominator, i.e. permanently INFLATED escape coverage. `scantxoutset` has no
+    /// such blind spot, so the reorg pass takes it and re-imports the descriptors from
+    /// the birthday that fresh scan proves; only then does the wallet serve again.
+    #[test]
+    fn a_reorg_below_the_wallet_anchor_latches_the_wallet_out_until_it_is_re_imported() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let vault_desc = format!("raw({script_hex})#abcdefgh");
+        let tip = "ef".repeat(32);
+        let reorged_tip = "fe".repeat(32);
+        let txid = Txid::from_byte_array([0x44; 32]);
+        let unspent = serde_json::json!([
+            {"txid": txid.to_string(), "vout": 0, "scriptPubKey": script_hex},
+        ]);
+        let replies = vec![
+            // Pass 1 — no cache yet, so no reorg to detect; the wallet serves and
+            // anchors the cache at height 31.
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": vault_desc.clone()},
+                    {"desc": completion_marker(31, &tip)},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(tip)),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("listunspent", unspent.clone()),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": tip}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(tip)),
+            // Post-read anchor re-check, against the marker this handle verified.
+            ("getblockhash", serde_json::json!(tip)),
+            // Pass 2 — height 31, where this wallet's completion marker sits, now holds
+            // a DIFFERENT block, so the wallet may be blind to what the reorg
+            // resurrected. No `listunspent` may appear until the repair lands.
+            ("getblockhash", serde_json::json!(reorged_tip)),
+            (
+                "scantxoutset",
+                serde_json::json!({
+                    "success": true,
+                    "bestblock": reorged_tip,
+                    "unspents": [{"txid": txid.to_string(), "vout": 0, "height": 4}],
+                }),
+            ),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(reorged_tip)),
+            // The repair: re-import from the birthday the fresh scan proves, even
+            // though this wallet already verified as complete.
+            ("getblockhash", serde_json::json!("04".repeat(32))),
+            (
+                "getblockheader",
+                serde_json::json!({"time": 1_700_000_000u64}),
+            ),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": vault_desc}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": completion_marker(31, &reorged_tip)}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            // Pass 3 — repaired, so the wallet serves again and the scan is gone.
+            ("getblockhash", serde_json::json!(reorged_tip)),
+            ("getbestblockhash", serde_json::json!(reorged_tip)),
+            ("listunspent", unspent),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": reorged_tip}),
+            ),
+            ("getbestblockhash", serde_json::json!(reorged_tip)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(reorged_tip)),
+            // …and re-proves the warm cache anchor after that read.
+            ("getblockhash", serde_json::json!(reorged_tip)),
+        ];
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&script);
+
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the wallet serves the first pass");
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the reorg pass falls back to the scan and repairs the wallet");
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the repaired wallet serves again");
+        server.join().expect("scripted RPC completed");
+
+        // The cache still holds the vault's coin: a reorg degrades this node to the
+        // slow source, never to an empty vault.
+        let cached = backend.scan_cache.lock().expect("scan cache lock poisoned");
+        assert_eq!(
+            cached.as_ref().expect("a warm cache").candidates,
+            HashSet::from([OutPoint::new(txid, 0)])
+        );
+        let methods: Vec<String> = requests
+            .lock()
+            .expect("recorded requests lock")
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let scan = methods
+            .iter()
+            .position(|method| method == "scantxoutset")
+            .expect("the reorg pass scanned");
+        let repair = methods
+            .iter()
+            .position(|method| method == "importdescriptors")
+            .expect("the reorg pass re-imported the descriptors");
+        let served_again = methods
+            .iter()
+            .rposition(|method| method == "listunspent")
+            .expect("the wallet served again");
+        assert!(
+            scan < repair && repair < served_again,
+            "the wallet may only serve again AFTER the repair: {methods:?}"
+        );
+        assert_eq!(
+            methods.iter().filter(|m| *m == "listunspent").count(),
+            2,
+            "the reorg pass itself must not read the wallet: {methods:?}"
+        );
+    }
+
+    /// The other side of that guard: a reorg ABOVE the wallet's completion anchor —
+    /// the routine 1-block kind — must NOT latch, must not scan, and must not
+    /// re-import.
+    ///
+    /// A block hash commits to its whole ancestry, so while height 31 still holds the
+    /// marker's block nothing at or below 31 has moved: every output such a reorg can
+    /// resurrect was unspent at 31, hence at or after the birthday that marker's import
+    /// proved, hence already watched. Latching on the last pass's tip instead would pay
+    /// a whole-set scan AND an `importdescriptors` rescan of the vault's history for
+    /// every one-block reorg — and `confirmed_candidates` refuses every fire-time read
+    /// until that finishes, so the fail-closed cost of over-latching is an escape-path
+    /// outage on a routine chain event.
+    #[test]
+    fn a_reorg_above_the_wallet_anchor_is_reconciled_by_the_wallet_without_a_scan() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let marker_block = "31".repeat(32);
+        let tip_a = "ef".repeat(32);
+        let tip_b = "fe".repeat(32);
+        let held = OutPoint::new(Txid::from_byte_array([0x44; 32]), 0);
+        let unspent = serde_json::json!([
+            {"txid": held.txid.to_string(), "vout": held.vout, "scriptPubKey": script_hex},
+        ]);
+        let replies = vec![
+            // Pass 1 — the wallet serves and anchors the CACHE at (40, tip_a), while
+            // the wallet's own completion anchor stays at (31, marker_block).
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": format!("raw({script_hex})#abcdefgh")},
+                    {"desc": completion_marker(31, &marker_block)},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(marker_block)),
+            ("getbestblockhash", serde_json::json!(tip_a)),
+            ("listunspent", unspent.clone()),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": tip_a}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip_a)),
+            ("getblockheader", serde_json::json!({"height": 40})),
+            ("getblockhash", serde_json::json!(tip_a)),
+            ("getblockhash", serde_json::json!(marker_block)),
+            // Pass 2 — a reorg replaced the block at height 40, so the CACHE anchor is
+            // gone; the marker at 31 is untouched, so the wallet still serves. It is
+            // handed the orphaned anchor as `listsinceblock`'s `since`, which Core
+            // answers from the fork point.
+            ("getblockhash", serde_json::json!(marker_block)),
+            ("getbestblockhash", serde_json::json!(tip_b)),
+            ("listunspent", unspent),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": tip_b}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip_b)),
+            ("getblockheader", serde_json::json!({"height": 40})),
+            ("getblockhash", serde_json::json!(tip_b)),
+            ("getblockhash", serde_json::json!(marker_block)),
+        ];
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&script);
+
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the wallet serves the first pass");
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("a reorg above the wallet anchor is served by the wallet too");
+        server.join().expect("scripted RPC completed");
+
+        let cached = backend.scan_cache.lock().expect("scan cache lock poisoned");
+        let cached = cached.as_ref().expect("a warm cache");
+        assert_eq!(cached.candidates, HashSet::from([held]));
+        assert_eq!(
+            (cached.height, cached.bestblock.to_string()),
+            (40, tip_b),
+            "the cache re-anchors on the new chain"
+        );
+        assert_eq!(
+            backend.full_scan_count(),
+            0,
+            "a reorg the wallet can see through costs no whole-set scan"
+        );
+        let requests = requests.lock().expect("recorded requests lock");
+        let methods: Vec<String> = requests
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default().to_string())
+            .collect();
+        for forbidden in ["scantxoutset", "importdescriptors", "createwallet"] {
+            assert!(
+                !methods.iter().any(|method| method == forbidden),
+                "a reorg above the wallet anchor must not {forbidden}: {methods:?}"
+            );
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "listsinceblock")
+                .filter_map(|request| request["params"][0].as_str().map(str::to_string))
+                .collect::<Vec<String>>(),
+            vec![tip_a],
+            "the second pass asks Core to reconcile from the orphaned cache anchor"
+        );
+    }
+
+    /// A repair that FAILS keeps the wallet latched out and is retried on the next
+    /// pass. The latch is what makes the reorg guard fail closed: while it is set the
+    /// pass takes the full scan even from a live cache anchor, because only that scan
+    /// re-derives the birthday the repair needs. Without the retry a single failed
+    /// import would pin this node to `scantxoutset` for the rest of its life.
+    #[test]
+    fn a_failed_repair_keeps_the_wallet_out_until_a_later_pass_succeeds() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let vault_desc = format!("raw({script_hex})#abcdefgh");
+        let tip = "ef".repeat(32);
+        let reorged_tip = "fe".repeat(32);
+        let txid = Txid::from_byte_array([0x44; 32]);
+        let unspent = serde_json::json!([
+            {"txid": txid.to_string(), "vout": 0, "scriptPubKey": script_hex},
+        ]);
+        let scan = || {
+            serde_json::json!({
+                "success": true,
+                "bestblock": reorged_tip,
+                "unspents": [{"txid": txid.to_string(), "vout": 0, "height": 4}],
+            })
+        };
+        // The scan, its anchor check, and the birthday read that opens every repair.
+        let scan_and_birthday = || {
+            vec![
+                ("scantxoutset", scan()),
+                ("getblockheader", serde_json::json!({"height": 31})),
+                ("getblockhash", serde_json::json!(reorged_tip)),
+                ("getblockhash", serde_json::json!("04".repeat(32))),
+                (
+                    "getblockheader",
+                    serde_json::json!({"time": 1_700_000_000u64}),
+                ),
+                (
+                    "getdescriptorinfo",
+                    serde_json::json!({"descriptor": vault_desc.clone()}),
+                ),
+            ]
+        };
+        let mut replies = vec![
+            // Pass 1 — the wallet serves and anchors the cache at height 31.
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": vault_desc.clone()},
+                    {"desc": completion_marker(31, &tip)},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(tip)),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("listunspent", unspent.clone()),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": tip}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(tip)),
+            // Post-read anchor re-check, against the marker this handle verified.
+            ("getblockhash", serde_json::json!(tip)),
+            // Pass 2 — a reorg below the anchor; the repair's import FAILS.
+            ("getblockhash", serde_json::json!(reorged_tip)),
+        ];
+        replies.extend(scan_and_birthday());
+        replies.push((
+            "importdescriptors",
+            serde_json::json!([{"success": false, "error": {"code": -1, "message": "aborted"}}]),
+        ));
+        // Pass 3 — the anchor is live again, so nothing here re-detects the reorg: only
+        // the latch keeps the wallet out and drives the full scan that retries the
+        // repair. This time it lands.
+        replies.push(("getblockhash", serde_json::json!(reorged_tip)));
+        replies.extend(scan_and_birthday());
+        replies.extend([
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": completion_marker(31, &reorged_tip)}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            // Pass 4 — repaired, so the wallet serves again.
+            ("getblockhash", serde_json::json!(reorged_tip)),
+            ("getbestblockhash", serde_json::json!(reorged_tip)),
+            ("listunspent", unspent),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": reorged_tip}),
+            ),
+            ("getbestblockhash", serde_json::json!(reorged_tip)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(reorged_tip)),
+            // …and re-proves the warm cache anchor after that read.
+            ("getblockhash", serde_json::json!(reorged_tip)),
+        ]);
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&script);
+
+        for pass in 1..=4 {
+            backend
+                .refresh_vault_unspent_cache(scripts)
+                .unwrap_or_else(|e| panic!("pass {pass} must still warm the cache: {e}"));
+        }
+        server.join().expect("scripted RPC completed");
+
+        let methods: Vec<String> = requests
+            .lock()
+            .expect("recorded requests lock")
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            methods.iter().filter(|m| *m == "scantxoutset").count(),
+            2,
+            "the failed repair must be retried by a second scan: {methods:?}"
+        );
+        assert_eq!(
+            methods.iter().filter(|m| *m == "listunspent").count(),
+            2,
+            "the wallet serves only before the reorg and after the repair: {methods:?}"
+        );
+    }
+
+    /// A wallet whose build was interrupted before the completion marker landed — a
+    /// rescan cut short in an earlier process generation — is FINISHED by the
+    /// cold-scan seeding path rather than abandoned. Without this the node would
+    /// refuse its own half-built wallet forever and never leave the `scantxoutset`
+    /// fallback.
+    #[test]
+    fn an_interrupted_wallet_build_is_finished_by_the_next_cold_scan() {
+        let fixture = VaultViewFixture::new();
+        let vault_desc = format!("raw({})#abcdefgh", fixture.script_hex());
+        let unmarked = serde_json::json!({"descriptors": [{"desc": vault_desc.clone()}]});
+        let complete = serde_json::json!({"descriptors": [
+            {"desc": vault_desc.clone()},
+            {"desc": completion_marker(12, &fixture.tip)},
+        ]});
+        let watch_only = serde_json::json!({"private_keys_enabled": false});
+        let mut replies = vec![
+            // The wallet read finds the half-built wallet and refuses it: no birthday
+            // here, so it cannot be finished, and the scan fallback runs.
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            ("getwalletinfo", watch_only.clone()),
+            ("listdescriptors", unmarked.clone()),
+            ("scantxoutset", fixture.scan()),
+            ("getblockheader", serde_json::json!({"height": 12})),
+            ("getblockhash", serde_json::json!(fixture.tip)),
+            // Seeding, now WITH a birthday: the wallet is already loaded, is watch-only,
+            // and holds a subset of what this node imports — so finish the build.
+            (
+                "loadwallet",
+                serde_json::json!({"__error": {"code": -35, "message": "already loaded"}}),
+            ),
+            ("getwalletinfo", watch_only),
+            ("listdescriptors", unmarked),
+            ("getblockhash", serde_json::json!("09".repeat(32))),
+            (
+                "getblockheader",
+                serde_json::json!({"time": 1_700_000_000u64}),
+            ),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": vault_desc}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": completion_marker(12, &fixture.tip)}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            ("listdescriptors", complete),
+        ];
+        replies.extend(fixture.read_replies());
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&fixture.script);
+
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the cold scan warms the cache and finishes the wallet");
+        let authorized = HashSet::from([fixture.authorized.compute_txid()]);
+        let unspent = backend
+            .vault_unspent(scripts, &authorized)
+            .expect("vault unspent");
+        server.join().expect("scripted RPC completed");
+
+        assert_eq!(unspent.len(), 3, "the scan still served this pass");
+        let requests = requests.lock().expect("recorded requests lock");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request["method"] == "createwallet"),
+            "an existing wallet is finished, never re-created"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "importdescriptors")
+                .count(),
+            2,
+            "the vault descriptors are re-imported from the birthday, then the marker"
+        );
+    }
+
+    /// The repair is bounded by a SUBSET test, so a wallet holding anything this node
+    /// would not import is left completely alone — no import, no balance read.
+    #[test]
+    fn a_wallet_holding_a_foreign_descriptor_is_never_repaired() {
+        let fixture = VaultViewFixture::new();
+        let foreign = serde_json::json!({"descriptors": [
+            {"desc": format!("raw({})#abcdefgh", fixture.script_hex())},
+            {"desc": "wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#5cwmnzsm"},
+        ]});
+        let watch_only = serde_json::json!({"private_keys_enabled": false});
+        let mut replies = vec![
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            ("getwalletinfo", watch_only.clone()),
+            ("listdescriptors", foreign.clone()),
+            ("scantxoutset", fixture.scan()),
+            ("getblockheader", serde_json::json!({"height": 12})),
+            ("getblockhash", serde_json::json!(fixture.tip)),
+            // Seeding sees the same foreign wallet and, having a birthday, still
+            // refuses: the subset test fails, so nothing is imported into it.
+            (
+                "loadwallet",
+                serde_json::json!({"__error": {"code": -35, "message": "already loaded"}}),
+            ),
+            ("getwalletinfo", watch_only),
+            ("listdescriptors", foreign),
+        ];
+        replies.extend(fixture.read_replies());
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&fixture.script);
+
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the scan serves even though the wallet is unusable");
+        let authorized = HashSet::from([fixture.authorized.compute_txid()]);
+        let unspent = backend
+            .vault_unspent(scripts, &authorized)
+            .expect("vault unspent");
+        server.join().expect("scripted RPC completed");
+
+        assert_eq!(
+            unspent.len(),
+            3,
+            "the scan reports the whole vault; the foreign wallet reports nothing"
+        );
+        assert!(
+            !requests
+                .lock()
+                .expect("recorded requests lock")
+                .iter()
+                .any(|request| request["method"] == "importdescriptors"),
+            "a wallet this node did not build must never be written to"
+        );
+    }
+
+    /// The vault's script is PUBLIC, so anyone may pay it. Such a deposit is
+    /// credit-only: it holds no vault prevout that `listunspent` could be hiding, so
+    /// nothing about it belongs in the confirmed-candidate set. Expanding it anyway
+    /// would hand an attacker a cheap lever on the FIRE path — every input of every
+    /// unconfirmed deposit would land in the batched `gettxout` that the coverage read
+    /// must finish inside the combine window — and one `gettransaction` per deposit on
+    /// every refresh besides.
+    ///
+    /// `scripted_rpc` serves an exact method sequence, so the absence of a
+    /// `gettransaction` reply for the deposit is itself the assertion: expanding it
+    /// fails this test.
+    #[test]
+    fn an_unconfirmed_deposit_to_the_vault_does_not_expand_the_candidate_set() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let tip = "ef".repeat(32);
+        let held = OutPoint::new(Txid::from_byte_array([0x11; 32]), 0);
+        let spent = OutPoint::new(Txid::from_byte_array([0x22; 32]), 0);
+        // The vault's own unconfirmed spend, which DOES hide a vault output.
+        let spend = tx_spending(&[spent], 90_000, 1);
+        // An unrelated deposit paying the vault, carrying many inputs of its own.
+        let deposit_inputs: Vec<OutPoint> = (0..16)
+            .map(|i| OutPoint::new(Txid::from_byte_array([0x90 + i as u8; 32]), i))
+            .collect();
+        let mut deposit = tx_spending(&deposit_inputs, 10_000, 2);
+        deposit.output[0].script_pubkey = script.clone();
+        let replies = vec![
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": format!("raw({script_hex})#abcdefgh")},
+                    {"desc": completion_marker(31, &tip)},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(tip)),
+            ("getbestblockhash", serde_json::json!(tip)),
+            (
+                "listunspent",
+                serde_json::json!([
+                    {"txid": held.txid.to_string(), "vout": held.vout, "scriptPubKey": script_hex},
+                ]),
+            ),
+            (
+                "listsinceblock",
+                serde_json::json!({
+                    "transactions": [
+                        {
+                            "txid": deposit.compute_txid().to_string(),
+                            "vout": 0,
+                            "category": "receive",
+                            "confirmations": 0,
+                        },
+                        {
+                            "txid": spend.compute_txid().to_string(),
+                            "vout": 0,
+                            "category": "send",
+                            "confirmations": 0,
+                        },
+                    ],
+                    "lastblock": tip,
+                }),
+            ),
+            // Exactly one expansion: the vault-debiting spend.
+            (
+                "gettransaction",
+                serde_json::json!({"decoded": {"vin": [
+                    {"txid": spent.txid.to_string(), "vout": spent.vout},
+                ]}}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(tip)),
+            ("getblockhash", serde_json::json!(tip)),
+        ];
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        backend
+            .refresh_vault_unspent_cache(std::slice::from_ref(&script))
+            .expect("the wallet serves this pass");
+        server.join().expect("scripted RPC completed");
+
+        let cached = backend.scan_cache.lock().expect("scan cache lock poisoned");
+        assert_eq!(
+            cached.as_ref().expect("a warm cache").candidates,
+            HashSet::from([held, spent]),
+            "the vault's own held and mempool-hidden outputs, and nothing the deposit dragged in"
+        );
+        let expanded: Vec<serde_json::Value> = requests
+            .lock()
+            .expect("recorded requests lock")
+            .iter()
+            .filter(|request| request["method"] == "gettransaction")
+            .map(|request| request["params"][0].clone())
+            .collect();
+        assert_eq!(
+            expanded,
+            vec![serde_json::json!(spend.compute_txid().to_string())],
+            "only vault-debiting transactions are read; a deposit costs no RPC at all"
+        );
+    }
+
+    /// The carried-forward candidate set must SHRINK when the chain spends a vault
+    /// output, not just grow. `listunspent` simply stops reporting a spent output, and
+    /// the union with the previous cache (and, after a restart, with every confirmed
+    /// credit in the wallet's whole history) would otherwise put it back forever — so
+    /// the fire path's batched `gettxout`, the one read that must finish inside the
+    /// combine window, would scale with LIFETIME deposits instead of live outputs.
+    /// Only a confirmed debit prunes: an unconfirmed one is still expanded, because
+    /// its spender can leave the mempool and the chain still holds the output.
+    #[test]
+    fn a_confirmed_vault_spend_prunes_the_outputs_it_consumed() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let tip_a = "ef".repeat(32);
+        let tip_b = "fe".repeat(32);
+        let first = OutPoint::new(Txid::from_byte_array([0x11; 32]), 0);
+        let second = OutPoint::new(Txid::from_byte_array([0x22; 32]), 0);
+        // A confirmed vault spend consuming both, paying the vault back once.
+        let spend = tx_spending(&[first, second], 190_000, 1);
+        let change = OutPoint::new(spend.compute_txid(), 0);
+        let both = serde_json::json!([
+            {"txid": first.txid.to_string(), "vout": first.vout, "scriptPubKey": script_hex},
+            {"txid": second.txid.to_string(), "vout": second.vout, "scriptPubKey": script_hex},
+        ]);
+        let replies = vec![
+            // Pass 1 — the wallet reports both outputs and anchors the cache at tip_a.
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": format!("raw({script_hex})#abcdefgh")},
+                    {"desc": completion_marker(31, &tip_a)},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(tip_a)),
+            ("getbestblockhash", serde_json::json!(tip_a)),
+            ("listunspent", both),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": tip_a}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip_a)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(tip_a)),
+            ("getblockhash", serde_json::json!(tip_a)),
+            // Pass 2 — the spend confirmed. `listunspent` now reports only its change,
+            // and wallet history carries the confirmed debit plus the credit it paid.
+            ("getblockhash", serde_json::json!(tip_a)),
+            ("getbestblockhash", serde_json::json!(tip_b)),
+            (
+                "listunspent",
+                serde_json::json!([
+                    {"txid": change.txid.to_string(), "vout": change.vout, "scriptPubKey": script_hex},
+                ]),
+            ),
+            (
+                "listsinceblock",
+                serde_json::json!({
+                    "transactions": [
+                        {
+                            "txid": spend.compute_txid().to_string(),
+                            "vout": 0,
+                            "category": "send",
+                            "confirmations": 1,
+                        },
+                        {
+                            "txid": spend.compute_txid().to_string(),
+                            "vout": 0,
+                            "category": "receive",
+                            "confirmations": 1,
+                        },
+                    ],
+                    "lastblock": tip_b,
+                }),
+            ),
+            // The confirmed debit is read for its inputs, exactly like an unconfirmed
+            // one — but to REMOVE them.
+            (
+                "gettransaction",
+                serde_json::json!({"decoded": {"vin": [
+                    {"txid": first.txid.to_string(), "vout": first.vout},
+                    {"txid": second.txid.to_string(), "vout": second.vout},
+                ]}}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip_b)),
+            ("getblockheader", serde_json::json!({"height": 32})),
+            ("getblockhash", serde_json::json!(tip_b)),
+            ("getblockhash", serde_json::json!(tip_a)),
+        ];
+        let (addr, server) = scripted_rpc(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&script);
+
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the wallet serves the first pass");
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the wallet serves the pass that sees the spend confirm");
+        server.join().expect("scripted RPC completed");
+
+        assert_eq!(
+            backend
+                .scan_cache
+                .lock()
+                .expect("scan cache lock poisoned")
+                .as_ref()
+                .expect("a warm cache")
+                .candidates,
+            HashSet::from([change]),
+            "the two consumed outputs must be gone, not carried forward forever"
+        );
+    }
+
+    /// The endpoint tip comparison alone cannot detect A→B→A around `listunspent`.
+    /// Here that call returns B's empty view while both endpoint reads see A. Core's
+    /// `listsinceblock` response is modeled at A: its transaction list and `lastblock`
+    /// come from one wallet-locked snapshot, so the confirmed A output is restored and
+    /// the cache cannot be published empty.
+    #[test]
+    fn an_aba_reorg_around_listunspent_cannot_understate_the_vault_cache() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let tip_a = "ef".repeat(32);
+        let held = OutPoint::new(Txid::from_byte_array([0x44; 32]), 0);
+        let replies = vec![
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": format!("raw({script_hex})#abcdefgh")},
+                    {"desc": completion_marker(31, &tip_a)},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(tip_a)),
+            // Endpoint A before the wallet read.
+            ("getbestblockhash", serde_json::json!(tip_a)),
+            // The interleaved B snapshot omits A's output.
+            ("listunspent", serde_json::json!([])),
+            // Wallet processing has returned to A. The all-history read restores the
+            // confirmed credit and binds it to A in this same RPC response.
+            (
+                "listsinceblock",
+                serde_json::json!({
+                    "transactions": [{
+                        "txid": held.txid.to_string(),
+                        "vout": held.vout,
+                        "category": "receive",
+                        "confirmations": 6,
+                    }],
+                    "lastblock": tip_a,
+                }),
+            ),
+            // Endpoint A again: the old bracket alone would accept the empty view.
+            ("getbestblockhash", serde_json::json!(tip_a)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(tip_a)),
+            ("getblockhash", serde_json::json!(tip_a)),
+        ];
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+
+        backend
+            .refresh_vault_unspent_cache(std::slice::from_ref(&script))
+            .expect("the wallet-anchored history reconciles the ABA read");
+        server.join().expect("scripted RPC completed");
+
+        assert_eq!(
+            backend
+                .scan_cache
+                .lock()
+                .expect("scan cache lock poisoned")
+                .as_ref()
+                .expect("a warm cache")
+                .candidates,
+            HashSet::from([held]),
+            "the A output omitted by listunspent must remain in the A-anchored cache"
+        );
+        let requests = requests.lock().expect("recorded requests lock");
+        let history = requests
+            .iter()
+            .find(|request| request["method"] == "listsinceblock")
+            .expect("wallet history request");
+        assert!(
+            history["params"][0].is_null(),
+            "a restart has no in-memory candidate superset, so it must read all wallet history"
+        );
+    }
+
+    /// The reorg check that keeps a wallet-blind view out of the cache runs BEFORE the
+    /// wallet read, so it must be re-proved after it. A reorg landing inside that window
+    /// is not a transient loss: the blind result would be installed anchored to the NEW
+    /// tip, every later pass would find that anchor active, the latch would never fire,
+    /// and the resurrected pre-birthday output would be missing from the protected
+    /// balance for good — permanently INFLATED escape coverage.
+    #[test]
+    fn a_reorg_landing_while_the_wallet_is_read_discards_that_read() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let vault_desc = format!("raw({script_hex})#abcdefgh");
+        let tip = "ef".repeat(32);
+        let new_tip = "fe".repeat(32);
+        let replacement_at_31 = "dc".repeat(32);
+        let held = OutPoint::new(Txid::from_byte_array([0x44; 32]), 0);
+        // Older than the wallet's birthday, so only the scan can see it once the reorg
+        // un-spends it. This is the output the wallet is blind to.
+        let resurrected = OutPoint::new(Txid::from_byte_array([0x55; 32]), 1);
+        let unspent = serde_json::json!([
+            {"txid": held.txid.to_string(), "vout": held.vout, "scriptPubKey": script_hex},
+        ]);
+        let replies = vec![
+            // Pass 1 — the wallet serves and anchors the cache at (31, tip).
+            ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+            (
+                "getwalletinfo",
+                serde_json::json!({"private_keys_enabled": false}),
+            ),
+            (
+                "listdescriptors",
+                serde_json::json!({"descriptors": [
+                    {"desc": vault_desc.clone()},
+                    {"desc": completion_marker(31, &tip)},
+                ]}),
+            ),
+            ("getblockhash", serde_json::json!(tip)),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("listunspent", unspent.clone()),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": tip}),
+            ),
+            ("getbestblockhash", serde_json::json!(tip)),
+            ("getblockheader", serde_json::json!({"height": 31})),
+            ("getblockhash", serde_json::json!(tip)),
+            ("getblockhash", serde_json::json!(tip)),
+            // Pass 2 — the pre-read check still sees height 31 holding `tip`, so the
+            // wallet is read. The reorg lands DURING that read: it replaces 31 and
+            // builds to 32, which the read's own bracket accepts as a stable tip.
+            ("getblockhash", serde_json::json!(tip)),
+            ("getbestblockhash", serde_json::json!(new_tip)),
+            ("listunspent", unspent),
+            (
+                "listsinceblock",
+                serde_json::json!({"transactions": [], "lastblock": new_tip}),
+            ),
+            ("getbestblockhash", serde_json::json!(new_tip)),
+            ("getblockheader", serde_json::json!({"height": 32})),
+            ("getblockhash", serde_json::json!(new_tip)),
+            // The post-read re-check of the SAME anchor: height 31 has changed.
+            ("getblockhash", serde_json::json!(replacement_at_31)),
+            // So the wallet's answer is discarded and the scan re-derives the truth,
+            // including the output the reorg resurrected below the wallet's birthday.
+            (
+                "scantxoutset",
+                serde_json::json!({
+                    "success": true,
+                    "bestblock": new_tip,
+                    "unspents": [
+                        {"txid": held.txid.to_string(), "vout": held.vout, "height": 20},
+                        {
+                            "txid": resurrected.txid.to_string(),
+                            "vout": resurrected.vout,
+                            "height": 4,
+                        },
+                    ],
+                }),
+            ),
+            ("getblockheader", serde_json::json!({"height": 32})),
+            ("getblockhash", serde_json::json!(new_tip)),
+            // …and the descriptors are re-imported from that fresh birthday.
+            ("getblockhash", serde_json::json!("04".repeat(32))),
+            (
+                "getblockheader",
+                serde_json::json!({"time": 1_700_000_000u64}),
+            ),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": vault_desc}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+            (
+                "getdescriptorinfo",
+                serde_json::json!({"descriptor": completion_marker(32, &new_tip)}),
+            ),
+            ("importdescriptors", serde_json::json!([{"success": true}])),
+        ];
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&script);
+
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the wallet serves the first pass");
+        backend
+            .refresh_vault_unspent_cache(scripts)
+            .expect("the raced pass falls back to the scan");
+        server.join().expect("scripted RPC completed");
+
+        let cached = backend.scan_cache.lock().expect("scan cache lock poisoned");
+        let cached = cached.as_ref().expect("a warm cache");
+        assert_eq!(
+            cached.candidates,
+            HashSet::from([held, resurrected]),
+            "the installed cache must be the scan's, which sees the resurrected output"
+        );
+        assert_eq!(
+            (cached.height, cached.bestblock.to_string()),
+            (32, new_tip),
+            "and it must be anchored where the scan proved it, not where the wallet read"
+        );
+        assert!(
+            requests
+                .lock()
+                .expect("recorded requests lock")
+                .iter()
+                .any(|request| request["method"] == "importdescriptors"),
+            "the raced read must also latch the wallet out until it is re-imported"
+        );
+    }
+
+    /// The live refresher must RETURN after publishing the cold scan's cache, without
+    /// waiting for the wallet build it seeds. `importdescriptors` is budgeted in
+    /// minutes, and a reorg below the wallet anchor forces the same build path — so
+    /// merely publishing before a synchronous build is insufficient: the one refresher
+    /// could not advance that cache when the next block lands. The gate suspends the
+    /// background seed inside `createwallet`; reaching it after the live refresh already
+    /// returned proves the slow work no longer occupies the refresher.
+    #[test]
+    fn the_live_refresher_returns_after_publishing_before_the_wallet_build() {
+        let fixture = VaultViewFixture::new();
+        let (hit_tx, hit_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (addr, server, _) = scripted_rpc_gated(
+            fixture.scan_replies(),
+            Some(("createwallet", hit_tx, resume_rx)),
+        );
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = vec![fixture.script.clone()];
+
+        backend
+            .refresh_vault_unspent_cache_live(&scripts)
+            .expect("the live refresh returns after publishing the cold cache");
+        hit_rx
+            .recv()
+            .expect("the background seed reached the wallet build");
+        let candidates = backend
+            .scan_cache
+            .lock()
+            .expect("scan cache lock poisoned")
+            .as_ref()
+            .map(|cache| cache.candidates.clone());
+        resume_tx.send(()).expect("release the wallet build");
+        server.join().expect("scripted RPC completed");
+        while backend.wallet_reimport_in_progress.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        assert_eq!(
+            candidates,
+            Some(HashSet::from([
+                fixture.confirmed,
+                fixture.mempool_spent,
+                fixture.evicted_spent,
+            ])),
+            "the whole scan-derived vault view must already be serving mid-build"
+        );
+    }
+
+    /// Once a cold reorg scan has launched the slow descriptor repair, later live
+    /// passes must keep its complete scan-derived cache at the active tip. Otherwise
+    /// `confirmed_candidates` rejects the cache at the first new block and no escape
+    /// can pass coverage until the up-to-ten-minute import returns.
+    #[test]
+    fn a_background_wallet_repair_does_not_stop_scan_cache_delta_advancement() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let old_tip = "ab".repeat(32);
+        let new_tip = "cd".repeat(32);
+        let held = OutPoint::new(Txid::from_byte_array([0x44; 32]), 0);
+        let replies = vec![
+            // The cached scan anchor is still active.
+            ("getblockhash", serde_json::json!(old_tip)),
+            ("getblockcount", serde_json::json!(32)),
+            ("getblockhash", serde_json::json!(new_tip)),
+            (
+                "getblock",
+                serde_json::json!({
+                    "previousblockhash": old_tip,
+                    "tx": [],
+                }),
+            ),
+            // Transactional terminal check for the delta, then the fire-time tip read.
+            ("getblockhash", serde_json::json!(new_tip)),
+            ("getbestblockhash", serde_json::json!(new_tip)),
+        ];
+        let (addr, server) = scripted_rpc(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        *backend.scan_cache.lock().expect("scan cache lock poisoned") = Some(VaultUnspentCache {
+            bestblock: old_tip.parse().expect("old tip"),
+            height: 31,
+            scripts: vec![script.clone()],
+            candidates: HashSet::from([held]),
+        });
+        *backend
+            .wallet_reimport_pending
+            .lock()
+            .expect("wallet reimport lock poisoned") = true;
+        backend
+            .wallet_reimport_in_progress
+            .store(true, Ordering::Release);
+
+        backend
+            .refresh_vault_unspent_cache_live(std::slice::from_ref(&script))
+            .expect("the scan-derived cache advances while repair is in progress");
+        let (tip, candidates) = backend
+            .confirmed_candidates(std::slice::from_ref(&script))
+            .expect("the advanced cache serves coverage at the new tip");
+        backend
+            .wallet_reimport_in_progress
+            .store(false, Ordering::Release);
+        server.join().expect("scripted RPC completed");
+
+        assert_eq!(tip.to_string(), new_tip);
+        assert_eq!(candidates, vec![held]);
+        assert_eq!(
+            backend.full_scan_count(),
+            0,
+            "an in-progress repair advances its scan cache by cheap block deltas"
+        );
+    }
+
+    /// bitcoind restarting unloads a wallet this node created with
+    /// `load_on_startup=false`. The cached handle would then name a wallet Core no
+    /// longer has, so every wallet call fails — and without dropping it, the node stays
+    /// on the fallback until the NODE restarts. `scripted_rpc` asserts the exact method
+    /// sequence, so the `loadwallet` scripted for pass 3 IS the assertion.
+    #[test]
+    fn a_failed_wallet_read_drops_the_handle_so_the_next_pass_reloads_it() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hex = script.as_bytes().to_lower_hex_string();
+        let tip = "ef".repeat(32);
+        let txid = Txid::from_byte_array([0x44; 32]);
+        let unspent = serde_json::json!([
+            {"txid": txid.to_string(), "vout": 0, "scriptPubKey": script_hex},
+        ]);
+        let locate = || {
+            vec![
+                ("loadwallet", serde_json::json!({"name": "vaultnode"})),
+                (
+                    "getwalletinfo",
+                    serde_json::json!({"private_keys_enabled": false}),
+                ),
+                (
+                    "listdescriptors",
+                    serde_json::json!({"descriptors": [
+                        {"desc": format!("raw({script_hex})#abcdefgh")},
+                        {"desc": completion_marker(31, &tip)},
+                    ]}),
+                ),
+                ("getblockhash", serde_json::json!(tip)),
+            ]
+        };
+        let read = |unspent: serde_json::Value| {
+            vec![
+                ("getbestblockhash", serde_json::json!(tip)),
+                ("listunspent", unspent),
+                (
+                    "listsinceblock",
+                    serde_json::json!({"transactions": [], "lastblock": tip}),
+                ),
+                ("getbestblockhash", serde_json::json!(tip)),
+                ("getblockheader", serde_json::json!({"height": 31})),
+                ("getblockhash", serde_json::json!(tip)),
+                ("getblockhash", serde_json::json!(tip)),
+            ]
+        };
+        // Pass 1 — locate, verify, serve.
+        let mut replies = locate();
+        replies.extend(read(unspent.clone()));
+        // Pass 2 — bitcoind has restarted: the wallet is gone from its loaded set.
+        replies.extend([
+            ("getblockhash", serde_json::json!(tip)),
+            ("getbestblockhash", serde_json::json!(tip)),
+            (
+                "listunspent",
+                serde_json::json!({
+                    "__error": {"code": -18, "message": "Requested wallet does not exist or is not loaded"},
+                }),
+            ),
+            // The fallback proves the cache anchor is still active — a delta can only
+            // extend a live anchor — and then finds no new block, so the cache is
+            // unchanged.
+            ("getblockhash", serde_json::json!(tip)),
+            ("getblockcount", serde_json::json!(31)),
+        ]);
+        // Pass 3 — the dropped handle means this pass has no anchor to reorg-check and
+        // instead re-`loadwallet`s, re-proving the marker as it verifies the wallet.
+        replies.extend(locate());
+        replies.extend(read(unspent));
+        let (addr, server, requests) = scripted_rpc_recording(replies);
+        let backend = BitcoindBackend::new(addr, String::new());
+        let scripts = std::slice::from_ref(&script);
+
+        for pass in 1..=3 {
+            backend
+                .refresh_vault_unspent_cache(scripts)
+                .unwrap_or_else(|e| panic!("pass {pass} must still warm the cache: {e}"));
+        }
+        server.join().expect("scripted RPC completed");
+
+        let methods: Vec<String> = requests
+            .lock()
+            .expect("recorded requests lock")
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| *method == "loadwallet")
+                .count(),
+            2,
+            "the failed read must be followed by a fresh loadwallet: {methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|method| method == "scantxoutset"),
+            "recovering the wallet must not cost a whole-set scan: {methods:?}"
+        );
+        assert_eq!(
+            backend
+                .scan_cache
+                .lock()
+                .expect("scan cache lock poisoned")
+                .as_ref()
+                .expect("a warm cache")
+                .candidates,
+            HashSet::from([OutPoint::new(txid, 0)]),
+            "and the vault's coin is never lost along the way"
+        );
+    }
+
+    /// The wallet name is a pure function of the node owner and watched script set:
+    /// restarts converge on one wallet, while sibling nodes and different vaults do
+    /// not share it.
+    #[test]
+    fn the_wallet_name_is_derived_from_the_node_and_watched_scripts() {
+        let first = ScriptBuf::from_bytes(vec![0x51]);
+        let second = ScriptBuf::from_bytes(vec![0x52]);
+        let owner = [1; 32];
+        let name = super::vault_wallet_name(&owner, std::slice::from_ref(&first));
+
+        assert!(name.starts_with(super::VAULT_WALLET_PREFIX), "{name}");
+        assert!(
+            name.strip_prefix(super::VAULT_WALLET_PREFIX)
+                .is_some_and(|tail| tail.len() == 16 && tail.chars().all(|c| c.is_ascii_hexdigit())),
+            "the name must be the prefix plus a fixed hex digest: {name}"
+        );
+        assert_eq!(
+            name,
+            super::vault_wallet_name(&owner, std::slice::from_ref(&first)),
+            "the same node and script set must always derive the same wallet"
+        );
+        assert_ne!(
+            name,
+            super::vault_wallet_name(&[2; 32], std::slice::from_ref(&first)),
+            "sibling nodes must never share a wallet"
+        );
+        assert_ne!(
+            name,
+            super::vault_wallet_name(&owner, std::slice::from_ref(&second)),
+            "a different vault must never share the wallet"
+        );
+        // Order and duplication in the caller's list are not part of the identity.
+        assert_eq!(
+            super::vault_wallet_name(&owner, &[first.clone(), second.clone()]),
+            super::vault_wallet_name(&owner, &[second, first.clone(), first]),
         );
     }
 }

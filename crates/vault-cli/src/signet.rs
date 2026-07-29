@@ -215,13 +215,22 @@ impl SignetFederation {
         std::fs::create_dir_all(&nodes_dir)?;
         let rpc_addr = signet_rpc_addr();
         let auth = signet_auth();
-        // The startup vault-unspent warm is a full `scantxoutset`, ~10s on this signet's
-        // 72M-UTXO set, and Core serializes scans process-wide — so raise the readiness
-        // deadline above the default 15s and spawn nodes ONE AT A TIME. Five concurrent
-        // boots would queue their scans behind each other and the later nodes would blow
-        // the deadline; a sequential boot gives each node the scan slot to itself. Nodes
-        // serve `/healthz` independently and connect to peers lazily, so an early node
-        // waiting for later peers is not a concern.
+        // The startup vault-unspent warm reads the node-owned descriptor wallet (bead
+        // btc-policy-hn8), so normal restarts issue no `scantxoutset`. A node's FIRST
+        // bring-up against a backend still seeds its own wallet with a scan — ~10s on
+        // this signet's 72M-UTXO set, with Core serializing scans process-wide. Five
+        // fresh nodes started concurrently would therefore queue behind each other.
+        // Keep raising the readiness deadline above the default 15s and spawn them ONE
+        // AT A TIME for that one-time initialization. Nodes serve `/healthz`
+        // independently and connect to peers lazily, so an early node waiting for
+        // later peers is not a concern.
+        //
+        // The `importdescriptors` that follows that scan adds nothing measurable HERE:
+        // this driver spawns before `fund_vault`, so the scan finds no vault output and
+        // the birthday it derives is the tip itself — Core rescans from the tip, not
+        // from the vault's history. A deployment brought up against an ALREADY funded
+        // vault rescans from its oldest live output instead, and that is the case this
+        // deadline would have to grow for.
         std::env::set_var("VAULT_NODE_READY_TIMEOUT_SECS", "120");
         let mut nodes = Vec::new();
         for (index, device) in devices.iter().enumerate() {

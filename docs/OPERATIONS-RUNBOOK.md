@@ -66,6 +66,30 @@ stdin, never stored. So every start — first boot, restart, or recovery — nee
 **Stopping a node.** A stopped node is simply absent; 3-of-5 tolerates two. It does not need to
 be drained.
 
+**A node's FIRST start against a given bitcoind takes longer than its restarts** and does not
+answer `/healthz` until it finishes. It warms its vault-unspent view before serving, and that
+first pass runs a `scantxoutset` (~10 s on signet's 72M-output set, and Core serializes scans
+process-wide, so five nodes sharing one backend queue behind each other) and then imports the
+vault descriptors into its own watch-only wallet — which rescans from the vault's oldest live
+output, so against an already-funded vault that import, not the scan, dominates. Bring nodes up
+one at a time on a real chain and expect minutes, not seconds. Every later start reads the wallet
+instead and is fast. See `docs/THREAT-MODEL.md` R5.
+
+**A node that says it is falling back to `scantxoutset` is slow, not wrong.** Two log lines
+report it — `vault descriptor-wallet read unavailable, falling back to scantxoutset: …` and
+`vault descriptor wallet not established, scantxoutset stays in use: …`. In both, the node keeps
+a complete scan-derived view of the vault's coins; nothing it accepts or refuses changes. What
+changes is cost: it is back to paying the scan above, on a resource Core serializes across every
+node sharing that bitcoind, which is a readiness problem long before it is anything else. **Do:**
+the first line retries itself on the next refresh pass; the second may print once and never
+again, because the node re-attempts that build on its next start — so restart it. If the message
+survives that, read its tail. `is not a complete
+node-owned vault wallet` means a wallet carrying this node's own generated name exists but this
+node did not build it — it will never write to a wallet it does not recognise, so move that
+wallet aside and restart. Anything else is bitcoind refusing to make one (no wallet support
+compiled in, a full or read-only wallet directory). Neither is urgent the way §5 is, but do not
+leave it: see `docs/THREAT-MODEL.md` R5.
+
 **A rebooted node is a dead node** (ADR-0007). The model assumes config and keys live on tmpfs,
 so a reboot wipes the signing key, the Lockdown latch, and the process-generation marker. If the
 node warns at startup that its inode is on a non-volatile filesystem, that assumption does not
@@ -157,6 +181,7 @@ Test a restore. A backup you have never restored from is a hypothesis.
   `/pending` are pull surfaces and someone has to actually pull them.
 - **Key ceremony logistics** (who holds what, where, in which jurisdiction) — that is deployment
   policy, and ADR-0009's correlation-class rule is the constraint it has to satisfy.
-- **Anything about running at scale.** This is a single-user vault; the `scantxoutset` cost
-  measured on signet (`docs/THREAT-MODEL.md` R5) is a live operational limit, not a solved
-  problem.
+- **Anything about running at scale.** This is a single-user vault. Steady-state operation no
+  longer scans the UTXO set (§4), but the `scantxoutset` cost measured on signet still applies to
+  first bring-up and to every fallback path, and nobody has measured it on mainnet
+  (`docs/THREAT-MODEL.md` R5).

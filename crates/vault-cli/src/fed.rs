@@ -883,10 +883,14 @@ impl NodeProcess {
     /// never started or from an unrelated process that recycled the port — the same
     /// distinction `restart_must_be_refused` relies on for the opposite conclusion.
     pub(crate) fn wait_ready(&mut self) -> Result<(), Error> {
-        // 15s covers a regtest boot with room to spare. On a real chain the startup
-        // vault-unspent warm is a full `scantxoutset` (~10s on a 72M-UTXO signet), so
-        // the signet driver raises this via `VAULT_NODE_READY_TIMEOUT_SECS`; the demos
-        // leave it unset and keep the fast default.
+        // 15s covers a regtest boot with room to spare. On a real chain a node's FIRST
+        // bring-up against a backend still seeds its descriptor wallet from a full
+        // `scantxoutset` (~10s on a 72M-UTXO signet, serialized process-wide across
+        // nodes) PLUS the `importdescriptors` rescan that scan's birthday implies —
+        // negligible against an empty vault, but on an already-funded one it rescans
+        // from the oldest live vault output and dominates. The signet driver raises
+        // this via `VAULT_NODE_READY_TIMEOUT_SECS` for that one-time cost; later
+        // restarts read the wallet instead and the demos keep the fast default.
         let secs = std::env::var("VAULT_NODE_READY_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
