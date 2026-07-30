@@ -103,34 +103,34 @@ recovery keys waits hours instead of months), which is what the warning is for. 
 `btc-policy-wdu`.
 
 **On mainnet, a below-default timelock requires typed confirmation recorded in the ceremony
-artifacts — PLUS independent out-of-band verification, because the confirmation alone cannot defend
-against the threat it is aimed at.** Both reviewers made the same point and it is decisive: the
-prompt, the displayed duration, the encoded `older(...)`, and the recorded confirmation are all
-produced by the setup tool — the exact component R8b says may be compromised pre-wrench. A wrapped
-tool can display 180 days, seal 512 seconds, and record that the operator confirmed, in one motion.
-A record produced by the thing being doubted is not evidence.
+artifacts.** The typed phrase must contain the VALUE — type the duration, never a fixed word like
+CONFIRM — or a wrapper script pipes the constant and the protection evaporates for automation. The
+ceremony displays the duration in human units, because unit confusion (BIP68 512-second units read
+as days) is the actual failure mode.
 
-So the control has two halves:
+**What this control is for: MISTAKES.** Unit confusion, scrolling past a warning, copying a signet
+configuration to mainnet. That is the whole scope, and it is enough — those are the realistic ways a
+short timelock gets sealed.
 
-1. **Typed confirmation, against MISTAKES** — unit confusion (BIP68 512-second units read as days),
-   scroll-past, a copied signet config. The typed phrase must include the VALUE (type the duration or
-   maturity date, never a fixed word like CONFIRM), or a wrapper pipes the constant and the protection
-   evaporates for automation. The artifact must bind the wallet/manifest hash, the network, the raw
-   `nSequence`, the decoded duration and a fresh nonce, so a `confirmed=true` field cannot be replayed
-   from another ceremony. Below-default mainnet automation **fails closed** without it.
-2. **Independent verification, against a TAMPERED TOOL** — before any mainnet vault is funded, a
-   separate tool (the user's own `cyberkrill`) parses the sealed descriptor and displays the timelock.
-   That is the only check a wrapped setup binary cannot forge, it costs almost nothing, and it is a
-   named step of every mainnet ceremony rather than a test assertion.
+**It is NOT an anti-tampering control, and must not be described as one.** An earlier draft of this
+section justified it against a compromised setup tool by citing threat-model R8b. That was a
+misreading, corrected here: R8b is scoped to the coordinator **trusted-until-wrench** (ADR-0012
+"Pin handling — Direction 3"), i.e. malware resident on the *operating* coordinator that observes
+PINs during normal spends. The setup ceremony is a different phase — one-time, witnessed, before any
+funds exist — and it is trusted. A compromised ceremony tool would not forge a timelock display; it
+would seal a descriptor containing its own key, or exfiltrate the recovery keys. Defending this one
+field against that attacker is not defence in depth, it is a control that assumes an adversary
+strong enough to forge the display yet uninterested in simply taking the vault.
 
-Note also that a ceremony-time "maturity date" is indicative only: the relative timelock runs per UTXO
-from each coin's confirmation, so maturity moves with deposits and Refreshes. Display it as
-"earliest maturity for coins confirmed now", not as a fixed date. There is deliberately no hard floor — the choice stays the operator's — but it
-cannot be made by accident or by scrolling past a warning, and an auditor can see afterwards that it
-was chosen deliberately. This answers the reviewers' concrete failure case: confusing BIP68 512-second
-units for days, or copying a signet configuration to mainnet, would otherwise seal a vault whose
-2-of-3 recovery keyset becomes a complete spend path about eight minutes later — unrepairable, since
-the manifest is immutable. Signet and regtest keep warn-only.
+One cheap check is still worth doing, for a different and honest reason: **before funding a mainnet
+vault, parse the sealed descriptor with an independent tool** (the user's own `cyberkrill`) and read
+the timelock back. Not because the setup tool is assumed hostile, but because it may be **buggy** —
+and a unit-conversion bug produces exactly the value this section is trying to avoid. It is a
+correctness check, not an adversarial one.
+
+Note also that a ceremony-time "maturity date" is indicative only: the relative timelock runs per
+UTXO from each coin's confirmation, so maturity moves with deposits and Refreshes. Display it as
+"earliest maturity for coins confirmed now", not as a fixed date.
 
 **Only the Sacrificial vault may use a short timelock.** Both reviewers independently confirmed
 the interaction: a Survivor vault left deliberately "untouched" at stage 8 runs past its own

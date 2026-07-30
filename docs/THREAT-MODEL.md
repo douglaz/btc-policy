@@ -64,6 +64,18 @@ consolidated architecture.
    are **sealed** (ADR-0005): the manifest is immutable, so a changed parameter is a *new vault*,
    not a reconfiguration.
 
+   **The ceremony is TRUSTED, and that boundary is easy to misread.** The coordinator is
+   "trusted until the wrench attack, untrusted after" (ADR-0010/0012) — so R8b's pre-wrench
+   compromise means malware resident on the **operating** coordinator, observing the normal PIN
+   during ordinary spends before a coercion event. It does **not** mean a compromised ceremony
+   tool. The ceremony is one-time and witnessed, and it precedes any funds.
+
+   Nor is it useful to defend individual ceremony outputs against a hostile ceremony tool: such a
+   tool would not forge a display, it would seal a descriptor containing its own key or exfiltrate
+   the recovery keys. A control that assumes an adversary strong enough to forge one field yet
+   uninterested in taking the vault is not defence in depth — it is confusion. (Corrected
+   2026-07-30, after exactly this error was made while designing the recovery-timelock control.)
+
 ## 5. Load-bearing invariants
 
 These are what a reviewer should try hardest to break. Each is enforced in code, not convention.
