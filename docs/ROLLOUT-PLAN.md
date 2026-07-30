@@ -75,8 +75,21 @@ unconditional Lockdown for the federation's lifetime, and Recovery spends the co
 
 **Sacrificial vault** — driven to its terminal end:
 
-5. Duress arm (duress PIN) → `T` → escape sweep → unconditional Lockdown
+5. Duress arm (duress PIN) → `T` → **unconditional Lockdown**, *and* a best-effort escape sweep
 6. Recovery (2-of-3 recovery keys after the timelock), from the locked-down vault
+
+**Step 5's two tracks are not sequential, and the drill must not assert that they are.** An earlier
+draft of this line read `T → escape sweep → unconditional Lockdown`, which inverts the invariant:
+it reads as though Lockdown follows *from* a successful sweep. ADR-0012's state table is explicit —
+at `T` the node **enters Lockdown unconditionally (terminal safety)** and *separately* spawns a
+best-effort Firing sweep job. The sweep may fail (coverage, feerate, relay) and Lockdown still
+holds; that is the whole point of the two-track split, and a stage drill that asserts sweep-then-
+Lockdown would pass a build in which Lockdown had become conditional on the sweep — the exact
+theft class ADR-0012 §"Duress state machine" exists to rule out.
+
+So the stage-5 acceptance criteria are **independent**: Lockdown is verified at `T` regardless of
+sweep outcome (every subsequent spend returns `FRAUD_SUSPECTED`, `/healthz locked_down` is true on
+every node), and the sweep is verified on its own terms.
 
 Step 5 → 6 is not an artificial sequence: after Lockdown the Recovery path *is* the only exit, so
 the Sacrificial vault rehearses the real incident rather than approximating it. A stage where 6
