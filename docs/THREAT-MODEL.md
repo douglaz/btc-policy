@@ -167,6 +167,20 @@ are a hardened dedicated host and reproducible builds. **Neither exists** (see R
 is also software in every current driver and would live on that same host, which merges this
 with adversary A3.
 
+**Attribution corrected 2026-07-30 (codex + Fable spec review).** The two stated mitigations do
+not cover the same vector, and this entry used to imply they jointly answered R8b. ADR-0012's
+residual names four vectors; reproducible builds close **poisoned build** and **tampered
+dependency**, host hardening reduces the *probability* of **resident malware** without removing
+the capability — malware that is already on the host reads the PIN out of a byte-identical
+binary — and **nothing** addresses a **wrench that begins mid-spend** while the normal PIN is
+still in RAM. See the vector table in ADR-0012 under "Coordinator host hardening". So R8b is
+**likelihood-reduced but unclosed**, and it would remain unclosed even if both mitigations
+shipped tomorrow. Its severity is unchanged and was already right — this is a correction to what
+the controls are credited with, not a re-ranking. What keeps the loss finite once it fires is the
+consequence-bounding set: the Hot budget and velocity ledger (ADR-0014), the Hold, the allowlist,
+and hardware user signing (`btc-policy-bq6`) for the merged-A3 half. The only true prevention is
+ADR-0012's Direction 1, which is hardware-gated and deliberately unplanned.
+
 Neither is a new discovery; both are named in ADR-0009/ADR-0012. What is worth stating plainly
 is that they are the top of the risk list and the code has not moved on either.
 
