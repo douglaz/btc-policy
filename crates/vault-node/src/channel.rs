@@ -2197,6 +2197,85 @@ impl PartialStore {
     fn is_unexposed_hot(candidate: &Candidate) -> bool {
         candidate.hot && !candidate.released && !candidate.broadcast
     }
+
+    /// **Terminalize every resident hot candidate that `spender_id`'s transaction
+    /// defeated by spending one of its inputs, and return their ids.**
+    ///
+    /// `spender_id` itself is never touched: it is SETTLED, not defeated, and what
+    /// becomes of it is its caller's decision — [`ChannelState::mark_broadcast`]
+    /// latches it (or, for an armed escape, evicts it), while the armed escape's
+    /// CONFIRMED branch in the fire pass deliberately keeps it resident and unlatched
+    /// so an in-window reorg can re-broadcast the same rung. Both callers need the
+    /// defeated set; only one of them may write the spender.
+    ///
+    /// The ids are derived from the candidate PSBTs already in this store; no conflict
+    /// index or second source of truth is kept. Settlement uses them to clear
+    /// `PendingLog`: an escape-class clawback is the protocol's implicit cancel, so a
+    /// hot spend whose input is now spent must not remain projected as pending or keep
+    /// refreshes subordinated until its otherwise-unrelated expiry.
+    ///
+    /// Clearing the pending entry is NOT enough on its own, and `broadcast = true` here
+    /// is the half that makes it safe. `broadcast` is what [`ChannelState::due_for_fire`]
+    /// reads, so a defeated candidate left unmarked would stay release-authorized and
+    /// still combine at its Hold expiry — and if the conflicting transaction were later
+    /// evicted from the mempool, it would then broadcast successfully while `/pending`
+    /// reported nothing. That is precisely the theft the projection exists to keep
+    /// visible, so the two states must move together: one settlement, one decision,
+    /// under one lock. The direction is also the fail-safe one — a defeated spend that
+    /// a mempool eviction later reprieves does not fire, and the coins simply stay in
+    /// the vault until the owner resubmits.
+    ///
+    /// Give the Hot budget back FIRST, then mark. [`Self::is_unexposed_hot`] is
+    /// `hot && !released && !broadcast`, so setting `broadcast` before releasing makes
+    /// the release a silent no-op and strands the reservation until the velocity
+    /// window ages out (codex k0t review). That matters concretely: an unauthorized
+    /// spend that consumed `hot_max_per_window` would keep blocking legitimate hot
+    /// spends even after the user's clawback defeated it — the vault would penalize
+    /// the victim for the theft it just refused. A candidate whose share already LEFT
+    /// this node stays metered, because a peer may still broadcast it and have it
+    /// LAND: at [`ChannelState::mark_broadcast`] the settling transaction is only in
+    /// the mempool and can be evicted, and even a CONFIRMED sweep can be reorged out
+    /// inside the fire window — the very case the escape stays resident and unlatched
+    /// for. That is exactly what `release_if_unexposed` checks.
+    ///
+    /// **Idempotent**, which the confirmation branch relies on: it re-runs on every
+    /// tick the escape stays confirmed inside its fire window. A second call re-finds
+    /// the same candidates (the scan does not filter on `broadcast`) and both halves
+    /// are then no-ops — `HotBudgetLedger::release` is a map removal, and the mark is
+    /// already set, which is also what stops the second call from double-refunding.
+    fn invalidate_hot_conflicts(&mut self, spender_id: &str) -> Vec<String> {
+        let spent_inputs: HashSet<OutPoint> = self
+            .candidates
+            .get(spender_id)
+            .into_iter()
+            .flat_map(|candidate| &candidate.base.psbt.unsigned_tx.input)
+            .map(|input| input.previous_output)
+            .collect();
+        let invalidated: Vec<String> = self
+            .candidates
+            .iter()
+            .filter(|(id, candidate)| {
+                id.as_str() != spender_id
+                    && candidate.hot
+                    && candidate
+                        .base
+                        .psbt
+                        .unsigned_tx
+                        .input
+                        .iter()
+                        .any(|input| spent_inputs.contains(&input.previous_output))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &invalidated {
+            if let Some(candidate) = self.candidates.get_mut(id) {
+                Self::release_if_unexposed(&mut self.hot_budget, candidate);
+                candidate.broadcast = true;
+            }
+        }
+        invalidated
+    }
+
     /// Keep confirmation state and its replay memo on the same strict freshness
     /// boundary as the coordinator nonce log (`expiry > now`). Expiry is the ONLY
     /// bound applied here; there is no count cap in this function. It is the shared
@@ -4429,32 +4508,51 @@ impl ChannelState {
         Some(candidate.authorized_rung())
     }
 
+    /// [`PartialStore::invalidate_hot_conflicts`] for a caller that is NOT already
+    /// holding the store lock — the armed escape's CONFIRMED branch in the fire pass,
+    /// which must settle the candidates its sweep defeated while leaving the sweep
+    /// itself resident for in-window reorg recovery.
+    ///
+    /// **LOCK ORDER.** This takes the store lock alone and releases it before it
+    /// returns; it holds nothing else, and in particular never takes `sign_state`. The
+    /// confirmation branch calls it exactly where it already calls [`Self::pairing`] —
+    /// BEFORE acquiring `sign_state` — so that branch never holds the two at once.
+    /// Where the two DO nest elsewhere the order is `sign_state -> store`
+    /// (`Node::confirm_carrier`, and the fire pass's release guard), so nothing here
+    /// may reach back for `sign_state`. `mark_broadcast` below already holds the lock
+    /// and therefore calls the `PartialStore` method directly: `std::sync::Mutex` is
+    /// not reentrant, and going through this wrapper would deadlock the fire path.
+    /// The distinct name keeps the two call sites apart, but staying out of that
+    /// deadlock is a CONVENTION, not compiler-enforced: a method already holding the
+    /// guard can still write this wrapper's name, and it will hang. Check by hand when
+    /// adding a caller. [`Self::prune_store`] splits from `PartialStore::prune` the
+    /// same way.
+    pub(crate) fn invalidate_hot_conflicts_in_store(&self, spender_id: &str) -> Vec<String> {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        store.invalidate_hot_conflicts(spender_id)
+    }
+
     /// Mark `commitment_id` broadcast so later ticks skip it (the `else` branch —
     /// the only path production reaches), TERMINALIZE every other resident hot
     /// candidate the transaction invalidated by spending one of its inputs, and return
     /// those ids.
     ///
-    /// The ids are derived from the candidate PSBTs already in this store; no conflict
-    /// index or second source of truth is kept. Settlement uses them to clear
-    /// `PendingLog`: an escape-class clawback is the protocol's implicit cancel, so a
-    /// hot spend whose input is now spent must not remain projected as pending or keep
-    /// refreshes subordinated until its otherwise-unrelated expiry.
+    /// The invalidation itself — the scan, the Hot-budget refund, and the mark — is
+    /// [`PartialStore::invalidate_hot_conflicts`], shared with the armed escape's
+    /// confirmation branch. Read its contract for why a defeated candidate must be
+    /// terminalized and refunded rather than merely dropped from `PendingLog`.
     ///
-    /// Clearing the pending entry is NOT enough on its own, and the `broadcast = true`
-    /// below is the half that makes it safe. `broadcast` is what [`Self::due_for_fire`]
-    /// reads, so a defeated candidate left unmarked would stay release-authorized and
-    /// still combine at its Hold expiry — and if the conflicting transaction were later
-    /// evicted from the mempool, it would then broadcast successfully while `/pending`
-    /// reported nothing. That is precisely the theft the projection exists to keep
-    /// visible, so the two states must move together: one settlement, one decision,
-    /// under one lock. The direction is also the fail-safe one — a defeated spend that
-    /// a mempool eviction later reprieves does not fire, and the coins simply stay in
-    /// the vault until the owner resubmits.
+    /// It runs BEFORE the branch below, because the overlap is derived from
+    /// `commitment_id`'s own inputs and the armed branch REMOVES that candidate; run
+    /// afterwards, the armed path would find no inputs and defeat nothing.
     ///
-    /// The marking runs AFTER the branch below, so the armed branch's own removal and
-    /// its unexposed-Hot-budget refund (which reads `!broadcast`) keep their existing
-    /// semantics; only candidates still resident afterwards are marked. A defeated
-    /// candidate that never released its share does then hold its Hot reservation to
+    /// A paired hot spend that shares an input with the escape — the ordinary shape,
+    /// since the sweep claws back the coins that spend would have moved — is one of
+    /// the conflicts and is refunded by the scan, so the armed branch's own
+    /// `release_if_unexposed` then finds nothing to free (`HotBudgetLedger::release`
+    /// is a map removal). That is why the two refund sites do not double-count.
+    ///
+    /// A defeated candidate that HAD released its share holds its Hot reservation to
     /// age-out instead of getting it back at [`Self::prune`], exactly as a broadcast
     /// spend does — the same fail-safe direction the whole ledger takes, since it can
     /// only ever refuse a later hot spend, never admit an over-budget one.
@@ -4469,31 +4567,9 @@ impl ChannelState {
     /// path that DOES settle an armed escape immediately.
     pub(crate) fn mark_broadcast(&self, commitment_id: &str) -> Vec<String> {
         let mut store = self.store.lock().expect("store lock poisoned");
-        let spent_inputs: HashSet<OutPoint> = store
-            .candidates
-            .get(commitment_id)
-            .into_iter()
-            .flat_map(|candidate| &candidate.base.psbt.unsigned_tx.input)
-            .map(|input| input.previous_output)
-            .collect();
-        // `commitment_id` itself is excluded: it is settled, not defeated, and the
-        // branch below already decides what happens to it.
-        let invalidated_hot: Vec<String> = store
-            .candidates
-            .iter()
-            .filter(|(id, candidate)| {
-                id.as_str() != commitment_id
-                    && candidate.hot
-                    && candidate
-                        .base
-                        .psbt
-                        .unsigned_tx
-                        .input
-                        .iter()
-                        .any(|input| spent_inputs.contains(&input.previous_output))
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        // The scan excludes `commitment_id` itself: it is settled, not defeated, and
+        // the branch below is what decides what happens to it.
+        let invalidated_hot = store.invalidate_hot_conflicts(commitment_id);
         let armed_escape = store.armed.active
             && store.armed.sweep_active
             && store.armed.escape_commitment_id == commitment_id;
@@ -4520,29 +4596,6 @@ impl ChannelState {
             }
         } else if let Some(candidate) = store.candidates.get_mut(commitment_id) {
             candidate.broadcast = true;
-        }
-        // The defeated candidates are done here too: their input is spent by a
-        // transaction this node just observed on the network, so they must not remain
-        // in the due set that `PendingLog` no longer reports.
-        //
-        // Give the Hot budget back FIRST, then mark. `is_unexposed_hot` is
-        // `hot && !released && !broadcast`, so setting `broadcast` before releasing makes
-        // the release a silent no-op and strands the reservation until the velocity
-        // window ages out (codex k0t review). That matters concretely: an unauthorized
-        // spend that consumed `hot_max_per_window` would keep blocking legitimate hot
-        // spends even after the user's clawback defeated it — the vault would penalize
-        // the victim for the theft it just refused. A candidate whose share already LEFT
-        // this node stays metered, because a peer may still broadcast the conflicting
-        // spend later; that is exactly what `release_if_unexposed` checks.
-        for id in &invalidated_hot {
-            // Take it out to release, then reinsert: `release_if_unexposed` needs the
-            // candidate and `&mut store.hot_budget` at the same time, which the borrow
-            // checker will not grant while it is still inside `store.candidates`.
-            if let Some(mut candidate) = store.candidates.remove(id) {
-                PartialStore::release_if_unexposed(&mut store.hot_budget, &candidate);
-                candidate.broadcast = true;
-                store.candidates.insert(id.clone(), candidate);
-            }
         }
         invalidated_hot
     }
@@ -12941,6 +12994,171 @@ mod duress {
         );
     }
 
+    /// **A confirmed sweep settles every hot candidate it defeated, not only its own
+    /// paired sibling** (bead btc-policy-6nq).
+    ///
+    /// The escape spends the vault coin, so ANY other resident hot candidate spending
+    /// that coin is provably dead the moment the sweep confirms — this node has
+    /// watched the conflicting transaction land. The confirmation branch used to
+    /// clear only the escape and its pair, which left `/pending` projecting a spend
+    /// the node had already observed defeated (contradicting the endpoint's settlement
+    /// semantics — an id disappears once the candidate is seen on the network) and
+    /// left that spend's Hot reservation metered until an unrelated expiry.
+    ///
+    /// The PROJECTION is the half that is observable here. A stranded reservation can
+    /// only ever bite at `HotBudgetLedger::reserve`, whose production callers are both
+    /// on the `/sign` admission path — and reaching this branch means `T` has already
+    /// Locked Down, so every later spend answers `FRAUD_SUSPECTED` first. On
+    /// `mark_broadcast`'s path — reached with the node still signing — the same
+    /// stranded reservation really does block a legitimate replacement. The refund is
+    /// asserted anyway because both settlement paths run the ONE shared scan under one
+    /// contract, and a quietly weaker contract on the confirmation branch is the drift
+    /// this test exists to stop.
+    ///
+    /// The armed escape itself must survive untouched: resident and unlatched through
+    /// the fire window, so an in-window reorg can still re-broadcast it.
+    #[tokio::test]
+    async fn a_confirmed_sweep_settles_every_hot_candidate_it_defeated() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let (node, escape, escape_cid) = arm_hot(node, &fx);
+        let paired_cid = crate::commitment_id_for(&node, &fx.spend_psbt(&fx.hot_spk, 7), EXPIRY);
+
+        // An UNRELATED hot request over the SAME vault coin, arriving while the node
+        // is armed. Ingress is pin-independent, so an armed node accepts and freezes
+        // it rather than refusing it — which is exactly how a second conflicting hot
+        // candidate comes to be resident when the sweep lands. Its own mandatory
+        // escape differs from the armed one, so the two requests register four
+        // distinct candidates instead of colliding on one commitment id.
+        let other_spend = fx.spend_psbt_paying(&fx.hot_spk, 7, 40_000_000);
+        let mut other = fx.spend_request(&other_spend, EXPIRY, "other-hot");
+        other.escape_psbt = escape_with(&fx, 99_000_000, Sequence::MAX).to_string();
+        fx.coord_sign(&mut other, "other-hot");
+        assert!(
+            matches!(
+                crate::handle_sign(&node, &other, NOW).expect("decodable"),
+                SignResponse::Accepted(_)
+            ),
+            "an armed node accepts and freezes a later hot spend; refusing it would be \
+             the pin-dependent ingress observable ADR-0012 forbids"
+        );
+        let other_cid = crate::commitment_id_for(&node, &other_spend, EXPIRY);
+        assert_ne!(
+            other_cid, paired_cid,
+            "the second request must be a DIFFERENT candidate from the armed pair, or \
+             this test proves nothing about OTHER conflicts"
+        );
+
+        // Both hot spends are projected as pending and both hold reservations.
+        assert_eq!(
+            node.sign_state.lock().expect("sign_state").pending.len(),
+            2,
+            "both hot spends are outstanding before the sweep confirms"
+        );
+        assert_eq!(
+            node.channel.as_ref().expect("channel").hot_window_sum(NOW),
+            Fixture::INPUT_SAT - Fixture::SPEND_FEE_SAT + 40_000_000,
+            "the armed pair's hot spend and the later one both meter"
+        );
+
+        // `T`, with the sweep ALREADY confirmed. Model Core faithfully: a mined escape
+        // has spent the vault coin, so `gettxout` no longer offers that prevout.
+        let mut confirmed = backend_for(&escape);
+        confirmed
+            .confirmed_txs
+            .insert(escape.unsigned_tx.compute_txid());
+        confirmed
+            .prevouts
+            .remove(&escape.unsigned_tx.input[0].previous_output);
+        let node = Arc::new(node);
+        let confirmed = Arc::new(confirmed);
+        assert_eq!(
+            crate::fire_tick(node.clone(), confirmed.clone(), NOW + DELAY).await,
+            0,
+            "a sweep already confirmed at T is terminal for this pass — nothing to send"
+        );
+        assert!(
+            node.is_locked_down(),
+            "Lockdown at T is still unconditional"
+        );
+
+        let channel = node.channel.as_ref().expect("channel");
+        assert!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .pending
+                .ids(NOW + DELAY)
+                .is_empty(),
+            "the confirmed sweep clears BOTH defeated hot spends from `/pending`, not \
+             only its own paired sibling"
+        );
+        assert_eq!(
+            channel.hot_window_sum(NOW + DELAY),
+            0,
+            "a reservation held by a spend the confirmed sweep defeated must come back"
+        );
+        assert_eq!(
+            channel.candidate_is_broadcast(&other_cid),
+            Some(true),
+            "the defeated candidate is TERMINALIZED, not merely dropped from the \
+             projection: `due_for_fire` must never re-authorize it at its Hold expiry"
+        );
+        assert_eq!(
+            channel.candidate_is_broadcast(&paired_cid),
+            Some(true),
+            "the escape's OWN paired spend shares the swept input, so it is one of the \
+             conflicts and latches here, refunded under the same unexposed-Hot predicate"
+        );
+        // The sweep itself is untouched by the invalidation it caused.
+        assert!(
+            channel.has_candidate(&escape_cid),
+            "the armed escape stays resident through the fire window"
+        );
+        assert_eq!(
+            channel.candidate_is_broadcast(&escape_cid),
+            Some(false),
+            "and stays UNLATCHED, so an in-window reorg can re-broadcast it"
+        );
+
+        // Confirmation is polled again on every tick through the finite fire window.
+        // Re-running the same settlement must not double-refund or evict the armed
+        // escape that reorg recovery still needs.
+        assert_eq!(
+            crate::fire_tick(node.clone(), confirmed, NOW + DELAY + 1).await,
+            0,
+            "a second confirmed tick is still terminal — nothing to send"
+        );
+        assert!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .pending
+                .ids(NOW + DELAY + 1)
+                .is_empty(),
+            "repeated confirmation keeps every defeated hot spend out of `/pending`"
+        );
+        assert_eq!(
+            channel.hot_window_sum(NOW + DELAY + 1),
+            0,
+            "repeated confirmation cannot double-refund or recreate Hot budget"
+        );
+        assert_eq!(
+            channel.candidate_is_broadcast(&other_cid),
+            Some(true),
+            "the defeated candidate stays terminalized after repeated confirmation"
+        );
+        assert!(
+            channel.has_candidate(&escape_cid),
+            "the armed escape remains resident after repeated confirmation"
+        );
+        assert_eq!(
+            channel.candidate_is_broadcast(&escape_cid),
+            Some(false),
+            "the armed escape remains unlatched after repeated confirmation"
+        );
+    }
+
     /// Unconditional Lockdown at `T` on EVERY sweep-failure branch: below quorum,
     /// coverage-fail, feerate-fail, non-final nSequence, package-reject, broadcast-fail.
     /// In every case the sweep does NOT fire and the node STILL Locks Down at T →
@@ -17122,6 +17340,85 @@ mod hot_budget {
         // Only the window rolling past it frees the budget.
         channel.pin_hot_clock(NOW + WINDOW + 1);
         assert_eq!(channel.hot_window_sum(NOW + WINDOW + 1), 0);
+    }
+
+    /// **The fail-safe half of the settlement refund**: a DEFEATED hot spend whose
+    /// partial already LEFT this node keeps its reservation.
+    ///
+    /// [`PartialStore::invalidate_hot_conflicts`] — the scan both settlement paths
+    /// share, the fire pass's ordinary `mark_broadcast` and the armed escape's
+    /// confirmation branch — refunds through `release_if_unexposed`, and that
+    /// predicate is what makes the difference. A released share is finalizable
+    /// authority already in other hands, so the conflicting transaction being on the
+    /// network is not the end of the story: it can be evicted from the mempool, and
+    /// even a CONFIRMED sweep can be reorged out inside the fire window — the very
+    /// case the escape stays resident and unlatched for. Refunding here would let a
+    /// coercer recycle the whole window's budget by getting a conflicting spend seen.
+    ///
+    /// The other half — an UNEXPOSED defeated candidate does get its budget back — is
+    /// pinned by `an_escape_sweep_releases_the_hot_spend_it_supersedes` and, on the
+    /// confirmation path, by `a_confirmed_sweep_settles_every_hot_candidate_it_defeated`.
+    #[test]
+    fn a_defeated_hot_spend_whose_partial_already_left_keeps_metering() {
+        let fx = fx_with_caps(60_000_000, 100_000_000);
+        let node = node_of(&fx, 0, "");
+        let channel = node.channel.as_ref().expect("channel");
+
+        // A hot spend over coin 7. Its mandatory escape sweeps BOTH vault coins, so it
+        // is a different transaction from the one-input clawback below rather than
+        // colliding with it on one commitment id.
+        let hot = fx.spend_psbt_paying(&fx.hot_spk, 7, 60_000_000);
+        let mut request = fx.spend_request(&hot, EXPIRY, "defeated-exposed");
+        request.escape_psbt = fx.two_input_spend_psbt(&fx.escape_spk).to_string();
+        fx.coord_sign(&mut request, "defeated-exposed");
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let hot_cid = crate::commitment_id_for(&node, &hot, EXPIRY);
+        assert_eq!(channel.hot_window_sum(NOW), 60_000_000);
+
+        // EXPOSED: the t-holder decision opens the release gate and this node's
+        // partial leaves at Hold fire.
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        for peer in 1..=2u16 {
+            assert!(!node.confirm_carrier(peer, &carrier, NOW).armed);
+        }
+        assert!(
+            channel.release_partials(&hot_cid, NOW + HOLD).is_some(),
+            "the partial must actually leave, or this test pins the unexposed half again"
+        );
+
+        // An independent escape-class clawback over the same coin settles, defeating
+        // the hot spend — `demo theft-refused`'s shape.
+        let clawback = fx.spend_psbt(&fx.escape_spk, 7);
+        let mut clawback_request = fx.spend_request(&clawback, EXPIRY, "exposed-clawback");
+        clawback_request.escape_psbt = fx.spend_psbt(&fx.escape_spk, 8).to_string();
+        fx.coord_sign(&mut clawback_request, "exposed-clawback");
+        assert!(matches!(
+            crate::handle_sign(&node, &clawback_request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let clawback_cid = crate::commitment_id_for(&node, &clawback, EXPIRY);
+        crate::settle_candidate(&node, channel, &clawback_cid);
+
+        assert_eq!(
+            channel.candidate_is_broadcast(&hot_cid),
+            Some(true),
+            "the defeated candidate is terminalized either way — only the refund differs"
+        );
+        assert_eq!(
+            channel.hot_window_sum(NOW),
+            60_000_000,
+            "a defeated spend whose share already left this node must stay metered"
+        );
+        // And the budget is genuinely still spent: 60M + 50M crosses the window cap.
+        let (_, next) = hot_request(&fx, 9, 50_000_000, "1234");
+        assert_eq!(
+            refusal_of(crate::handle_sign(&node, &next, NOW).expect("decodable")).code,
+            RefusalCode::HotVelocityExceeded,
+            "refunding a spend a peer can still complete would double the window's bound"
+        );
     }
 
     /// The window rolls: reservations age out after `hot_window_secs` and the

@@ -141,11 +141,15 @@ pub struct Health {
 ///   `class == TxClass::Hot` and on nothing else. A duress-pin spend and a normal-pin
 ///   spend of the same transaction record the SAME id under the SAME expiry.
 /// - **remove** — only once a candidate has been observed ON THE NETWORK: a normal
-///   spend in the mempool or the chain ([`settle_candidate`], which drops the hot
-///   spends that transaction defeated by spending their inputs along with it), or a
-///   CONFIRMED armed escape clearing its paired hot spend. Both are public events, and
-///   a defeated candidate is terminalized in the same settlement, so an id this stops
-///   reporting is one no later fire tick can broadcast.
+///   spend in the mempool or the chain ([`settle_candidate`]), or a CONFIRMED armed
+///   escape. Both are public events, and both drop the same two sets — the settled
+///   spend's own paired sibling, and every hot spend that transaction defeated by
+///   spending their inputs. The second set comes from one shared scan
+///   (`channel::PartialStore::invalidate_hot_conflicts`), which the settle path reaches
+///   through [`channel::ChannelState::mark_broadcast`] and the confirmation branch
+///   through [`channel::ChannelState::invalidate_hot_conflicts_in_store`]. A defeated
+///   candidate is terminalized in the same settlement, so an id this stops reporting
+///   is one no later fire tick can broadcast.
 /// - **prune**, at commitment expiry — the coordinator's own `expiry` field, which is
 ///   the same byte under either pin.
 ///
@@ -2991,10 +2995,40 @@ fn combine_and_broadcast_with_contexts(
                 // `Absent` arm and re-broadcasts at the SAME latched rung.
                 Ok(ArmedEscapeState::Confirmed(txid)) => {
                     let paired = channel.pairing(commitment_id).map(|(_, sibling)| sibling);
+                    // A confirmed sweep defeats every OTHER resident hot candidate that
+                    // spends one of its inputs, not just its own paired sibling: those
+                    // coins are now provably gone, so those candidates must stop being
+                    // projected as pending, and hand their Hot reservations back rather
+                    // than metering until an unrelated expiry. Without this the node
+                    // would report as outstanding a spend it has already watched the
+                    // network defeat (bead btc-policy-6nq).
+                    //
+                    // LOCK ORDER: same shape as `settle_candidate` and as the `pairing`
+                    // call above — the store lock is taken and released INSIDE this
+                    // call, before `sign_state` is acquired below, so this branch never
+                    // holds the two together. The armed escape itself is untouched:
+                    // `invalidate_hot_conflicts` never writes the spender, which is what
+                    // keeps the sweep resident and unlatched for in-window reorg
+                    // recovery.
+                    //
+                    // SCOPE (the window bound is stated on the branch above): what this
+                    // settles is the projection and the reservation, never the
+                    // authorization — `armed` is monotonic and `T` has already Locked
+                    // Down, so nothing it touches could have fired either way.
+                    let invalidated_hot = channel.invalidate_hot_conflicts_in_store(commitment_id);
                     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
                     let mut first_confirmation = state.pending.remove(commitment_id);
                     if let Some(paired) = paired {
                         first_confirmation |= state.pending.remove(&paired);
+                    }
+                    // Folded into the one-shot marker rather than discarded: these are
+                    // settlements this tick performed, so a confirmation whose paired
+                    // spend had already been pruned at its own expiry still logs once
+                    // when it clears an OTHER defeated candidate. Still one-shot — they
+                    // are gone from the log after this pass, and Lockdown at `T` means
+                    // no later `record` can put a spend back.
+                    for invalidated in invalidated_hot {
+                        first_confirmation |= state.pending.remove(&invalidated);
                     }
                     drop(state);
                     if first_confirmation {
@@ -3159,10 +3193,14 @@ fn combine_and_broadcast_with_contexts(
 /// the pending removal here never outruns the fire path: an id this drops is an id
 /// [`ChannelState::due_for_fire`] will not schedule.
 ///
-/// Armed escapes use the confirmation branch above instead: it clears the same paired
-/// pending entries but deliberately retains the candidate through the fire window so
-/// an in-window reorg can re-broadcast it. Read the pairing BEFORE `mark_broadcast`,
-/// which may remove candidate context. Every pending removal is idempotent.
+/// Armed escapes use the confirmation branch above instead: it clears the same two
+/// sets — the paired sibling AND every hot candidate the settling transaction defeated
+/// — but reaches the second through
+/// [`ChannelState::invalidate_hot_conflicts_in_store`] rather than `mark_broadcast`,
+/// which is what lets it deliberately retain the escape itself, resident and unlatched,
+/// through the fire window so an in-window reorg can re-broadcast it. Read the pairing
+/// BEFORE `mark_broadcast`, which may remove candidate context. Every pending removal
+/// is idempotent.
 fn settle_candidate(node: &Node, channel: &channel::ChannelState, commitment_id: &str) {
     let paired = channel.pairing(commitment_id).map(|(_, sibling)| sibling);
     let invalidated_hot = channel.mark_broadcast(commitment_id);
