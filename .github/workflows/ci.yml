@@ -23,6 +23,11 @@ name: CI
 on:
   push:
   pull_request:
+  # Manual re-run. Added 2026-07-31 (bead btc-policy-9yf): with no dispatch trigger, a
+  # gate that fails for an INFRASTRUCTURE reason — 44/44 runs died at job startup with
+  # zero steps recorded, while Actions itself was enabled — cannot be retried without
+  # manufacturing a commit. That is part of how the failure stayed invisible.
+  workflow_dispatch:
 
 # Coalesce runs so a superseded push on a feature branch/PR does not keep a runner busy
 # proving something about a commit nobody will merge. `main` is the exception on BOTH axes,
