@@ -83,9 +83,16 @@
 //!
 //! Instrument new sites here for ORDER; the two evaluation counters cover MEMORY-HARD
 //! cost only, and the two projections cover channel-store and `/sign`-state net state.
-//! A new write to `Node::outbox` or `Node::authorized` MUST record its op — those two
-//! reach neither projection, so an uninstrumented write to either is invisible to the
-//! whole record, and the paragraph above states their whitelist is complete.
+//! A new write to `Node::outbox`, `Node::authorized`, `Node::alerts`, or
+//! `ChannelState`'s `freshness_counts` / `ingress_guards` MUST record its op — none of
+//! those reach either projection, so an uninstrumented write to any of them is invisible
+//! to the whole record. `Node::alerts` is the one to watch hardest: it is served
+//! verbatim over `GET /events`, which SILENCE names as an observable, so a duress-only
+//! alert write from ingress would pass all seven deterministic cases while being
+//! pin-readable over HTTP — with only the live harness's `/events` body comparison in
+//! its way. Nothing on the `/sign` path writes any of these today (the sole alert push
+//! is `record_freshness_reject`, on the `/channel` peer path); this rule is what keeps
+//! that true.
 //!
 //! **Why this can never become the leak it tests for.** The log lives in a
 //! thread-local, is `#[cfg(test)]`, and is written only while a test has explicitly
