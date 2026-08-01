@@ -50,6 +50,91 @@ pub(crate) struct SignState {
     pub(crate) pin_budget: crate::pin::AttemptBudget,
 }
 
+#[cfg(test)]
+impl SignState {
+    /// A canonical projection of the WHOLE `/sign` handler state, for the
+    /// constant-observable-ingress comparison in `channel::duress`
+    /// (`normal_and_duress_ingress_op_sequences_*`).
+    ///
+    /// It is the `StoreShape` idea applied to the state that lives under the `/sign`
+    /// lock rather than in the channel store, and it exists for the same reason: the
+    /// ingress op log and `ScheduleWorkTrace` are WHITELISTS of hand-placed
+    /// instrumentation, so a duress-only mutation made anywhere they do not watch
+    /// appends nothing to either. This one is read off the fields, so it sees such a
+    /// mutation wherever in `SignState` it lands. The one site that matters most is
+    /// [`crate::pin::AttemptBudget::charge`], which takes the PIN VERDICT itself as an
+    /// argument — the only place in this struct the verdict reaches at all.
+    ///
+    /// Nothing is masked. Every value below is pin-independent by construction for the
+    /// request pairs that use it: a pair re-signs the SAME coordinator nonce over the
+    /// SAME transaction pair at the same `now`, so the nonce log, the commitment-keyed
+    /// replay and pending logs, and the recorded verdict all coincide; and normal and
+    /// duress are the two classes `charge` treats identically (only a WRONG pin moves
+    /// the budget). A difference in any row is therefore a real asymmetry, not a
+    /// by-design one — unlike the channel store's pin-derived carrier ids.
+    ///
+    /// Every struct is destructured exhaustively, here and in
+    /// [`crate::pin::AttemptBudget::shape`]. That is part of the gate, not style:
+    /// adding a field must fail the build until this projection records it.
+    pub(crate) fn shape(&self) -> Vec<String> {
+        let SignState {
+            replay,
+            pending,
+            coord_nonces,
+            refreshes,
+            pin_budget,
+        } = self;
+
+        let ReplayLog { entries } = replay;
+        let mut lines = vec![format!("replay count={}", entries.len())];
+        let mut rows: Vec<String> = entries
+            .iter()
+            .map(|(key, entry)| {
+                let Entry { expiry, verdict } = entry;
+                format!("replay key={key} expiry={expiry} verdict={verdict:?}")
+            })
+            .collect();
+        rows.sort();
+        lines.extend(rows);
+
+        let PendingLog { entries } = pending;
+        lines.push(format!("pending count={}", entries.len()));
+        let mut rows: Vec<String> = entries
+            .iter()
+            .map(|(commitment_id, expiry)| format!("pending id={commitment_id} expiry={expiry}"))
+            .collect();
+        rows.sort();
+        lines.extend(rows);
+
+        let NonceLog {
+            entries,
+            high_water,
+        } = coord_nonces;
+        lines.push(format!(
+            "coord_nonces count={} high_water={high_water}",
+            entries.len()
+        ));
+        let mut rows: Vec<String> = entries
+            .iter()
+            .map(|(nonce, expiry)| format!("coord_nonce nonce={nonce} expiry={expiry}"))
+            .collect();
+        rows.sort();
+        lines.extend(rows);
+
+        let RefreshLog { entries } = refreshes;
+        lines.push(format!("refreshes count={}", entries.len()));
+        let mut rows: Vec<String> = entries
+            .iter()
+            .map(|(outpoint, at)| format!("refresh outpoint={outpoint} at={at}"))
+            .collect();
+        rows.sort();
+        lines.extend(rows);
+
+        lines.push(pin_budget.shape());
+        lines
+    }
+}
+
 /// In-memory anti-replay log: `decision identity -> recorded verdict`.
 #[derive(Default)]
 pub(crate) struct ReplayLog {
