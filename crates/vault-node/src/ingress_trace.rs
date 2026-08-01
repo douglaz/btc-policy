@@ -83,16 +83,37 @@
 //!
 //! Instrument new sites here for ORDER; the two evaluation counters cover MEMORY-HARD
 //! cost only, and the two projections cover channel-store and `/sign`-state net state.
-//! A new write to `Node::outbox`, `Node::authorized`, `Node::alerts`, or
-//! `ChannelState`'s `freshness_counts` / `ingress_guards` MUST record its op — none of
-//! those reach either projection, so an uninstrumented write to any of them is invisible
-//! to the whole record. `Node::alerts` is the one to watch hardest: it is served
-//! verbatim over `GET /events`, which SILENCE names as an observable, so a duress-only
-//! alert write from ingress would pass all seven deterministic cases while being
-//! pin-readable over HTTP — with only the live harness's `/events` body comparison in
-//! its way. Nothing on the `/sign` path writes any of these today (the sole alert push
-//! is `record_freshness_reject`, on the `/channel` peer path); this rule is what keeps
-//! that true.
+//! **This is a WHITELIST, and a whitelist cannot be proven complete.** Four review
+//! passes each found one more piece of state outside it, which is the nature of the
+//! construction rather than a defect being slowly fixed. So state the boundary instead
+//! of claiming closure.
+//!
+//! COVERED generically: everything inside `PartialStore` and everything under the
+//! `/sign` lock, via the two whole-struct projections — those destructure without `..`,
+//! so a new field is a compile error, not a silent gap.
+//!
+//! NOT covered by the projections; an uninstrumented write is invisible to the whole
+//! record, so a new write to any of these MUST record its op:
+//!   * `Node::outbox`, `Node::authorized` — instrumented today at every production site.
+//!   * `Node::alerts` — served verbatim over `GET /events`, an observable SILENCE names.
+//!   * `ChannelState::freshness_counts` / `ingress_guards` — `/channel` path only today.
+//!   * `Node::lockdown`, `last_deadline_tick`, `generation_claimed` — the `/healthz`
+//!     latches. `lockdown` is the LOUDEST oracle the node can emit (it flips every later
+//!     `/sign` to `FRAUD_SUSPECTED`), and it is not in either projection.
+//!
+//! KNOWN-UNCOVERED CLASSES, named so nobody mistakes this gate for more than it is:
+//! non-memory-hard duress-only cost (see above); the VALUES behind instrumented markers
+//! (`AuthorizedInsert` records that an insert happened, not which txid); the
+//! nonce→carrier→intent LINKAGE, which per-value masking necessarily breaks; and the
+//! preflight guard's release POINT, since `preflight_after` compares only the settled
+//! depth. Each is reachable in principle by a pin-dependent regression that leaves every
+//! comparison here equal.
+//!
+//! Nothing on the `/sign` path writes any of the uncovered state today — verified, not
+//! assumed. What stands between those classes and the wire is the live harness's
+//! non-timing hard gates (per-sample response bodies, body sizes, `/events`) and the
+//! ordinary review of writes to shared node state. This gate is a strong net for the
+//! ORDER and NET STATE of instrumented work, not a proof of pin-uniformity.
 //!
 //! **Why this can never become the leak it tests for.** The log lives in a
 //! thread-local, is `#[cfg(test)]`, and is written only while a test has explicitly

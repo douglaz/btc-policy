@@ -2248,17 +2248,17 @@ impl Node {
     /// subordinates a refresh very slightly longer than strictly necessary, which the
     /// coordinator resolves by retrying — while the opposite direction would be the
     /// escape-invalidation race this exists to close.
+    fn spend_preflight_in_flight(&self) -> bool {
+        self.spend_preflight.load(Ordering::SeqCst) > 0
+    }
+
     /// The settled preflight-slot depth, for the ingress-work projection (bead
-    /// btc-policy-c9r). Read-only, test-only: a duress-dependent guard lifetime would
-    /// otherwise be invisible to both state shapes and to the op log, which records the
-    /// claim but not the release.
+    /// btc-policy-c9r). Read-only, test-only. It asserts every pass leaves the slot as
+    /// it found it; it does NOT pin WHEN the guard dropped, so a pin-dependent release
+    /// POINT inside the pass is invisible to it (see `ingress_trace`'s boundary list).
     #[cfg(test)]
     pub(crate) fn spend_preflight_depth(&self) -> usize {
         self.spend_preflight.load(Ordering::SeqCst)
-    }
-
-    fn spend_preflight_in_flight(&self) -> bool {
-        self.spend_preflight.load(Ordering::SeqCst) > 0
     }
 
     /// The §0 confirmation receipt: a peer's propagation of `carrier` proves that peer
