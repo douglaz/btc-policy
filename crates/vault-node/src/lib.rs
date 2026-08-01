@@ -2248,6 +2248,15 @@ impl Node {
     /// subordinates a refresh very slightly longer than strictly necessary, which the
     /// coordinator resolves by retrying — while the opposite direction would be the
     /// escape-invalidation race this exists to close.
+    /// The settled preflight-slot depth, for the ingress-work projection (bead
+    /// btc-policy-c9r). Read-only, test-only: a duress-dependent guard lifetime would
+    /// otherwise be invisible to both state shapes and to the op log, which records the
+    /// claim but not the release.
+    #[cfg(test)]
+    pub(crate) fn spend_preflight_depth(&self) -> usize {
+        self.spend_preflight.load(Ordering::SeqCst)
+    }
+
     fn spend_preflight_in_flight(&self) -> bool {
         self.spend_preflight.load(Ordering::SeqCst) > 0
     }

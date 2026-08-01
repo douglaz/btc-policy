@@ -253,7 +253,13 @@ impl Card {
             if complete_scorecard {
                 println!(
                     "\nNo theft path, safety track held (freeze + unconditional lockdown at T), \
-                     silence preserved, censorship residual bounded to the Hot budget."
+                     censorship residual bounded to the Hot budget. SILENCE: this harness gates \
+                     the wire — response bodies, body sizes, /events — and NOT end-to-end \
+                     timing, whose wall-clock skew it now reports as ADVISORY only. Pin-uniform \
+                     ingress is gated by vault-node's deterministic ingress-work assertions \
+                     (`channel::duress::normal_and_duress_ingress_op_sequences_*`) under \
+                     `cargo test`, which this command does NOT run. A green scorecard here is \
+                     not by itself evidence that silence holds."
                 );
             } else {
                 println!(

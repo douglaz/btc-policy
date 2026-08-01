@@ -12094,9 +12094,14 @@ mod duress {
             ),
             format!("candidates count={}", candidates.len()),
         ];
-        let mut sorted_candidates: Vec<&Candidate> = candidates.values().collect();
-        sorted_candidates.sort_by(|a, b| a.commitment_id.cmp(&b.commitment_id));
-        for candidate in sorted_candidates {
+        // The MAP KEY is projected alongside the value, not just the embedded
+        // `commitment_id`: the key is the lookup identity every cached-schedule and
+        // release path uses, so a rekey that left the embedded id untouched would
+        // otherwise leave both shapes identical while lookups diverged.
+        let mut sorted_candidates: Vec<(&String, &Candidate)> = candidates.iter().collect();
+        sorted_candidates.sort_by(|a, b| (a.0, &a.1.commitment_id).cmp(&(b.0, &b.1.commitment_id)));
+        for (map_key, candidate) in sorted_candidates {
+            lines.push(format!("candidate key={map_key}"));
             let Candidate {
                 commitment_id,
                 role,
@@ -12323,6 +12328,15 @@ mod duress {
         response: SignResponse,
         /// The ordered observable ops (locks, writes, timer installs, signatures).
         ops: Vec<crate::ingress_trace::IngressOp>,
+        /// The preflight slot counter AFTER the pass. `Node::spend_preflight` is an
+        /// RAII counter (`enter_spend_preflight` / `SpendPreflightGuard::drop`) that
+        /// neither projection otherwise reads, and the trace records the CLAIM without
+        /// the release — so pin-dependent control flow that dropped the guard at a
+        /// different point would leave ops and both shapes equal while a concurrent
+        /// `/refresh` saw `spend_preflight_in_flight()` differ and returned
+        /// `REFRESH_SUBORDINATED` under one pin only. Comparing the settled value
+        /// closes that: every pass must leave the slot as it found it.
+        preflight_after: usize,
         /// Per-request delta of the channel store's internal schedule work: store
         /// locks, candidate visits, allocations, overlay writes, and timer-window
         /// writes. This closes the call-site log's deliberate blind spot inside
@@ -12453,6 +12467,7 @@ mod duress {
                 ),
                 pin_evaluations: calls.lock().expect("pin call log").clone(),
                 carrier_derivations: node.carrier_derivation_count() - derivations_before,
+                preflight_after: node.spend_preflight_depth(),
             },
             arm_delta: node.duress_arm_count() - arm_before,
         }
