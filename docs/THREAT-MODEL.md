@@ -82,7 +82,7 @@ These are what a reviewer should try hardest to break. Each is enforced in code,
 
 | Invariant | What it means | Break it and… |
 |---|---|---|
-| **SILENCE** (scoped — read the scope) | Across the protocol observables a node emits — response bytes, timing class, `/events`, `/healthz`, `/pending`, peer effects — a duress-PIN ceremony is identical to a normal-PIN one. **It is NOT a claim that no adversary can learn the PIN class.** A compromised NODE sees the submitted PIN in plaintext, and a coordinator compromised BEFORE the wrench can read the normal PIN and substitute it, nullifying duress entirely (ADR-0012 Direction 3, and R8 below). The guarantee is: silence against a coordinator that turns hostile AT the wrench, across the observables listed. | The wrench attacker learns the duress PIN was used and simply escalates. This is the invariant most easily lost to an innocuous-looking new field or endpoint. |
+| **SILENCE** (scoped — read the scope) | Across the protocol observables a node emits — response bytes, timing class, `/events`, `/healthz`, `/pending`, peer effects — a duress-PIN ceremony is identical to a normal-PIN one. **It is NOT a claim that no adversary can learn the PIN class.** A compromised NODE sees the submitted PIN in plaintext, and a coordinator compromised BEFORE the wrench can read the normal PIN and substitute it, nullifying duress entirely (ADR-0012 Direction 3, and R8 below). The guarantee is: silence against a coordinator that turns hostile AT the wrench, across the observables listed. R10 below states the evidence boundary for end-to-end timing and post-handler effects; SILENCE itself remains normative. | The wrench attacker learns the duress PIN was used and simply escalates. This is the invariant most easily lost to an innocuous-looking new field or endpoint. |
 | **Signer/partial COUPLING + RELEASE-GATE** | A partial is finalizable authority the moment `t−1` compromised peers hold it, so every fire-time check runs BEFORE release; `release_partials` is the sole egress. | A `t−1` set combines a transaction the honest node had refused. |
 | **Unconditional Lockdown at T** | Once armed, Lockdown happens at `T` regardless of whether the sweep succeeded, the chain was readable, or anything else. | Duress becomes survivable for the attacker: the vault keeps signing after coercion. |
 | **Determinism across the honest set** | Every honest node derives the same verdicts, and the same fee-bump rung, from the same chain state. | Partials cover different transactions, no rung reaches `t`, and the escape fails exactly when it is needed. |
@@ -196,6 +196,19 @@ protocol core is considerably more finished than the product around it.
 core-proven gate. Correlated automated review — including this repo's `codex` + Claude Fable
 panels, however adversarially prompted — **does not** substitute for it, and this document must
 not be read as evidence that it has.
+
+**R10 — End-to-end SILENCE timing has no hard wall-clock gate.** The live normal/duress skew is
+still sampled and reported, but it is advisory: repeated CI runs on identical code produced
+opposite signs and a noise range larger than the one-extra-Argon2 regression it was meant to
+detect, so it could produce false negatives as readily as false positives. The hard replacement
+is deterministic and in-process: it compares the synchronous `/sign` response, ordered handler
+operations, an exhaustive pin-masked channel-store projection, an exhaustive projection of the
+`/sign` handler state (including the PIN attempt budget), schedule-work counts, PIN evaluations,
+and carrier derivations — across seven request shapes including a locked-out node. Its capture ends at handler return, before the server drains
+the outbox and spawned peer sends run. Those post-handler effects are exercised by live
+propagation scenarios, but neither they nor arbitrary end-to-end CPU/scheduler cost have a
+deterministic timing gate. SILENCE remains the normative invariant; this is the evidence boundary
+an external reviewer must not mistake for a proof of every timing effect.
 
 ## 8. What a reviewer should attack first
 

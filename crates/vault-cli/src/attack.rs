@@ -3620,9 +3620,12 @@ fn selective_delivery() -> Result<String, Error> {
 // ---------------------------------------------------------------------------
 // Timing-probe instrumentation
 
-/// What one Argon2 evaluation should cost for a latency comparison to be evidence.
-/// The actual bound remains relative to a measured evaluation; this target only
-/// guides calibration and makes no claim about runner jitter.
+/// What one Argon2 evaluation should cost, so that the node's OWN observed ingress
+/// latency can be checked against the `2 x one_argon2` floor every pin class must
+/// clear ([`assert_pin_cost_reached_the_node`], the surviving hard control). The same
+/// measurement supplies the reporting reference for the advisory skew
+/// ([`pin_latency_advisory`]), which decides nothing. This target only guides
+/// calibration and makes no claim about runner jitter.
 const PIN_COST_TARGET: Duration = Duration::from_millis(200);
 /// The probe cost the calibration measures at before scaling. Small enough to be
 /// cheap on a slow debug build, large enough to time reliably.
@@ -3631,9 +3634,11 @@ const PIN_COST_PROBE_KIB: u32 = 8 * 1024;
 /// ceiling, and bounded so a slow machine cannot scale itself into swapping — every
 /// node in the federation allocates this much while evaluating a pin.
 const PIN_COST_MAX_KIB: u32 = 128 * 1024;
-/// The floor a measured evaluation must clear for the derived bound to beat
-/// loopback jitter. Only an implausibly fast machine misses it at the ceiling
-/// above, and failing loudly beats asserting a bound that cannot detect anything.
+/// The floor a measured evaluation must clear for `2 x one_argon2` to sit clear of a
+/// loopback round trip, which is what makes the enrolment control able to separate a
+/// correctly-configured node from one still at `Params::MIN_M_COST`. Only an
+/// implausibly fast machine misses it at the ceiling above, and failing loudly beats
+/// running a control that cannot distinguish the two.
 const PIN_COST_FLOOR: Duration = Duration::from_millis(50);
 /// `vault-node`'s base `/sign` handler deadline (`server::HANDLER_TIMEOUT`, private
 /// there). Production adds the configured maximum PIN backoff; this harness enrols
@@ -3645,7 +3650,7 @@ const NODE_HANDLER_DEADLINE: Duration = Duration::from_secs(10);
 /// the `arm_carrier_id` derivation, whose work factor is the elementwise MAX of the
 /// two slots (`vault-node/src/pin.rs`, `CarrierKdf::new`).
 const PIN_EVALUATIONS_PER_SIGN: u32 = 3;
-/// Replication keeps one unusually fast/slow enrolment from setting the bound for
+/// Replication keeps one unusually fast/slow enrolment from setting the floor for
 /// the whole live run. Odd so the median is one observed duration.
 const PIN_CALIBRATION_SAMPLES: usize = 5;
 
@@ -3653,11 +3658,13 @@ const PIN_CALIBRATION_SAMPLES: usize = 5;
 /// dominate measurement noise, and return it with the cost actually measured there.
 ///
 /// The fixture enrolment cost is Argon2's minimum — tens of microseconds per
-/// evaluation. A probe enrolled there can assert a latency bound, but the bound
-/// cannot detect the leak it exists to catch (one extra Argon2 on the duress path),
-/// because that leak is three orders of magnitude below the noise. The cost is
-/// derived per machine rather than hard-coded because the same constant means
-/// entirely different things in a release build and an unoptimized one.
+/// evaluation. No node-side latency floor can tell a fixture left at that cost apart
+/// from one enrolled at the calibrated cost, because the whole difference sits under
+/// the loopback round trip. That harness-configuration mismatch is what
+/// [`assert_pin_cost_reached_the_node`] exists to catch, and this calibration is what
+/// gives it a floor to check against. The cost is derived per machine rather than
+/// hard-coded because the same constant means entirely different things in a release
+/// build and an unoptimized one.
 fn calibrate_pin_cost() -> Result<(u32, Duration), Error> {
     // Argon2id's cost is ~linear in `m_cost` at fixed `t`/`p`, so a replicated
     // median measurement scales to the target without trusting one scheduler turn.
@@ -3673,8 +3680,8 @@ fn calibrate_pin_cost() -> Result<(u32, Duration), Error> {
     if measured < PIN_COST_FLOOR {
         return Err(format!(
             "pin-cost calibration failed: one Argon2 evaluation is {measured:?} at {m_cost_kib} \
-             KiB (ceiling {PIN_COST_MAX_KIB} KiB), under the {PIN_COST_FLOOR:?} floor a latency \
-             comparison needs to mean anything on a loopback round trip. If {m_cost_kib} is the \
+             KiB (ceiling {PIN_COST_MAX_KIB} KiB), under the {PIN_COST_FLOOR:?} floor the \
+             enrolment control needs to stand clear of a loopback round trip. If {m_cost_kib} is the \
              ceiling, raise PIN_COST_MAX_KIB (vault_node accepts up to 256 MiB); otherwise the \
              cost scaled non-linearly and PIN_COST_TARGET needs re-deriving."
         )
@@ -3722,33 +3729,204 @@ fn median_pin_evaluation(m_cost_kib: u32) -> Duration {
     samples[PIN_CALIBRATION_SAMPLES / 2]
 }
 
-/// A full short-circuit regression costs one extra Argon2 evaluation. Keep the
-/// bound below one evaluation while leaving more runner headroom than a half-cost
+/// A full short-circuit regression costs one extra Argon2 evaluation. The reference
+/// stays below one evaluation while leaving more runner headroom than a half-cost
 /// threshold on machines that hit the calibration ceiling.
-fn pin_latency_bound(one_argon2: Duration) -> Duration {
+///
+/// This is a REPORTING reference, not a gate — see [`pin_latency_advisory`]. It is also
+/// only HALF of what makes the advisory speak: this says how big an effect would be
+/// interesting, and [`within_pin_spread`] says how big this run's own noise already is.
+fn pin_latency_reference(one_argon2: Duration) -> Duration {
     one_argon2 * 3 / 4
 }
 
-/// The positive control for the latency bound: prove the calibrated cost actually
-/// REACHED the daemon before concluding anything from a skew that clears the bound.
+/// How much THIS RUN's timings already vary WITHIN one pin — the widest
+/// max-minus-min of the two same-pin sample sets.
 ///
-/// [`pin_latency_bound`] is derived entirely from an Argon2 evaluation timed in this
-/// CLI process. Nothing in that derivation observes the node, so a regression in the
-/// config plumbing that left both slots enrolled at `Params::MIN_M_COST` would leave
-/// the bound at ~150 ms while every real evaluation cost tens of microseconds — a
-/// genuine short-circuit leak (one extra evaluation, ~50 µs) would sail under it
-/// while the scorecard printed "one Argon2 = 200 ms". The comparison would be
-/// vacuous in exactly the way it is written to prevent.
+/// A same-pin spread is noise by construction: those samples differ in nothing the
+/// silence property cares about, so whatever separates them is the box. Reporting a
+/// between-pin skew as interesting when it is smaller than that would be reporting
+/// noise as signal — which is the failure this whole bead is about, arriving in the
+/// report instead of in a gate. The measured CI spread on identical code was 2 ms –
+/// 680 ms against a 149 ms single-evaluation reference, so a reference-only comparison
+/// prints an alarm-shaped line on a large fraction of healthy runs and teaches the next
+/// reader to skip it.
 ///
-/// So require the node's own observed latency to be consistent with the enrolled
-/// cost. `verify_pin` evaluates BOTH slots unconditionally, in separate `let`
-/// bindings the compiler cannot short-circuit (`vault-node/src/pin.rs`), so every
-/// pin class costs at least two evaluations at the enrolled cost — including the
-/// wrong-pin class, which returns early only AFTER both have run. Two evaluations is
-/// therefore a floor the node cannot be under unless it is enrolled somewhere else,
-/// and it is a floor with three orders of magnitude of headroom against the
-/// regression it detects: everything else on the path (HTTP round trip, PSBT decode,
-/// signature verification, carrier derivation) only adds to it.
+/// It is a floor on this run's noise, not an estimate of its distribution: with 4–8
+/// samples per pin the tail is unobserved, and the advisory claims no statistical power
+/// from it ([`pin_latency_advisory`]). Zero for a single sample, which is correct — a
+/// one-shot pair supplies no evidence about its own noise, so the caller passes the
+/// replicated spread measured beside it.
+///
+/// It also RISES WITH THE SAMPLE COUNT, while the difference of medians it is compared
+/// against does not — so `two-spend-probe` (8 per pin) sets a higher bar for speaking
+/// than `escape-class-sequences` (4), as a consequence of their sample budgets rather
+/// than of any decision about them. That is the safe direction for a report: more
+/// samples means more of this box's behaviour at FIXED pin actually observed, and the
+/// only thing the bar decides is whether a line is shouted. Both numbers print either
+/// way. A count-invariant spread (an IQR, or the spread of split-half medians) would
+/// make the two scenarios' reports comparable, but at four samples per pin it would be
+/// estimating a quantile from two points, and it would still buy no detection power for
+/// a signal that gates nothing — so the mismatch is stated here rather than papered
+/// over with a statistic that looks more principled than its inputs are.
+fn within_pin_spread(normal: &[Duration], duress: &[Duration]) -> Duration {
+    let spread = |samples: &[Duration]| match (samples.iter().min(), samples.iter().max()) {
+        (Some(min), Some(max)) => *max - *min,
+        _ => Duration::ZERO,
+    };
+    spread(normal).max(spread(duress))
+}
+
+/// Report one normal-vs-duress median-latency comparison. **Advisory: it never fails
+/// a scenario.**
+///
+/// # Why this is not a gate (bead btc-policy-c9r)
+///
+/// It used to be one, and it could not do the job. The leak these comparisons exist
+/// to catch is ONE EXTRA ARGON2 EVALUATION — about 199 ms at this harness's enrolled
+/// cost. Two consecutive CI runs of the SAME commit measured, for `two-spend-probe`,
+/// a skew of 223.9 ms with duress slower and then 680.1 ms with NORMAL slower; for
+/// `escape-class-sequences`, 2.27 ms and then 317.6 ms. The sign flips between runs
+/// and the spread is 2 ms – 680 ms on identical code. A measurement whose noise
+/// exceeds the effect it is looking for cannot detect that effect: the false
+/// positives were the visible half, and a real 199 ms leak sitting inside that same
+/// spread would have passed just as easily. For SILENCE — the invariant that protects
+/// the person holding the duress PIN — a false negative is the worst failure
+/// available, so gating on this measurement was worse than not gating at all.
+///
+/// # Why advisory rather than a variance-derived GATE
+///
+/// (The trip condition below IS derived from measured variance. What is out of reach is
+/// making that a PASS/FAIL bound with stated statistical power — this section is about
+/// the gate, the next one about the report.)
+///
+/// The alternative was to keep it as a gate with a bound derived from measured
+/// variance and enough samples to state real statistical power. That is not reachable
+/// here. The sample count is capped by the scenario's own duress delay — each sample
+/// costs `PIN_EVALUATIONS_PER_SIGN` memory-hard evaluations, and
+/// `escape-class-sequences` refuses outright any calibration whose sampled requests
+/// would not fit before `T`, because a loop that ran past `T` would manufacture a
+/// false violation in that scenario's other, hard assertions. Separating a 199 ms
+/// shift from a distribution with a ~680 ms tail needs sample counts an order of
+/// magnitude beyond that budget, and they would have to be re-measured per runner
+/// besides. Widening the constant instead is the
+/// one fix the bead explicitly forbids: a bound loose enough never to fire is
+/// decoration.
+///
+/// # What it takes for this to speak, and why it is two conditions
+///
+/// The skew must exceed BOTH the single-evaluation reference AND
+/// [`within_pin_spread`] — how far this run's own SAME-PIN samples already spread. The
+/// reference alone would not do: it is ~149 ms while the measured CI spread on
+/// identical code was 2 ms – 680 ms, so a reference-only line prints on a large
+/// fraction of healthy runs. An advisory that cries out on green runs is not a
+/// conservative advisory, it is one nobody reads, and re-creating the false-positive
+/// problem in report form gets to the same place bead c9r started from. Requiring the
+/// between-pin skew to be larger than the noise the same run demonstrably produces is
+/// the honest form of the question, and it is measured, not chosen.
+///
+/// This buys no detection power and does not make it a gate: with 4–8 samples per pin
+/// the spread is a floor on the noise rather than a description of it, and both numbers
+/// are printed unconditionally so a reader can judge the run for themselves rather than
+/// trust the verdict.
+///
+/// # What gates the property instead
+///
+/// A deterministic, in-process counting seam, following the shape
+/// `pin::PinEvaluator`/`CountingEvaluator` already established for the pin compare.
+/// `vault-node`'s ingress work record compares six things, and each answers a
+/// question the others cannot:
+///
+/// * The `/sign` ACKNOWLEDGEMENT, field for field. It is the one part of the record the
+///   attacker actually receives, so it is also the only one that is not in-process; the
+///   node-side comparison needs no normalization, which makes it stricter than the body
+///   equality this scenario can perform (`pin_invariant_body`).
+/// * The ORDERED op sequence — `/sign` lock acquisitions, replay/pending/refresh-log
+///   writes, outbox pushes, signatures, candidate registration, the Hold timer
+///   install — so an op added, dropped, or merely MOVED on one pin's path fails the
+///   comparison.
+/// * A canonical PIN-MASKED PROJECTION OF THE WHOLE CHANNEL STORE. The op sequence and
+///   the schedule counters are whitelists of hand-placed instrumentation; this one is
+///   read off the store's fields, so a duress-only write landing anywhere in it — the
+///   first clause of the ADR-0012 rule — fails the comparison even though nobody
+///   instrumented that site.
+/// * The same whole-struct projection of the `/sign` HANDLER STATE: replay, pending,
+///   coordinator-nonce and refresh logs plus the PIN ATTEMPT BUDGET, which is the one
+///   piece of state the pin VERDICT itself is passed into (`AttemptBudget::charge`).
+/// * The MEMORY-HARD WORK the pass performed: every Argon2 PIN evaluation, in order,
+///   and every arm-carrier derivation. This is what makes the replacement cover the
+///   ~199 ms effect this timing probe was aimed at, and it is not redundant with the
+///   op log: an extra `carrier_kdf.derive` bolted onto one pin's path costs a full
+///   evaluation while appending nothing to that log.
+/// * `ChannelState::schedule_work_trace`'s per-request delta, for the store's internal
+///   lock, visit, allocation, and timer-window counts.
+///
+/// All six are asserted identical for a normal-pin and a duress-pin request across
+/// the first carrier, an already-armed node, fresh and replay-cached escape-class
+/// spends, a replay-cached Hot resubmission, a Hot-budget refusal, and a LOCKED-OUT
+/// node — the attacker's cheapest probe, and the path where §0's fail-closed rule makes
+/// a refused duress request still derive its carrier, run the arm hook, and stage for
+/// peers (`channel::duress::normal_and_duress_ingress_op_sequences_*`). They have no
+/// noise floor and cannot false-negative for the operations, state, and memory-hard
+/// seams they record, so this signal's remaining job is to be reported, not to decide.
+fn pin_latency_advisory(
+    label: &str,
+    skew: Duration,
+    reference: Duration,
+    observed_noise: Duration,
+    normal_median: Duration,
+    duress_median: Duration,
+    samples: usize,
+) -> String {
+    if skew > reference && skew > observed_noise {
+        // Distinct from `FAIL` on purpose: a future reader must not take this for a
+        // detected silence break. Nothing here concluded that duress did extra work.
+        println!(
+            "  ADVISORY (not a failure)  {label}: skew {skew:?} over BOTH this run's own \
+             within-pin spread ({observed_noise:?}) and the {reference:?} single-evaluation \
+             reference ({normal_median:?} normal vs {duress_median:?} duress over {samples} \
+             sample(s)). This is a LOADED-BOX NOISE REPORT, and this harness draws no silence \
+             conclusion from it. The gate for pin-uniform ingress is vault-node's deterministic \
+             ingress-work assertion \
+             (`channel::duress::normal_and_duress_ingress_op_sequences_*`), which runs in \
+             `cargo test`, not here. See `pin_latency_advisory`."
+        );
+        format!(
+            "ADVISORY {label} skew {skew:?} over both the {observed_noise:?} within-pin spread \
+             and the {reference:?} reference ({normal_median:?} normal vs {duress_median:?} \
+             duress, {samples} samples) — reported as noise, NOT a detected silence break"
+        )
+    } else {
+        format!(
+            "advisory {label} skew {skew:?} (within-pin spread {observed_noise:?}, \
+             single-evaluation reference {reference:?}; {normal_median:?} normal vs \
+             {duress_median:?} duress, {samples} samples)"
+        )
+    }
+}
+
+/// Prove the calibrated PIN cost actually REACHED the daemon. **Still a hard gate**
+/// while the skew comparisons it used to guard are advisory ([`pin_latency_advisory`]).
+///
+/// What it detects is a HARNESS CONFIGURATION regression, not a timing one: if
+/// `pin_m_cost_kib` never reached the generated node configs, both slots stay at
+/// `Params::MIN_M_COST` while the scorecard still prints "one Argon2 = 200 ms" from a
+/// cost measured in this CLI process. The reported reference would not describe the
+/// nodes under test, and nothing else in the run would notice that scenario-setup
+/// mismatch.
+///
+/// The NODE-SIDE term survives the noise that disqualified the skew comparison,
+/// because node contention moves it in only one direction. `verify_pin` evaluates BOTH slots
+/// unconditionally, in separate `let` bindings the compiler cannot short-circuit
+/// (`vault-node/src/pin.rs`), so every pin class costs at least two evaluations at the
+/// enrolled cost — including the wrong-pin class, which returns early only AFTER both
+/// have run. Two evaluations is therefore a floor the node cannot be under unless it
+/// is enrolled somewhere else, node contention only pushes an observed median further
+/// ABOVE that floor, and everything else on the path (HTTP round trip, PSBT decode,
+/// signature verification, carrier derivation) only adds to it. The reference is
+/// calibrated earlier in the CLI process, so load concentrated only during that
+/// calibration can still inflate the floor; the replicated median reduces that remote
+/// false-failure mode but does not make a wall-clock control infallible.
 fn assert_pin_cost_reached_the_node(
     context: &str,
     medians: &[(&str, Duration)],
@@ -3762,9 +3940,9 @@ fn assert_pin_cost_reached_the_node(
                 "{context}: the {class}-pin median ingress latency is {median:?}, under the \
                  {floor:?} floor of the two unconditional Argon2 evaluations every pin class \
                  costs at {m_cost_kib} KiB (one evaluation measures {one_argon2:?} here). The \
-                 federation is not enrolled at the calibrated cost, so the derived latency bound \
-                 is orders of magnitude too loose to detect the extra evaluation it exists to \
-                 catch — check that `pin_m_cost_kib` reaches the node config"
+                 harness federation is not enrolled at the calibrated cost, so the reported \
+                 Argon2 reference does not describe the node — check that `pin_m_cost_kib` \
+                 reaches the generated node config"
             )
             .into());
         }
@@ -3927,9 +4105,11 @@ fn normalize_request_dependent(value: &mut Value) {
 /// constant-observable: identical operations in identical order under both pins,
 /// with the pin choosing only the contents of a same-shaped schedule record.
 ///
-/// The probe compares the complete ingress acknowledgement body, its size, latency,
-/// and the `/events` projection under the normal and duress pins, and includes the
-/// Hot-budget refusal path, which is amount-based and therefore pin-independent.
+/// The probe hard-gates the complete ingress acknowledgement body, its size, and the
+/// `/events` projection under the normal and duress pins. It still measures and
+/// reports latency, including the amount-based Hot-budget refusal path, but that noisy
+/// wall-clock signal is advisory; the deterministic node tests hard-gate ingress work
+/// shape across both pins.
 /// `/pending` is request-varying, so its stronger whole-body equality checks live in
 /// the deterministic node tests that hold every input except pin/arm state equal.
 ///
@@ -3938,22 +4118,17 @@ fn normalize_request_dependent(value: &mut Value) {
 /// behind fresh coordinator envelopes because no refused candidate is registered.
 /// An accepted resubmission hits the anti-replay log's idempotent-accepted early return
 /// (`handle_sign_after_lock`), which answers from cache without reaching candidate
-/// registration, signing, or `record_arm_intent` — precisely the work whose cost
-/// and observables differ by pin, and therefore precisely the path a probe must
-/// compare. Sampling replays would measure the two pins agreeing on work neither
-/// one did.
+/// registration or signing. It still records the arm intent and re-applies the cached
+/// schedule; the deterministic cached-resubmission test covers that shape separately.
+/// Sampling only replays would leave the fresh registration and signing path untested.
 fn two_spend_probe() -> Result<String, Error> {
     const SAMPLES: usize = 8;
     const REFUSAL_SAMPLES: usize = 8;
     const PRE_T_GUARD_SECS: u64 = 10;
 
-    // Enrol the pins at a cost where ONE Argon2 evaluation dominates loopback
-    // jitter. At the fixture minimum an evaluation is tens of microseconds, so a
-    // latency comparison could not detect the leak this scenario exists to catch —
-    // a short-circuiting pin compare ("try normal; if it matches, stop") that costs
-    // the duress path one EXTRA evaluation. The bound below is derived from the
-    // measured cost rather than fixed, so it stays meaningful across machines and
-    // build profiles.
+    // Enrol the pins at a measurable cost so the hard configuration control below
+    // can prove that cost reached the node. The same measurement supplies a useful
+    // reference for the advisory latency report, but never a silence verdict.
     let (pin_m_cost_kib, one_argon2) = calibrate_pin_cost()?;
 
     // A long hostage window: everything measured here happens BEFORE T, which is
@@ -4066,11 +4241,13 @@ fn two_spend_probe() -> Result<String, Error> {
         .max(normal_accepted.first_seen)
         .max(duress_accepted.first_seen);
     // This is the only sample that crosses Idle -> arm-intent on the directly
-    // addressed node. Later duress samples run after propagation has armed the
-    // federation, so their registration work cannot detect a regression that adds
-    // synchronous first-carrier schedule/deadline work only to the duress path.
-    // Keep this one-shot comparison separately from the replicated steady-state
-    // medians below: dropping it would make that first-arm work invisible again.
+    // addressed node; later duress samples run after propagation has already armed the
+    // federation. It is kept separate from the replicated steady-state medians below
+    // because it is a different STATE, not because it decides anything: like them it is
+    // advisory. First-carrier schedule/deadline work added only to the duress path is
+    // gated deterministically by
+    // `channel::duress::normal_and_duress_ingress_op_sequences_match_on_a_first_carrier`,
+    // and what this one-shot adds is a live end-to-end sample of that transition.
     let first_arm_skew = normal_probe.elapsed.abs_diff(duress_probe.elapsed);
 
     // Response cover: the COMPLETE body, not a chosen field or its length.
@@ -4117,20 +4294,27 @@ fn two_spend_probe() -> Result<String, Error> {
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .sum();
-    // Latency: normal and duress pins must perform the same observable work. A
-    // short-circuiting compare ("try normal; if it matches, stop") makes the duress
-    // class cost an EXTRA Argon2 evaluation, directly measurable by an attacker who
-    // controls the coordinator. Do not fold BAD_PIN into this assertion: after both
-    // unconditional digest evaluations it correctly returns before PSBT policy,
-    // signing, candidate registration, and Hot-budget accounting, so the design does
-    // not promise that refusal class the same end-to-end latency as a valid PIN.
+    // The replicated steady-state samples, which carry a HARD gate and an ADVISORY
+    // signal and must not be read as one thing. Hard, per sample: the normalized
+    // response BODY and its byte count under the two pins. Advisory: the latency each
+    // sample took, reported by `pin_latency_advisory` and deciding nothing, because a
+    // wall clock here cannot resolve the one extra Argon2 evaluation a short-circuiting
+    // compare would cost — that regression is gated deterministically in `vault-node`
+    // instead.
+    //
+    // BAD_PIN stays out of BOTH halves, and for a reason that survives the demotion:
+    // after its two unconditional digest evaluations a wrong pin correctly returns
+    // before PSBT policy, signing, candidate registration, and Hot-budget accounting,
+    // so the design promises that refusal class neither the same body nor the same
+    // end-to-end latency as a valid PIN. The pin-uniform refusal this scenario DOES
+    // compare is HOT_BUDGET_EXCEEDED, below, which is decided on the amount alone.
     //
     // Every sample is a FRESH candidate pair — a new spend amount and a new escape
     // fee, so each is a distinct commitment. Resubmitting the pairs above would be
     // answered from the anti-replay log's idempotent-accepted branch, which returns
-    // before candidate registration, signing, and `record_arm_intent`; the pin's
-    // Argon2 evaluations would still run, but the schedule work this comment claims
-    // to compare would not, under either pin.
+    // before candidate registration and signing. It still records the arm intent and
+    // re-applies the cached schedule under either pin, but it does not exercise the
+    // fresh registration work these samples mean to compare.
     //
     // Sampled INTERLEAVED so machine load, page-cache warmth, and scheduler drift
     // hit both pins equally, and ALTERNATED by parity so neither pin is
@@ -4240,51 +4424,63 @@ fn two_spend_probe() -> Result<String, Error> {
     let normal_median = normal_timings[SAMPLES / 2];
     let duress_median = duress_timings[SAMPLES / 2];
     let skew = normal_median.abs_diff(duress_median);
-    // The bound stays below one measured Argon2 evaluation at the cost these pins are
-    // enrolled at — derived, not fixed, because a fixed millisecond bound is only
+    // The reference stays below one measured Argon2 evaluation at the cost these pins
+    // are enrolled at — derived, not fixed, because a fixed millisecond value is only
     // meaningful relative to what an evaluation actually costs on this machine and
     // in this build profile. Replicated calibration prevents one scheduler outlier
     // from tightening or loosening the whole run.
-    let bound = pin_latency_bound(one_argon2);
-    // Before reading EITHER skew: is the bound measuring anything at all? This has to
-    // precede the first-arm comparison as much as the median one. Under the exact
-    // regression this control exists to catch — `pin_m_cost_kib` never reaching the
-    // node's config, leaving both slots at `Params::MIN_M_COST` — `bound` sits at
-    // ~150 ms while a node-side evaluation costs tens of microseconds, so a
-    // first-arm check placed ahead of this one passes against a bound that has not
-    // been shown to measure anything.
+    let reference = pin_latency_reference(one_argon2);
+    // This control REMAINS a hard gate while the skew comparisons below are advisory,
+    // and the asymmetry is deliberate — but it is a difference of KIND, not a claim
+    // that this measurement is noise-free. What it detects is a CONFIGURATION
+    // regression: `pin_m_cost_kib` never reaching the generated node configs, leaving
+    // both slots at `Params::MIN_M_COST` while the reported Argon2 reference describes
+    // the calibrated cost. That is a three-orders-of-magnitude effect, not the ~199 ms
+    // one the skew comparison could not resolve. Contention at the node only pushes an
+    // observed median further ABOVE the floor; contention during the CLI-side
+    // calibration can still inflate the floor itself, which is a real residual
+    // false-failure mode and is stated where the arithmetic lives (see
+    // `assert_pin_cost_reached_the_node`).
     assert_pin_cost_reached_the_node(
         "two-spend probe",
         &[("normal", normal_median), ("duress", duress_median)],
         one_argon2,
         pin_m_cost_kib,
     )?;
-    if first_arm_skew > bound {
-        return Err(format!(
-            "SILENCE BREAK: the first duress carrier's ingress latency differs from the fresh \
-             normal carrier by {first_arm_skew:?}, over the {bound:?} bound \
-             ({:?} normal vs {:?} first-arm duress; one Argon2 evaluation measures \
-             {one_argon2:?}) — synchronous arm/schedule work is measurable",
-            normal_probe.elapsed, duress_probe.elapsed
-        )
-        .into());
-    }
-    if skew > bound {
-        return Err(format!(
-            "SILENCE BREAK: median ingress latency differs between the normal and duress pins by \
-             {skew:?}, over the {bound:?} bound ({normal_median:?} normal, {duress_median:?} \
-             duress over {SAMPLES} interleaved fresh samples; one Argon2 evaluation measures \
-             {one_argon2:?}) — an extra Argon2 evaluation, or synchronous schedule work of \
-             comparable magnitude, is measurable; smaller per-pin work sits below timing \
-             resolution and is caught instead by the whole-body, /events, and partial equality"
-        )
-        .into());
-    }
+    // Advisory, not gates — see `pin_latency_advisory` for why wall-clock skew cannot
+    // decide this property and what gates it instead. Each report is scored against
+    // this run's OWN within-pin spread as well as the single-evaluation reference, so a
+    // loaded box does not print an alarm-shaped line on a green run.
+    let observed_noise = within_pin_spread(&normal_timings, &duress_timings);
+    // The one-shot first-arm pair has no spread of its own — two samples that differ in
+    // the pin cannot say how much the box moves at fixed pin. It borrows the replicated
+    // steady-state spread measured moments ago on the same daemon: the honest available
+    // estimate of this run's noise, and stated as borrowed rather than passed as zero,
+    // which would silently make this the one reference-only report.
+    let first_arm_advisory = pin_latency_advisory(
+        "two-spend first-arm ingress latency (noise borrowed from the steady-state samples)",
+        first_arm_skew,
+        reference,
+        observed_noise,
+        normal_probe.elapsed,
+        duress_probe.elapsed,
+        1,
+    );
+    let median_advisory = pin_latency_advisory(
+        "two-spend steady-state median ingress latency",
+        skew,
+        reference,
+        observed_noise,
+        normal_median,
+        duress_median,
+        SAMPLES,
+    );
     // The Hot-budget refusal path, included because a refusal that leaked the pin
     // would hand the attacker the bit for free. `HOT_BUDGET_EXCEEDED` is decided on
-    // the amount alone, so both its body and its replicated latency distribution must
-    // be pin-independent. A one-off body comparison would miss a refusal-only timing
-    // oracle.
+    // the amount alone, so both its body and its work shape must be pin-independent.
+    // Body equality is hard-gated here, store/handler work shape is hard-gated by the
+    // deterministic refusal test, and the replicated wall-clock distribution remains
+    // visible only as an advisory signal.
     let over = vault.hot_spend(&vault.vault_utxo, Amount::from_sat(400_000_000))?;
     let over_escape = vault.escape_over_fee(&[&vault.vault_utxo], FEE + Amount::from_sat(2_000))?;
     let mut refusal_normal_timings = Vec::with_capacity(REFUSAL_SAMPLES);
@@ -4365,15 +4561,18 @@ fn two_spend_probe() -> Result<String, Error> {
         one_argon2,
         pin_m_cost_kib,
     )?;
-    if refusal_skew > bound {
-        return Err(format!(
-            "SILENCE BREAK: median HOT_BUDGET_EXCEEDED latency differs by pin by \
-             {refusal_skew:?}, over the {bound:?} bound ({refusal_normal_median:?} normal vs \
-             {refusal_duress_median:?} duress over {REFUSAL_SAMPLES} interleaved samples; one \
-             Argon2 evaluation measures {one_argon2:?})"
-        )
-        .into());
-    }
+    // Advisory for the same reason as the acceptance medians above. The refusal's
+    // BODY equality, asserted per sample and across fresh envelopes, stays a hard
+    // gate: it is exact-byte, not statistical.
+    let refusal_advisory = pin_latency_advisory(
+        "two-spend HOT_BUDGET_EXCEEDED refusal median latency",
+        refusal_skew,
+        reference,
+        within_pin_spread(&refusal_normal_timings, &refusal_duress_timings),
+        refusal_normal_median,
+        refusal_duress_median,
+        REFUSAL_SAMPLES,
+    );
 
     let silence_deadline = duress_accepted
         .first_seen
@@ -4431,16 +4630,15 @@ fn two_spend_probe() -> Result<String, Error> {
 
     Ok(format!(
         "identical under both pins before T: whole /sign body equal modulo its request-dependent \
-         fields (remaining_secs {}, {normal_size}B), normal/duress median latency skew \
-         {skew:?} under the {bound:?} bound over {SAMPLES}/{SAMPLES} interleaved \
-         FRESH pairs below lockout plus first-arm skew {first_arm_skew:?} under the same bound \
-         (one Argon2 = {one_argon2:?} at {pin_m_cost_kib} KiB), /events \
+         fields (remaining_secs {}, {normal_size}B) over {SAMPLES}/{SAMPLES} interleaved FRESH \
+         pairs below lockout, /events \
          unchanged ({events_alerts} alert(s) either side; live /events control observed \
          {events_control_alerts} across {} honest nodes; partial wiretap proven audible by \
          {partial_control_signers} honest share(s) on a normal-pin control), \
-         HOT_BUDGET_EXCEEDED refusal byte-identical with median latency skew {refusal_skew:?} over \
-         {REFUSAL_SAMPLES} interleaved samples; and the duress carrier is proven to have \
-         carried the duress bit — all {} honest nodes locked down at T",
+         HOT_BUDGET_EXCEEDED refusal byte-identical; and the duress carrier is proven to have \
+         carried the duress bit — all {} honest nodes locked down at T. \
+         Wall-clock timing is ADVISORY ONLY (one Argon2 = {one_argon2:?} at {pin_m_cost_kib} \
+         KiB): {first_arm_advisory}; {median_advisory}; {refusal_advisory}",
         normal_accepted.remaining_secs,
         vault.honest.len(),
         vault.honest.len()
@@ -4898,12 +5096,13 @@ fn in_flight_refresh() -> Result<String, Error> {
 /// duress residual has spent `D` and the normal residual is then unbroadcastable for
 /// a reason that has nothing to do with the two-slot record.
 fn escape_class_sequences() -> Result<String, Error> {
-    // This scenario also compares settlement latency by pin, so it too needs pins
-    // enrolled at a cost where one Argon2 evaluation is measurable.
+    // Keep the same measurable enrolment as the dedicated silence probe: the hard
+    // control below proves the configured cost reached the node, while the settlement
+    // skew uses the measured evaluation only as an advisory reporting reference.
     let (pin_m_cost_kib, one_argon2) = calibrate_pin_cost()?;
     let vault = Vault::build(&Setup {
         // Match the dedicated silence probe's headroom. At the calibration ceiling
-        // the 16 Argon2-heavy samples below can take tens of seconds; T must not land
+        // the 8 Argon2-heavy samples below can take seconds; T must not land
         // mid-loop and turn an otherwise valid sample into FRAUD_SUSPECTED.
         hold_secs: 120,
         duress_delay_secs: 90,
@@ -5134,16 +5333,33 @@ fn escape_class_sequences() -> Result<String, Error> {
     // (`handle_sign_after_lock` charges the attempt budget at step 1 and consults
     // the log at step 4), so a short-circuiting pin compare is still measurable.
     // `two_spend_probe` is what covers the fresh-registration path.
-    const SAMPLES: usize = 8;
+    //
+    // SIZED TO THE SURVIVING HARD GATE, which is `assert_pin_cost_reached_the_node`'s
+    // per-pin median, not the skew. The skew is advisory now
+    // (`pin_latency_advisory`), so buying more samples buys only a prettier report —
+    // while the budget check below turns an over-long loop into a scenario ABORT,
+    // because these Argon2-heavy requests must finish before the real duress `T`.
+    // Four per pin keeps the alternating lead order balanced and supplies a replicated
+    // upper median, which is all a one-sided floor with three orders of magnitude of
+    // headroom needs. What the reduction from eight does cost is stated rather than
+    // waved away: each sample hard-gates `expect_accepted` on the idempotent
+    // resubmission, so four acceptance checks per pin went with it — a
+    // repeated identical replay of a path already covered by its own deterministic
+    // test, which is why the trade is worth taking. Unlike `two_spend_probe`, whose
+    // per-sample BODY/SIZE equality is a distinct comparison at every count, nothing
+    // here compares more as the count grows. Widening the abort threshold instead would
+    // be the "loosen the constant" move bead btc-policy-c9r forbids.
+    const SAMPLES: usize = 4;
     let sample_requests = u32::try_from(SAMPLES.saturating_mul(2))?;
     let measured_pin_work = one_argon2 * PIN_EVALUATIONS_PER_SIGN * sample_requests;
     // From the duress carrier's first_seen until the normal no-op window is fully
     // observable there are `duress_delay - NO_OP_CONTROL_GUARD_SECS` seconds. The
-    // `/events` settle consumes a fixed part of that interval before these 16
+    // `/events` settle consumes a fixed part of that interval before these
     // Argon2-heavy requests start. Refuse a calibration that cannot fit by arithmetic;
     // otherwise the loop can cross the real duress T and manufacture a false
-    // normal-slot violation. Variable RPC/mining overhead is still caught by the
-    // adjacent before/after deadline guards below.
+    // normal-slot violation — this abort protects the scenario's OTHER hard
+    // assertions, not the advisory skew. Variable RPC/mining overhead is still caught
+    // by the adjacent before/after deadline guards below.
     let sample_window = Duration::from_secs(
         vault
             .params
@@ -5197,23 +5413,33 @@ fn escape_class_sequences() -> Result<String, Error> {
     let duress_median = duress_timings[SAMPLES / 2];
     let skew = normal_median.abs_diff(duress_median);
     // Below one measured Argon2 evaluation at this federation's enrolment cost — see
-    // `calibrate_pin_cost`. A fixed millisecond bound would say nothing about
+    // `calibrate_pin_cost`. A fixed millisecond value would say nothing about
     // whether an extra evaluation is detectable.
-    let bound = pin_latency_bound(one_argon2);
+    let reference = pin_latency_reference(one_argon2);
+    // Still a hard gate, because what it detects is a pin-enrolment CONFIGURATION
+    // regression — a three-orders-of-magnitude effect — rather than the ~199 ms timing
+    // skew that turned out to be unmeasurable here. It is not noise-free either; see
+    // the note at the two-spend probe's call and `assert_pin_cost_reached_the_node`.
     assert_pin_cost_reached_the_node(
         "escape-class timing",
         &[("normal", normal_median), ("duress", duress_median)],
         one_argon2,
         pin_m_cost_kib,
     )?;
-    if skew > bound {
-        return Err(format!(
-            "escape-class timing oracle: median settlement latency differs by pin by {skew:?}, \
-             over the {bound:?} bound ({normal_median:?} normal vs {duress_median:?} duress over \
-             {SAMPLES} samples; one Argon2 evaluation measures {one_argon2:?})"
-        )
-        .into());
-    }
+    // Advisory. This scenario is the one whose skew measured 2.27 ms and then
+    // 317.6 ms on two consecutive CI runs of the same commit — the clearest available
+    // demonstration that the measurement is noise, not signal. The cached escape-class
+    // ingress shape it was covering is now gated deterministically
+    // by `channel::duress::normal_and_duress_ingress_op_sequences_match_on_a_replay_cached_escape_class_spend`.
+    let timing_advisory = pin_latency_advisory(
+        "escape-class median settlement latency",
+        skew,
+        reference,
+        within_pin_spread(&normal_timings, &duress_timings),
+        normal_median,
+        duress_median,
+        SAMPLES,
+    );
 
     // Confirm both completed spends before `T`, so the residual's coverage
     // denominator at fire time is exactly what remains in the vault: `C ∪ D`.
@@ -5417,9 +5643,9 @@ fn escape_class_sequences() -> Result<String, Error> {
          {escape_class_b_txid} reached the chain, complete {normal_size}B /sign body equal modulo \
          request fields, /events unchanged ({events_alerts} alert(s) either side; live positive \
          control observed {events_control_alerts} across {} honest nodes), \
-         remaining_secs 0, median latency skew {skew:?} under \
-         the {bound:?} bound over {SAMPLES} interleaved samples, one Argon2 = {one_argon2:?} at \
-         {pin_m_cost_kib} KiB); the duress pin's delayed slot fired BOTH Lockdown at T and the \
+         remaining_secs 0; wall-clock timing is ADVISORY ONLY (one Argon2 = \
+         {one_argon2:?} at {pin_m_cost_kib} KiB): {timing_advisory}); \
+         the duress pin's delayed slot fired BOTH Lockdown at T and the \
          residual sweep {residual_b_txid} over the union of 2 inputs disjoint from its spend \
          ({} honest escape partial(s) observed); while the normal pin's slot stayed inert past a \
          full release window after the instant it would have fired and before the duress T, with \
@@ -7688,16 +7914,98 @@ mod tests {
         }
     }
 
-    /// The bound must stay strictly under one evaluation — at or above it, the extra
-    /// Argon2 a short-circuiting pin compare costs is exactly what it cannot detect.
+    /// The reporting reference must stay strictly under one evaluation — at or above
+    /// it, the extra Argon2 a short-circuiting pin compare costs is exactly what it
+    /// could not even flag.
     #[test]
-    fn the_latency_bound_sits_below_one_evaluation() {
+    fn the_latency_reference_sits_below_one_evaluation() {
         let one = Duration::from_millis(200);
-        assert!(pin_latency_bound(one) < one);
-        assert!(pin_latency_bound(one) > one / 2);
+        assert!(pin_latency_reference(one) < one);
+        assert!(pin_latency_reference(one) > one / 2);
     }
 
-    /// The positive control for that bound: medians consistent with the two
+    /// An over-reference skew must read as a NOISE REPORT, never as a detected
+    /// silence break, and must not be able to fail a scenario. This is the whole
+    /// point of the demotion (bead btc-policy-c9r): the previous text said "SILENCE
+    /// BREAK" for what two consecutive CI runs showed was scheduler noise with a
+    /// flipping sign, which is how a future reader gets misled into hunting a leak
+    /// that was never measured.
+    #[test]
+    fn an_over_reference_skew_reports_as_advisory_noise_not_a_silence_break() {
+        let reference = pin_latency_reference(Duration::from_millis(200));
+        // Run 30683094069's `two-spend-probe`: a 680 ms skew on a box whose same-pin
+        // samples stayed within 40 ms. That is the shape worth printing.
+        let tripped = pin_latency_advisory(
+            "unit",
+            Duration::from_millis(680),
+            reference,
+            Duration::from_millis(40),
+            Duration::from_millis(2_501),
+            Duration::from_millis(1_821),
+            8,
+        );
+        assert!(tripped.starts_with("ADVISORY "), "unexpected: {tripped}");
+        assert!(
+            tripped.contains("NOT a detected silence break"),
+            "an over-reference skew must say what it is not: {tripped}"
+        );
+        assert!(
+            !tripped.contains("SILENCE BREAK:"),
+            "the advisory must not read like the hard failure it replaced: {tripped}"
+        );
+
+        let quiet = pin_latency_advisory(
+            "unit",
+            Duration::from_millis(2),
+            reference,
+            Duration::from_millis(40),
+            Duration::from_millis(1_815),
+            Duration::from_millis(1_817),
+            8,
+        );
+        assert!(quiet.starts_with("advisory "), "unexpected: {quiet}");
+    }
+
+    /// The other half of the demotion, and the one that keeps the report readable: a
+    /// skew OVER the single-evaluation reference but NO LARGER than the noise the same
+    /// run produced at a FIXED pin says nothing about the pin, so it must not print an
+    /// alarm-shaped line. Bead c9r's own data is the case — a 680 ms spread on
+    /// identical code against a ~149 ms reference — and a reference-only comparison
+    /// would have shouted on a large fraction of green runs, which is how a reader
+    /// learns to skip the line.
+    #[test]
+    fn a_skew_inside_the_runs_own_noise_is_reported_quietly() {
+        let reference = pin_latency_reference(Duration::from_millis(200));
+        let quiet = pin_latency_advisory(
+            "unit",
+            Duration::from_millis(317),
+            reference,
+            Duration::from_millis(680),
+            Duration::from_millis(2_501),
+            Duration::from_millis(2_184),
+            3,
+        );
+        assert!(quiet.starts_with("advisory "), "unexpected: {quiet}");
+        assert!(
+            quiet.contains("within-pin spread 680"),
+            "the quiet form must still report both numbers, not hide them: {quiet}"
+        );
+    }
+
+    /// The spread is a floor on this run's noise, so it must come from the WIDEST
+    /// same-pin sample set, and a single sample must not manufacture one.
+    #[test]
+    fn the_within_pin_spread_is_the_widest_same_pin_range() {
+        let ms = |millis: u64| Duration::from_millis(millis);
+        assert_eq!(
+            within_pin_spread(&[ms(100), ms(140)], &[ms(200), ms(500), ms(210)]),
+            ms(300)
+        );
+        assert_eq!(within_pin_spread(&[ms(100)], &[ms(900)]), Duration::ZERO);
+        assert_eq!(within_pin_spread(&[], &[]), Duration::ZERO);
+    }
+
+    /// The positive control for the enrolment floor: medians consistent with the two
     /// unconditional evaluations pass, and a federation still enrolled at the
     /// fixture minimum — the config-plumbing regression — fails loudly.
     #[test]

@@ -31,6 +31,12 @@ mod replay;
 pub mod server;
 pub mod watchtower;
 
+/// The op-ORDER half of the deterministic gate for ADR-0012's
+/// constant-observable-ingress rule. Paired with the memory-hard evaluation counters
+/// and the pin-masked store projection in `channel::duress::IngressWork`; see this
+/// module's own docs for what each half does and does not cover.
+#[cfg(test)]
+pub(crate) mod ingress_trace;
 /// V0-7: arbitrary-byte robustness for every untrusted-input parser.
 #[cfg(test)]
 mod prop_decoder;
@@ -69,6 +75,8 @@ use zeroize::Zeroizing;
 
 use crate::chain::{BitcoindBackend, ChainBackend, Prevout};
 use crate::channel::ChannelReply;
+#[cfg(test)]
+use crate::ingress_trace::IngressOp;
 use crate::watchtower::{AlertQueue, Event};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -2192,10 +2200,14 @@ impl Node {
         expiry: u64,
         now: u64,
     ) {
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::ArmHook);
         let is_duress = (verdict as u8).ct_eq(&(pin::PinVerdict::Duress as u8));
         let delta = u64::conditional_select(&0, &1, is_duress);
         self.duress_arm.fetch_add(delta, Ordering::Relaxed);
         if let Some(channel) = &self.channel {
+            #[cfg(test)]
+            ingress_trace::record(IngressOp::ArmIntentWrite);
             channel.record_arm_intent(
                 is_duress.into(),
                 carrier,
@@ -2384,6 +2396,8 @@ fn arm_carrier_id(node: &Node, request: CoordRequest<'_>) -> String {
     let digest = Zeroizing::new(request.auth_digest(&node.wallet_id));
     match request {
         CoordRequest::Spend { .. } => {
+            #[cfg(test)]
+            ingress_trace::record(IngressOp::CarrierDerive);
             let stretched = node.carrier_kdf.derive(&digest);
             vault_proto::tagged_hash(ARM_CARRIER_TAG, stretched.as_slice()).to_lower_hex_string()
         }
@@ -4195,11 +4209,15 @@ pub fn propagate_outbox(node: &Arc<Node>) {
 /// `t` OTHER peers instead of self + `t−1`. Two identically-bodied helpers would let one
 /// path silently drift from the other and break that invariant.
 fn stage_spend_carrier(node: &Node, request: vault_proto::TaggedRequest, carrier: &str) {
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::OutboxPush);
     node.outbox
         .lock()
         .expect("outbox lock poisoned")
         .push(request);
     if let Some(channel) = &node.channel {
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::CarrierPropagated);
         channel.mark_carrier_propagated(carrier);
     }
 }
@@ -4623,6 +4641,8 @@ fn handle_sign_after_lock(
     // memo and do not re-enter the KDF, preventing a captured-request replay convoy.
     // The wrong-pin rate-limit backoff sleep is taken OUTSIDE this lock (below),
     // so a wrong-pin flood never pins `/sign` against honest spends.
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::SignStateLock);
     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
     // Authoritative Lockdown check, UNDER the lock. The pre-lock check above is only
     // a fast path; `enter_lockdown` sets the flag while holding this same lock, so a
@@ -4723,6 +4743,14 @@ fn handle_sign_after_lock(
         // before any carrier exists. Peer receipt resolution runs after this
         // authoritative handler and treats a vacant memo as "nothing to confirm",
         // so replays stay KDF-free without creating refusal-only carrier state.
+        //
+        // Recorded like every other outbox write, even though this one is provably
+        // pin-uniform (it returns before the pin is evaluated). The ordered log is a
+        // whitelist, so a write it does not name is a write it cannot see MOVE —
+        // and `ingress_trace` states outright that every `Node::outbox` write
+        // appears in it. A bare push here would make that statement false.
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::OutboxPush);
         node.outbox
             .lock()
             .expect("outbox lock poisoned")
@@ -4825,6 +4853,8 @@ fn handle_sign_after_lock(
         // no verdict is recorded, so it is safe to drop the sign lock now and sleep
         // the backoff OUTSIDE it — a wrong-pin flood must not pin the one `/sign`
         // lock for the whole backoff and stall honest spends.
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::SignStateUnlock);
         drop(state);
         if !charge.backoff.is_zero() {
             std::thread::sleep(charge.backoff);
@@ -4896,9 +4926,17 @@ fn handle_sign_after_lock(
     // path stages at step 9. That additional lock-wait/work term can grow under
     // concurrent authenticated coordinator traffic; it is separate from the
     // request-shape-controlled preflight term this bead closes.
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::PreflightEnter);
     let _preflight = node.enter_spend_preflight();
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::SignStateUnlock);
     drop(state);
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::ChainPreflight);
     let (spend_prevouts, escape_prevouts) = prefetch_spend_escape_prevouts(node, request);
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::SignStateLock);
     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
     if node.is_locked_down() {
         return Ok(fraud_suspected());
@@ -5041,6 +5079,8 @@ fn handle_sign_after_lock(
     //    transaction-determined refusals remain keyed by the spend commitment. An
     //    RBF replacement has a different commitment and is never blocked here.
     //    Prune the pending log on the same schedule so its Hold timers stay bounded.
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::ReplayPrune);
     state.replay.prune(now);
     if let Some(recorded) = state.replay.get(&accepted_replay_key, now) {
         // Maintain the cover overlay on the cached path exactly as fresh ingress
@@ -5053,12 +5093,16 @@ fn handle_sign_after_lock(
         // rather than on whatever later cover traffic left in the overlay. Without
         // that, the row would silently degrade to Lockdown-only.
         if let Some(channel) = &node.channel {
+            #[cfg(test)]
+            ingress_trace::record(IngressOp::CachedScheduleApply);
             channel.apply_cached_schedule(
                 &escape_commitment_id,
                 verdict == pin::PinVerdict::Duress,
                 now,
                 node.epsilon_secs,
             );
+            #[cfg(test)]
+            ingress_trace::record(IngressOp::IntentPairWrite);
             channel.record_intent_pair(&carrier, &commitment_id, &escape_commitment_id);
         }
         // Idempotent accepted requests re-propagate under BOTH matching pins, so a
@@ -5113,13 +5157,19 @@ fn handle_sign_after_lock(
         stage_spend_carrier(node, propagated_request, &carrier);
         return Ok(refused);
     }
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::PendingPrune);
     state.pending.prune(now);
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::RefreshPrune);
     state.refreshes.prune(now, node.refresh_min_interval_secs);
     // Prune expired channel candidates on the SAME sweep the replay/pending logs
     // run on (§5): a candidate and its stored partials evict when its commitment
     // expires. (`/channel` lookup also evicts expired candidates, so an idle node
     // that never runs this sweep still rejects them.)
     if let Some(channel) = &node.channel {
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::ChannelStorePrune);
         channel.prune_store(now);
     }
 
@@ -5242,6 +5292,8 @@ fn handle_sign_after_lock(
             // here could call a reservation dead after a rollback while its paired
             // spend remained resident through the delayed-slot exemption. See
             // `channel::HotClock` and `channel::HotBudgetLedger::is_live`.
+            #[cfg(test)]
+            ingress_trace::record(IngressOp::HotBudgetReserve);
             match channel.reserve_hot_budget(
                 &commitment_id,
                 outflow.to_sat(),
@@ -5262,6 +5314,8 @@ fn handle_sign_after_lock(
     // candidate and leaves `hot_reservation` empty, so it is never unwound here.
     let unwind_hot_reservation = || {
         if let (Some(id), Some(channel)) = (hot_reservation, &node.channel) {
+            #[cfg(test)]
+            ingress_trace::record(IngressOp::HotBudgetRelease);
             channel.release_hot_budget(id);
         }
     };
@@ -5467,10 +5521,18 @@ fn handle_sign_after_lock(
     //     something. And a rung sitting unconfirmed in the mempool is as
     //     authorized a parent as the base escape is.
     {
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::AuthorizedLock);
         let mut authorized = node.authorized.lock().expect("authorized lock poisoned");
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::AuthorizedInsert);
         authorized.insert(spend.unsigned_tx.compute_txid());
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::AuthorizedInsert);
         authorized.insert(escape.unsigned_tx.compute_txid());
         for bump in &escape_bumps {
+            #[cfg(test)]
+            ingress_trace::record(IngressOp::AuthorizedInsert);
             authorized.insert(bump.unsigned_tx.compute_txid());
         }
     }
@@ -5479,6 +5541,8 @@ fn handle_sign_after_lock(
     //     to any pending spend" reads (ADR-0012). An escape-class spend fires now,
     //     so it is never pending — the ADR names that as the explicit exception.
     if class == policy_core::TxClass::Hot {
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::HoldTimerInstall);
         state.pending.record(commitment_id.clone(), request.expiry);
     }
 
@@ -5722,10 +5786,23 @@ fn handle_refresh_after_lock(
     // would never fire on the chain it is meant to stop.
     state.refreshes.record(&refresh, now);
 
-    node.authorized
-        .lock()
-        .expect("authorized lock poisoned")
-        .insert(refresh.unsigned_tx.compute_txid());
+    // Instrumented on the same rule as the `/sign` writes to these two structures.
+    // A refresh carries no pin, so nothing here decides a SILENCE comparison; the
+    // records exist because `ingress_trace` claims every write to `Node::outbox`
+    // and `Node::authorized` records its op, and that claim has to hold for the
+    // whole crate or it is a boundary statement that quietly excludes a path. A
+    // capture opened around a refresh pass already records this handler's shared
+    // helpers (replay write, node signature, candidate register).
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::AuthorizedLock);
+    {
+        let mut authorized = node.authorized.lock().expect("authorized lock poisoned");
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::AuthorizedInsert);
+        authorized.insert(refresh.unsigned_tx.compute_txid());
+    }
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::OutboxPush);
     node.outbox
         .lock()
         .expect("outbox lock poisoned")
@@ -5946,6 +6023,8 @@ fn register_pair(node: &Node, pair: RegisterPair) -> Result<(), SignResponse> {
     // fixed delayed slot at `T`: normal makes it a no-op and duress makes it live.
     // Both pins write this same delayed-slot id. Escape-class validation above
     // guarantees it is a distinct residual rather than the already-completed spend.
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::CandidateRegister);
     let outcomes = channel
         .register_candidates(
             candidates,
@@ -6633,6 +6712,8 @@ fn verify_spend(
 /// idempotency check above it.
 fn record_verdict(replay: &mut ReplayLog, key: &str, expiry: u64, verdict: &SignResponse) {
     if is_recordable_verdict(verdict) {
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::ReplayWrite);
         replay.record(key.to_string(), expiry, verdict.clone());
     }
 }
@@ -7179,6 +7260,8 @@ fn verify_user_signatures(node: &Node, psbt: &Psbt) -> Result<(), SignResponse> 
 /// Add this node's partial signature to every input, signing the node's own
 /// recomputed p2wsh sighash (SIGHASH_ALL) with its own witness script.
 fn add_node_signatures(node: &Node, psbt: &mut Psbt) -> Result<(), String> {
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::NodeSignature);
     let secp = Secp256k1::signing_only();
     let unsigned_tx = psbt.unsigned_tx.clone();
     let mut cache = SighashCache::new(&unsigned_tx);

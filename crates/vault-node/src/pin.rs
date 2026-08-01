@@ -740,6 +740,32 @@ impl AttemptBudget {
     pub(crate) fn locked_until(&self) -> u64 {
         self.locked_until
     }
+
+    /// The WHOLE budget as one canonical row, for
+    /// [`crate::replay::SignState::shape`]'s ingress-work comparison. Exhaustively
+    /// destructured so a new field must be recorded here before the test build
+    /// succeeds — [`charge`](AttemptBudget::charge) is the only place in `SignState`
+    /// the PIN VERDICT reaches, which is what makes projecting all of its state, and
+    /// not just the three counters above, worth doing.
+    ///
+    /// Nothing is masked: `charge` treats normal and duress identically (both are
+    /// `!is_wrong`, so `apply` is false and every conditional select keeps the prior
+    /// value, including the candidate ring slot), so the two silent classes must leave
+    /// this row byte-identical. Only a WRONG pin moves it, and a wrong pin is neither
+    /// PIN.
+    pub(crate) fn shape(&self) -> String {
+        let AttemptBudget {
+            fail_times,
+            fail_head,
+            fails,
+            locked_until,
+            charges,
+        } = self;
+        format!(
+            "budget charges={charges} fails={fails} fail_head={fail_head} \
+             locked_until={locked_until} fail_times={fail_times:?}"
+        )
+    }
 }
 
 // ---- PHC generation (setup ceremony / demo / fixtures) ----------------------

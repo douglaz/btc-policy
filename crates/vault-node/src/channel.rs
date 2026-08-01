@@ -1382,6 +1382,33 @@ pub(crate) struct ScheduleWorkTrace {
 }
 
 #[cfg(test)]
+impl ScheduleWorkTrace {
+    /// Return only the store work performed after `earlier` was sampled.
+    ///
+    /// The counters are cumulative so other tests can assert whole-history work
+    /// shapes. Ingress symmetry needs the narrower per-request delta: setup work may
+    /// differ between cases, but every normal/duress pair must perform identical work
+    /// for the request being compared.
+    fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            safety_locks: self.safety_locks - earlier.safety_locks,
+            safety_candidate_visits: self.safety_candidate_visits - earlier.safety_candidate_visits,
+            safety_overlay_writes: self.safety_overlay_writes - earlier.safety_overlay_writes,
+            registration_locks: self.registration_locks - earlier.registration_locks,
+            hot_hold_steps: self.hot_hold_steps - earlier.hot_hold_steps,
+            selector_allocations: self.selector_allocations - earlier.selector_allocations,
+            delayed_window_writes: self.delayed_window_writes - earlier.delayed_window_writes,
+            prune_locks: self.prune_locks - earlier.prune_locks,
+            prune_candidate_visits: self.prune_candidate_visits - earlier.prune_candidate_visits,
+            deadline_poll_locks: self.deadline_poll_locks - earlier.deadline_poll_locks,
+            deadline_comparisons: self.deadline_comparisons - earlier.deadline_comparisons,
+            due_poll_locks: self.due_poll_locks - earlier.due_poll_locks,
+            due_candidate_visits: self.due_candidate_visits - earlier.due_candidate_visits,
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Default)]
 struct ScheduleWorkCounters {
     safety_locks: std::sync::atomic::AtomicUsize,
@@ -11896,6 +11923,1095 @@ mod duress {
         };
         assert_eq!(normal_channel.schedule_work_trace(), expected);
         assert_eq!(duress_channel.schedule_work_trace(), expected);
+    }
+
+    // -- Constant-observable ingress: the node-level WORK RECORD -------------
+    //
+    // [`ScheduleWorkTrace`] above covers the channel STORE's work shape. These cover
+    // the rest of the handler, in six parts that answer six different questions:
+    //
+    //  * the `/sign` ACKNOWLEDGEMENT, compared field-for-field — the one observable
+    //    the attacker actually receives, and the only one of the six that is not
+    //    in-process;
+    //  * the `/sign` lock, the replay/pending/refresh logs, the outbox, the
+    //    vault-authorized set, the signatures and the Hold timer as an ORDERED
+    //    sequence, so an op added, dropped, or merely MOVED on one pin's path fails
+    //    the comparison;
+    //  * the CHANNEL STORE ITSELF, projected canonically with the three pin-derived
+    //    values masked ([`StoreShape`]) — not built from hand-placed instrumentation,
+    //    and therefore what catches channel-store state nobody thought to instrument;
+    //  * the `/sign` HANDLER STATE ITSELF — replay, pending, nonce and refresh logs
+    //    plus the attempt budget ([`SignStateShape`]) — read off its fields for the
+    //    same reason, and covering the half of the node's mutable state the channel
+    //    store does not hold: the half `AttemptBudget::charge` is handed the pin
+    //    VERDICT to mutate;
+    //  * the memory-hard work (Argon2 PIN evaluations and arm-carrier derivations),
+    //    which is the term a wall clock was ever really measuring;
+    //  * plus `ScheduleWorkTrace`'s per-request delta for the store's internal
+    //    lock/visit/allocation counts.
+    //
+    // Together they are the deterministic gate for ADR-0012's "no write, timer
+    // install, or lock acquisition that duress performs and normal does not"; the
+    // adversarial harness's wall-clock skew is advisory, because its measured noise
+    // floor (2 ms – 680 ms across CI runs) is wider than the one extra Argon2
+    // evaluation (~199 ms) it was meant to detect, which makes false negatives as
+    // available as the false positives that were observed (bead btc-policy-c9r).
+
+    /// Both pins' copies of one request shape: the fixture's normal-pin request and a
+    /// duress clone re-coord-signed under the SAME nonce, so the PIN is the only
+    /// difference between the two byte streams.
+    fn pin_pair(fx: &Fixture, normal: SignRequest, nonce: &str) -> (SignRequest, SignRequest) {
+        let mut duress = normal.clone();
+        duress.pin = "9999".into();
+        fx.coord_sign(&mut duress, nonce);
+        (normal, duress)
+    }
+
+    /// A canonical, PIN-MASKED projection of the WHOLE channel store as it stands
+    /// after one ingress pass. With [`SignStateShape`] it is one of the record's two
+    /// GENERIC parts, and it catches any NET channel-store STATE DIFFERENCE between a
+    /// duress pass and a normal one.
+    ///
+    /// Net state, precisely — not every write. This is a projection of the store as it
+    /// stands when the pass returns, so a write that is REVERTED within the same pass
+    /// leaves it byte-identical. The existing instance of that shape is the Hot-budget
+    /// reserve/unwind pair (`lib.rs`, the `unwind_hot_reservation` closure), and it is
+    /// exactly why both halves carry their own ordered-log entry
+    /// ([`IngressOp::HotBudgetReserve`]/[`IngressOp::HotBudgetRelease`]) rather than
+    /// being left to this projection: transient writes are covered where they are
+    /// made, net state is covered here.
+    ///
+    /// The op log and [`ScheduleWorkTrace`] are both WHITELISTS: an entry exists only
+    /// because someone placed a `record`/`fetch_add` at that site, so a duress-only
+    /// mutation of the store made anywhere else appends nothing to either. Verified by
+    /// construction: a duress-only `store.carriers_by_nonce.insert(...)` dropped into
+    /// [`ChannelState::record_arm_intent`] beside `intent.duress |= duress` leaves both
+    /// of those records byte-identical under the two pins. This projection is read off
+    /// the store's FIELDS instead of off instrumentation, so that mutation — and any
+    /// other one still standing in the store when the pass returns — changes it.
+    ///
+    /// **What is masked, and why none of the three is an asymmetry.** These values
+    /// differ between a normal and a duress pass by ADR-0012's own design, so comparing
+    /// them verbatim would fail every case below while proving nothing:
+    ///
+    /// * The arm-intent map's KEY, and the carrier a nonce memo names. A carrier id is
+    ///   `arm_carrier_id`'s memory-hard digest of a request whose bytes include the
+    ///   PIN, so it MUST differ — that is the point of stretching it. Masked by
+    ///   projecting each intent to a key-less line and
+    ///   comparing the SORTED MULTISET of lines, which still sees an intent added,
+    ///   removed, or altered.
+    /// * `ArmIntent::duress` — the internal fire bit itself, the one observable the ADR
+    ///   permits the two pins to differ on. Asserted directly and separately through
+    ///   [`IngressPass::arm_delta`].
+    /// * A memo's `signature_tag`, a digest of the coordinator's signature over a body
+    ///   that differs in the PIN bytes, so it inherits exactly the same difference.
+    ///
+    /// Everything else is compared verbatim, including the parts a hand-placed counter
+    /// would be least likely to cover: every candidate row down to its serialized PSBT,
+    /// sighashes and collected partials, the safety overlay's fire time AND its
+    /// `sweep_active` delayed-slot selector, the capacity accounting, and the Hot-budget
+    /// ledger.
+    ///
+    /// **`sweep_active` is compared, not masked, and it is NOT unconditionally uniform
+    /// at ingress.** [`ChannelState::apply_arm_directive`] writes it here —
+    /// `armed.sweep_active |= armed.active & arm.duress & escape_live` — so an
+    /// ALREADY-ARMED node adopting an already-holder-confirmed escape latches it on the
+    /// duress path at ingress, not only at `t`-of-`n` confirmation. It stays uniform in
+    /// every case below for a reason each case establishes, not by luck: the unarmed
+    /// cases fail `armed.active`, and the armed case arms BOTH nodes through
+    /// `confirm_carrier`, which latches the bit on both before the compared request.
+    /// Masking it (and the `escape_commitment_id` it selects) to pre-empt some future
+    /// case would cost real coverage — every accepted request rewrites that id
+    /// deliberately, under both pins, precisely so pre-`T` candidate capacity cannot
+    /// leak the earlier pin, and the masking criterion above is "differs by design in
+    /// every case", which this does not meet. A future case that does reach a divergent
+    /// state — an arm committed with an empty escape id (`confirm_carrier`'s fail-closed
+    /// lockout path leaves the sweep UNSELECTED) followed by a duress resubmission that
+    /// adopts one — should be read as the permitted internal fire bit surfacing, and
+    /// handled where [`IngressPass::arm_delta`] handles its twin, rather than by
+    /// widening the mask here.
+    #[derive(PartialEq, Eq)]
+    struct StoreShape(Vec<String>);
+
+    impl fmt::Debug for StoreShape {
+        /// One row per line, so a failing `assert_eq!` reads as a diff instead of as a
+        /// single unbroken `Vec<String>`.
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            for line in &self.0 {
+                write!(f, "\n      {line}")?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Domain tag for the per-variant PSBT digest below. Test-only: it keeps a row
+    /// short while still covering every serialized byte of the stored PSBT.
+    const STORE_SHAPE_PSBT_TAG: &str = "btc-policy/test/ingress-store-shape/psbt";
+
+    /// Project the channel store into [`StoreShape`].
+    ///
+    /// Every store-owned struct this projection NAMES is destructured exhaustively
+    /// below — `PartialStore`, `Armed`, `Candidate`, `SigningVariant`, `ArmIntent`,
+    /// `CarrierMemo`, `HotBudgetLedger`, `HotBudget`, `HotReservation`. That is part of
+    /// this gate, not style: adding a field to one of them must fail this test module's
+    /// build until the projection either records it or explicitly masks it as
+    /// pin-derived.
+    ///
+    /// [`FireWindow`] is the one store-owned struct outside that mechanism: it reaches
+    /// the projection through `Candidate::fire`'s derived `Debug` (`fire={fire:?}`), so
+    /// a new field on it is still COMPARED — printed, and a pin-dependent value still
+    /// fails the case — but it arrives silently instead of breaking this build. Nothing
+    /// is uncovered either way; only the reminder is missing, which matters to whoever
+    /// adds that field, not to the comparison.
+    fn store_shape(channel: &ChannelState) -> StoreShape {
+        let store = channel.store.lock().expect("store lock poisoned");
+        let PartialStore {
+            candidates,
+            reserved_bytes,
+            max_active_candidates,
+            max_bytes,
+            armed,
+            intents,
+            carriers_by_nonce,
+            hot_budget,
+        } = &*store;
+        let Armed {
+            active,
+            fire_at,
+            escape_commitment_id,
+            sweep_active,
+            combine_slack_secs,
+        } = armed;
+        let mut lines = vec![
+            format!(
+                "caps reserved_bytes={} max_active_candidates={} max_bytes={}",
+                reserved_bytes, max_active_candidates, max_bytes
+            ),
+            format!(
+                "armed active={} fire_at={} sweep_active={} escape_commitment_id={} \
+                 combine_slack_secs={}",
+                active, fire_at, sweep_active, escape_commitment_id, combine_slack_secs
+            ),
+            format!("candidates count={}", candidates.len()),
+        ];
+        let mut sorted_candidates: Vec<&Candidate> = candidates.values().collect();
+        sorted_candidates.sort_by(|a, b| a.commitment_id.cmp(&b.commitment_id));
+        for candidate in sorted_candidates {
+            let Candidate {
+                commitment_id,
+                role,
+                hot,
+                paired_commitment_id,
+                holder_quorum_reached,
+                base,
+                bumps,
+                rung,
+                release_floor,
+                expiry,
+                fire,
+                released,
+                released_through,
+                broadcast,
+                bytes,
+                capacity_bytes,
+            } = candidate;
+            lines.push(format!(
+                "candidate id={} role={:?} hot={} paired={} holder_quorum_reached={} rung={} \
+                 release_floor={} expiry={} fire={:?} released={} released_through={:?} \
+                 broadcast={} bytes={} capacity_bytes={} variants={}",
+                commitment_id,
+                role,
+                hot,
+                paired_commitment_id,
+                holder_quorum_reached,
+                rung,
+                release_floor,
+                expiry,
+                fire,
+                released,
+                released_through,
+                broadcast,
+                bytes,
+                capacity_bytes,
+                bumps.len() + 1,
+            ));
+            let variants = std::iter::once(base).chain(bumps);
+            for (rung, variant) in variants.enumerate() {
+                let SigningVariant {
+                    unsigned_txid,
+                    psbt,
+                    sighashes,
+                    user_sig_hash,
+                    partials,
+                } = variant;
+                let mut partials: Vec<((u32, u16), String)> = partials
+                    .iter()
+                    .map(|(key, der)| (*key, der.to_lower_hex_string()))
+                    .collect();
+                partials.sort();
+                let sighashes: Vec<String> = sighashes
+                    .iter()
+                    .map(|sighash| sighash.to_lower_hex_string())
+                    .collect();
+                lines.push(format!(
+                    "  variant rung={rung} txid={} psbt={} sighashes={sighashes:?} \
+                     user_sig_hash={} partials={partials:?}",
+                    unsigned_txid,
+                    tagged_hash(STORE_SHAPE_PSBT_TAG, &psbt.serialize()).to_lower_hex_string(),
+                    user_sig_hash.to_lower_hex_string(),
+                ));
+            }
+        }
+        // Key-less and `duress`-less, then sorted: the carrier id is pin-derived by
+        // design, so the multiset of intent BODIES is the strongest comparison that is
+        // not false by construction.
+        let mut intents: Vec<String> = intents
+            .values()
+            .map(|intent| {
+                let ArmIntent {
+                    holders,
+                    ready_to_propagate,
+                    duress: _duress,
+                    first_seen,
+                    spend_commitment_id,
+                    escape_commitment_id,
+                    expiry,
+                    committed,
+                } = intent;
+                let mut sorted_holders: Vec<u16> = holders.iter().copied().collect();
+                sorted_holders.sort_unstable();
+                format!(
+                    "intent holders={sorted_holders:?} ready_to_propagate={} first_seen={} \
+                     spend_commitment_id={} escape_commitment_id={} expiry={} committed={}",
+                    ready_to_propagate,
+                    first_seen,
+                    spend_commitment_id,
+                    escape_commitment_id,
+                    expiry,
+                    committed,
+                )
+            })
+            .collect();
+        intents.sort();
+        lines.push(format!("intents count={}", intents.len()));
+        lines.extend(intents);
+        // The nonce IS pin-independent (a pair re-signs the same nonce), so these keep
+        // their keys; only the derived carrier and its signature tag are masked.
+        let mut memos: Vec<(&String, &CarrierMemo)> = carriers_by_nonce.iter().collect();
+        memos.sort_by(|a, b| a.0.cmp(b.0));
+        lines.push(format!("nonce_memos count={}", memos.len()));
+        for (nonce, memo) in memos {
+            let CarrierMemo { outcome, expiry } = memo;
+            let MemoOutcome::Derived {
+                carrier: _carrier,
+                signature_tag: _signature_tag,
+                resolved_senders,
+            } = outcome;
+            let mut senders: Vec<u16> = resolved_senders.iter().copied().collect();
+            senders.sort_unstable();
+            lines.push(format!(
+                "memo nonce={nonce} outcome=Derived resolved_senders={senders:?} expiry={}",
+                expiry
+            ));
+        }
+        let HotBudgetLedger {
+            budget,
+            reservations,
+        } = hot_budget;
+        let HotBudget {
+            max_per_tx_sat,
+            max_per_window_sat,
+            window_secs,
+        } = budget;
+        lines.push(format!(
+            "hot_budget max_per_tx_sat={} max_per_window_sat={} window_secs={} reservations={}",
+            max_per_tx_sat,
+            max_per_window_sat,
+            window_secs,
+            reservations.len()
+        ));
+        let mut sorted_reservations: Vec<(&String, &HotReservation)> =
+            reservations.iter().collect();
+        sorted_reservations.sort_by(|a, b| a.0.cmp(b.0));
+        for (commitment_id, reservation) in sorted_reservations {
+            let HotReservation {
+                outflow_sat,
+                reserved_at,
+                expiry,
+            } = reservation;
+            lines.push(format!(
+                "reservation id={commitment_id} outflow_sat={} reserved_at={} expiry={}",
+                outflow_sat, reserved_at, expiry
+            ));
+        }
+        StoreShape(lines)
+    }
+
+    /// The [`StoreShape`] analogue for the state that lives under the `/sign` lock
+    /// rather than in the channel store: the anti-replay log, the pending log, the
+    /// coordinator-nonce log, the refresh log, and the PIN ATTEMPT BUDGET. Built by
+    /// [`crate::replay::SignState::shape`], which owns those private fields and
+    /// destructures every one of them.
+    ///
+    /// It is here for the reason `StoreShape` is: `ops` and `schedule_work` are
+    /// whitelists of hand-placed instrumentation, so a duress-only mutation of
+    /// `SignState` made anywhere they do not watch appends nothing to either — and
+    /// `SignState` is where the PIN VERDICT is actually written. `state.pin_budget
+    /// .charge(verdict, …)` takes the verdict itself, has no [`IngressOp`] of its own,
+    /// and moves no `ScheduleWorkTrace` counter.
+    /// `pin_substrate_tests::the_budget_is_charged_once_and_normal_equals_duress`
+    /// asserts the normal/duress budget equality separately, but on a non-channel node
+    /// with no armed history and as a three-field read; this carries the whole struct
+    /// through every case below, including the armed and locked-out ones.
+    ///
+    /// Nothing in it is masked — see [`crate::replay::SignState::shape`] for why every
+    /// row is pin-independent by construction for a [`pin_pair`], unlike the channel
+    /// store's pin-derived carrier ids.
+    ///
+    /// It also needs no clock pin, unlike [`counted_duress_node`]'s `HotClock`: every
+    /// timestamp it projects — replay and pending expiries, the nonce log's expiries and
+    /// high-water mark, refresh times, the attempt ring — is derived from the `now`
+    /// ARGUMENT the test passes to `handle_sign` or from the request's own expiry, never
+    /// from a wall-clock read. Re-check that when adding a row; a wall clock smuggled
+    /// into this record is the defect that would make it the thing it replaced.
+    #[derive(PartialEq, Eq)]
+    struct SignStateShape(Vec<String>);
+
+    impl fmt::Debug for SignStateShape {
+        /// One row per line, exactly as [`StoreShape`] formats, so a failing
+        /// `assert_eq!` reads as a diff.
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            for line in &self.0 {
+                write!(f, "\n      {line}")?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Everything one ingress pass is measured by here: the acknowledgement it
+    /// returned, the ordered op log, AND the memory-hard work the pass performed.
+    ///
+    /// The two Argon2 fields are not decoration, and they are the reason this is a
+    /// struct rather than a bare `Vec<IngressOp>`. The leak the demoted wall-clock
+    /// comparison existed to detect is ONE EXTRA ARGON2 EVALUATION (~199 ms), and the
+    /// op log alone cannot see one: [`IngressOp::CarrierDerive`] is recorded at
+    /// `arm_carrier_id`'s call into the KDF, so a second `carrier_kdf.derive` bolted
+    /// on somewhere else — the arm hook, say — costs a full memory-hard evaluation and
+    /// appends NOTHING to the log. Verified by construction: with a duress-only extra
+    /// derivation inserted into `fire_arm_hook`, every case below reports
+    /// BYTE-IDENTICAL `ops` for the two pins and separates them on
+    /// `carrier_derivations` alone (1 vs 2) — the `ops` field is blind to exactly the
+    /// effect the wall clock was aimed at, and this field is what sees it.
+    /// Counting the evaluations directly, through the seams that already
+    /// exist for it ([`Node::carrier_derivation_count`] and
+    /// [`CountingEvaluator`](crate::pin::test_util::CountingEvaluator)), is what makes
+    /// the replacement gate cover the effect the removed gate was aimed at. Nothing in
+    /// `pin.rs` changes for this — both counters are already there.
+    #[derive(Debug, PartialEq, Eq)]
+    struct IngressWork {
+        /// The `/sign` acknowledgement itself — the most attacker-visible observable
+        /// on this path, and the one ADR-0012 names outright ("response cover":
+        /// `pending`/`first_seen`/remaining-Hold reported identically under both
+        /// pins). Compared VERBATIM rather than by variant, and it is free to do so
+        /// here: [`pin_pair`] re-coord-signs the SAME nonce over the SAME transaction
+        /// pair and both passes run at the same `now`, so every field of `Accepted`
+        /// (`commitment_id`, `first_seen`, `remaining_secs`) and of `Refusal` (`code`,
+        /// `check`, `detail`) is pin-independent by construction. The harness's live
+        /// `two_spend_probe` must normalize request-dependent fields away before it
+        /// can compare bodies at all (`normalize_request_dependent`); this comparison
+        /// needs no normalization, so it is the stricter of the two.
+        response: SignResponse,
+        /// The ordered observable ops (locks, writes, timer installs, signatures).
+        ops: Vec<crate::ingress_trace::IngressOp>,
+        /// Per-request delta of the channel store's internal schedule work: store
+        /// locks, candidate visits, allocations, overlay writes, and timer-window
+        /// writes. This closes the call-site log's deliberate blind spot inside
+        /// `record_arm_intent`, `apply_cached_schedule`, and `register_candidates`.
+        schedule_work: ScheduleWorkTrace,
+        /// The whole channel store after the pass, pin-masked and canonicalized. The
+        /// two fields above are hand-placed whitelists and see only the sites someone
+        /// instrumented; this one is read off the store's fields, so it is what
+        /// catches a duress-only WRITE landing anywhere in it. See [`StoreShape`].
+        store: StoreShape,
+        /// The whole `/sign` handler state after the pass — replay, pending, nonce and
+        /// refresh logs plus the attempt budget — read off its fields for the same
+        /// reason `store` is. This is the half of the node's mutable state the channel
+        /// store does not hold, and the half the PIN VERDICT is passed into. See
+        /// [`SignStateShape`].
+        sign_state: SignStateShape,
+        /// Every Argon2 PIN evaluation this pass ran, in order. `verify_pin`'s own
+        /// unit test proves the COMPARE is two-and-fixed-order; this catches an extra
+        /// evaluation anywhere else in the handler, which that test cannot see.
+        pin_evaluations: Vec<crate::pin::PinSlot>,
+        /// Every memory-hard arm-carrier derivation this pass ran.
+        carrier_derivations: usize,
+    }
+
+    /// A node whose PIN evaluator is wrapped in a [`CountingEvaluator`], paired with
+    /// the call log to read it back through. Both pins' nodes are built this way, so
+    /// the wrapper itself is symmetric and cannot bias the comparison.
+    ///
+    /// **The Hot clock is pinned, and that is a determinism requirement, not a
+    /// convenience.** A hot-class spend's reservation stores `reserved_at` — the
+    /// [`HotClock`] reading, which is `Instant::elapsed().as_secs()` counted from THAT
+    /// node's construction — and [`store_shape`] compares it. The two nodes of a pair
+    /// are constructed at different instants and their passes run sequentially, so
+    /// their two elapsed readings are independent; a pause anywhere in between (a
+    /// loaded box, a slow Argon2, a GC of the test binary's pages) that pushes one
+    /// reading across a whole-second boundary and not the other would report
+    /// `reserved_at=0` vs `1` as a SILENCE BREAK, from scheduling alone. Three of the
+    /// SEVEN comparison cases carry such a row — `first_carrier`, `armed_node`, and the
+    /// cached Hot resubmission, the three that leave a live hot reservation behind. A
+    /// gate that replaced a wall-clock
+    /// comparison because its noise floor exceeded the effect it measured (bead
+    /// btc-policy-c9r) must not smuggle a wall clock back in, so both nodes read the
+    /// same pinned second and the row is a constant. Production has no such lever —
+    /// [`HotClock`] is unsteppable on purpose.
+    ///
+    /// This removes the WALL READING and nothing else: a duress-only reservation, one
+    /// released only under one pin, or a different outflow or expiry still changes the
+    /// projected row set. Verified by construction — with the pin removed and a 1.1 s
+    /// delay inserted between the pair's two nodes, `first_carrier` fails on
+    /// `reserved_at=1` vs `0` alone; with the pin restored and the same delay in place
+    /// it passes.
+    fn counted_duress_node(fx: &Fixture) -> (crate::Node, Arc<Mutex<Vec<crate::pin::PinSlot>>>) {
+        counted_duress_node_with(fx, &format!("duress_delay_secs = {DELAY}"))
+    }
+
+    /// [`counted_duress_node`] over a caller-chosen top-level config — the lockout case
+    /// needs its own `[pin_attempt_budget]`, and both nodes of its pair must get the
+    /// identical one.
+    fn counted_duress_node_with(
+        fx: &Fixture,
+        extra_toplevel: &str,
+    ) -> (crate::Node, Arc<Mutex<Vec<crate::pin::PinSlot>>>) {
+        let mut node = duress_node(fx, HOLD, extra_toplevel);
+        let counting = Arc::new(crate::pin::test_util::CountingEvaluator::new(
+            node.pin_evaluator(),
+        ));
+        let calls = Arc::clone(&counting.calls);
+        node.set_pin_evaluator(counting);
+        node.channel
+            .as_ref()
+            .expect("ingress-work tests require channel mode")
+            .pin_hot_clock(NOW);
+        (node, calls)
+    }
+
+    /// One captured ingress pass: the record the two pins must AGREE on (response
+    /// included — see [`IngressWork::response`]) and the one thing they must
+    /// DISAGREE on.
+    struct IngressPass {
+        work: IngressWork,
+        /// How many duress arm intents this pass recorded: `1` for a duress-verdict
+        /// pass, `0` for a normal one.
+        ///
+        /// Deliberately OUTSIDE [`IngressWork`]. This is the internal fire bit — the
+        /// one thing ADR-0012 says the two pins legitimately differ on ("the pin only
+        /// flips an INTERNAL fire bit — *which* transaction eventually broadcasts and
+        /// *when*") — so folding it into the compared record would make every case
+        /// below fail by design. It is asserted separately, as the positive control
+        /// that the pair really was a pair.
+        arm_delta: u64,
+    }
+
+    /// Drive one `/sign` with the ingress trace open and return the response, the work
+    /// the handler performed, and the arm bit it flipped.
+    fn ingress_pass(
+        node: &crate::Node,
+        calls: &Mutex<Vec<crate::pin::PinSlot>>,
+        request: &SignRequest,
+        now: u64,
+    ) -> IngressPass {
+        calls.lock().expect("pin call log").clear();
+        let derivations_before = node.carrier_derivation_count();
+        let arm_before = node.duress_arm_count();
+        let schedule_before = node
+            .channel
+            .as_ref()
+            .expect("ingress-work tests require channel mode")
+            .schedule_work_trace();
+        let (response, ops) = crate::ingress_trace::capture(|| {
+            crate::handle_sign(node, request, now).expect("decodable")
+        });
+        let channel = node
+            .channel
+            .as_ref()
+            .expect("ingress-work tests require channel mode");
+        let schedule_work = channel.schedule_work_trace().delta_since(schedule_before);
+        IngressPass {
+            work: IngressWork {
+                response,
+                ops,
+                schedule_work,
+                store: store_shape(channel),
+                sign_state: SignStateShape(
+                    node.sign_state
+                        .lock()
+                        .expect("sign_state lock poisoned")
+                        .shape(),
+                ),
+                pin_evaluations: calls.lock().expect("pin call log").clone(),
+                carrier_derivations: node.carrier_derivation_count() - derivations_before,
+            },
+            arm_delta: node.duress_arm_count() - arm_before,
+        }
+    }
+
+    /// The PIN-PAIR positive control, and the reason it is not optional.
+    ///
+    /// Every equality below is only as meaningful as the DIFFERENCE between the two
+    /// requests it compares. If both carried the same pin, the two records match
+    /// trivially and the case asserts nothing whatever about SILENCE — the exact
+    /// "passes both ways, proves nothing" shape this bead exists to stamp out.
+    /// Verified by construction: with [`pin_pair`] handing back the fixture's NORMAL
+    /// pin twice instead of the duress pin AND this guard stubbed out, all SEVEN
+    /// comparison cases still passed green; restoring the guard alone failed all seven.
+    /// [`assert_the_pass_is_worth_comparing`] does not catch it — every guard
+    /// there (both slots evaluated, one carrier derived, the arm hook reached) holds
+    /// identically for a normal pin.
+    ///
+    /// The witness is the node's own internal fire bit
+    /// ([`Node::duress_arm_count`], the `#[cfg(test)]` reader over the counter
+    /// `fire_arm_hook` already maintains). That is the right witness precisely because
+    /// it is the one observable ADR-0012 lets the pins differ on: it is in-process and
+    /// unreachable over HTTP, so reading it here asserts the verdicts diverged without
+    /// creating the oracle the whole invariant forbids.
+    fn assert_the_pins_really_differed(normal: &IngressPass, duress: &IngressPass, case: &str) {
+        assert_eq!(
+            normal.arm_delta, 0,
+            "{case}: the normal-pin pass recorded a duress arm intent, so the two requests are \
+             not the normal/duress pair this case means to compare"
+        );
+        assert_eq!(
+            duress.arm_delta, 1,
+            "{case}: the duress-pin pass recorded no duress arm intent — the \"duress\" request \
+             did not take the duress verdict, so comparing it against the normal pass asserts \
+             nothing about SILENCE"
+        );
+    }
+
+    /// One of the two anti-vacuity guards every case below shares — this one covers
+    /// the PASS, and [`assert_the_pins_really_differed`] covers the PAIR. A captured
+    /// pass that did not reach the two ops the PIN VERDICT actually flows through, or
+    /// that ran no memory-hard work at all, proves nothing by being equal to another
+    /// such pass. Asserted per case rather than once, because a future edit that
+    /// silently stopped instrumenting the arm hook would otherwise leave `assert_eq!`
+    /// comparing two logs of pin-independent prologue.
+    ///
+    /// Note what this guard canNOT see, and why the second one is not redundant with
+    /// it: every check here holds identically for a NORMAL pin, so it stays green if
+    /// the two requests being compared stop being a normal/duress pair at all.
+    fn assert_the_pass_is_worth_comparing(work: &IngressWork, case: &str) {
+        use crate::ingress_trace::IngressOp;
+        assert!(
+            work.ops.contains(&IngressOp::ArmHook) && work.ops.contains(&IngressOp::ArmIntentWrite),
+            "{case}: the captured ingress sequence never reached the arm hook, so comparing it \
+             against the other pin's asserts nothing: {:?}",
+            work.ops
+        );
+        // Both Argon2 consumers must have actually run, or the equality on their
+        // counts is an equality of zeroes. Two PIN evaluations is `verify_pin`'s
+        // unconditional floor; one derivation is the spend carrier's.
+        assert_eq!(
+            work.pin_evaluations,
+            vec![crate::pin::PinSlot::Normal, crate::pin::PinSlot::Duress],
+            "{case}: every accepted or refused SpendRequest evaluates both enrolled slots \
+             unconditionally, in fixed order"
+        );
+        assert_eq!(
+            work.carrier_derivations, 1,
+            "{case}: a spend's ingress derives its arm carrier exactly once, so comparing the \
+             count across pins is not a comparison of zeroes"
+        );
+        assert_eq!(
+            work.schedule_work.safety_locks, 1,
+            "{case}: every spend ingress must take the channel store's arm-intent lock once"
+        );
+        assert_eq!(
+            work.schedule_work.safety_overlay_writes, 1,
+            "{case}: every spend ingress must perform one fixed-shape safety-overlay write"
+        );
+        // And the store projection must have actually seen the arm intent this pass
+        // wrote. A projection that silently stopped reading `intents` — a renamed
+        // field, a masked-too-much edit — would still compare equal across the pins
+        // and hide exactly the duress-only write it is here to catch.
+        assert!(
+            work.store.0.iter().any(|row| row.starts_with("intent ")),
+            "{case}: the store projection recorded no arm intent, so comparing it across pins \
+             cannot see a duress-only write: {:?}",
+            work.store
+        );
+        // Same question for the OTHER generic projection, anchored on the one row the
+        // pin verdict is passed into: a `/sign` pass that did not charge the attempt
+        // budget never reached `AttemptBudget::charge(verdict, …)` at all, and a
+        // projection that stopped reading the budget would compare equal across the
+        // pins while blind to it.
+        assert!(
+            work.sign_state
+                .0
+                .iter()
+                .any(|row| row.starts_with("budget ") && !row.contains("charges=0 ")),
+            "{case}: the /sign-state projection recorded no attempt-budget charge, so comparing \
+             it across pins cannot see a duress-only budget mutation: {:?}",
+            work.sign_state
+        );
+    }
+
+    /// The FIRST carrier a node ever sees: Idle → arm intent. This is the transition
+    /// the harness's one-shot `first_arm_skew` sample covered — the only sample in
+    /// which the directly-addressed node has to create carrier, intent, and schedule
+    /// state from nothing, so a regression that added synchronous arm work only to
+    /// the duress path would show up here or nowhere.
+    #[test]
+    fn normal_and_duress_ingress_op_sequences_match_on_a_first_carrier() {
+        use crate::ingress_trace::IngressOp;
+
+        let fx = Fixture::new(3, 5);
+        let (node_n, calls_n) = counted_duress_node(&fx);
+        let (node_d, calls_d) = counted_duress_node(&fx);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let (normal, duress) =
+            pin_pair(&fx, fx.spend_request(&spend, EXPIRY, "shape-1"), "shape-1");
+
+        let normal_pass = ingress_pass(&node_n, &calls_n, &normal, NOW);
+        let duress_pass = ingress_pass(&node_d, &calls_d, &duress, NOW);
+        let (normal_work, duress_work) = (&normal_pass.work, &duress_pass.work);
+        assert!(matches!(normal_work.response, SignResponse::Accepted(_)));
+        assert!(matches!(duress_work.response, SignResponse::Accepted(_)));
+        assert_the_pins_really_differed(&normal_pass, &duress_pass, "first carrier");
+        assert_the_pass_is_worth_comparing(normal_work, "first carrier");
+        assert_eq!(
+            normal_work, duress_work,
+            "the first carrier's ingress must perform the identical operations in the identical \
+             order, and the identical memory-hard work, under both pins (ADR-0012 \
+             constant-observable ingress)"
+        );
+        // A hot-class first carrier must have gone all the way through registration
+        // and installed its Hold, or the sequences agree only because both stopped
+        // early.
+        assert!(
+            normal_work.ops.contains(&IngressOp::CandidateRegister)
+                && normal_work.ops.contains(&IngressOp::HoldTimerInstall),
+            "a hot-class acceptance must reach candidate registration and install its Hold \
+             timer: {:?}",
+            normal_work.ops
+        );
+    }
+
+    /// Steady state: two nodes ALREADY armed by the same duress carrier, then one
+    /// fresh normal-pin request and one fresh duress-pin request. This is the
+    /// comparison the harness's interleaved median sampled — the state in which a node
+    /// has the most to hide, since it is armed and accepting hot spends it will never
+    /// release.
+    ///
+    /// BOTH nodes are armed, deliberately: arm state is a difference the ADR permits,
+    /// so holding it equal is what leaves the fresh request's PIN as the only variable.
+    /// Comparing an armed node against an unarmed one would fail on the arm, not on a
+    /// silence break.
+    #[test]
+    fn normal_and_duress_ingress_op_sequences_match_on_an_armed_node() {
+        let fx = Fixture::new(3, 5);
+        let (node_n, calls_n) = counted_duress_node(&fx);
+        let (node_d, calls_d) = counted_duress_node(&fx);
+
+        // Give BOTH nodes the identical history, so the second request's pin is the
+        // only thing that differs. Arming happens the §0 way: ingress records the
+        // intent, `t`-of-`n` peer receipts commit the freeze.
+        let arming_spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let arming = duress_request(&fx, &arming_spend, &default_escape(&fx), "shape-arm");
+        for node in [&node_n, &node_d] {
+            assert!(matches!(
+                crate::handle_sign(node, &arming, NOW).expect("decodable"),
+                SignResponse::Accepted(_)
+            ));
+            assert!(
+                confirm_peers(node, &arming, 2, NOW),
+                "the duress carrier reaching t holders must commit the arm"
+            );
+        }
+
+        let spend = fx.spend_psbt(&fx.hot_spk, 8);
+        let (normal, duress) =
+            pin_pair(&fx, fx.spend_request(&spend, EXPIRY, "shape-2"), "shape-2");
+        let normal_pass = ingress_pass(&node_n, &calls_n, &normal, NOW + 1);
+        let duress_pass = ingress_pass(&node_d, &calls_d, &duress, NOW + 1);
+        let (normal_work, duress_work) = (&normal_pass.work, &duress_pass.work);
+        // An armed node ACCEPTS and freezes hot-class spends — it does not refuse
+        // them; refusing would be the pin-dependent observable this test exists for.
+        assert!(matches!(normal_work.response, SignResponse::Accepted(_)));
+        assert!(matches!(duress_work.response, SignResponse::Accepted(_)));
+        assert_the_pins_really_differed(&normal_pass, &duress_pass, "armed node");
+        assert_the_pass_is_worth_comparing(normal_work, "armed node");
+        assert_eq!(
+            normal_work, duress_work,
+            "an already-armed node must answer a fresh spend with the same ingress operations, \
+             in the same order, and the same memory-hard work, under both pins"
+        );
+    }
+
+    /// The fresh escape-class shape: a spend that completes at ingress plus a DISJOINT
+    /// residual escape. It takes a different path from a hot spend — no Hold timer, no
+    /// Hot-budget reservation — and must still be pin-uniform along it. The harness's
+    /// repeated advisory samples use the cached form, covered separately below.
+    #[test]
+    fn normal_and_duress_ingress_op_sequences_match_for_an_escape_class_spend() {
+        use crate::ingress_trace::IngressOp;
+
+        let fx = Fixture::new(3, 5);
+        let (node_n, calls_n) = counted_duress_node(&fx);
+        let (node_d, calls_d) = counted_duress_node(&fx);
+        let spend = fx.spend_psbt(&fx.escape_spk, 7);
+        let residual = fx.spend_psbt(&fx.escape_spk, 8);
+        let mut base = fx.spend_request(&spend, EXPIRY, "shape-3");
+        base.escape_psbt = residual.to_string();
+        fx.coord_sign(&mut base, "shape-3");
+        let (normal, duress) = pin_pair(&fx, base, "shape-3");
+
+        let normal_pass = ingress_pass(&node_n, &calls_n, &normal, NOW);
+        let duress_pass = ingress_pass(&node_d, &calls_d, &duress, NOW);
+        let (normal_work, duress_work) = (&normal_pass.work, &duress_pass.work);
+        assert!(matches!(normal_work.response, SignResponse::Accepted(_)));
+        assert!(matches!(duress_work.response, SignResponse::Accepted(_)));
+        assert_the_pins_really_differed(&normal_pass, &duress_pass, "escape class");
+        assert_the_pass_is_worth_comparing(normal_work, "escape class");
+        assert_eq!(
+            normal_work, duress_work,
+            "an escape-class spend and its residual must be admitted by the identical ingress \
+             operations, and the identical memory-hard work, under both pins"
+        );
+        assert!(
+            !normal_work.ops.contains(&IngressOp::HoldTimerInstall),
+            "an escape-class spend fires at ingress, so it installs no Hold: {:?}",
+            normal_work.ops
+        );
+    }
+
+    /// The replay-CACHED acceptance branch, where `verdict == Duress` is read a
+    /// second time to re-apply the cached schedule. A coordinator re-issues the same
+    /// transaction pair under a fresh nonce (the old nonce is single-use), so this
+    /// path is reachable in production and carries the duress bit — it is one of the
+    /// only three sites the verdict flows to at all.
+    #[test]
+    fn normal_and_duress_ingress_op_sequences_match_on_a_replay_cached_resubmission() {
+        use crate::ingress_trace::IngressOp;
+
+        let fx = Fixture::new(3, 5);
+        let (node_n, calls_n) = counted_duress_node(&fx);
+        let (node_d, calls_d) = counted_duress_node(&fx);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let (first_normal, first_duress) = pin_pair(
+            &fx,
+            fx.spend_request(&spend, EXPIRY, "shape-4a"),
+            "shape-4a",
+        );
+        assert!(matches!(
+            crate::handle_sign(&node_n, &first_normal, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(matches!(
+            crate::handle_sign(&node_d, &first_duress, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        // Same pair, fresh nonce: the anti-replay log answers from cache.
+        let (again_normal, again_duress) = pin_pair(
+            &fx,
+            fx.spend_request(&spend, EXPIRY, "shape-4b"),
+            "shape-4b",
+        );
+        let normal_pass = ingress_pass(&node_n, &calls_n, &again_normal, NOW);
+        let duress_pass = ingress_pass(&node_d, &calls_d, &again_duress, NOW);
+        let (normal_work, duress_work) = (&normal_pass.work, &duress_pass.work);
+        assert!(matches!(normal_work.response, SignResponse::Accepted(_)));
+        assert!(matches!(duress_work.response, SignResponse::Accepted(_)));
+        assert_the_pins_really_differed(&normal_pass, &duress_pass, "cached resubmission");
+        assert!(
+            normal_work.ops.contains(&IngressOp::CachedScheduleApply),
+            "this case must actually land on the cached-acceptance branch: {:?}",
+            normal_work.ops
+        );
+        assert_the_pass_is_worth_comparing(normal_work, "cached resubmission");
+        assert_eq!(
+            normal_work, duress_work,
+            "an idempotent resubmission must re-apply its cached schedule with the identical \
+             ingress operations, and the identical memory-hard work, under both pins"
+        );
+    }
+
+    /// The exact cached escape-class shape the harness's `escape-class-sequences`
+    /// advisory samples ride: the already-accepted escape spend and its disjoint
+    /// residual are resubmitted under a fresh nonce. This combines the cached branch's
+    /// second verdict sink (`apply_cached_schedule`) with escape-class candidate state;
+    /// neither the fresh escape-class case nor the cached Hot case covers that
+    /// combination alone.
+    #[test]
+    fn normal_and_duress_ingress_op_sequences_match_on_a_replay_cached_escape_class_spend() {
+        use crate::ingress_trace::IngressOp;
+
+        let fx = Fixture::new(3, 5);
+        let (node_n, calls_n) = counted_duress_node(&fx);
+        let (node_d, calls_d) = counted_duress_node(&fx);
+        let spend = fx.spend_psbt(&fx.escape_spk, 7);
+        let residual = fx.spend_psbt(&fx.escape_spk, 8);
+        let request = |nonce: &str| {
+            let mut request = fx.spend_request(&spend, EXPIRY, nonce);
+            request.escape_psbt = residual.to_string();
+            fx.coord_sign(&mut request, nonce);
+            request
+        };
+
+        let (first_normal, first_duress) = pin_pair(&fx, request("shape-4c"), "shape-4c");
+        assert!(matches!(
+            crate::handle_sign(&node_n, &first_normal, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(matches!(
+            crate::handle_sign(&node_d, &first_duress, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        let (again_normal, again_duress) = pin_pair(&fx, request("shape-4d"), "shape-4d");
+        let normal_pass = ingress_pass(&node_n, &calls_n, &again_normal, NOW);
+        let duress_pass = ingress_pass(&node_d, &calls_d, &again_duress, NOW);
+        let (normal_work, duress_work) = (&normal_pass.work, &duress_pass.work);
+        assert!(matches!(normal_work.response, SignResponse::Accepted(_)));
+        assert!(matches!(duress_work.response, SignResponse::Accepted(_)));
+        assert_the_pins_really_differed(
+            &normal_pass,
+            &duress_pass,
+            "cached escape-class resubmission",
+        );
+        assert!(
+            normal_work.ops.contains(&IngressOp::CachedScheduleApply),
+            "this case must actually land on the cached-acceptance branch: {:?}",
+            normal_work.ops
+        );
+        assert!(
+            !normal_work.ops.contains(&IngressOp::CandidateRegister)
+                && !normal_work.ops.contains(&IngressOp::NodeSignature),
+            "a cached acceptance must not register or sign candidates again: {:?}",
+            normal_work.ops
+        );
+        assert_the_pass_is_worth_comparing(normal_work, "cached escape-class resubmission");
+        assert_eq!(
+            normal_work, duress_work,
+            "an idempotent escape-class resubmission must re-apply its cached schedule with the \
+             identical ingress operations, and the identical memory-hard work, under both pins"
+        );
+    }
+
+    /// The refusal path the harness timed separately: `HOT_BUDGET_EXCEEDED` is
+    /// decided on the amount alone, so a refusal that did pin-dependent work would
+    /// hand the attacker the duress bit for free — and refusals are the cheapest
+    /// probe an attacker has, since they need no spendable coin.
+    #[test]
+    fn normal_and_duress_ingress_op_sequences_match_on_a_hot_budget_refusal() {
+        use crate::ingress_trace::IngressOp;
+
+        let mut fx = Fixture::new(3, 5);
+        fx.reseal_hot_budget(HotBudget {
+            max_per_tx_sat: 1_000_000,
+            max_per_window_sat: 1_000_000,
+            window_secs: 172_800,
+        });
+        let (node_n, calls_n) = counted_duress_node(&fx);
+        let (node_d, calls_d) = counted_duress_node(&fx);
+        let over_cap = fx.spend_psbt_paying(&fx.hot_spk, 7, 50_000_000);
+        let (normal, duress) = pin_pair(
+            &fx,
+            fx.spend_request(&over_cap, EXPIRY, "shape-5"),
+            "shape-5",
+        );
+
+        let normal_pass = ingress_pass(&node_n, &calls_n, &normal, NOW);
+        let duress_pass = ingress_pass(&node_d, &calls_d, &duress, NOW);
+        let (normal_work, duress_work) = (&normal_pass.work, &duress_pass.work);
+        for response in [&normal_work.response, &duress_work.response] {
+            assert!(
+                matches!(response, SignResponse::Refusal(r)
+                    if r.code == vault_proto::RefusalCode::HotBudgetExceeded),
+                "expected HOT_BUDGET_EXCEEDED, got {response:?}"
+            );
+        }
+        assert_the_pins_really_differed(&normal_pass, &duress_pass, "hot-budget refusal");
+        assert_the_pass_is_worth_comparing(normal_work, "hot-budget refusal");
+        assert_eq!(
+            normal_work, duress_work,
+            "a Hot-budget refusal must perform the identical ingress operations, and the \
+             identical memory-hard work, under both pins"
+        );
+        assert!(
+            !normal_work.ops.contains(&IngressOp::CandidateRegister),
+            "a refused request registers no candidate: {:?}",
+            normal_work.ops
+        );
+    }
+
+    /// The LOCKED-OUT path — the cheapest probe an attacker has, and the one place a
+    /// duress pin does arming work the node will not sign for.
+    ///
+    /// It costs no spendable coin: flood wrong pins until the budget locks the node,
+    /// then submit a valid pin. §0's fail-closed rule (`handle_sign_after_lock`, the
+    /// comment above `charge.refuse`) makes the refused request still derive its
+    /// carrier, run `fire_arm_hook`, and `stage_spend_carrier` for peers BEFORE the
+    /// uniform refusal returns — deliberately, so a wrong-pin flood cannot rate-limit
+    /// away a valid duress arm. Everything on that path is therefore work a duress pin
+    /// performs while locked out, and if any of it were pin-shaped the lockout refusal
+    /// would hand over the duress bit for free.
+    ///
+    /// `a_valid_duress_pin_arms_even_when_locked_out` covers the ARMING behaviour here
+    /// (that the intent survives the refusal and still commits on `t` receipts). This
+    /// covers the other half: that the two pins reach it by the identical observable
+    /// route. Both nodes are flooded with the identical wrong requests first, so the
+    /// lockout state, the staged wrong carriers, and the budget's ring are equal going
+    /// in and the compared request's PIN is the only variable.
+    #[test]
+    fn normal_and_duress_ingress_op_sequences_match_when_locked_out() {
+        use crate::ingress_trace::IngressOp;
+
+        // `backoff_schedule = [0, 0, 0]`: a wrong pin sleeps its backoff outside the
+        // `/sign` lock, and a lockout never extends it, so zeroes keep this case from
+        // spending three real sleeps on state the flood only needs to reach.
+        let lockout_config = format!(
+            "duress_delay_secs = {DELAY}\n[pin_attempt_budget]\nmax_attempts = 3\n\
+             window_secs = 3600\nbackoff_schedule = [0, 0, 0]\nlockout_secs = 100"
+        );
+        let fx = Fixture::new(3, 5);
+        let (node_n, calls_n) = counted_duress_node_with(&fx, &lockout_config);
+        let (node_d, calls_d) = counted_duress_node_with(&fx, &lockout_config);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+
+        for i in 0..3 {
+            let mut wrong = fx.spend_request(&spend, EXPIRY, &format!("shape-7-wrong-{i}"));
+            wrong.pin = "0000".into();
+            fx.coord_sign(&mut wrong, &format!("shape-7-wrong-{i}"));
+            for node in [&node_n, &node_d] {
+                assert!(
+                    matches!(crate::handle_sign(node, &wrong, NOW).expect("decodable"),
+                        SignResponse::Refusal(r) if r.code == vault_proto::RefusalCode::BadPin),
+                    "the flood must be refused, not accepted"
+                );
+            }
+        }
+
+        let (normal, duress) =
+            pin_pair(&fx, fx.spend_request(&spend, EXPIRY, "shape-7"), "shape-7");
+        let normal_pass = ingress_pass(&node_n, &calls_n, &normal, NOW);
+        let duress_pass = ingress_pass(&node_d, &calls_d, &duress, NOW);
+        let (normal_work, duress_work) = (&normal_pass.work, &duress_pass.work);
+        // The lockout refusal is the uniform BAD_PIN body every class gets — a locked
+        // node must not answer a VALID pin any differently from a wrong guess.
+        for response in [&normal_work.response, &duress_work.response] {
+            assert!(
+                matches!(response, SignResponse::Refusal(r)
+                    if r.code == vault_proto::RefusalCode::BadPin),
+                "a locked-out node refuses every pin class uniformly, got {response:?}"
+            );
+        }
+        assert_the_pins_really_differed(&normal_pass, &duress_pass, "locked out");
+        assert_the_pass_is_worth_comparing(normal_work, "locked out");
+        // The fail-closed work this case exists for must actually have happened: the
+        // carrier is staged for peers (outbox push + this node's own holder slot) even
+        // though nothing will be signed. Without it the two records would agree only
+        // because both stopped at the refusal.
+        assert!(
+            normal_work.ops.contains(&IngressOp::OutboxPush)
+                && normal_work.ops.contains(&IngressOp::CarrierPropagated),
+            "a locked-out refusal must still stage its carrier for peers: {:?}",
+            normal_work.ops
+        );
+        assert!(
+            !normal_work.ops.contains(&IngressOp::NodeSignature)
+                && !normal_work.ops.contains(&IngressOp::CandidateRegister),
+            "a locked-out refusal signs and registers nothing: {:?}",
+            normal_work.ops
+        );
+        assert_eq!(
+            normal_work, duress_work,
+            "a locked-out node must perform the identical ingress operations, in the identical \
+             order, and the identical memory-hard work, under both pins — the fail-closed arm \
+             path a refused duress request still runs included"
+        );
+    }
+
+    /// The positive control for every equality above: the record has to be able to
+    /// come out DIFFERENT, or `assert_eq!` on it is decoration. Two genuinely
+    /// different ingress shapes — a hot spend that installs a Hold and meters the Hot
+    /// budget, versus an escape-class spend that does neither — must produce
+    /// different records on the same fixture.
+    ///
+    /// This control covers `ops`, `store`, `sign_state`, `schedule_work` and `response`
+    /// — every field whose contents are derived rather than asserted against fixed
+    /// expectations. The
+    /// enumeration is deliberately exhaustive over [`IngressWork`]: a compared field
+    /// with neither a concrete expectation nor a proof it can differ is a field the
+    /// equality might be passing on for free. `schedule_work` is the one that most
+    /// needed saying — `assert_the_pass_is_worth_comparing` pins two of its thirteen
+    /// counters (`safety_locks`, `safety_overlay_writes`), so without this the other
+    /// eleven had neither anchor.
+    ///
+    /// The two memory-hard counters are the exception, anchored a stronger way and
+    /// needing no separate control: `assert_the_pass_is_worth_comparing` pins them to
+    /// CONCRETE expected values (exactly `[Normal, Duress]` evaluations and exactly one
+    /// carrier derivation) on the normal side of every case before the equality runs, so
+    /// a pass that performed a different amount of memory-hard work fails outright
+    /// rather than merely failing to match.
+    #[test]
+    fn the_ingress_op_sequence_discriminates_different_work_shapes() {
+        let fx = Fixture::new(3, 5);
+        let (hot_node, hot_calls) = counted_duress_node(&fx);
+        let (escape_node, escape_calls) = counted_duress_node(&fx);
+
+        let hot = fx.spend_request(&fx.spend_psbt(&fx.hot_spk, 7), EXPIRY, "shape-6a");
+        let escape_class = fx.spend_psbt(&fx.escape_spk, 7);
+        let residual = fx.spend_psbt(&fx.escape_spk, 8);
+        let mut escape = fx.spend_request(&escape_class, EXPIRY, "shape-6b");
+        escape.escape_psbt = residual.to_string();
+        fx.coord_sign(&mut escape, "shape-6b");
+
+        let hot_work = ingress_pass(&hot_node, &hot_calls, &hot, NOW).work;
+        let escape_work = ingress_pass(&escape_node, &escape_calls, &escape, NOW).work;
+        assert!(
+            !hot_work.ops.is_empty(),
+            "an empty trace would make every equality above vacuous"
+        );
+        assert_ne!(
+            hot_work.ops, escape_work.ops,
+            "the ingress op sequence must be able to tell two different work shapes apart, or \
+             comparing it across pins detects nothing"
+        );
+        // The schedule-work delta, for the eleven counters no case pins concretely.
+        assert_ne!(
+            hot_work.schedule_work, escape_work.schedule_work,
+            "the per-request schedule-work delta must be able to tell two different work shapes \
+             apart, or comparing it across pins detects nothing"
+        );
+        // And the acknowledgement: a hot spend reports its Hold as `remaining_secs`,
+        // an escape-class spend fires at ingress and reports `0`.
+        assert_ne!(
+            hot_work.response, escape_work.response,
+            "the /sign acknowledgement must be able to tell two different work shapes apart, or \
+             comparing it across pins detects nothing"
+        );
+        // Same question for the store projection, and it needs its own answer: the
+        // masking that keeps the pin-derived carrier out of it is exactly the edit that
+        // could quietly mask away everything else too, leaving a constant that compares
+        // equal to itself forever.
+        assert_ne!(
+            hot_work.store, escape_work.store,
+            "the pin-masked store projection must be able to tell two different work shapes \
+             apart, or comparing it across pins detects nothing"
+        );
+        // And the `/sign`-state projection, for the same reason: it is the other
+        // whole-struct read, so an over-broad edit there is the other way this record
+        // could quietly degrade into a constant. A hot spend leaves a pending entry
+        // behind; an escape-class spend settles at ingress and leaves none.
+        assert_ne!(
+            hot_work.sign_state, escape_work.sign_state,
+            "the /sign-state projection must be able to tell two different work shapes apart, or \
+             comparing it across pins detects nothing"
+        );
     }
 
     // -- Partial-release authorization --------------------------------------
