@@ -131,10 +131,13 @@ async fn read_secret_body(
 /// arrives well within this; a body that does not is a stalled peer we shed.
 const CHANNEL_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// `/pending` performs one short `sign_state` snapshot, but an unbounded number of
-/// concurrent snapshots could all occupy Tokio blocking-pool workers while `/sign`
-/// holds that lock for its memory-hard PIN work. One in-flight read is sufficient for
-/// this polling surface and bounds that contention without adding a timeout that would
-/// detach the still-blocked job and admit another one.
+/// concurrent snapshots could all occupy Tokio blocking-pool workers while `/sign` holds
+/// that lock. Since bead btc-policy-9zs the memory-hard PIN work is NO LONGER what they
+/// would be queued behind — it runs in an out-of-lock window — but `/sign`'s REGISTRATION
+/// hold still decodes both PSBTs, validates every rung, signs and registers under this
+/// lock, so the contention is shorter, not gone. One in-flight read is sufficient for
+/// this polling surface and bounds it without adding a timeout that would detach the
+/// still-blocked job and admit another one.
 const PENDING_MAX_CONCURRENCY: usize = 1;
 
 /// The deadline is state so the no-cancel test can force its path.
@@ -337,8 +340,10 @@ async fn sign(State(state): State<AppState>, body: Body) -> Response {
     }
     let node = Arc::clone(&state.node);
     let propagation_node = Arc::clone(&state.node);
-    // `/sign` uses one `Mutex<SignState>` for an atomic ingress phase and an atomic
-    // replay/pending phase, with only the slow chain preflight between them. Dropping
+    // `/sign` uses one `Mutex<SignState>` across three holds — an atomic ingress hold, a
+    // commit hold, and an atomic replay/pending registration hold — with the memory-hard
+    // PIN window and the slow chain preflight held OUTSIDE it, one between each pair
+    // (bead btc-policy-9zs). Dropping
     // a timed-out JoinHandle detaches rather than aborts the job, preventing
     // half-mutated ghost state. The DETACHED JOB also owns propagation:
     // if the policy work finishes after the client deadline, it drains the outbox
@@ -483,9 +488,11 @@ async fn pending(State(state): State<AppState>) -> Response {
         // while this job is parked on `sign_state` cancels the handler future, and
         // a permit tied to that future would be released while the job stays
         // parked. Connect-and-drop in a loop would then queue unbounded blocking
-        // workers behind `/sign`'s memory-hard PIN work — the exact contention
+        // workers behind `/sign`'s registration hold — the exact contention
         // `PENDING_MAX_CONCURRENCY` exists to bound, and the one that could put
-        // observational work in front of the fire path.
+        // observational work in front of the fire path. (Before bead btc-policy-9zs
+        // that queue also formed behind the memory-hard PIN work; that half now runs
+        // out of lock, which shortens the wait without removing it.)
         let _permit = permit;
         node.pending_projection_now()
     })
@@ -1858,7 +1865,8 @@ mod tests {
     }
 
     /// At most one `/pending` snapshot may wait behind `sign_state`. Without this
-    /// pre-lock bound, a local poll flood during `/sign`'s memory-hard PIN work could
+    /// pre-lock bound, a local poll flood during any `/sign` hold — its registration
+    /// hold today, and before bead btc-policy-9zs its memory-hard PIN work too — could
     /// occupy the whole blocking pool and queue the fire path behind observational work.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pending_sheds_concurrent_reads_before_the_sign_lock() {

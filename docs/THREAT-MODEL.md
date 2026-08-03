@@ -94,7 +94,7 @@ These are what a reviewer should try hardest to break. Each is enforced in code,
 
 | Surface | Exposure | Notes for a reviewer |
 |---|---|---|
-| `POST /sign` | The main gate | Coord-auth → freshness/nonce → PIN (two Argon2id evaluations, constant-time compare) → user signature → class/allowlist → Hot budget → chain preflight → register. The nonce is consumed atomically under the sign lock; the slow chain I/O is deliberately *outside* it so no RPC can delay Lockdown-at-T. |
+| `POST /sign` | The main gate | Coord-auth → freshness/nonce → PIN (two Argon2id evaluations, constant-time compare) → user signature → class/allowlist → Hot budget → chain preflight → register. The nonce is consumed atomically under the sign lock; the two Argon2id PIN evaluations, the carrier derivation and the slow chain I/O are all deliberately *outside* it (bead btc-policy-9zs), so neither memory-hard work nor a slow RPC lengthens the section a waiting Lockdown-at-T contends for — but see R11: the acquisition delay itself still has no finite bound. |
 | `POST /channel` | Peer transport | Manifest-pinned endpoints and endorsed channel keys; per-peer rate quota; size bound is manifest-uniform. |
 | `GET /events` | Watchtower alerts + one channel diagnostic | Carries on-chain watchtower alerts (`RECOVERY_PATH_SPEND`, `UNRECOGNIZED_SPEND`) plus `CHANNEL_FRESHNESS_REJECT`, which names a peer whose clock is off. It carries nothing about pending or armed state. A reviewer should confirm the freshness diagnostic is genuinely pin-independent, since it is the one `/events` entry not derived from the chain. |
 | `GET /healthz` | Liveness | Three atomic loads; must stay free of duress-dependent content. |
@@ -204,11 +204,61 @@ detect, so it could produce false negatives as readily as false positives. The h
 is deterministic and in-process: it compares the synchronous `/sign` response, ordered handler
 operations, an exhaustive pin-masked channel-store projection, an exhaustive projection of the
 `/sign` handler state (including the PIN attempt budget), schedule-work counts, PIN evaluations,
-and carrier derivations — across seven request shapes including a locked-out node. Its capture ends at handler return, before the server drains
+and carrier derivations — across seven request shapes including a locked-out node. Those seven
+are SEQUENTIAL: each drives one `/sign` to completion, so none of them can see a concurrent
+observer. Bead btc-policy-9zs adds one structurally different eighth case,
+`an_in_flight_receipt_is_answered_identically_under_both_pins`, which parks a handler inside its
+out-of-lock PIN window and compares what a peer receipt for the same nonce sees under each pin —
+the reply sequence, the retry count, the induced memory-hard work and the pin-masked store. Its
+capture, like the other seven, ends at handler return, before the server drains
 the outbox and spawned peer sends run. Those post-handler effects are exercised by live
 propagation scenarios, but neither they nor arbitrary end-to-end CPU/scheduler cost have a
 deterministic timing gate. SILENCE remains the normative invariant; this is the evidence boundary
 an external reviewer must not mistake for a proof of every timing effect.
+
+**R11 — The delay before Lockdown at T has no finite bound.** The transition is unconditional as a
+DECISION — no branch, chain view, or fire failure can skip it, and the deadline driver attempts it
+on every tick — but `Node::enter_lockdown` needs the one `/sign` lock, and `std::sync::Mutex` offers
+neither fairness nor deadline priority. `/sign` is the only admission-free surface that ACQUIRES
+that lock — `/events` and `/healthz` carry no permit either, but never take `sign_state`, while
+`/pending` caps at 1 and `/channel` is semaphore-bounded — and its
+HTTP timeout does not cancel: the job detaches and keeps running. A coordinator that turns hostile
+at the wrench holds the auth key, so it can mint arbitrarily many validly-signed requests with fresh
+nonces and keep overtaking a waiting `enter_lockdown` indefinitely. Note what does NOT fix this: a
+concurrency semaphore bounds *simultaneous* jobs, not *successive* ones, so a continuing flood
+defeats it on an unfair mutex. Bead btc-policy-9zs moved all three memory-hard passes (~600 ms) out
+of the contended section, which shortens each individual hold and does nothing more to bound lock
+acquisition. The CONSEQUENCES are bounded by the signer/partial coupling + release-gate (ADR-0012
+invariant vii) plus expiry-bounded arming: a merely DELAYED node is still frozen, still releases no
+hot partial, and its carriers still expire — so the outcome is denial, not theft. A reviewer should
+read "unconditional Lockdown at T" everywhere it appears as a statement about the decision, never
+about its latency.
+
+The same unbounded concurrency has one further cost the bead added, stated here rather than left in
+a code comment: a peer receipt for a nonce whose handler has not yet RULED on it — the out-of-lock
+PIN window, and then the chain preflight and registration until the carrier is staged — is
+answered `RATE_LIMITED` with a fixed 1 s retry (it must be — answering `ACCEPTED` would be the
+silent false positive that loses a holder receipt). Both spans end when that one handler exits,
+including on a panic, so the retries are bounded by handler LIFETIMES; a handler that ruled and
+refused without staging the carrier is not in either span and gets the single `ACCEPTED` it got
+before, never a retry against a decision that can no longer change. Both Argon2 consumers share one node-wide work
+slot, so that window stretches with the number of concurrent `/sign` handlers, and the retries a
+flood induces therefore grow roughly with the SQUARE of that number, competing for the same
+`max_concurrent_channel_requests` permits as honest partials. Each retry is a pre-Argon2 replay
+refusal costing microseconds — but state where it is paid: a relayed Spend runs the full `/sign`
+ingress before the memo lookup, so reaching that `NONCE_REPLAYED` means TAKING `sign_state`. Those
+`C² × peers` retries are therefore `C² × peers` further *successive* acquisitions of the very lock
+this residual is about, and pre-9zs the receipt took one `ACCEPTED` and stopped. It is still not a
+new capability — a hostile coordinator can already mint unbounded `/sign` requests directly, and
+these retries come from HONEST senders and stop at `commitment_expiry` — so it is additional
+contention under R11's existing unbounded-acquisition residual, bounded only by the same missing
+`/sign` admission control (bead btc-policy-1y2), not independently.
+
+Moving that work also lets multiple `/sign` handlers queue directly on the shared Argon2 slot.
+While any one of them owns it, `/channel`'s conflicting-signature receipt path deliberately sheds
+instead of queueing, so a burst can widen the interval in which those honest receipts receive
+`RATE_LIMITED`. They remain retryable and expiry-bounded; this is added censorship pressure under
+the same admission-control residual, not a correctness or PIN-observability exception.
 
 ## 8. What a reviewer should attack first
 
@@ -222,7 +272,9 @@ Ranked by "most damaging if wrong":
 3. **Determinism.** Find two honest nodes that, on the same chain state, could disagree about a
    verdict or a fee rung — especially across the manifest-pinned config fields.
 4. **Lockdown-at-T unconditionality.** Find a failure (chain unreadable, panic, lock poisoned,
-   RPC hang) that skips or delays it.
+   RPC hang) that skips it. DELAY is already known and unbounded — see R11 — so the interesting
+   question there is whether any consequence escapes the release gate during the delay, not
+   whether a delay exists.
 5. **The ceremony.** Find a way to seal a vault whose manifest, descriptor, keys, or coordinator
    secret disagree with each other — or an independence violation that slips past ADR-0003's
    check.

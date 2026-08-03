@@ -1485,7 +1485,13 @@ impl Vault {
         for &target_index in targets {
             let target = &self.honest[target_index];
             for compromised in &self.compromised {
-                let response = compromised.relay_request(
+                // `RATE_LIMITED` here is "not ruled on yet", not "refused": since bead
+                // btc-policy-9zs a nonce claimed by a `/sign` handler inside its
+                // out-of-lock PIN window answers 429 on purpose, and the production
+                // sender retries. Reading the first 429 as a rejection made this
+                // scenario fail on a loaded box for a reason unrelated to the safety
+                // property. See `CompromisedNode::relay_request_awaiting_ruling`.
+                let response = compromised.relay_request_awaiting_ruling(
                     &self.secp,
                     target.addr(),
                     target.node_id,
@@ -2542,7 +2548,7 @@ fn arm_split_closed() -> Result<String, Error> {
         // a reason that has nothing to do with the release gate. This is also the
         // only live check on the envelope constants `crate::adversary` mirrors, which
         // have no local drift oracle of their own.
-        let response = node.relay_request(
+        let response = node.relay_request_awaiting_ruling(
             &vault.secp,
             vault.honest[target].addr(),
             target_id,
