@@ -42,7 +42,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -406,8 +406,14 @@ impl CompromisedNode {
     /// workaround. Each attempt builds a FRESH envelope (new nonce and timestamp), so a
     /// retry is never a channel replay.
     ///
-    /// BOUNDED ON TOTAL WAIT, not on attempt count, so a node that never rules still
-    /// fails its caller rather than hanging the scenario. The node's legitimate
+    /// BOUNDED ON ELAPSED WALL TIME, not on attempt count, so a node that never rules
+    /// still fails its caller rather than hanging the scenario. Elapsed rather than
+    /// summed-sleep because each attempt also spends up to `http::post_json`'s 5s connect
+    /// plus 10s read/write timeout: a peer that returns every 429 slowly would keep an
+    /// accumulated-sleep counter under the ceiling for over an hour. The ceiling gates
+    /// whether a further attempt STARTS, so the true worst case is `MAX_TOTAL_WAIT` plus
+    /// one in-flight attempt (~15s) — bounded, and not worth threading a per-request
+    /// deadline through `http::post_json` to shave. The node's legitimate
     /// claimed-but-unruled span is not just the PIN window: it ends when the handler
     /// does, so it also covers the out-of-lock chain preflight, whose two RPC batches are
     /// each bounded by `vault_node::chain`'s 60s timeout. An attempt cap of 10 against
@@ -425,7 +431,12 @@ impl CompromisedNode {
         const MAX_ATTEMPTS: usize = 256;
         const MAX_TOTAL_WAIT: Duration = Duration::from_secs(150);
 
-        let mut waited = Duration::ZERO;
+        // ELAPSED wall time, not accumulated sleep: every attempt also spends up to
+        // `http::post_json`'s 5s connect plus 10s read/write timeout, and a peer that
+        // returns each 429 slowly would otherwise blow the ceiling by two orders of
+        // magnitude while `waited` stayed under it. `Instant` advances across the
+        // requests as well as the sleeps, so the deadline binds what the doc claims.
+        let deadline = Instant::now() + MAX_TOTAL_WAIT;
         let mut response = self.relay_request(secp, peer, recipient, request)?;
         for _ in 1..MAX_ATTEMPTS {
             if response.status != 429 {
@@ -433,20 +444,20 @@ impl CompromisedNode {
             }
             // Honour the server's own value rather than a guess; every in-flight site
             // sends the fixed 1s, and the floor keeps a malformed body from spinning.
-            // The body is the node's, so it is parsed as untrusted: the ceiling below
-            // uses `saturating_add`, or a value near `u64::MAX` would panic the harness
-            // in `Duration`'s `Add` instead of failing its caller.
+            // The body is the node's, so it is parsed as untrusted: the deadline check
+            // below uses `checked_add`, or a value near `u64::MAX` would panic the
+            // harness in `Instant`'s `Add` instead of failing its caller.
             let wait = serde_json::from_str::<Value>(&response.body)
                 .ok()
                 .and_then(|body| body.get("retry_after_secs").and_then(Value::as_u64))
                 .map_or(Duration::from_secs(1), |secs| {
                     Duration::from_secs(secs.max(1))
                 });
-            if waited.saturating_add(wait) > MAX_TOTAL_WAIT {
-                break;
+            match Instant::now().checked_add(wait) {
+                Some(resume) if resume <= deadline => {}
+                _ => break,
             }
             std::thread::sleep(wait);
-            waited += wait;
             response = self.relay_request(secp, peer, recipient, request)?;
         }
         Ok(response)

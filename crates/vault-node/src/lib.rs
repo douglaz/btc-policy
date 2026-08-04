@@ -4571,7 +4571,9 @@ fn handle_channel_body_with_clocks(
                         // this sender's one derivation for the nonce and `Skip` its own
                         // retry — and every later honest receipt from it — forever.
                         //
-                        // `retry_after_secs` is the fixed 1s every other site sends.
+                        // `retry_after_secs` is the fixed 1s every other IN-FLIGHT site
+                        // sends. The per-peer quota refusal is the exception: it sends
+                        // `oldest + 60 - now`, up to a full window.
                         // RateLimited does not advance the backoff ladder and the floor
                         // is 1s, so each in-flight nonce draws one retry per second per
                         // peer, each retry a pre-Argon2 replay refusal costing
@@ -4583,8 +4585,13 @@ fn handle_channel_body_with_clocks(
                         // — every evaluation takes the one node-wide Argon2 slot
                         // (`pin::CarrierKdf::work_lock`), so the window stretches with
                         // `C` and the induced retries grow as roughly `C² × peers`,
-                        // competing for the same `max_concurrent_channel_requests`
-                        // permits as honest partials. What leaves `C` unbounded is
+                        // contending with honest partials. What binds that first is the
+                        // PER-PEER ENVELOPE QUOTA, not the concurrency permits: quota is
+                        // charged before the `msg_type` dispatch, so ~10 unruled nonces
+                        // at 1 Hz exhaust one peer's default 600/60s and its next
+                        // envelope — a `partial` included — is refused. Idempotent and
+                        // the nonce stays reusable, so it delays, not loses. What leaves
+                        // `C` unbounded is
                         // `/sign`'s missing admission control, which is bead
                         // btc-policy-1y2's and is recorded as threat-model R11; this
                         // reply adds retry traffic under that residual, not a new one. A

@@ -52,8 +52,9 @@ consolidated architecture.
    *untrusted*: it is a relay whose signature only proves "this vault's coordinator authored this
    request", never that the request is legitimate.
 2. **Coordinator ↔ node.** The hard boundary. Every node independently re-runs coord-auth,
-   freshness, the PIN, the user signature, destination class, the Hot budget, and the chain
-   preflight. A node never signs because a peer or the coordinator said so
+   freshness, the PIN, the chain preflight, the user signature, destination class, and the
+   Hot budget (§6 gives the order; the preflight precedes validation).
+   A node never signs because a peer or the coordinator said so
    (the signing-oracle prohibition).
 3. **Node ↔ node.** Peers relay coordinator-signed requests verbatim and exchange partials after
    the fire event. A peer is pure transport: authority is cryptographic, rooted in the sealed
@@ -94,7 +95,7 @@ These are what a reviewer should try hardest to break. Each is enforced in code,
 
 | Surface | Exposure | Notes for a reviewer |
 |---|---|---|
-| `POST /sign` | The main gate | Coord-auth → freshness/nonce → PIN (two Argon2id evaluations, constant-time compare) → user signature → class/allowlist → Hot budget → chain preflight → register. The nonce is consumed atomically under the sign lock; the two Argon2id PIN evaluations, the carrier derivation and the slow chain I/O are all deliberately *outside* it (bead btc-policy-9zs), so neither memory-hard work nor a slow RPC lengthens the section a waiting Lockdown-at-T contends for — but see R11: the acquisition delay itself still has no finite bound. |
+| `POST /sign` | The main gate | Coord-auth → freshness/nonce → PIN (two Argon2id evaluations, constant-time compare) → chain preflight → user signature → class/allowlist → Hot budget → register. The preflight really does precede validation: its fail-closed exit is step 4b (`lib.rs`) and user-signature verification is step 5, a shape bead btc-policy-f91 established and btc-policy-9zs kept. The nonce is consumed atomically under the sign lock; the two Argon2id PIN evaluations, the carrier derivation and the slow chain I/O are all deliberately *outside* it (bead btc-policy-9zs), so neither memory-hard work nor a slow RPC lengthens the section a waiting Lockdown-at-T contends for — but see R11: the acquisition delay itself still has no finite bound. |
 | `POST /channel` | Peer transport | Manifest-pinned endpoints and endorsed channel keys; per-peer rate quota; size bound is manifest-uniform. |
 | `GET /events` | Watchtower alerts + one channel diagnostic | Carries on-chain watchtower alerts (`RECOVERY_PATH_SPEND`, `UNRECOGNIZED_SPEND`) plus `CHANNEL_FRESHNESS_REJECT`, which names a peer whose clock is off. It carries nothing about pending or armed state. A reviewer should confirm the freshness diagnostic is genuinely pin-independent, since it is the one `/events` entry not derived from the chain. |
 | `GET /healthz` | Liveness | Three atomic loads; must stay free of duress-dependent content. |
@@ -243,8 +244,13 @@ including on a panic, so the retries are bounded by handler LIFETIMES; a handler
 refused without staging the carrier is not in either span and gets the single `ACCEPTED` it got
 before, never a retry against a decision that can no longer change. Both Argon2 consumers share one node-wide work
 slot, so that window stretches with the number of concurrent `/sign` handlers, and the retries a
-flood induces therefore grow roughly with the SQUARE of that number, competing for the same
-`max_concurrent_channel_requests` permits as honest partials. Each retry is a pre-Argon2 replay
+flood induces therefore grow roughly with the SQUARE of that number. What binds that traffic first
+is NOT `max_concurrent_channel_requests` but the PER-PEER ENVELOPE QUOTA: `check_and_consume`
+charges `per_peer_quota_per_min` (default 600 per 60s) BEFORE it dispatches on `msg_type`, so about
+ten concurrently unruled nonces at 1 Hz exhaust one peer's whole budget, and that peer's next
+envelope — an honest `partial` included — is answered RATE_LIMITED with `oldest + 60 - now` rather
+than the fixed 1s. Partial delivery is idempotent and the channel nonce is deliberately reusable
+after a quota refusal, so this DELAYS a combine input by up to a window rather than losing it. Each retry is a pre-Argon2 replay
 refusal costing microseconds — but state where it is paid: a relayed Spend runs the full `/sign`
 ingress before the memo lookup, so reaching that `NONCE_REPLAYED` means TAKING `sign_state`. Those
 `C² × peers` retries are therefore `C² × peers` further *successive* acquisitions of the very lock

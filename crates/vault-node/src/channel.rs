@@ -3631,26 +3631,37 @@ impl ChannelState {
         // holds `sign_state`, so a panic here poisons BOTH and every later
         // `.expect("... lock poisoned")` aborts — bricking a node that, under
         // reboot-death (ADR-0007), can never restart. Turning an internal accounting
-        // invariant into a remote kill switch is strictly worse than the bounded
-        // over-count it would be guarding against: the map is already pruned on the
-        // nonce log's own horizon just above, so live intents are a subset of live
-        // nonces and one extra entry is bounded either way. `debug_assert!` keeps the
-        // BOUND enforced under test, where a regression that let intent memory outgrow
-        // the nonce log should still fail loudly.
+        // invariant into a remote kill switch is strictly worse than the over-count it
+        // would be guarding against — the prune just above keeps the map a working set
+        // rather than a leak, even where the count is not a strict subset of the log.
+        // `debug_assert!` keeps a GROWTH check under test; what it can honestly assert
+        // is spelled out at the ceiling below, and it is NOT that intents stay within
+        // the nonce log's cap.
         //
         // The BOUND is what this asserts, and it is deliberately not restated as a 1:1
         // intent/nonce correspondence any more: an intent can now be BORN EXPIRED (the
         // out-of-lock window outlived this request's expiry, so the prune just above
-        // removed nothing on its behalf and `confirm_carrier` will evict it on the next
-        // receipt), and a MISMATCHED generation records its own separately-keyed intent
-        // for a nonce another generation's memo owns. Neither breaks the subset bound —
-        // both entries are still keyed under live-or-lapsing nonces the log itself caps
-        // — so keep the bound and do NOT "restore" the correspondence by comparing
-        // `intents.len() + carriers_by_nonce.len()`, which double-counts every Derived
-        // request.
+        // removed nothing on its behalf; `confirm_carrier` evicts it on the first receipt
+        // AFTER its owner stops ruling, NOT the next one — a born-expired intent's owner
+        // is ruling by construction here, and that site now refuses without destroying
+        // while `owner_ruling` holds), and a MISMATCHED generation records its own
+        // separately-keyed intent
+        // for a nonce another generation's memo owns. THAT second entry is what stops the
+        // count being a strict subset of the nonce log: one nonce can carry the stale
+        // generation's intent and the fresh one's at once, and chained supersessions can
+        // add further ones. The overshoot is bounded only by how many handlers sit in
+        // that state, which nothing bounds until btc-policy-1y2 puts admission control on
+        // `/sign` — so there is no honest constant equal to the real ceiling. What
+        // follows is therefore a SMOKE ALARM for genuine unbounded growth, not a
+        // statement of the invariant: at the log's own cap it would fire on a legitimate
+        // superseded intent and, in a debug build, panic into a poisoned-lock Lockdown.
+        // Do NOT tighten it back to `MAX_COORD_NONCES`, and do NOT "restore" the
+        // correspondence by comparing `intents.len() + carriers_by_nonce.len()`, which
+        // double-counts every Derived request.
         debug_assert!(
-            store.intents.contains_key(carrier) || store.intents.len() < MAX_COORD_NONCES,
-            "arm-intent count must remain bounded by the coordinator nonce log"
+            store.intents.contains_key(carrier)
+                || store.intents.len() < MAX_COORD_NONCES.saturating_mul(4),
+            "arm-intent count is growing past any plausible supersession overshoot"
         );
         let intent = store
             .intents
@@ -4138,10 +4149,25 @@ impl ChannelState {
         // (nobody arms) instead of a scheduling-dependent split. Pin-independent:
         // both verdicts evict on the same clock comparison.
         if intent.expiry <= now {
-            store.intents.remove(carrier);
-            store.carriers_by_nonce.retain(|_, remembered| {
-                !matches!(&remembered.outcome, MemoOutcome::Derived { carrier: c, .. } if c == carrier)
-            });
+            // REFUSE always; DESTROY only when no handler is still ruling. `now` here HAS
+            // been through `NonceLog::effective_now` (`Node::confirm_carrier`), but that
+            // is a rollback LOWER bound — `high_water.max(now)` — so it corrects a
+            // backward step and passes a FORWARD excursion through untouched. The
+            // residual is therefore forward-only, and a transient forward step still
+            // reaches this branch for a carrier that is not really expired. Deleting a still-ruling owner's
+            // intent there is the same silent failed-arm `prune_intents`' exception
+            // exists to prevent — and it is worse here, because the wrong-pin/lockout
+            // exit leaves an intent `ready_to_propagate` across its whole backoff, which
+            // is exactly the fail-closed intent a locked-out node needs in order to arm
+            // on confirmation at all. Refusing without destroying keeps both properties:
+            // an expired carrier still never collects a holder, and the owner's state
+            // survives the clock correcting. The owner's own exit prunes it normally.
+            if !intent.owner_ruling {
+                store.intents.remove(carrier);
+                store.carriers_by_nonce.retain(|_, remembered| {
+                    !matches!(&remembered.outcome, MemoOutcome::Derived { carrier: c, .. } if c == carrier)
+                });
+            }
             return CarrierConfirmation::NONE;
         }
         if !intent.ready_to_propagate {
@@ -12748,12 +12774,13 @@ mod duress {
         ops: Vec<crate::ingress_trace::IngressOp>,
         /// The preflight slot counter AFTER the pass. `Node::spend_preflight` is an
         /// RAII counter (`enter_spend_preflight` / `SpendPreflightGuard::drop`) that
-        /// neither projection otherwise reads, and the trace records the CLAIM without
-        /// the release — so pin-dependent control flow that dropped the guard at a
-        /// different point would leave ops and both shapes equal while a concurrent
-        /// `/refresh` saw `spend_preflight_in_flight()` differ and returned
-        /// `REFRESH_SUBORDINATED` under one pin only. Comparing the settled value
-        /// closes that: every pass must leave the slot as it found it.
+        /// neither projection otherwise reads. The ordered log now records the release
+        /// too (`IngressOp::PreflightExit`, emitted unconditionally in
+        /// `SpendPreflightGuard::drop`), so it is no longer blind to WHERE the guard
+        /// went — but an ordered log still cannot settle the resulting COUNT, and it is
+        /// the count a concurrent `/refresh` reads through `spend_preflight_in_flight()`
+        /// before returning `REFRESH_SUBORDINATED`. Comparing the settled value is what
+        /// closes that: every pass must leave the slot exactly as it found it.
         preflight_after: usize,
         /// Per-request delta of the channel store's internal schedule work: store
         /// locks, candidate visits, allocations, overlay writes, and timer-window
@@ -13852,6 +13879,66 @@ mod duress {
         );
     }
 
+    /// The SECOND eviction site. `prune_intents`' unruled-owner exception covers the
+    /// lookup path; `confirm_carrier` evicts on its own bare `intent.expiry <= now`. That
+    /// clock has been through `NonceLog::effective_now`, which is only a rollback LOWER
+    /// bound, so a FORWARD excursion still passes through untouched. Refusing is correct
+    /// and must not change —
+    /// an expired carrier may never collect a holder — but DESTROYING a still-ruling
+    /// owner's intent on a transient forward step is the silent failed arm. It is worst
+    /// exactly where it is most reachable: the wrong-pin/lockout exit stages the carrier
+    /// and drops `sign_state`, so an intent sits `ready_to_propagate` (hence looked up as
+    /// `Exact`, not `AwaitingPropagation`) with its guard still live across the whole
+    /// backoff — and that is the fail-closed intent a locked-out node needs in order to
+    /// arm on confirmation at all.
+    #[test]
+    fn a_forward_receipt_clock_refuses_a_ruling_owners_intent_without_destroying_it() {
+        const SENDER: u16 = 1;
+        const CARRIER: &str = "carrier-still-ruling";
+
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: EPS,
+            combine_slack_secs: SLACK,
+        };
+        let generation = MemoGeneration {
+            signature_tag: [0x33; 32],
+            expiry: EXPIRY,
+        };
+
+        // An owner inside its COMMIT HOLD that has staged but not yet exited.
+        channel.record_arm_intent(true, CARRIER, "ruling-nonce", generation, NOW, NOW, timing);
+        channel.mark_carrier_propagated(CARRIER);
+        assert_eq!(channel.intent_counts(), (1, 1));
+
+        // A receipt whose clock has transiently stepped past the expiry. The nonce log's
+        // high-water never advanced, so this reading is not authoritative.
+        assert!(
+            !node.confirm_carrier(SENDER, CARRIER, EXPIRY).armed,
+            "an expired carrier must never collect a holder, ruling owner or not"
+        );
+        assert_eq!(
+            channel.intent_counts(),
+            (1, 1),
+            "the refusal must NOT destroy a still-ruling owner's intent: after the clock \
+             corrects the owner signs, and every later receipt would find Vacant, be \
+             answered ACCEPTED, and stop retrying — the node never reaches t"
+        );
+
+        // Once the owner has ruled, the ordinary eviction must still fire — otherwise
+        // this exception would leak an intent per expired carrier forever.
+        channel.end_carrier_ruling(CARRIER);
+        assert!(!node.confirm_carrier(SENDER, CARRIER, EXPIRY).armed);
+        assert_eq!(
+            channel.intent_counts(),
+            (0, 0),
+            "with no owner ruling, the expiry eviction is unchanged"
+        );
+    }
+
     /// The negative control for the case above: the compared record must be ABLE to come
     /// out different, or its `assert_eq!` is decoration. A run whose handler is NOT
     /// parked in WINDOW A — the receipt arrives after the node has already ruled —
@@ -14516,6 +14603,19 @@ mod duress {
                 intents[0].contains("holders=[0] ready_to_propagate=true"),
                 "{case}: the refusal must STAGE — a recorded intent without this node's own \
                  holder claim is hollow and can never confirm: {intents:?}"
+            );
+            // Deliverable 6's two-clock mapping, pinned. Without this, substituting the
+            // COMMIT-HOLD reading for the INGRESS one at the `fire_arm_hook` call site
+            // passes the entire suite — every other test drives both clocks with the same
+            // value, so nothing distinguishes them.
+            assert!(
+                intents[0].contains(&format!("first_seen={NOW}")),
+                "{case}: `first_seen` must be the INGRESS-HOLD clock ({NOW}), never the \
+                 COMMIT-HOLD reading ({commit_read}). `T` is anchored to it \
+                 (`t = first_seen + duress_delay_secs`), so taking the later value would let \
+                 a WINDOW A stretched by `work_lock` contention push Lockdown at T further \
+                 out than the user was promised — an attacker-influenced delay, since R11 \
+                 leaves concurrent handler count unbounded: {intents:?}"
             );
             assert_eq!(
                 node.outbox.lock().expect("outbox").len(),
