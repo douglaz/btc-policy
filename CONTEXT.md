@@ -44,6 +44,10 @@ _Avoid_: gossip, mesh (implies shared state), p2p
 The user's own key, mandatory on every Normal-path spend (hardware-backed in real use; software in the regtest demo).
 _Avoid_: owner key, master key
 
+**Operator**:
+The human who runs a sealed Vault: funds it, authorizes spends, watches Alerts, and drives Recovery if it comes to that. Distinct from the User key they hold, and from the Coordinator, which is untrusted infrastructure rather than a person. The Operator is who the Ceremony's questions are addressed to and who the operations runbook instructs.
+_Avoid_: user (when the human rather than the key is meant), admin (a Sealed host has no administrative access), owner
+
 **Policy**:
 Ambiguous on its own — always qualify. Three distinct meanings exist: Spending policy, Policy checks, Policy config.
 _Avoid_: unqualified "policy"
@@ -76,9 +80,17 @@ _Avoid_: spending wallet, mobile wallet
 The enforced ceiling on Hot-class outflow — a per-transaction cap and a rolling-window velocity cap on the sum of a spend's outputs to neither the vault nor the escape wallet (ADR-0014); vault change, escape outputs, and the fee are all excluded. Federation-uniform (the caps plus the hot/escape descriptors and derivation bound are pinned in the Manifest); enforced by each Node at ingress before signing; window ≥ `max_commitment_age_secs` so no candidate ages out while the Node still authorizes its completion. This is what makes the Hot wallet's "risk budget" a real bound, not an assumption: with `c < t` compromised signer Nodes, the newly completable outflow admitted per window is at most `((n−c)/(t−c))` × the per-Node window cap. For production `n = 2t−1`, that is `(2 − 1/t)` × the cap (<2×) in the pure Duress-censorship residual (`c = 0`), and at most `t` × the cap under the full `c = t−1` soft-vault tolerance. Lifetime exposure is bounded by detection + Recovery, not the cap. Escape and Refresh are not Hot-class → never consume it.
 _Avoid_: spend limit, rate limit (that's the pin-attempt budget)
 
+**Escape**:
+The mandatory second transaction in every Normal-path spend request: a user-signed sweep of the vault to the Escape wallet, carried whether or not anything is wrong. It is why the duress response needs no key the federation holds — at `T` a node broadcasts an Escape the user already authorized — and a request that omits one is refused at ingress. An escape-class spend IS its own Escape and completes at ingress rather than waiting for `T`.
+_Avoid_: panic tx, sweep (alone), escape wallet (that is where it pays, not what it is)
+
 **Escape fee ladder**:
 The bounded set of pre-signed, higher-fee alternatives to a request's mandatory Escape (wire field `escape_bumps`, ADR-0013 §2) — same inputs, same output scripts, strictly ascending fee, all BIP125-replaceable. It exists because the Escape is user-signed SIGHASH_ALL over its exact bytes: the federation holds no key that can raise a fee, so the only bump that can exist is one the user authorized when they signed the Escape. At `T` each node picks one **rung** — the cheapest whose feerate reaches `max(bump target, feerate floor)`, clamped to the highest rung the ≥95% coverage guard admits, never below a monotone per-candidate latch. The **bump target** is the median feerate of the block at `tip − (tip mod 6)` quantized down to 5 sat/vB: consensus-observable and quantized, because nodes that disagreed would sign different transactions and no rung would reach `t`. A spike above the cap is not overpaid — the sweep tops out and, unconfirmed, falls to the Recovery path.
 _Avoid_: fee estimation, RBF policy, panic fee (that is the *base* rung's fee)
+
+**Rung**:
+One step of the Escape fee ladder — the same Escape at a strictly higher fee, separately user-signed over its own exact bytes, which is why only the user can create one. Rungs are DERIVED from the Escape rather than composed by hand; one that would exceed the vault's sealed fee ceiling, leave a dust output, or fail to clear the relay increment is simply not offered. At `T` each node selects one.
+_Avoid_: bump (alone), replacement, retry
 
 **Escape wallet**:
 A single-sig offline cold wallet, allowlisted at setup, whose only job is receiving incident sweeps (Rotate, races). Keys independent of every other component.
@@ -103,6 +115,10 @@ _Avoid_: freeze (alone), pause
 **Sealed**:
 The post-setup state of a node host: SSH uninstalled, no administrative access; only the node API and its chain backend remain. Changes to a sealed federation mean rotating to a new Vault.
 _Avoid_: locked (use Lockdown for signing state), hardened
+
+**Ceremony**:
+The one-time setup that produces a Vault and ends with its hosts Sealed: keys generated and distributed, policy fixed, manifest and descriptor written. Its decisions are permanent — a value the Ceremony did not record cannot be added afterwards, only re-created as a new Vault — so every question it asks is asked exactly once, and asked of the Operator.
+_Avoid_: setup (when the sealed event rather than the command is meant), provisioning, onboarding
 
 **Hold**:
 The per-destination-class node-driven waiting period between a spend's first submission and its **combine + broadcast** (hot wallet: D, default 24h; Escape wallet and Refresh: none). Under Model B the node **signs its partial at ingress** (pin-independent); the Hold delays combine + broadcast, **not** signing (ADR-0012 Model-B Hold lifecycle). Off-chain, enforced independently by each node against its own clock. Not the Recovery-path timelock.
