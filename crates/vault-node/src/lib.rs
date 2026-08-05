@@ -922,12 +922,14 @@ pub struct Node {
     /// pin-independent ingress); V0-4b builds the arm/freeze/sweep state machine on
     /// this same seam.
     duress_arm: AtomicU64,
-    /// How many `/sign` requests are currently inside the OUT-OF-LOCK chain preflight
-    /// — the in-flight half of refresh subordination (bead btc-policy-f91).
+    /// How many `/sign` requests are currently inside an OUT-OF-LOCK window — the
+    /// memory-hard PIN window or the chain preflight (bead btc-policy-f91, widened to
+    /// cover both windows by btc-policy-9zs) — the in-flight half of refresh
+    /// subordination.
     ///
     /// Refresh subordination (ADR-0012: "while any normal-path spend is pending, a
     /// refresh is queued behind it") reads [`replay::PendingLog`], and a spend only
-    /// lands there in phase 2, AFTER its preflight. Across the preflight window the
+    /// lands there in phase 2, AFTER its preflight. Across those windows the
     /// spend is therefore invisible to that rule, so a concurrent `RefreshRequest`
     /// could complete its own (shorter) preflight, re-acquire `sign_state`, see no
     /// pending spend, and register an immediately-fireable refresh. If that refresh
@@ -944,10 +946,13 @@ pub struct Node {
     /// unwind on a poisoned lock. A counter (not a flag) is what makes it idempotent
     /// under concurrent replays: each in-flight request owns exactly one unit.
     ///
-    /// PIN-UNIFORM by construction: it is claimed after the pin verdict exists but
-    /// before that verdict can branch any observable, on the one code path both
-    /// matching pin classes take, and released identically. A refresh refusal caused
-    /// by it is the byte-identical `REFRESH_SUBORDINATED` a pending spend produces.
+    /// PIN-UNIFORM by construction, and MORE so since btc-policy-9zs moved the claim
+    /// into the INGRESS HOLD: it is now taken BEFORE the pin is evaluated at all, on the
+    /// one code path every pin class takes, and released identically — so no pin verdict
+    /// can decide whether it is held. (It is released before the wrong-pin backoff
+    /// sleep, which is a wrong-pin-only path and therefore says nothing about the two
+    /// SILENT classes.) A refresh refusal caused by it is the byte-identical
+    /// `REFRESH_SUBORDINATED` a pending spend produces.
     spend_preflight: AtomicUsize,
     /// The SAFETY deadline driver's liveness heartbeat (bead btc-policy-9y5.6): the
     /// coarse wall-clock bucket of the last absolute-schedule deadline pass this
@@ -1071,13 +1076,15 @@ pub struct Node {
     escape_coverage_pct: u8,
     escape_feerate_floor: u64,
     /// The `/sign` handler's replay log AND Hold-timer pending log under ONE
-    /// lock (see [`replay::SignState`]). `/sign` uses two guarded phases around
-    /// the slow chain preflight: phase 1 atomically consumes coordinator freshness
-    /// and records the safety intent, then phase 2 holds this same lock continuously
-    /// across every replay/pending check-and-update. Exact replays cannot enter the
-    /// gap because phase 1 already consumed their nonce. Splitting the state across
-    /// separate locks is FORBIDDEN — interleaved check/update over replay and pending
-    /// state would corrupt their shared semantics.
+    /// lock (see [`replay::SignState`]). Since bead btc-policy-9zs `/sign` uses THREE
+    /// guarded holds around two out-of-lock windows: the INGRESS HOLD atomically
+    /// consumes coordinator freshness and claims the nonce, the COMMIT HOLD records the
+    /// safety intent after the memory-hard PIN window, and the REGISTRATION HOLD (the
+    /// "phase 2" the older comments below still name) holds this same lock continuously
+    /// across every replay/pending check-and-update. Exact replays cannot enter either
+    /// gap because the INGRESS HOLD already consumed their nonce. Splitting the state
+    /// across separate locks is FORBIDDEN — interleaved check/update over replay and
+    /// pending state would corrupt their shared semantics.
     sign_state: Mutex<SignState>,
     /// **The validated-AND-policy-ACCEPTED transaction set** (ADR-0012's
     /// watchtower recognition rule, and V0-8b's vault-authorized set). Holds the
@@ -1121,6 +1128,22 @@ pub struct Node {
     /// compile the production path and exercise the real backend.
     #[cfg(test)]
     chain_backend_override: Option<Arc<dyn ChainBackend + Send + Sync>>,
+    /// Test-only rendezvous INSIDE the `/sign` handler's out-of-lock PIN window
+    /// (WINDOW A, bead btc-policy-9zs). A regression test parks a handler there — nonce
+    /// consumed, `InFlight` memo installed, `sign_state` released — and drives a peer
+    /// receipt for the same nonce through `/channel` to prove it is answered
+    /// `RATE_LIMITED` and not `ACCEPTED`.
+    ///
+    /// Unconditional and pin-independent when set: both pins reach the same line, so it
+    /// cannot bias a normal-vs-duress comparison. Production never compiles it.
+    ///
+    /// ONE-SHOT: the first handler through WINDOW A takes the barrier, every later one
+    /// passes straight through. That is what lets a test park one handler and then run a
+    /// SECOND `/sign` on the same node to completion — the shape the
+    /// superseded-generation case needs, since a second parker would pair with the first
+    /// one's release wait and let it go early.
+    #[cfg(test)]
+    window_a_midpoint: Mutex<Option<Arc<std::sync::Barrier>>>,
     /// The node-to-node channel runtime (V0-8a), built from the sealed manifest
     /// when `[channel]` is present. `None` ⇒ absent-channel mode: `/channel` is
     /// not mounted and no channel invariant runs. Read by the `/channel` route and
@@ -1883,6 +1906,8 @@ impl Node {
             chain_backend,
             #[cfg(test)]
             chain_backend_override: Some(Arc::new(crate::chain::mock::MockBackend::default())),
+            #[cfg(test)]
+            window_a_midpoint: Mutex::new(None),
             channel,
             outbox: Mutex::new(Vec::new()),
         })
@@ -2130,8 +2155,9 @@ impl Node {
     /// part is load-bearing, not tidiness: the fire driver and Lockdown-at-`T` contend
     /// for this exact lock, and bead btc-policy-9y5.3 had to hoist chain I/O out of it
     /// for that reason. A poll of this surface must never be the thing that postpones
-    /// `T`. (`/sign` holds the same lock across Argon2, so the marginal contention a
-    /// scan adds is not a new class of delay either.)
+    /// `T`. `/sign` now releases this lock for all three memory-hard passes, so this
+    /// short scan must preserve that convoy reduction rather than reintroducing a
+    /// contended stall.
     ///
     /// `now` is filtered through the nonce log's rollback-guarded lower bound — the
     /// same clock [`replay::PendingLog::prune`] and [`replay::PendingLog::has_any`] run
@@ -2191,41 +2217,72 @@ impl Node {
     /// the carrier ([`channel::ChannelState::confirm_carrier`]). Arming a node the
     /// moment it sees a duress pin is what made a hostile coordinator able to freeze
     /// ONE node and leave `t−1` free to finalize the coerced hot spend.
+    ///
+    /// Returns which of [`channel::MemoUpgrade`]'s three cases the nonce memo took, or
+    /// `None` outside channel mode (no store, so no memo). The value is a pure function
+    /// of the nonce, the generation and the clock — never of the pin — so branching on
+    /// it costs no pin observability.
+    #[allow(clippy::too_many_arguments)]
     fn fire_arm_hook(
         &self,
         verdict: pin::PinVerdict,
         carrier: &str,
         nonce: &str,
-        signature_tag: [u8; 32],
-        expiry: u64,
+        generation: channel::MemoGeneration,
+        first_seen: u64,
         now: u64,
-    ) {
+    ) -> Option<channel::MemoUpgrade> {
         #[cfg(test)]
         ingress_trace::record(IngressOp::ArmHook);
         let is_duress = (verdict as u8).ct_eq(&(pin::PinVerdict::Duress as u8));
         let delta = u64::conditional_select(&0, &1, is_duress);
         self.duress_arm.fetch_add(delta, Ordering::Relaxed);
-        if let Some(channel) = &self.channel {
-            #[cfg(test)]
-            ingress_trace::record(IngressOp::ArmIntentWrite);
-            channel.record_arm_intent(
-                is_duress.into(),
-                carrier,
-                nonce,
-                signature_tag,
-                expiry,
-                now,
-                self.duress_timing(),
-            );
-        }
+        let channel = self.channel.as_ref()?;
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::ArmIntentWrite);
+        Some(channel.record_arm_intent(
+            is_duress.into(),
+            carrier,
+            nonce,
+            generation,
+            first_seen,
+            now,
+            self.duress_timing(),
+        ))
     }
 
-    /// Claim one in-flight-spend slot for the duration of the out-of-lock chain
-    /// preflight (bead btc-policy-f91). MUST be called while `sign_state` is still
-    /// held in phase 1: the claim has to become visible to every refresh that later
-    /// acquires that lock, and only the lock orders it against a refresh already
-    /// inside its own phase 2. The returned guard releases the slot on EVERY exit —
-    /// early return, `?`, or panic — so the marker cannot leak.
+    /// Claim `nonce` for the out-of-lock window, returning the guard that removes the
+    /// claim again on every exit that never installs a `Derived` memo.
+    ///
+    /// `None` outside channel mode: there is no store to memoize into, and no peer
+    /// receipt can arrive to be confused by the gap.
+    fn claim_nonce_in_flight(
+        &self,
+        nonce: &str,
+        generation: channel::MemoGeneration,
+        now: u64,
+    ) -> Option<InFlightMemoGuard<'_>> {
+        let channel = self.channel.as_ref()?;
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::NonceClaim);
+        channel.claim_nonce_in_flight(nonce, generation, now);
+        Some(InFlightMemoGuard {
+            channel,
+            nonce: nonce.to_string(),
+            generation,
+            owns_memo: true,
+            ruling_carrier: None,
+        })
+    }
+
+    /// Claim one in-flight-spend slot for BOTH out-of-lock windows — the memory-hard
+    /// PIN window and the chain preflight (bead btc-policy-f91, widened by
+    /// btc-policy-9zs). MUST be called while `sign_state` is still held in the INGRESS
+    /// HOLD: the claim has to become visible to every refresh that later acquires that
+    /// lock, and only the lock orders it against a refresh already inside its own
+    /// REGISTRATION HOLD. The returned guard releases the slot on EVERY exit — early
+    /// return, `?`, or panic — so the marker cannot leak, and a request refused before
+    /// WINDOW B releases it before any wrong-PIN backoff sleep.
     ///
     /// The claim itself is a single lock-free atomic increment, so it adds nothing to
     /// the time the lock is held and nothing to the preflight window (LOAD-BEARING:
@@ -2236,9 +2293,9 @@ impl Node {
         SpendPreflightGuard { node: self }
     }
 
-    /// Whether any `/sign` request is currently between its phase-1 claim and its
-    /// phase-2 completion — the in-flight half of the refresh-subordination predicate
-    /// (the other half is [`replay::PendingLog::has_any`]).
+    /// Whether any `/sign` request is currently between its INGRESS-HOLD claim and its
+    /// REGISTRATION-HOLD completion — the in-flight half of the refresh-subordination
+    /// predicate (the other half is [`replay::PendingLog::has_any`]).
     ///
     /// Read under `sign_state`, which is what makes it sound: the claim is published
     /// under that lock, so a refresh holding it sees every spend that entered its
@@ -2340,16 +2397,44 @@ impl Node {
     pub(crate) fn carrier_derivation_count(&self) -> usize {
         self.carrier_kdf.total_derivations()
     }
+
+    /// Install the WINDOW A rendezvous. See [`Node::window_a_midpoint`].
+    #[cfg(test)]
+    pub(crate) fn pin_window_a_midpoint(&self, barrier: Arc<std::sync::Barrier>) {
+        *self.window_a_midpoint.lock().expect("window_a_midpoint") = Some(barrier);
+    }
+
+    /// Park inside WINDOW A when a test has installed a rendezvous, releasing on the
+    /// second wait. Two waits, matching `ChannelState::confirm_commit_midpoint`: the
+    /// first lets the test observe the parked state, the second lets the handler go.
+    ///
+    /// TAKES the barrier, so only the FIRST handler parks — see
+    /// [`Node::window_a_midpoint`].
+    #[cfg(test)]
+    fn window_a_rendezvous(&self) {
+        let barrier = self
+            .window_a_midpoint
+            .lock()
+            .expect("window_a_midpoint")
+            .take();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
+    }
 }
 
 /// The RAII half of [`Node::enter_spend_preflight`] (bead btc-policy-f91): holds one
-/// in-flight-spend slot for the out-of-lock chain preflight and gives it back when it
-/// drops.
+/// in-flight-spend slot from the INGRESS HOLD through both out-of-lock windows and the
+/// REGISTRATION HOLD, then gives it back when it drops. A request refused before WINDOW B
+/// releases the slot before any wrong-PIN backoff: it will never register a spend, so its
+/// sleep must not subordinate unrelated refreshes.
 ///
 /// A guard rather than a paired `-= 1` because `handle_sign_after_lock`'s phase 2 has
 /// a dozen early returns and every one of them must release the slot; a leaked slot
 /// would subordinate every refresh on this node until it died, which is denial. `Drop`
-/// runs on unwind too, so a panic between the two phases cannot strand it either.
+/// runs on unwind too, so a panic in either out-of-lock window — or between any two of
+/// the handler's three holds — cannot strand it either.
 ///
 /// `Drop` takes NO lock. That is deliberate and load-bearing: phase 2 holds
 /// `sign_state` across its returns, and locals drop in reverse declaration order, so a
@@ -2364,6 +2449,85 @@ struct SpendPreflightGuard<'a> {
 impl Drop for SpendPreflightGuard<'_> {
     fn drop(&mut self) {
         self.node.spend_preflight.fetch_sub(1, Ordering::SeqCst);
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::PreflightExit);
+    }
+}
+
+/// The RAII half of [`Node::claim_nonce_in_flight`] (bead btc-policy-9zs): the INGRESS
+/// HOLD consumes the coordinator nonce and installs a
+/// [`channel::MemoOutcome::InFlight`] memo under this handler's generation, and this
+/// guard takes it back on every exit that never installed a `Derived` one.
+///
+/// A guard rather than a paired removal for the same reason
+/// [`SpendPreflightGuard`] is one: the window it spans contains a Lockdown re-check,
+/// two memory-hard evaluations, and a panic boundary, and a claim left behind would
+/// answer every peer receipt for that nonce `RATE_LIMITED` throughout the sender's retry
+/// horizon (then remain until a later accepted ingress pruned it) — turning a crash into
+/// federation-wide censorship of one carrier.
+///
+/// **The predicate, not the action.** `Drop` removes ONLY a generation-matched
+/// `InFlight` entry and NEVER a `Derived` one, and every successful `Derived`
+/// installation — INCLUDING [`channel::MemoUpgrade::Reinstalled`], which installs one
+/// without ever having a matching claim to upgrade — relinquishes ownership through
+/// [`Self::relinquish`]. Expressing it as a guard checked on every exit rather than as a
+/// "disarm at the upgrade point" action is deliberate: an action can be missed on a
+/// branch, and deleting a live `Derived` memo on exit recreates exactly the
+/// silent-false-positive / failed-arm defect the `InFlight` variant exists to close.
+///
+/// **TWO OWNERSHIPS, ONE LIFETIME.** Handing the memo over at the upgrade does not end
+/// this handler's claim on the REQUEST: the carrier it just derived is not confirmable
+/// until `stage_spend_carrier` stages it, so the guard also carries the intent's ruling
+/// ([`channel::ArmIntent::owner_ruling`]) from the arm hook to the exit. That is what
+/// bounds a peer's `RATE_LIMITED` retry by one handler's lifetime rather than by the
+/// request expiry — a handler that ruled and refused WITHOUT staging, which every
+/// federation-uniform policy refusal below the hook does on purpose, must not keep
+/// answering "ask again in a second" until the commitment expires.
+struct InFlightMemoGuard<'a> {
+    channel: &'a channel::ChannelState,
+    nonce: String,
+    generation: channel::MemoGeneration,
+    /// Cleared once a `Derived` memo owns this nonce under this generation.
+    owns_memo: bool,
+    /// The carrier whose [`channel::ArmIntent`] this handler is still RULING on, set once
+    /// the arm hook has recorded it. `None` before that — an exit above the hook left no
+    /// intent behind to rule on.
+    ruling_carrier: Option<String>,
+}
+
+impl InFlightMemoGuard<'_> {
+    /// Hand memo-cleanup ownership to the `Derived` entry that now holds the key.
+    fn relinquish(&mut self) {
+        self.owns_memo = false;
+    }
+
+    /// Take ownership of `carrier`'s propagation ruling, which the arm hook just
+    /// recorded. Set in ALL THREE `MemoUpgrade` cases — the intent is recorded in all
+    /// three — and released on every exit below, which is what bounds a peer's retry
+    /// against this carrier by this handler's own lifetime instead of by the request
+    /// expiry. See [`channel::ArmIntent::owner_ruling`].
+    fn rules_carrier(&mut self, carrier: &str) {
+        self.ruling_carrier = Some(carrier.to_string());
+    }
+}
+
+impl Drop for InFlightMemoGuard<'_> {
+    /// Takes the STORE lock, which is sound on ordering grounds (`sign_state -> store`
+    /// is the order [`Node::confirm_carrier`] already establishes, and this guard is
+    /// declared before every `sign_state` binding it outlives, so it drops after them).
+    /// The poison handling inside [`channel::ChannelState::release_nonce_claim`] is what
+    /// keeps that legal during an unwind — see its doc.
+    fn drop(&mut self) {
+        // Two independent releases, neither conditional on the other: a `Superseded`
+        // handler still owns its own separately-keyed intent while owning no memo, and a
+        // handler that upgraded the memo owns the intent but no longer the memo.
+        if self.owns_memo {
+            self.channel
+                .release_nonce_claim(&self.nonce, self.generation);
+        }
+        if let Some(carrier) = &self.ruling_carrier {
+            self.channel.end_carrier_ruling(carrier);
+        }
     }
 }
 
@@ -2815,13 +2979,14 @@ async fn fire_tick_with_clock(
     // used by `confirm_carrier`.
     {
         let release_guard = node.sign_state.lock().expect("sign_state lock poisoned");
-        // Sample the release clock AFTER acquiring the guard. The acquisition can BLOCK (a
-        // `/sign` or relayed request holds `sign_state` through the ~100ms Argon2), so a
-        // `release_now` sampled BEFORE it would be STALE: `release_partials` would then
-        // authorize a share against an in-window timestamp the real send time has already
-        // passed, emitting a finalizable share AFTER the true `FireWindow::deadline`
-        // (v0-exit multi-reviewer-loop pass 4, codex P1). Sampling here — under the guard,
-        // just before the gate — makes release authorization reflect the actual send time.
+        // Sample the release clock AFTER acquiring the guard. The acquisition can BLOCK on
+        // an ingress or registration hold (direct `/sign` and relayed requests share those
+        // sections), so a `release_now` sampled BEFORE it would be STALE:
+        // `release_partials` would then authorize a share against an in-window timestamp
+        // the real send time has already passed, emitting a finalizable share AFTER the
+        // true `FireWindow::deadline` (v0-exit multi-reviewer-loop pass 4, codex P1).
+        // Sampling here — under the guard, just before the gate — makes release
+        // authorization reflect the actual send time.
         let release_now = clock();
         for commitment_id in &due {
             require_sign_state_guard_before_release(&node, &release_guard);
@@ -4383,6 +4548,62 @@ fn handle_channel_body_with_clocks(
                         channel::CarrierMemoLookup::Vacant | channel::CarrierMemoLookup::Skip => {
                             None
                         }
+                        // A CONCURRENT `/sign` owns this nonce, IS STILL RUNNING, and
+                        // either has no carrier yet (WINDOW A) or has derived one that is
+                        // not staged and hence not confirmable yet (WINDOW B /
+                        // registration). Both states end when that handler's guard
+                        // releases on exit, so the retry below is bounded by ONE
+                        // handler's lifetime — a handler that ruled and refused without
+                        // staging is not this case and gets the single ACCEPTED below,
+                        // never a retry against a decision that will never change.
+                        // Answering
+                        // ACCEPTED (which every other decodable outcome below maps to)
+                        // would stop `retry_loop` dead on a receipt this node did not
+                        // record: a SILENT FALSE POSITIVE in which the sender believes we
+                        // hold a carrier we do not, so §0's holder count silently misses
+                        // it and a duress freeze can fail to engage. RATE_LIMITED turns
+                        // that into an honest delivery failure, which ADR-0012's
+                        // censorship residual already bounds.
+                        //
+                        // Returned BEFORE the KDF reservation and BEFORE
+                        // `claim_carrier_derivation`, and it records NO sender: routing
+                        // an in-flight receipt through the derivation claim would burn
+                        // this sender's one derivation for the nonce and `Skip` its own
+                        // retry — and every later honest receipt from it — forever.
+                        //
+                        // `retry_after_secs` is the fixed 1s every other IN-FLIGHT site
+                        // sends. The per-peer quota refusal is the exception: it sends
+                        // `oldest + 60 - now`, up to a full window.
+                        // RateLimited does not advance the backoff ladder and the floor
+                        // is 1s, so each in-flight nonce draws one retry per second per
+                        // peer, each retry a pre-Argon2 replay refusal costing
+                        // microseconds — but paid UNDER `sign_state`, since a relayed
+                        // Spend runs the full `/sign` ingress before this lookup. Count
+                        // the total honestly rather than calling it
+                        // trivial: in-flight nonces are bounded by concurrent handlers
+                        // `C`, but the WINDOW A they are in flight FOR is not a constant
+                        // — every evaluation takes the one node-wide Argon2 slot
+                        // (`pin::CarrierKdf::work_lock`), so the window stretches with
+                        // `C` and the induced retries grow as roughly `C² × peers`,
+                        // contending with honest partials. What binds that first is the
+                        // PER-PEER ENVELOPE QUOTA, not the concurrency permits: quota is
+                        // charged before the `msg_type` dispatch, so ~10 unruled nonces
+                        // at 1 Hz exhaust one peer's default 600/60s and its next
+                        // envelope — a `partial` included — is refused. Idempotent and
+                        // the nonce stays reusable, so it delays, not loses. What leaves
+                        // `C` unbounded is
+                        // `/sign`'s missing admission control, which is bead
+                        // btc-policy-1y2's and is recorded as threat-model R11; this
+                        // reply adds retry traffic under that residual, not a new one. A
+                        // GROWING value would be actively worse — it delays honest
+                        // receipts against short expiries, producing more GaveUps, which
+                        // is the outcome this path exists to reduce.
+                        channel::CarrierMemoLookup::InFlight
+                        | channel::CarrierMemoLookup::AwaitingPropagation => {
+                            return ChannelReply::RateLimited {
+                                retry_after_secs: 1,
+                            };
+                        }
                         // A DIFFERENT valid signature over the SAME body is not a
                         // different carrier: canonical request bytes exclude
                         // `coord_sig`. Derive the body identity once for this sender;
@@ -4629,27 +4850,105 @@ fn handle_sign_after_lock(
     if node.is_locked_down() {
         return Ok(fraud_suspected());
     }
-    // The handler has two short sign-state phases around one out-of-lock chain
-    // preflight. Phase 1 atomically consumes coordinator freshness, evaluates the PIN,
-    // and records the safety intent. Phase 2 holds the SAME lock continuously across
-    // every replay/pending check-and-update. Consuming the nonce before releasing phase
-    // 1 prevents an exact replay from entering the RPC gap, while keeping the slow
-    // backend call out of the lock lets Lockdown-at-T take it independently.
+    // THE HANDLER'S SIGN-STATE SECTIONS, NAMED BY ROLE (bead btc-policy-9zs). There are
+    // now THREE, around two out-of-lock windows; the older source comments below still
+    // call the last one "phase 2".
     //
-    // Deliberate throughput tradeoff (V0-4a/V0-4b): the PIN compare's TWO Argon2id
-    // evaluations and, in channel mode, one carrier derivation run under this lock,
-    // so an authenticated request holds it for roughly three memory-hard evaluations
-    // instead of the old SHA-256 microseconds. The confirmed-prevout preflight's
-    // chain I/O is deliberately NOT part of that tradeoff: it runs between the two
-    // sign-state phases, after the safety intent exists, so no 60-second RPC timeout
-    // can delay the deadline driver's unconditional Lockdown-at-T. Hoisting the PIN
-    // work out would either
-    // run Argon2 BEFORE coord-auth (an unauthenticated-Argon2 DoS vector) or
-    // duplicate the atomic nonce consumption the lock exists to give. New carrier
-    // work is coordinator-signature-gated; exact peer replays use the nonce/signature
-    // memo and do not re-enter the KDF, preventing a captured-request replay convoy.
-    // The wrong-pin rate-limit backoff sleep is taken OUTSIDE this lock (below),
-    // so a wrong-pin flood never pins `/sign` against honest spends.
+    //   INGRESS HOLD       coordinator auth + the atomic nonce consumption, the §0b
+    //                      pin-independent deliverability gates, the preflight-slot
+    //                      claim, and the in-flight nonce claim.
+    //   WINDOW A (no lock) `pin::verify_pin` (two Argon2id evaluations) and
+    //                      `arm_carrier_id` (one more) — ~600 ms of memory-hard work.
+    //   COMMIT HOLD        Lockdown re-check, the arm intent + memo upgrade as one
+    //                      store-locked transaction, the three clock predicates, and
+    //                      the attempt-budget charge.
+    //   WINDOW B (no lock) the confirmed-prevout chain preflight.
+    //   REGISTRATION HOLD  decode, validate, sign, register ("phase 2" below).
+    //
+    // WHY WINDOW A EXISTS AT ALL. Both memory-hard operations are PURE functions of
+    // immutable state — `verify_pin` reads `node.pin_evaluator` and the request bytes,
+    // `arm_carrier_id` reads the request's auth digest and the immutable `carrier_kdf` —
+    // so neither needs `sign_state`, and holding it across them made `/sign` able to
+    // defer `Node::enter_lockdown`, which needs the same lock. `/sign` has no admission
+    // control and the HTTP timeout does not cancel (the job detaches and continues), so
+    // a post-wrench coordinator — UNTRUSTED by design, and holding the auth key — can
+    // mint arbitrarily many validly-signed requests with fresh nonces and keep that
+    // deferral going. Read the improvement precisely: this removes ~600 ms of
+    // memory-hard work from the contended section and NOTHING MORE. The acquisition
+    // delay on an unfair mutex still has NO FINITE BOUND, because a continuing flood
+    // keeps admitting SUCCESSIVE jobs that overtake a waiting `enter_lockdown`. What
+    // bounds the CONSEQUENCES is ADR-0012's per-carrier release gate plus
+    // expiry-bounded arming, not this ordering.
+    //
+    // WHAT MUST NOT MOVE, and why each is load-bearing:
+    //
+    //  - the nonce check stays BEFORE the KDF. Moving it after would reintroduce the
+    //    captured-request replay convoy the atomic consumption exists to close, and
+    //    running Argon2 before coordinator auth is an unauthenticated-Argon2 DoS vector;
+    //  - the §0b deliverability gates stay before the pin, so their refusals are
+    //    provably identical for every pin class (no oversized/near-expiry pin oracle);
+    //  - the preflight-slot claim stays INSIDE the INGRESS HOLD, or bead
+    //    btc-policy-f91's refresh-overtake race reopens;
+    //  - the nonce claim is installed before the lock is released, so no peer receipt
+    //    can observe a consumed nonce with nothing naming the handler that consumed it
+    //    (see `channel::MemoOutcome::InFlight` for what that ambiguity costs); and
+    //  - the wrong-pin rate-limit backoff sleep is still taken OUTSIDE the lock, and its
+    //    refresh-subordination slot is released before that sleep, so a wrong-pin flood
+    //    never pins `/sign` or `/refresh` while merely backing off. The sleep is the
+    //    SMALLER term now: the slot is claimed above, before the pin is evaluated, so
+    //    EVERY request — wrong pins included — now holds it across WINDOW A, where before
+    //    the claim sat after the budget charge and a wrong pin never took one at all. A
+    //    sustained wrong-pin flood therefore keeps `spend_preflight` non-zero and answers
+    //    `REFRESH_SUBORDINATED` for the whole evaluation window. Under that FLOOD it is a
+    //    change of RESPONSE rather than of availability — pre-9zs the same requests held
+    //    `sign_state` across the same evaluations, so a concurrent `/refresh` was blocked
+    //    on the lock for that window instead of refused within it. For a SINGLE in-flight
+    //    wrong-pin spend it is a real change and the stronger claim would be false: that
+    //    `/refresh` used to block ~one WINDOW A and then SUCCEED (the wrong pin refused
+    //    without ever taking a slot), and now it is refused with its coordinator nonce
+    //    already consumed at ingress, so the coordinator must re-mint to retry. Accepted:
+    //    the claim placement is not negotiable (previous bullet), the refusal is taken on
+    //    the one path EVERY pin class walks so it discloses nothing about the pin, and it
+    //    self-clears within WINDOW A. The disclosure is the part that was missing.
+    //
+    // Three things the reorder CHANGES, stated rather than left to be discovered.
+    //
+    // The critical section does NOT drop to "microseconds". The REGISTRATION HOLD still
+    // decodes both PSBTs, validates every ladder rung, signs and registers, all under
+    // this same lock; that work is unchanged and it dominates what is left.
+    //
+    // And the WRONG-PIN BACKOFF SEMANTICS CHANGE. The ladder itself is untouched — the
+    // charge is still serialized under this lock, so successive wrong pins still draw
+    // successive rungs — but the evaluation and the charge are no longer ONE critical
+    // section. A burst can therefore hold several ALREADY-COMPLETED evaluations queued at
+    // the budget at once (parked at the COMMIT HOLD behind, say, a REGISTRATION HOLD) and
+    // charge them back to back, where the old single hold forced the memory-hard work
+    // between one charge and the next; each of those that lands after the lockout has
+    // tripped takes `apply = is_wrong & !locked == false` and therefore sleeps ZERO
+    // (`pin::AttemptBudget::charge`).
+    //
+    // State the LIMIT of that precisely, because the obvious stronger claim is false:
+    // WINDOW As do NOT run in parallel and a flood is NOT cheaper in wall time. Both
+    // Argon2 consumers take the same node-wide work slot — `pin::CarrierKdf::work_lock`
+    // hands `Argon2Evaluator` the very `Arc<Mutex<()>>` the carrier derivation locks
+    // (asserted by `pin::tests::pin_and_carrier_kdfs_share_one_node_wide_memory_slot`) —
+    // so the per-attempt memory-hard cost is unchanged and the pacing MOVED from
+    // `sign_state` to `work_lock` rather than disappearing. What is accepted is the
+    // reordering above: the LOCKOUT HORIZON is unchanged, the refusal is uniform across
+    // pin classes, and the sleep was already outside this lock precisely so it could not
+    // be used to pin `/sign`.
+    //
+    // And THE COMMIT HOLD'S THREE CLOCK PREDICATES NOW PRECEDE THE BUDGET CHARGE, so a
+    // request whose WINDOW A crossed its own expiry or the delivery horizon returns
+    // without charging the attempt budget, where the old single hold charged before any
+    // re-check. It is disclosed rather than "fixed" because the section order is what
+    // makes the MISMATCHED-generation case work at all — the stale handler must refuse
+    // at expiry WITHOUT charging again — and because those exits answer
+    // `COMMITMENT_EXPIRED`/`EXPIRY_TOO_SHORT` rather than a pin verdict, so no
+    // informative attempt escapes the ladder and no pin class is favoured. What it does
+    // cost is that a boundary-timed flood can buy PIN evaluations without advancing
+    // `fails` toward lockout; that is the same admission-free-surface resource exposure
+    // bead btc-policy-1y2 owns, not a verdict oracle.
     #[cfg(test)]
     ingress_trace::record(IngressOp::SignStateLock);
     let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
@@ -4662,7 +4961,13 @@ fn handle_sign_after_lock(
     // poison-FORCED latch sets the flag without this lock and does not linearize, but it
     // fires only on a poisoned critical lock, so a request that raced past this check
     // then panics fail-closed at its store op before any egress (see `enter_lockdown`).
+    //
+    // Every refusal return in this hold drops the lock EXPLICITLY, so the ordered trace
+    // records the release and no refusal carries the lock into an outbox or store write.
     if node.is_locked_down() {
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::SignStateUnlock);
+        drop(state);
         return Ok(fraud_suspected());
     }
     let raw_now = clock();
@@ -4686,7 +4991,12 @@ fn handle_sign_after_lock(
         &mut state.coord_nonces,
     ) {
         Ok(effective_now) => effective_now,
-        Err(rejected) => return Ok(rejected),
+        Err(rejected) => {
+            #[cfg(test)]
+            ingress_trace::record(IngressOp::SignStateUnlock);
+            drop(state);
+            return Ok(rejected);
+        }
     };
     // 0b. PIN-INDEPENDENT DELIVERY PRECONDITIONS (V0-4b §0), refused BEFORE the pin
     //     is evaluated. Confirmation-gated arming rests on "a carrier this node can
@@ -4706,7 +5016,12 @@ fn handle_sign_after_lock(
     // and was then processed with the gate skipped — derived its carrier, reached the
     // outbox, and became a local holder of a carrier this node can never actually fan
     // out. A compromised peer could hand that to one node and leave it armed alone.
-    ensure_request_propagatable(node, &propagated_request)?;
+    if let Err(bad) = ensure_request_propagatable(node, &propagated_request) {
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::SignStateUnlock);
+        drop(state);
+        return Err(bad);
+    }
     // Every node enforces a fresh horizon the FIRST time it processes the carrier,
     // whether that first ingress is `/sign` or a peer relay. Otherwise `t−1`
     // compromised peers can hold a valid carrier until just before expiry, deliver it
@@ -4759,6 +5074,9 @@ fn handle_sign_after_lock(
         // and `ingress_trace` states outright that every `Node::outbox` write
         // appears in it. A bare push here would make that statement false.
         #[cfg(test)]
+        ingress_trace::record(IngressOp::SignStateUnlock);
+        drop(state);
+        #[cfg(test)]
         ingress_trace::record(IngressOp::OutboxPush);
         node.outbox
             .lock()
@@ -4773,6 +5091,52 @@ fn handle_sign_after_lock(
     // future-expiry cap deliberately stays on the raw clock, so rollback protection
     // cannot widen V0-2's exact `now + max_commitment_age_secs` acceptance horizon.
     let now = effective_now;
+    // Claim the in-flight-spend slot, while the lock is still held (bead
+    // btc-policy-f91). This spend does not enter `state.pending` until the REGISTRATION
+    // HOLD, so without the claim it is invisible to refresh subordination for both
+    // out-of-lock windows, and a `RefreshRequest` racing it could finish its own shorter
+    // preflight, see no pending spend, and register an immediately-fireable refresh
+    // over an input this request's MANDATORY ESCAPE needs — the escape then fails
+    // coverage at `T` and the sweep dies. Degrades to frozen funds → recovery, never
+    // theft, but it is honest-reachable, so it is closed rather than accepted. The
+    // claim MUST be taken inside this hold: only the lock orders it against a refresh
+    // already inside its own registration section. The guard releases the slot on every
+    // exit path including a panic; see [`SpendPreflightGuard`].
+    //
+    // The class is not derived until the REGISTRATION HOLD, so this conservatively
+    // covers an escape-class SpendRequest for both windows too; once accepted it
+    // releases the claim without entering `pending`, preserving ADR-0012's steady-state
+    // exception.
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::PreflightEnter);
+    let _preflight = node.enter_spend_preflight();
+    // CLAIM THE NONCE for WINDOW A, before the lock is released. The nonce is already
+    // consumed at this point, so without a claim the memo map says "unseen" for the
+    // whole out-of-lock window — and `CarrierMemoLookup::Vacant` means "the
+    // authoritative handler already returned and recorded no intent", which is now
+    // false. A peer receipt landing in that gap would be answered ACCEPTED and never
+    // retried, so the sender would believe this node holds a carrier it never recorded;
+    // §0 counts receipts to reach `t`, so lost receipts mean a node never arms. See
+    // [`channel::MemoOutcome::InFlight`].
+    //
+    // The generation token is `(nonce, signature_tag, expiry)`. It is needed because two
+    // handler generations can legitimately share one nonce key: `check_and_record` tests
+    // EXPIRY BEFORE REPLAY, so past expiry a differently-signed body with a fresh expiry
+    // is accepted onto the same key while this handler still runs.
+    let generation = channel::MemoGeneration {
+        signature_tag: arm_signature_tag(&request.coord_sig),
+        expiry: request.expiry,
+    };
+    let mut nonce_claim = node.claim_nonce_in_flight(&request.nonce, generation, now);
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::SignStateUnlock);
+    drop(state);
+    // The nonce is consumed, the claim is installed, and `sign_state` is free — the
+    // exact state a peer receipt for this nonce must be answered RATE_LIMITED in.
+    #[cfg(test)]
+    node.window_a_rendezvous();
+
+    // ---- WINDOW A (no lock) -------------------------------------------------------
     // 1. PIN + per-node attempt budget, before anything is signed (ADR-0012 /
     //    ADR-0013 §7). BOTH Argon2id digests are computed unconditionally for every
     //    authenticated, deliverable SpendRequest and the verdict is constant-time-
@@ -4787,21 +5151,58 @@ fn handle_sign_after_lock(
     //    A bad-pin verdict is never recorded in the replay log: the pin is not part
     //    of the commitment, so recording it would wrongly replay a BAD_PIN refusal
     //    for the same transaction later resubmitted with a good pin.
+    //
+    //    THIS WHOLE WINDOW IS PIN-UNIFORM BY CONSTRUCTION: both evaluations and the
+    //    derivation run unconditionally for every verdict, including a forced-Wrong
+    //    one, so moving them out of the lock moves the same work for every pin class.
+    //    A reorder that became pin-DEPENDENT here would be a crown-jewel break, not a
+    //    tuning question.
     // Even an empty or over-length value runs both PIN Argon2 evaluations: there is
     // no PIN-shape fast path. It is forced Wrong afterward: empty is also how an
     // omitted wire field decodes, and values beyond MAX_PIN_BYTES are outside the
     // enrolment protocol. The pin-independent 0b refusal above intentionally occurs
     // before these evaluations, as §0 requires.
+    //
+    // The marker is the SEAM the placement proof reads: nothing between it and the call
+    // touches `sign_state`, so the lock state recorded at the marker is the lock state
+    // during the evaluations. It proves PLACEMENT only — an ordered log cannot show
+    // elapsed time and must never be cited as proof that anything got faster.
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::PinEvaluate);
     let compared = pin::verify_pin(node.pin_evaluator.as_ref(), request.pin.as_bytes());
     let verdict = if request.pin.is_empty() || request.pin.len() > MAX_PIN_BYTES {
         pin::PinVerdict::Wrong
     } else {
         compared
     };
-    let charge = state
-        .pin_budget
-        .charge(verdict, now, &node.pin_budget_config);
-    // Fail-closed (ADR-0012): a valid DURESS pin ALWAYS fires the arm-hook — even
+    // The second memory-hard operation, and a pure function of the request's auth
+    // digest and the immutable `carrier_kdf` — it reads no state under `sign_state`,
+    // which is what lets it sit here.
+    let carrier = if node.channel.is_some() {
+        arm_carrier_id(node, request.coord_request())
+    } else {
+        String::new()
+    };
+
+    // ---- COMMIT HOLD --------------------------------------------------------------
+    #[cfg(test)]
+    ingress_trace::record(IngressOp::SignStateLock);
+    let mut state = node.sign_state.lock().expect("sign_state lock poisoned");
+    // 1. LOCKDOWN FIRST, before any intent or overlay write. A terminal transition that
+    //    won the lock while this request was in WINDOW A must not then be followed by an
+    //    arm intent, a cover-overlay rewrite, or a staged carrier. This exit
+    //    deliberately does NOT stage: a locked-down node answers FRAUD_SUSPECTED and
+    //    does no further work of any kind, and the nonce claim it installed is removed
+    //    by [`InFlightMemoGuard`] on the way out.
+    if node.is_locked_down() {
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::SignStateUnlock);
+        drop(state);
+        return Ok(fraud_suspected());
+    }
+    let commit_raw_now = clock();
+    let commit_now = state.coord_nonces.effective_now(commit_raw_now);
+    // 2. Fail-closed (ADR-0012): a valid DURESS pin ALWAYS fires the arm-hook — even
     // when the node is locked out on a wrong-pin flood, and even though V0-4a still
     // signs a not-locked duress request identically to a normal one. The budget
     // never charges a valid pin, so this can never be rate-limited away. The hook
@@ -4817,21 +5218,100 @@ fn handle_sign_after_lock(
     // cannot freeze THIS node while leaving `t−1` free to finalize the coerced hot
     // spend. Do not "restore" an arm here; that is the theft class §0 closes.
     //
-    // Placed above `charge.refuse` so a locked-out node still records the intent and
+    // Placed above the budget charge so a locked-out node still records the intent and
     // can therefore still arm on confirmation (fail-closed, invariant v).
-    let carrier = if node.channel.is_some() {
-        arm_carrier_id(node, request.coord_request())
-    } else {
-        String::new()
-    };
-    node.fire_arm_hook(
+    //
+    // THE INTENT AND THE MEMO UPGRADE ARE ONE STORE-LOCKED TRANSACTION, and the
+    // generation gate applies to the MEMO HALF ONLY — the intent is recorded in every
+    // case, because it is keyed by carrier (a digest of this exact body) and a staged
+    // carrier without an intent is the hollow configuration `confirm_carrier` can never
+    // resolve. TWO CLOCKS: `now` (INGRESS HOLD) is the immutable `first_seen` that `T`
+    // is measured from, `commit_now` drives pruning and the overlay's current-time
+    // input.
+    let upgrade = node.fire_arm_hook(
         verdict,
         &carrier,
         &request.nonce,
-        arm_signature_tag(&request.coord_sig),
-        request.expiry,
+        generation,
         now,
+        commit_now,
     );
+    if let (Some(claim), Some(upgrade)) = (nonce_claim.as_mut(), upgrade) {
+        // THE INTENT IS RECORDED IN ALL THREE CASES, so in all three this handler is now
+        // the one still ruling on that carrier's propagation. The guard releases that on
+        // every exit below — refusal, `?`, or panic — which is what keeps a peer receipt
+        // for it retriable for exactly as long as the answer can still change, and no
+        // longer. See [`channel::ArmIntent::owner_ruling`].
+        claim.rules_carrier(&carrier);
+        if matches!(
+            upgrade,
+            channel::MemoUpgrade::Upgraded | channel::MemoUpgrade::Reinstalled
+        ) {
+            // A `Derived` memo owns this nonce now, under this generation. Relinquish
+            // memo-cleanup ownership — INCLUDING on the Reinstalled branch, which
+            // installed one without ever having a claim to upgrade. A guard that deleted
+            // it on the way out would recreate the very silent-false-positive defect the
+            // claim exists to close. `Superseded` deliberately keeps the guard armed: its
+            // predicate then matches nothing, because a newer generation owns the key.
+            claim.relinquish();
+        }
+    }
+    // 3. THE THREE CLOCK PREDICATES. They are COPIES of the post-preflight checks below,
+    //    not a relocation of them: WINDOW A and WINDOW B are separate stalls, and each
+    //    re-acquisition must re-decide against the clock it actually re-acquired at.
+    if request.expiry <= commit_now {
+        // NODE-LOCAL expiry: this node's own WINDOW A outlived the commitment. Forward
+        // the carrier exactly like every other node-local clock refusal — the safety
+        // intent is already recorded just above, so refusing without staging would leave
+        // it hollow and drop a duress signal the coordinator already authenticated.
+        //
+        // THIS IS ALSO THE MISMATCHED-GENERATION EXIT. A stale handler whose nonce key
+        // a newer generation has claimed necessarily reaches this branch — its own
+        // expiry must have passed for that claim to have been accepted at all
+        // (`check_and_record` tests expiry before replay) — and it refuses here, stages
+        // like any other expiry exit, and never reaches the budget charge below.
+        stage_spend_carrier(node, propagated_request, &carrier);
+        return Ok(refusal(
+            RefusalCode::CommitmentExpired,
+            "commitment_expiry",
+            format!(
+                "expiry {} is at or before this node's post-pin clock (now {commit_now}); \
+                 forwarded but not signed",
+                request.expiry
+            ),
+        ));
+    }
+    if request.expiry > commit_raw_now.saturating_add(node.max_commitment_age_secs) {
+        // The future-expiry cap on the RAW clock (rollback protection deliberately does
+        // not widen it). Defensively unreachable on a monotonic clock; it can fire only
+        // if system time stepped BACKWARD during WINDOW A, a NODE-LOCAL fault this
+        // node's peers do not share — so STAGE, rather than letting one node's backward
+        // clock step swallow a selectively-delivered duress carrier.
+        stage_spend_carrier(node, propagated_request, &carrier);
+        return Ok(refusal(
+            RefusalCode::CommitmentExpired,
+            "commitment_expiry",
+            format!(
+                "expiry {} exceeds now + max age {}s (raw clock; a backward step forwarded \
+                 but did not sign)",
+                request.expiry, node.max_commitment_age_secs
+            ),
+        ));
+    }
+    if let Some(refused) = ensure_delivery_horizon(node, request.expiry, commit_now) {
+        // The carrier was fresh enough when received and its safety intent is already
+        // recorded, but the memory-hard window consumed the remaining relay margin.
+        // STAGE for the same reason: the intent exists, so this node must also self-hold
+        // or that intent is hollow and non-confirmable.
+        stage_spend_carrier(node, propagated_request, &carrier);
+        return Ok(refused);
+    }
+    // 4. The attempt budget, charged on the COMMIT-HOLD clock — the same value the
+    //    pruning and overlay above used, so a lockout horizon cannot be computed from
+    //    one clock and enforced against another.
+    let charge = state
+        .pin_budget
+        .charge(verdict, commit_now, &node.pin_budget_config);
     if charge.refuse {
         // Propagation belongs to the coordinator-authenticated request, not to this
         // node's ability to sign. Stage EVERY PIN verdict before this early exit: a
@@ -4861,10 +5341,15 @@ fn handle_sign_after_lock(
         // Locked out (any pin) or a wrong pin: refuse to sign. Nothing below runs and
         // no verdict is recorded, so it is safe to drop the sign lock now and sleep
         // the backoff OUTSIDE it — a wrong-pin flood must not pin the one `/sign`
-        // lock for the whole backoff and stall honest spends.
+        // lock for the whole backoff and stall honest spends. This request will enter
+        // neither WINDOW B nor the REGISTRATION HOLD, so it also no longer needs the
+        // refresh-subordination slot while sleeping.
         #[cfg(test)]
         ingress_trace::record(IngressOp::SignStateUnlock);
         drop(state);
+        drop(_preflight);
+        #[cfg(test)]
+        ingress_trace::record(IngressOp::PinBackoffBoundary);
         if !charge.backoff.is_zero() {
             std::thread::sleep(charge.backoff);
         }
@@ -4879,21 +5364,7 @@ fn handle_sign_after_lock(
     //
     // Re-acquire before any replay/pending mutation and re-sample time: an RPC that
     // outlasts the request's expiry or delivery horizon must not register a stale
-    // candidate using the phase-1 timestamp.
-    //
-    // Claim the in-flight-spend slot FIRST, while the lock is still held (bead
-    // btc-policy-f91). This spend does not enter `state.pending` until phase 2, so
-    // without the claim it is invisible to refresh subordination for the whole
-    // preflight, and a `RefreshRequest` racing it could finish its own shorter
-    // preflight, see no pending spend, and register an immediately-fireable refresh
-    // over an input this request's MANDATORY ESCAPE needs — the escape then fails
-    // coverage at `T` and the sweep dies. Degrades to frozen funds → recovery, never
-    // theft, but it is honest-reachable, so it is closed rather than accepted. The
-    // guard releases the slot on every exit path including a panic; see
-    // [`SpendPreflightGuard`].
-    // The class is not derived until phase 2, so this conservatively covers an
-    // escape-class SpendRequest during preflight too; once accepted it releases the
-    // claim without entering `pending`, preserving ADR-0012's steady-state exception.
+    // candidate using the commit-hold timestamp.
     //
     // WHAT THIS WINDOW STILL COSTS, and why that is the accepted answer (f91 (B)).
     // `stage_spend_carrier` — the peer fan-out that lets a selectively-delivered
@@ -4935,9 +5406,9 @@ fn handle_sign_after_lock(
     // path stages at step 9. That additional lock-wait/work term can grow under
     // concurrent authenticated coordinator traffic; it is separate from the
     // request-shape-controlled preflight term this bead closes.
-    #[cfg(test)]
-    ingress_trace::record(IngressOp::PreflightEnter);
-    let _preflight = node.enter_spend_preflight();
+    //
+    // The preflight slot is already claimed (INGRESS HOLD) and is deliberately KEPT
+    // through registration: it covers both out-of-lock windows, not just this one.
     #[cfg(test)]
     ingress_trace::record(IngressOp::SignStateUnlock);
     drop(state);
@@ -5703,9 +6174,10 @@ fn handle_refresh_after_lock(
     // overtake it, find `pending` empty, and register as immediately fireable — and
     // if it spent an input the racing spend's mandatory escape needs, the escape
     // would no longer cover at `T`, the sweep would fail, and the vault would exit
-    // through recovery. `spend_preflight_in_flight` covers exactly that gap; the two
-    // halves overlap (the claim is released only after phase 2 has registered), so
-    // there is no instant at which an in-flight spend is invisible to this rule.
+    // through recovery. `spend_preflight_in_flight` covers exactly that gap. Its claim
+    // is released only after the request has registered OR has taken a refusal path
+    // from which it can no longer register, so there is no instant at which a spend
+    // that can still become pending is invisible to this rule.
     //
     // Both halves produce the SAME refusal bytes, deliberately: an attacker must not
     // be able to tell which one deferred them, and neither half depends on the racing
@@ -9217,6 +9689,7 @@ mod sign_clock_tests {
 /// answers FRAUD_SUSPECTED once locked down.
 #[cfg(test)]
 mod pin_substrate_tests {
+    use super::ingress_trace::{self, IngressOp};
     use super::pin::{PinEvaluator, PinSlot};
     use super::test_support::{
         coord_sign, load_node, node_and_valid_request, node_and_valid_request_with_budget,
@@ -9255,6 +9728,43 @@ mod pin_substrate_tests {
             SignResponse::Refusal(refusal) => refusal,
             other => panic!("expected refusal, got {other:?}"),
         }
+    }
+
+    /// The preflight slot is claimed before WINDOW A, so the wrong-PIN exit must release
+    /// it before applying the pin budget's backoff. Releasing only by function-exit RAII
+    /// would keep every racing refresh subordinated for the entire backoff ladder.
+    ///
+    /// This is an ordering proof, not a wall-clock test: the zero-backoff fixture still
+    /// crosses the exact production boundary, and `SpendPreflightGuard::drop` records
+    /// the release itself. Moving the explicit drop below the backoff boundary reverses
+    /// these two markers and fails deterministically.
+    #[test]
+    fn a_wrong_pin_releases_the_preflight_slot_before_its_backoff() {
+        let (node, base) = node_and_valid_request_with_budget(SMALL_BUDGET);
+        let wrong = with_pin(&base, WRONG, "wrong-preflight-release");
+        let now = wrong.expiry - 3_600;
+
+        let (response, ops) = ingress_trace::capture(|| {
+            handle_sign(&node, &wrong, now).expect("decodable wrong-pin request")
+        });
+        assert_eq!(expect_refusal(response).code, RefusalCode::BadPin);
+
+        let position = |needle| {
+            ops.iter()
+                .position(|op| *op == needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in {ops:?}"))
+        };
+        let enter = position(IngressOp::PreflightEnter);
+        let exit = position(IngressOp::PreflightExit);
+        let backoff = position(IngressOp::PinBackoffBoundary);
+        assert!(
+            enter < exit && exit < backoff,
+            "the preflight slot must be released before wrong-PIN backoff: {ops:?}"
+        );
+        assert!(
+            !node.spend_preflight_in_flight(),
+            "the wrong-PIN exit must not leak its preflight slot"
+        );
     }
 
     /// PRIMARY structural constant-cost test: every SpendRequest — normal, duress, or

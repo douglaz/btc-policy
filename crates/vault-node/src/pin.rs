@@ -728,7 +728,11 @@ impl AttemptBudget {
 
 #[cfg(test)]
 impl AttemptBudget {
-    /// Times `charge` ran (structural test: exactly once per SpendRequest).
+    /// Times `charge` ran (structural test: AT MOST once per SpendRequest — exactly once
+    /// for any request that reaches a PIN ruling. Since bead btc-policy-9zs the three
+    /// COMMIT-HOLD clock predicates refuse ahead of the charge, so a request whose
+    /// WINDOW A crossed an expiry boundary is charged zero times; it also returns no pin
+    /// verdict, so no informative attempt escapes the lockout ladder).
     pub(crate) fn charges(&self) -> u64 {
         self.charges
     }

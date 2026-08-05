@@ -1256,6 +1256,29 @@ struct ArmIntent {
     /// when lockout prevents PSBT validation. A request that returns before the outbox
     /// write keeps a same-shaped intent but cannot be confirmed at all.
     ready_to_propagate: bool,
+    /// True while the `/sign` handler that recorded this intent is STILL RULING on it —
+    /// set with the intent itself, cleared by that handler's ingress guard on every
+    /// exit, including a panic ([`Self::end_carrier_ruling`]).
+    ///
+    /// It is the [`MemoOutcome::InFlight`] claim's counterpart for the second half of the
+    /// handler: once the COMMIT HOLD upgrades the memo to `Derived`, the carrier still is
+    /// not confirmable until [`Self::mark_carrier_propagated`] stages it, and that span
+    /// covers WINDOW B and the whole registration section. A receipt landing there must
+    /// RETRY, not be answered `ACCEPTED`.
+    ///
+    /// WHY IT CANNOT BE `!ready_to_propagate` ALONE. Refusals below the arm hook that are
+    /// FEDERATION-UNIFORM deliberately never stage (see `Node::handle_sign_now`'s policy
+    /// exits): this node decided not to be a holder, and contributing no self receipt is
+    /// what stops a locally drifted node from arming alone. Those intents keep
+    /// `ready_to_propagate == false` until their own expiry — up to
+    /// `max_commitment_age_secs` — so treating that as "still deciding" would answer a
+    /// peer `RATE_LIMITED` once a second for the whole horizon (`retry_loop` retries
+    /// until `commitment_expiry`), against a decision that will never change. Bounding
+    /// the retry by the RULING window instead keeps it bounded by the handler's own
+    /// lifetime, and a receipt arriving after a non-staging refusal gets the one
+    /// `ACCEPTED` it got before this state existed: the node HAS ruled, and the answer
+    /// "there is no carrier here for you to confirm" is true and final.
+    owner_ruling: bool,
     /// This node's OWN internal pin verdict for this carrier. Written under both pins
     /// in the same-shaped record; only this bit differs, and it is what decides
     /// whether reaching `t` commits an arm or is a same-shaped no-op.
@@ -1296,8 +1319,43 @@ struct CarrierMemo {
     expiry: u64,
 }
 
+impl CarrierMemo {
+    /// Whether this memo is the IN-FLIGHT CLAIM of `generation` — the one thing a
+    /// handler may upgrade or remove. A `Derived` memo answers `false` however well its
+    /// tag matches: it is a real carrier some receipt may already be confirming
+    /// against, and the generation gate exists to keep a stale handler from touching it.
+    fn matches_generation(&self, generation: &MemoGeneration) -> bool {
+        self.expiry == generation.expiry
+            && matches!(
+                &self.outcome,
+                MemoOutcome::InFlight { signature_tag } if *signature_tag == generation.signature_tag
+            )
+    }
+}
+
 /// What consuming a coordinator nonce left behind on this node.
 enum MemoOutcome {
+    /// An ingress handler has CLAIMED this nonce and has NOT YET RULED on it: it
+    /// consumed the nonce under `sign_state` and then released that lock to run the
+    /// two memory-hard evaluations (`pin::verify_pin` and `arm_carrier_id`) out of the
+    /// critical section, so no carrier exists for this nonce yet.
+    ///
+    /// Without this variant the window between the two holds has no name, and
+    /// [`CarrierMemoLookup::Vacant`]'s "the authoritative handler already returned"
+    /// assumption silently becomes false. A peer receipt landing there would be read as
+    /// "that handler recorded no intent", answered `ACCEPTED`, and never retried
+    /// ([`retry_loop`] returns on `Accepted`) — a SILENT FALSE POSITIVE in which the
+    /// sender believes this node holds a carrier it never recorded. §0 arming counts
+    /// receipts to reach `t`, so receipts lost that way mean a node never arms: with two
+    /// compromised withholders in 3-of-5, a slow honest node can lose both remaining
+    /// honest receipts, stay unarmed, and form an UNFROZEN quorum. That is the hazard
+    /// class [`CarrierMemoLookup`] calls theft rather than censorship.
+    InFlight {
+        /// The claiming handler's generation, so a stale handler can neither delete nor
+        /// overwrite a memo a NEWER generation of the same nonce key now owns. See
+        /// [`MemoGeneration`].
+        signature_tag: [u8; 32],
+    },
     /// Ingress derived a carrier for the body carrying `signature_tag`.
     Derived {
         carrier: String,
@@ -1316,6 +1374,47 @@ enum MemoOutcome {
     },
 }
 
+/// Which ingress handler owns a nonce's [`CarrierMemo`] right now.
+///
+/// TWO HANDLER GENERATIONS CAN SHARE ONE NONCE KEY, which is why the memo cannot be
+/// keyed by nonce alone. [`replay::NonceLog::check_and_record`] tests EXPIRY BEFORE
+/// REPLAY (`replay.rs`), so once a request's own expiry has passed, a differently-signed
+/// body carrying a fresh expiry under the SAME nonce is Accepted and enters its own
+/// out-of-lock window while the first handler is still running.
+///
+/// The token is `(nonce, signature_tag, expiry)`: the nonce is the map key, and both
+/// remaining fields live here. A handler may only remove or upgrade a memo whose
+/// generation matches its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemoGeneration {
+    /// Domain-separated digest of this request's verified coordinator signature — the
+    /// same tag [`MemoOutcome::Derived`] memoizes.
+    pub(crate) signature_tag: [u8; 32],
+    /// This request's own expiry, which is also the memo's eviction horizon.
+    pub(crate) expiry: u64,
+}
+
+/// What [`ChannelState::record_arm_intent`] did with the nonce memo. The ARM INTENT is
+/// recorded in every one of these cases — it is separately keyed by carrier, and an
+/// intent-less staged carrier is the "hollow" configuration this file's refusal paths
+/// forbid. The generation gate applies to the MEMO half only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoUpgrade {
+    /// MATCHED: the [`MemoOutcome::InFlight`] entry this handler installed was still
+    /// present under its own generation, and is now `Derived`.
+    Upgraded,
+    /// MISMATCHED: a NEWER generation owns the key (this handler's expiry has therefore
+    /// necessarily passed — that is the only way a second generation could claim the
+    /// nonce, since `check_and_record` tests expiry before replay). The stale handler
+    /// neither reinserted nor deleted the memo.
+    Superseded,
+    /// ABSENT: a later accepted nonce pruned the claim mid-window after advancing the
+    /// nonce log's rollback high-water through this generation's expiry. The memo was
+    /// re-installed directly as `Derived` under this request's generation; the caller's
+    /// COMMIT-HOLD effective-clock check then stages and refuses the expired generation.
+    Reinstalled,
+}
+
 /// Result of the nonce-indexed carrier replay lookup.
 ///
 /// The signature tag is a fast path, NOT the carrier identity: `canonical_bytes`
@@ -1332,6 +1431,35 @@ pub(crate) enum CarrierMemoLookup {
     /// did not record an intent (for example freshness/capacity refused it), so
     /// there is no carrier this receipt can confirm.
     Vacant,
+    /// A CONCURRENT handler has claimed this nonce and has not yet ruled on it
+    /// ([`MemoOutcome::InFlight`]). There is no carrier to confirm YET — but unlike
+    /// [`Self::Vacant`] there may well be one in a few hundred milliseconds, so the
+    /// receipt must be answered `RATE_LIMITED` and retried, never `ACCEPTED`.
+    /// `retry_loop` returns on `Accepted` and retries only on `RateLimited` and
+    /// `UnknownCandidate`, so answering `ACCEPTED` here IS the silent-false-positive
+    /// bug. `RATE_LIMITED` converts it into an honest delivery failure, which
+    /// ADR-0012's censorship residual already bounds.
+    ///
+    /// The caller must answer this BEFORE reserving the global KDF slot and BEFORE
+    /// [`ChannelState::claim_carrier_derivation`], and must NOT record the sender:
+    /// routing an in-flight receipt through the derivation claim would burn the
+    /// sender's one derivation for this nonce and `Skip` a later honest receipt forever.
+    InFlight,
+    /// The handler has derived this carrier and upgraded the memo, is STILL RULING on
+    /// the request ([`ArmIntent::owner_ruling`]), and has not yet staged it for fan-out.
+    /// This spans WINDOW B and the registration work before `stage_spend_carrier`. A
+    /// receipt cannot be counted while `ArmIntent::ready_to_propagate` is false;
+    /// answering `ACCEPTED` would nevertheless stop the sender's retry loop and lose that
+    /// holder confirmation permanently. Answer `RATE_LIMITED`, before any KDF reservation
+    /// or sender claim, until staging makes the carrier confirmable.
+    ///
+    /// It is NOT `!ready_to_propagate` on its own. A handler that RULED and refused
+    /// without staging — every federation-uniform policy refusal below the arm hook does
+    /// exactly that, deliberately — leaves an intent that will never be staged and never
+    /// be pruned before its own expiry. Retrying against that is retrying against a final
+    /// answer, once a second until `commitment_expiry`, which is why the ruling bit and
+    /// not the staging bit is what makes this state end.
+    AwaitingPropagation,
     /// This exact signature is memoized; reuse its carrier with no derivation.
     Exact(String),
     /// A different valid signature under a live nonce. Derive the incoming body's own
@@ -2303,20 +2431,69 @@ impl PartialStore {
         invalidated
     }
 
-    /// Keep confirmation state and its replay memo on the same strict freshness
-    /// boundary as the coordinator nonce log (`expiry > now`). Expiry is the ONLY
-    /// bound applied here; there is no count cap in this function. It is the shared
-    /// horizon that keeps both maps a subset of the live nonces the log itself caps,
-    /// so a stalled backend/fire pass cannot make intent memory grow without bound;
-    /// ingress calls this independently of the fire driver. The corresponding count
-    /// invariant is only checked, never enforced, at
-    /// [`ChannelState::record_arm_intent`]'s `debug_assert!`.
+    /// Keep completed confirmation state and its replay memo on the same strict
+    /// freshness boundary as the coordinator nonce log (`expiry > now`). Expiry is the
+    /// only bound applied here; there is no count cap in this function. Ingress calls
+    /// this independently of the fire driver, so a stalled backend/fire pass cannot make
+    /// completed intent memory grow without bound. The corresponding count invariant is
+    /// only checked, never enforced, at [`ChannelState::record_arm_intent`]'s
+    /// `debug_assert!`.
+    ///
+    /// STATE WHOSE OWNER HAS NOT YET RULED IS DIFFERENT, and this is the one exception:
+    /// a passive receipt's clock read, or another handler's COMMIT-HOLD read, must not
+    /// delete it. The nonce log deliberately does not ratchet on a request rejected
+    /// during a transient forward clock excursion, so this prune can run past an expiry
+    /// the authoritative freshness state has NOT reached. If such a read deleted a live
+    /// claim, the receipt that triggered it would be answered `ACCEPTED` against a vacant
+    /// memo while the owner went on to install its carrier and sign after the clock
+    /// corrected — the silent false positive [`MemoOutcome::InFlight`] exists to close —
+    /// and the owner's own intent would be gone, leaving a registered candidate whose
+    /// holder gate can never open. The exception therefore covers BOTH halves of an
+    /// unruled request: an `InFlight` claim, and a `Derived` memo plus the
+    /// [`ArmIntent`] whose `owner_ruling` handler is still running.
+    ///
+    /// Both maps stay bounded by the nonce log: an entry exists only for an accepted
+    /// nonce, unruled entries are additionally bounded by the concurrent handlers holding
+    /// them (each releases on every exit, including a panic), and
+    /// [`Self::prune_intents_after_nonce_accept`] evicts expired ones unconditionally
+    /// once a later accepted nonce has advanced the authoritative freshness state.
     fn prune_intents(&mut self, now: u64) {
-        self.intents.retain(|_, intent| intent.expiry > now);
+        self.intents
+            .retain(|_, intent| intent.expiry > now || intent.owner_ruling);
         // Memos carry their own horizon rather than following their intent: a memo
         // outlives nothing longer than the nonce whose replay it short-circuits, and
         // pinning it to its intent instead would keep it alive across the eviction
-        // `confirm_carrier` performs when a receipt lands past expiry.
+        // `confirm_carrier` performs when a receipt lands past expiry. The unruled owner
+        // is the one deliberate departure from that, and it reads the intents RETAINED
+        // just above, so the two halves of one unruled request survive or expire
+        // together.
+        let intents = &self.intents;
+        self.carriers_by_nonce
+            .retain(|_, memo| memo.expiry > now || Self::owner_still_ruling(intents, memo));
+    }
+
+    /// Whether `memo`'s authoritative `/sign` handler is still deciding this nonce: it
+    /// has claimed it and not yet derived a carrier (`InFlight`), or it has derived one
+    /// and not yet exited. `Derived` with no live intent is a ruled request whose intent
+    /// already aged out, which is exactly the ordinary expiry case.
+    fn owner_still_ruling(intents: &HashMap<String, ArmIntent>, memo: &CarrierMemo) -> bool {
+        match &memo.outcome {
+            MemoOutcome::InFlight { .. } => true,
+            MemoOutcome::Derived { carrier, .. } => intents
+                .get(carrier)
+                .is_some_and(|intent| intent.owner_ruling),
+        }
+    }
+
+    /// Prune after `NonceLog::check_and_record` accepted a new request under the same
+    /// effective `now`. That acceptance atomically forgot every expired nonce and
+    /// advanced its rollback high-water through the removed expiries, so an old handler
+    /// cannot later revive after a clock correction. This is therefore the one write
+    /// site allowed to evict expired state whose owner has not yet ruled — the
+    /// `owner_ruling` / `InFlight` exception above deliberately does NOT apply here,
+    /// which is what keeps [`MemoUpgrade::Reinstalled`] reachable and both maps bounded.
+    fn prune_intents_after_nonce_accept(&mut self, now: u64) {
+        self.intents.retain(|_, intent| intent.expiry > now);
         self.carriers_by_nonce.retain(|_, memo| memo.expiry > now);
     }
 
@@ -3392,17 +3569,30 @@ impl ChannelState {
     /// `fire_at` over live hot spends. Shrinks only once Armed. If that formula is
     /// already past, the effective `T` is `now`: Lockdown and the escape fire now with
     /// a fresh `[now, now + combine_slack_secs]` window rather than an empty past one.
+    ///
+    /// **TWO CLOCK VALUES, and the mapping is not the implementer's choice.**
+    /// `first_seen` is the INGRESS-HOLD effective time — the instant this node consumed
+    /// the coordinator nonce — and is what `T` is measured from. `now` is the
+    /// COMMIT-HOLD effective time and drives pruning and the overlay's current-time
+    /// input. Using the commit-hold value for `first_seen` too would let a lock or
+    /// `work_lock` delay move `T` LATER, silently stretching the hostage window past
+    /// what the user was promised (see [`ArmIntent::first_seen`]); using the ingress
+    /// value for pruning would violate the nonce-log effective-clock coupling
+    /// ([`replay::NonceLog::effective_now`]). The overlay therefore receives BOTH.
+    ///
+    /// Returns which of [`MemoUpgrade`]'s three cases the nonce memo took. The INTENT is
+    /// recorded in all three.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_arm_intent(
         &self,
         duress: bool,
         carrier: &str,
         nonce: &str,
-        signature_tag: [u8; 32],
-        expiry: u64,
+        generation: MemoGeneration,
+        first_seen: u64,
         now: u64,
         timing: DuressTiming,
-    ) {
+    ) -> MemoUpgrade {
         // The store lock is also the final-send authorization boundary. If this
         // update wins that lock, every later hot send observes Armed and refuses. If
         // an overlapping send already passed its store check, that send linearized
@@ -3422,7 +3612,7 @@ impl ChannelState {
         // armed) leaves the committed schedule untouched. Accepted post-arm hot
         // spends shrink `T` atomically with candidate registration instead. See the
         // doc comment — the arm itself is confirmation-gated.
-        Self::write_safety_overlay(&mut store, false, now, now, timing);
+        Self::write_safety_overlay(&mut store, false, first_seen, now, timing);
         #[cfg(test)]
         self.schedule_work
             .safety_overlay_writes
@@ -3431,20 +3621,47 @@ impl ChannelState {
         // admitted this nonce under the same MAX_COORD_NONCES/live-expiry bound, so
         // finding the intent table full after this prune would indicate an internal
         // accounting bug rather than attacker-controlled capacity.
+        //
+        // Passive COMMIT-HOLD pruning deliberately retains in-flight claims. A later
+        // ACCEPTED ingress may already have pruned this one after advancing the nonce
+        // log's rollback high-water; that is the `MemoUpgrade::Reinstalled` case below,
+        // not an error.
         store.prune_intents(now);
         // NOT a hard `assert!`. This runs while holding `store` and while the caller
         // holds `sign_state`, so a panic here poisons BOTH and every later
         // `.expect("... lock poisoned")` aborts — bricking a node that, under
         // reboot-death (ADR-0007), can never restart. Turning an internal accounting
-        // invariant into a remote kill switch is strictly worse than the bounded
-        // over-count it would be guarding against: the map is already pruned on the
-        // nonce log's own horizon just above, so live intents are a subset of live
-        // nonces and one extra entry is bounded either way. `debug_assert!` keeps the
-        // invariant enforced under test, where a regression in the 1:1 intent/nonce
-        // correspondence should still fail loudly.
+        // invariant into a remote kill switch is strictly worse than the over-count it
+        // would be guarding against — the prune just above keeps the map a working set
+        // rather than a leak, even where the count is not a strict subset of the log.
+        // `debug_assert!` keeps a GROWTH check under test; what it can honestly assert
+        // is spelled out at the ceiling below, and it is NOT that intents stay within
+        // the nonce log's cap.
+        //
+        // The BOUND is what this asserts, and it is deliberately not restated as a 1:1
+        // intent/nonce correspondence any more: an intent can now be BORN EXPIRED (the
+        // out-of-lock window outlived this request's expiry, so the prune just above
+        // removed nothing on its behalf; `confirm_carrier` evicts it on the first receipt
+        // AFTER its owner stops ruling, NOT the next one — a born-expired intent's owner
+        // is ruling by construction here, and that site now refuses without destroying
+        // while `owner_ruling` holds), and a MISMATCHED generation records its own
+        // separately-keyed intent
+        // for a nonce another generation's memo owns. THAT second entry is what stops the
+        // count being a strict subset of the nonce log: one nonce can carry the stale
+        // generation's intent and the fresh one's at once, and chained supersessions can
+        // add further ones. The overshoot is bounded only by how many handlers sit in
+        // that state, which nothing bounds until btc-policy-1y2 puts admission control on
+        // `/sign` — so there is no honest constant equal to the real ceiling. What
+        // follows is therefore a SMOKE ALARM for genuine unbounded growth, not a
+        // statement of the invariant: at the log's own cap it would fire on a legitimate
+        // superseded intent and, in a debug build, panic into a poisoned-lock Lockdown.
+        // Do NOT tighten it back to `MAX_COORD_NONCES`, and do NOT "restore" the
+        // correspondence by comparing `intents.len() + carriers_by_nonce.len()`, which
+        // double-counts every Derived request.
         debug_assert!(
-            store.intents.contains_key(carrier) || store.intents.len() < MAX_COORD_NONCES,
-            "arm-intent count must remain bounded by the coordinator nonce log"
+            store.intents.contains_key(carrier)
+                || store.intents.len() < MAX_COORD_NONCES.saturating_mul(4),
+            "arm-intent count is growing past any plausible supersession overshoot"
         );
         let intent = store
             .intents
@@ -3452,32 +3669,161 @@ impl ChannelState {
             .or_insert(ArmIntent {
                 holders: HashSet::new(),
                 ready_to_propagate: false,
+                owner_ruling: false,
                 duress: false,
-                first_seen: now,
+                first_seen,
                 spend_commitment_id: String::new(),
                 escape_commitment_id: String::new(),
-                expiry,
+                expiry: generation.expiry,
                 committed: false,
             });
         // Monotonic: a carrier's verdict is decided once, by the first processing of
         // it. Re-processing (a peer's propagation racing the coordinator's copy) must
         // not be able to CLEAR a duress bit already recorded.
         intent.duress |= duress;
-        store.carriers_by_nonce.insert(
-            nonce.to_string(),
-            CarrierMemo {
-                outcome: MemoOutcome::Derived {
-                    carrier: carrier.to_string(),
-                    signature_tag,
-                    resolved_senders: HashSet::new(),
-                },
-                expiry,
+        // THE CALLER IS, BY CONSTRUCTION, STILL RULING ON THIS CARRIER: it is inside its
+        // COMMIT HOLD and has neither staged nor refused yet. Set on the existing entry
+        // too — an intent can only be re-recorded by a handler that is itself unruled —
+        // and cleared by that handler's guard on every exit, INCLUDING a panic, so a
+        // crashed handler cannot leave a peer retrying forever. The two halves are
+        // [`Self::end_carrier_ruling`] and, for the memo, `release_nonce_claim`.
+        intent.owner_ruling = true;
+        // THE MEMO HALF, AND THE GENERATION GATE THAT APPLIES ONLY TO IT. The intent
+        // above is recorded unconditionally — it is keyed by CARRIER, which is a digest
+        // of this exact body, so a stale generation's intent is separately keyed and
+        // harmless, while staging without an intent is the "hollow" configuration the
+        // refusal paths forbid. The memo is keyed by NONCE, which two generations can
+        // share, so it needs the gate.
+        let derived = CarrierMemo {
+            outcome: MemoOutcome::Derived {
+                carrier: carrier.to_string(),
+                signature_tag: generation.signature_tag,
+                // EMPTY, always. A conflicting-signature derivation budget is spent per
+                // (nonce, sender) against a memo that already resolves to a carrier; an
+                // upgrade inherits no such spend, and seeding this from anywhere would
+                // Skip a peer receipt that never got its one derivation.
+                resolved_senders: HashSet::new(),
             },
-        );
+            expiry: generation.expiry,
+        };
+        match store.carriers_by_nonce.get(nonce) {
+            // MATCHED — this handler's own claim is still here. Upgrade it.
+            Some(memo) if memo.matches_generation(&generation) => {
+                store.carriers_by_nonce.insert(nonce.to_string(), derived);
+                MemoUpgrade::Upgraded
+            }
+            // MISMATCHED — a newer generation owns the key. Neither reinsert nor
+            // delete: the newer handler's claim (or its already-Derived carrier) is
+            // live, and clobbering it would either strand a receipt on a carrier that
+            // no longer exists or resurrect this stale body's. The caller falls through
+            // to the COMMIT-HOLD expiry re-check, which refuses it — its own expiry has
+            // necessarily passed, since that is the only way a second generation could
+            // claim this nonce — and STAGES the carrier on that refusal like every
+            // other expiry exit, because refusing without staging would drop a duress
+            // signal the coordinator already authenticated.
+            Some(_) => MemoUpgrade::Superseded,
+            // ABSENT — pruned mid-window. RE-INSTALL directly as Derived under this
+            // request's generation and continue. This is FORCED, not a preference: the
+            // alternative, reading absence as staleness and refusing, SILENTLY SWALLOWS
+            // A DURESS SIGNAL, which is the failure class this whole reorder exists to
+            // close. Do not "simplify" it into the mismatched branch.
+            //
+            // Only a later ACCEPTED ingress may prune an owned claim: that operation
+            // advances the nonce log's rollback high-water through this expiry, so the
+            // caller necessarily reaches its COMMIT-HOLD expiry refusal even if the raw
+            // wall clock then steps backward. Passive receipt reads retain `InFlight`
+            // and answer RATE_LIMITED; they must never create a Vacant memo that a
+            // still-authoritative handler can revive after clock correction.
+            None => {
+                store.carriers_by_nonce.insert(nonce.to_string(), derived);
+                MemoUpgrade::Reinstalled
+            }
+        }
         // Do not float an older normal no-op slot forward on a later request. Each
         // request writes its own finite cover window in `apply_arm_directive`; the
         // selected live escape is refreshed there only when a successfully retained
         // request can actually shrink T.
+    }
+
+    /// Claim `nonce` for an ingress handler that is about to leave `sign_state` to run
+    /// its two memory-hard evaluations, by installing an [`MemoOutcome::InFlight`] memo
+    /// under `generation`.
+    ///
+    /// Called from the INGRESS HOLD, immediately after the nonce is consumed, so no
+    /// window exists in which the nonce is spent but nothing names the claim. `now` is
+    /// the ingress-hold effective time, and the caller has just accepted this nonce under
+    /// that same time. That accepted transition is what authorizes pruning expired
+    /// in-flight owners: the nonce log has already advanced its rollback high-water
+    /// through every nonce it forgot.
+    pub(crate) fn claim_nonce_in_flight(&self, nonce: &str, generation: MemoGeneration, now: u64) {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        #[cfg(test)]
+        self.schedule_work
+            .safety_locks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.prune_intents_after_nonce_accept(now);
+        store.carriers_by_nonce.insert(
+            nonce.to_string(),
+            CarrierMemo {
+                outcome: MemoOutcome::InFlight {
+                    signature_tag: generation.signature_tag,
+                },
+                expiry: generation.expiry,
+            },
+        );
+    }
+
+    /// Release an in-flight claim that never became a carrier — the cleanup half of
+    /// [`Self::claim_nonce_in_flight`], driven from the ingress guard's `Drop`.
+    ///
+    /// THE COMPLETE PREDICATE: remove ONLY a generation-matched `InFlight` entry, NEVER
+    /// a `Derived` one. Deleting a `Derived` memo on exit recreates exactly the
+    /// silent-false-positive / failed-arm defect the `InFlight` variant exists to close,
+    /// and a mismatched `InFlight` belongs to a newer generation that is still running.
+    /// Stating it as a guard checked on every exit — rather than as a "disarm at the
+    /// upgrade point" action — is the point: an action can be missed on a branch.
+    ///
+    /// POISON-TOLERANT BY REQUIREMENT, not by taste. This runs in a `Drop`, so it can
+    /// run while unwinding from a panic elsewhere in the handler; `.expect("store lock
+    /// poisoned")` on an already-poisoned store would panic DURING that unwind, and a
+    /// double panic ABORTS the process — killing every Lockdown net and leaving the node
+    /// dead-but-UNLATCHED instead of in terminal Lockdown. Taking the store lock in a
+    /// `Drop` at all is sound on ordering grounds: `sign_state -> store` is the order
+    /// [`crate::Node::confirm_carrier`] already establishes, and the guard outlives
+    /// every `sign_state` binding in the handler.
+    pub(crate) fn release_nonce_claim(&self, nonce: &str, generation: MemoGeneration) {
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let claimed = store
+            .carriers_by_nonce
+            .get(nonce)
+            .is_some_and(|memo| memo.matches_generation(&generation));
+        if claimed {
+            store.carriers_by_nonce.remove(nonce);
+        }
+    }
+
+    /// End this handler's ruling on `carrier` — the second half of the ingress guard's
+    /// `Drop`, and the counterpart of [`Self::release_nonce_claim`] for the span AFTER
+    /// the memo became `Derived`.
+    ///
+    /// A GUARD, NOT A PER-BRANCH ACTION, for the same reason the memo cleanup is one: the
+    /// span it closes contains WINDOW B, the whole registration section, a dozen refusal
+    /// returns and a panic boundary, and the alternative — "finalize the intent on every
+    /// exit that did not stage" — is an action that can be missed on a branch. A missed
+    /// one leaves every peer receipt for that carrier answered `RATE_LIMITED` once a
+    /// second until the request expires, which is a self-inflicted denial of the very
+    /// `/channel` capacity honest partials and receipts need.
+    ///
+    /// It deliberately does NOT touch `ready_to_propagate`: whether this node is a holder
+    /// was decided by whether the handler staged the carrier, and this call only records
+    /// that the decision — either way — has now been made. Poison-tolerant for the reason
+    /// [`Self::release_nonce_claim`] documents: a `Drop` that panicked while unwinding
+    /// would abort the process and leave the node dead but UNLATCHED.
+    pub(crate) fn end_carrier_ruling(&self, carrier: &str) {
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(intent) = store.intents.get_mut(carrier) {
+            intent.owner_ruling = false;
+        }
     }
 
     /// Mark the local intent as staged for federation fan-out and count this node as a
@@ -3512,11 +3858,34 @@ impl ChannelState {
         now: u64,
     ) -> CarrierMemoLookup {
         let mut store = self.store.lock().expect("store lock poisoned");
+        // Passive receipt clocks may step forward and then correct without advancing
+        // the nonce log's rollback high-water. `prune_intents` therefore retains state
+        // whose owner has not ruled, so the match below answers RATE_LIMITED until it has.
         store.prune_intents(now);
-        let Some(memo) = store.carriers_by_nonce.get_mut(nonce) else {
+        let Some(memo) = store.carriers_by_nonce.get(nonce) else {
             return CarrierMemoLookup::Vacant;
         };
-        match &mut memo.outcome {
+        if let MemoOutcome::Derived { carrier, .. } = &memo.outcome {
+            // BOTH conditions, and the second is what bounds the retry. `owner_ruling`
+            // alone would answer a receipt for an already-staged carrier RATE_LIMITED for
+            // the sliver between staging and handler exit; `!ready_to_propagate` alone
+            // would answer one RATE_LIMITED for the request's whole remaining lifetime
+            // after a federation-uniform refusal that deliberately never stages — a
+            // decision that will never change, retried once a second until
+            // `commitment_expiry`. See [`ArmIntent::owner_ruling`].
+            if store
+                .intents
+                .get(carrier)
+                .is_some_and(|intent| intent.owner_ruling && !intent.ready_to_propagate)
+            {
+                return CarrierMemoLookup::AwaitingPropagation;
+            }
+        }
+        match &memo.outcome {
+            // FIRST, and before any reservation or per-sender claim the caller might
+            // make: a claimed-but-unruled nonce has no carrier to confirm yet, and
+            // spending the sender's one derivation on it would Skip its own retry.
+            MemoOutcome::InFlight { .. } => CarrierMemoLookup::InFlight,
             MemoOutcome::Derived {
                 carrier,
                 signature_tag: remembered,
@@ -3563,6 +3932,13 @@ impl ChannelState {
                 ..
             } if carrier == memoized_carrier => resolved_senders.insert(sender),
             MemoOutcome::Derived { .. } => false,
+            // An in-flight claim replaced the memo between the lookup and here. There is
+            // no carrier to charge the derivation against, so refuse the claim without
+            // charging the new generation. Replacement is possible only after the
+            // looked-up generation expired, when `confirm_carrier` would refuse it too;
+            // the policy-opaque channel path therefore answers `Accepted`, not retriable
+            // `RateLimited`.
+            MemoOutcome::InFlight { .. } => false,
         }
     }
 
@@ -3773,10 +4149,25 @@ impl ChannelState {
         // (nobody arms) instead of a scheduling-dependent split. Pin-independent:
         // both verdicts evict on the same clock comparison.
         if intent.expiry <= now {
-            store.intents.remove(carrier);
-            store.carriers_by_nonce.retain(|_, remembered| {
-                !matches!(&remembered.outcome, MemoOutcome::Derived { carrier: c, .. } if c == carrier)
-            });
+            // REFUSE always; DESTROY only when no handler is still ruling. `now` here HAS
+            // been through `NonceLog::effective_now` (`Node::confirm_carrier`), but that
+            // is a rollback LOWER bound — `high_water.max(now)` — so it corrects a
+            // backward step and passes a FORWARD excursion through untouched. The
+            // residual is therefore forward-only, and a transient forward step still
+            // reaches this branch for a carrier that is not really expired. Deleting a still-ruling owner's
+            // intent there is the same silent failed-arm `prune_intents`' exception
+            // exists to prevent — and it is worse here, because the wrong-pin/lockout
+            // exit leaves an intent `ready_to_propagate` across its whole backoff, which
+            // is exactly the fail-closed intent a locked-out node needs in order to arm
+            // on confirmation at all. Refusing without destroying keeps both properties:
+            // an expired carrier still never collects a holder, and the owner's state
+            // survives the clock correcting. The owner's own exit prunes it normally.
+            if !intent.owner_ruling {
+                store.intents.remove(carrier);
+                store.carriers_by_nonce.retain(|_, remembered| {
+                    !matches!(&remembered.outcome, MemoOutcome::Derived { carrier: c, .. } if c == carrier)
+                });
+            }
             return CarrierConfirmation::NONE;
         }
         if !intent.ready_to_propagate {
@@ -3927,6 +4318,9 @@ impl ChannelState {
                 .or_insert_with(|| ArmIntent {
                     holders: HashSet::new(),
                     ready_to_propagate: true,
+                    // A seeded intent stands in for a handler that already RULED and
+                    // staged; nothing is still deciding it.
+                    owner_ruling: false,
                     duress: false,
                     first_seen: now,
                     spend_commitment_id,
@@ -10963,6 +11357,24 @@ mod duress {
             node.outbox.lock().expect("outbox").is_empty(),
             "the stall is exactly a fan-out deferral — this is the cost being bounded"
         );
+
+        // A peer can relay the coordinator-authenticated body while this handler is in
+        // WINDOW B. The COMMIT HOLD has already changed the nonce memo to `Derived`, but
+        // the carrier is not yet staged and therefore is not ready to confirm. ACCEPTED
+        // here would stop the peer's retry loop and permanently lose its holder receipt.
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request.clone()));
+        let envelope = fx
+            .channel_state(1)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        assert_eq!(
+            crate::handle_channel_body(&node, &body, NOW),
+            ChannelReply::RateLimited {
+                retry_after_secs: 1
+            },
+            "a receipt arriving after derivation but before staging must remain retriable"
+        );
         proceed.wait();
 
         assert!(matches!(
@@ -10973,6 +11385,20 @@ mod duress {
             node.outbox.lock().expect("outbox").len(),
             1,
             "the deferred fan-out still happens once the preflight returns"
+        );
+        assert_eq!(
+            crate::handle_channel_body(
+                &node,
+                &serde_json::to_vec(
+                    &fx.channel_state(1)
+                        .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                        .expect("fresh retry envelope"),
+                )
+                .expect("retry json"),
+                NOW,
+            ),
+            ChannelReply::Accepted,
+            "the same peer receipt must be accepted once staging makes the carrier confirmable"
         );
         assert!(
             confirm_to_quorum(&node, &request),
@@ -11899,10 +12325,12 @@ mod duress {
         assert!(duress_channel.armed_snapshot().is_some());
 
         let expected = ScheduleWorkTrace {
-            // Two ingress records plus two peer receipts. The t-th receipt scans and
-            // writes the overlay under BOTH verdicts; this is the confirmation-path
-            // cover that keeps the async arm invisible to concurrent `/sign` probes.
-            safety_locks: 4,
+            // Two ingress passes at TWO store locks each — the INGRESS HOLD's in-flight
+            // nonce claim and the COMMIT HOLD's intent record (bead btc-policy-9zs) —
+            // plus two peer receipts. The t-th receipt scans and writes the overlay
+            // under BOTH verdicts; this is the confirmation-path cover that keeps the
+            // async arm invisible to concurrent `/sign` probes.
+            safety_locks: 6,
             safety_candidate_visits: 4,
             safety_overlay_writes: 3,
             registration_locks: 2,
@@ -12176,6 +12604,13 @@ mod duress {
                 let ArmIntent {
                     holders,
                     ready_to_propagate,
+                    // PROJECTED, not masked: unlike the carrier id and the signature tag,
+                    // this bit is pin-INDEPENDENT by construction — it is set with every
+                    // intent and cleared by every handler's guard on exit — so showing it
+                    // can only strengthen the comparison, and hiding a state a receipt's
+                    // reply depends on would weaken the exhaustiveness this projection
+                    // claims.
+                    owner_ruling,
                     duress: _duress,
                     first_seen,
                     spend_commitment_id,
@@ -12186,9 +12621,11 @@ mod duress {
                 let mut sorted_holders: Vec<u16> = holders.iter().copied().collect();
                 sorted_holders.sort_unstable();
                 format!(
-                    "intent holders={sorted_holders:?} ready_to_propagate={} first_seen={} \
-                     spend_commitment_id={} escape_commitment_id={} expiry={} committed={}",
+                    "intent holders={sorted_holders:?} ready_to_propagate={} owner_ruling={} \
+                     first_seen={} spend_commitment_id={} escape_commitment_id={} expiry={} \
+                     committed={}",
                     ready_to_propagate,
+                    owner_ruling,
                     first_seen,
                     spend_commitment_id,
                     escape_commitment_id,
@@ -12207,17 +12644,24 @@ mod duress {
         lines.push(format!("nonce_memos count={}", memos.len()));
         for (nonce, memo) in memos {
             let CarrierMemo { outcome, expiry } = memo;
-            let MemoOutcome::Derived {
-                carrier: _carrier,
-                signature_tag: _signature_tag,
-                resolved_senders,
-            } = outcome;
-            let mut senders: Vec<u16> = resolved_senders.iter().copied().collect();
-            senders.sort_unstable();
-            lines.push(format!(
-                "memo nonce={nonce} outcome=Derived resolved_senders={senders:?} expiry={}",
-                expiry
-            ));
+            // BOTH variants mask `signature_tag`, for the one reason `Derived`'s is
+            // masked: the coordinator signature covers the PIN, so projecting the tag
+            // would make this SILENCE projection itself a pin oracle.
+            let row = match outcome {
+                MemoOutcome::InFlight {
+                    signature_tag: _signature_tag,
+                } => "outcome=InFlight".to_string(),
+                MemoOutcome::Derived {
+                    carrier: _carrier,
+                    signature_tag: _signature_tag,
+                    resolved_senders,
+                } => {
+                    let mut senders: Vec<u16> = resolved_senders.iter().copied().collect();
+                    senders.sort_unstable();
+                    format!("outcome=Derived resolved_senders={senders:?}")
+                }
+            };
+            lines.push(format!("memo nonce={nonce} {row} expiry={expiry}"));
         }
         let HotBudgetLedger {
             budget,
@@ -12330,12 +12774,13 @@ mod duress {
         ops: Vec<crate::ingress_trace::IngressOp>,
         /// The preflight slot counter AFTER the pass. `Node::spend_preflight` is an
         /// RAII counter (`enter_spend_preflight` / `SpendPreflightGuard::drop`) that
-        /// neither projection otherwise reads, and the trace records the CLAIM without
-        /// the release — so pin-dependent control flow that dropped the guard at a
-        /// different point would leave ops and both shapes equal while a concurrent
-        /// `/refresh` saw `spend_preflight_in_flight()` differ and returned
-        /// `REFRESH_SUBORDINATED` under one pin only. Comparing the settled value
-        /// closes that: every pass must leave the slot as it found it.
+        /// neither projection otherwise reads. The ordered log now records the release
+        /// too (`IngressOp::PreflightExit`, emitted unconditionally in
+        /// `SpendPreflightGuard::drop`), so it is no longer blind to WHERE the guard
+        /// went — but an ordered log still cannot settle the resulting COUNT, and it is
+        /// the count a concurrent `/refresh` reads through `spend_preflight_in_flight()`
+        /// before returning `REFRESH_SUBORDINATED`. Comparing the settled value is what
+        /// closes that: every pass must leave the slot exactly as it found it.
         preflight_after: usize,
         /// Per-request delta of the channel store's internal schedule work: store
         /// locks, candidate visits, allocations, overlay writes, and timer-window
@@ -12539,9 +12984,21 @@ mod duress {
             "{case}: a spend's ingress derives its arm carrier exactly once, so comparing the \
              count across pins is not a comparison of zeroes"
         );
+        // TWO store locks, not one, since bead btc-policy-9zs split the handler: the
+        // INGRESS HOLD claims the nonce in flight before releasing `sign_state`, and the
+        // COMMIT HOLD records the arm intent and upgrades that claim. Pinning the count
+        // at 2 is strictly stronger than the old 1 — it now requires BOTH store
+        // transactions to have happened before the cross-pin equality means anything, so
+        // a pass that silently stopped claiming the nonce fails here rather than
+        // comparing equal to another such pass.
         assert_eq!(
-            work.schedule_work.safety_locks, 1,
-            "{case}: every spend ingress must take the channel store's arm-intent lock once"
+            work.schedule_work.safety_locks, 2,
+            "{case}: a spend ingress that reaches the arm intent must have taken the channel \
+             store lock twice — once to claim the nonce for the out-of-lock PIN window, once \
+             to record the intent and upgrade that claim. (Counted, not exhaustive: an exit \
+             that never upgrades releases its claim under the store lock a third time, and \
+             `release_nonce_claim` is deliberately not instrumented — the removal is visible \
+             in the store projection instead.)"
         );
         assert_eq!(
             work.schedule_work.safety_overlay_writes, 1,
@@ -13026,6 +13483,1276 @@ mod duress {
             hot_work.sign_state, escape_work.sign_state,
             "the /sign-state projection must be able to tell two different work shapes apart, or \
              comparing it across pins detects nothing"
+        );
+    }
+
+    // -- The out-of-lock PIN window (bead btc-policy-9zs) ---------------------
+
+    /// STRUCTURAL PLACEMENT PROOF: both of the handler's memory-hard operations run
+    /// while `sign_state` is NOT held.
+    ///
+    /// **What this proves and what it cannot.** The ordered op log contains no clock, so
+    /// it shows PLACEMENT and only placement: that `verify_pin`'s two Argon2id
+    /// evaluations and `arm_carrier_id`'s derivation happen between a recorded release
+    /// and the next recorded acquisition. It says NOTHING about elapsed time and must
+    /// never be cited as evidence that any wait got shorter — the bead removes
+    /// memory-hard work from the contended section, and an unbounded acquisition delay
+    /// on an unfair mutex remains regardless.
+    ///
+    /// The walk is over lock DEPTH rather than over fixed indices so it stays honest as
+    /// the handler grows: any future edit that moved either evaluation back inside a
+    /// hold fails here whatever else changed around it.
+    #[test]
+    fn both_memory_hard_operations_run_outside_the_sign_state_lock() {
+        use crate::ingress_trace::IngressOp;
+
+        let fx = Fixture::new(3, 5);
+        let (node, calls) = counted_duress_node(&fx);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "placement");
+        let pass = ingress_pass(&node, &calls, &request, NOW);
+        assert!(
+            matches!(pass.work.response, SignResponse::Accepted(_)),
+            "the placement proof must walk a request that ran the whole handler, got {:?}",
+            pass.work.response
+        );
+
+        let mut held = false;
+        let mut pin_evaluations = 0usize;
+        let mut derivations = 0usize;
+        let mut releases = 0usize;
+        for op in &pass.work.ops {
+            match op {
+                IngressOp::SignStateLock => {
+                    assert!(!held, "the handler re-acquired a lock it already held");
+                    held = true;
+                }
+                IngressOp::SignStateUnlock => {
+                    assert!(held, "the handler released a lock it was not holding");
+                    held = false;
+                    releases += 1;
+                }
+                IngressOp::PinEvaluate => {
+                    assert!(
+                        !held,
+                        "the PIN's two Argon2id evaluations ran INSIDE the sign_state \
+                         critical section: {:?}",
+                        pass.work.ops
+                    );
+                    pin_evaluations += 1;
+                }
+                IngressOp::CarrierDerive => {
+                    assert!(
+                        !held,
+                        "the memory-hard arm-carrier derivation ran INSIDE the sign_state \
+                         critical section: {:?}",
+                        pass.work.ops
+                    );
+                    derivations += 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Anti-vacuity, three ways. The two markers must actually have been recorded
+        // (an equality over zero occurrences proves nothing), the pass must really have
+        // taken and released the lock rather than skipping it, and the counting seams
+        // must agree that the work behind the markers happened.
+        assert_eq!(
+            pin_evaluations, 1,
+            "the pass must reach the PIN compare exactly once: {:?}",
+            pass.work.ops
+        );
+        assert_eq!(
+            derivations, 1,
+            "the pass must reach the carrier derivation exactly once: {:?}",
+            pass.work.ops
+        );
+        assert!(
+            releases >= 2,
+            "an accepted pass releases the lock for BOTH out-of-lock windows: {:?}",
+            pass.work.ops
+        );
+        assert_eq!(
+            pass.work.pin_evaluations,
+            vec![crate::pin::PinSlot::Normal, crate::pin::PinSlot::Duress],
+            "the marker must bracket two real Argon2id slot evaluations, not a skipped compare"
+        );
+        assert_eq!(
+            pass.work.carrier_derivations, 1,
+            "the marker must bracket one real memory-hard carrier derivation"
+        );
+    }
+
+    /// One pin's half of the WINDOW A receipt comparison.
+    #[derive(Debug, PartialEq, Eq)]
+    struct InFlightReceiptRecord {
+        /// Every reply the retrying peer saw while the handler was parked in WINDOW A,
+        /// in order — the RETRY SEQUENCE.
+        in_window_replies: Vec<ChannelReply>,
+        /// How many of those replies ask the sender to retry. `retry_loop` retries only
+        /// on `RateLimited` and `UnknownCandidate` and RETURNS on `Accepted`, so this is
+        /// the count that decides whether the receipt is eventually delivered at all.
+        in_window_retries: usize,
+        /// Carrier derivations the in-window receipts induced. Must be zero: an
+        /// in-flight memo is answered before the KDF slot is reserved.
+        in_window_derivations: usize,
+        /// The whole pin-masked channel store while the handler is parked.
+        in_window_store: StoreShape,
+        /// The reply once the handler has ruled and its memo is `Derived`.
+        settled_reply: ChannelReply,
+        /// Derivations the settled receipt induced — one, because it carries a
+        /// conflicting signature and must resolve the body's own carrier.
+        settled_derivations: usize,
+        /// The whole pin-masked channel store afterwards, which is where the sender
+        /// claim shows up (`resolved_senders`).
+        settled_store: StoreShape,
+        /// The parked handler's own `/sign` acknowledgement.
+        sign_response: SignResponse,
+    }
+
+    /// Drive one pin through the WINDOW A receipt scenario: park a `/sign` handler
+    /// inside its out-of-lock PIN window, deliver `retries` peer receipts for the SAME
+    /// nonce while it is parked, release it, then deliver one more.
+    ///
+    /// The receipts carry a RE-SIGNED copy of the request — the same canonical body
+    /// under a different valid coordinator signature — which is what makes "no sender
+    /// claim is recorded" a real assertion rather than a tautology: once the handler has
+    /// ruled, that same receipt takes the conflicting-signature path, spends the global
+    /// KDF slot and records the sender. During WINDOW A it must do neither.
+    fn in_flight_receipt_record(
+        fx: &Fixture,
+        request: &SignRequest,
+        retries: usize,
+    ) -> (InFlightReceiptRecord, u64) {
+        const SENDER: u16 = 1;
+
+        let (node, _calls) = counted_duress_node(fx);
+        let node = Arc::new(node);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        node.pin_window_a_midpoint(Arc::clone(&barrier));
+        let arm_before = node.duress_arm_count();
+
+        // The peer's copy: same body, different valid signature.
+        let mut relayed = request.clone();
+        fx.coord_resign(&mut relayed, 0xC7);
+        assert_ne!(
+            relayed.coord_sig, request.coord_sig,
+            "the relayed copy must actually carry a different signature"
+        );
+        let deliver_receipt = |node: &crate::Node| {
+            let payload = request_payload(&vault_proto::TaggedRequest::Spend(relayed.clone()));
+            let envelope = fx
+                .channel_state(SENDER)
+                .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+                .expect("envelope");
+            let body = serde_json::to_vec(&envelope).expect("json");
+            crate::handle_channel_body(node, &body, NOW)
+        };
+
+        let worker_node = Arc::clone(&node);
+        let worker_request = request.clone();
+        let worker = std::thread::spawn(move || {
+            crate::handle_sign(&worker_node, &worker_request, NOW).expect("decodable")
+        });
+
+        // Rendezvous 1: the handler is inside WINDOW A — nonce consumed, in-flight memo
+        // installed, `sign_state` released, no carrier derived yet.
+        barrier.wait();
+        let channel = node.channel.as_ref().expect("channel");
+        let derivations_before = node.carrier_derivation_count();
+        let in_window_replies: Vec<ChannelReply> =
+            (0..retries).map(|_| deliver_receipt(&node)).collect();
+        let in_window_retries = in_window_replies
+            .iter()
+            .filter(|reply| matches!(reply, ChannelReply::RateLimited { .. }))
+            .count();
+        let in_window_derivations = node.carrier_derivation_count() - derivations_before;
+        let in_window_store = store_shape(channel);
+
+        // Rendezvous 2: release the handler and let it rule.
+        barrier.wait();
+        let sign_response = worker.join().expect("the parked /sign worker");
+        let settled_before = node.carrier_derivation_count();
+        let settled_reply = deliver_receipt(&node);
+        let record = InFlightReceiptRecord {
+            in_window_replies,
+            in_window_retries,
+            in_window_derivations,
+            in_window_store,
+            settled_reply,
+            settled_derivations: node.carrier_derivation_count() - settled_before,
+            settled_store: store_shape(channel),
+            sign_response,
+        };
+        (record, node.duress_arm_count() - arm_before)
+    }
+
+    /// SILENCE, CONCURRENTLY: a peer receipt injected during the out-of-lock PIN window
+    /// gets the identical treatment under a normal and a duress pin.
+    ///
+    /// The seven sequential comparison cases cannot see this at all — `ingress_pass`
+    /// drives one `/sign` to completion and `ingress_trace` is thread-local — and a
+    /// single-pin "mid-window RATE_LIMITED works" test would prove nothing about
+    /// SILENCE. What is compared here is the whole peer-visible outcome: the reply
+    /// SEQUENCE, the retry COUNT that decides whether the receipt is ever delivered, the
+    /// memory-hard work the receipts induced, the pin-masked store at both instants
+    /// (which is where a sender claim would show up), and the `/sign` acknowledgement
+    /// the parked handler finally returned.
+    ///
+    /// The behaviour under test is also the whole point of the `InFlight` variant:
+    /// answering `ACCEPTED` here would stop `retry_loop` dead on a receipt this node
+    /// never recorded, so §0's holder count would silently miss it and a duress freeze
+    /// could fail to engage.
+    #[test]
+    fn an_in_flight_receipt_is_answered_identically_under_both_pins() {
+        const RETRIES: usize = 3;
+
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let (normal, duress) = pin_pair(
+            &fx,
+            fx.spend_request(&spend, EXPIRY, "window-a"),
+            "window-a",
+        );
+
+        let (normal_record, normal_arm) = in_flight_receipt_record(&fx, &normal, RETRIES);
+        let (duress_record, duress_arm) = in_flight_receipt_record(&fx, &duress, RETRIES);
+
+        // The pair really was a pair — the same positive control the sequential cases
+        // use, and for the same reason: without it two identical-pin runs would compare
+        // equal and assert nothing whatever.
+        assert_eq!(
+            normal_arm, 0,
+            "the normal-pin run recorded a duress arm intent, so this is not a pin pair"
+        );
+        assert_eq!(
+            duress_arm, 1,
+            "the duress-pin run recorded no duress arm intent, so comparing the two runs \
+             asserts nothing about SILENCE"
+        );
+
+        // The pass is worth comparing: every in-window receipt must have been told to
+        // RETRY (never `ACCEPTED`, which would end the retry loop on a receipt this node
+        // had not recorded), and the settled receipt must have been accepted — otherwise
+        // both runs agree only because nothing was ever delivered.
+        for record in [&normal_record, &duress_record] {
+            assert_eq!(
+                record.in_window_replies,
+                vec![
+                    ChannelReply::RateLimited {
+                        retry_after_secs: 1
+                    };
+                    RETRIES
+                ],
+                "a receipt landing in the out-of-lock PIN window must be answered \
+                 RATE_LIMITED with the fixed 1s every other site sends"
+            );
+            assert_eq!(record.in_window_retries, RETRIES);
+            assert_eq!(
+                record.in_window_derivations, 0,
+                "an in-flight memo is answered BEFORE the global KDF slot is reserved"
+            );
+            assert_eq!(
+                record.settled_reply,
+                ChannelReply::Accepted,
+                "once the handler has ruled, the same receipt must be counted"
+            );
+            assert_eq!(
+                record.settled_derivations, 1,
+                "the settled receipt carries a conflicting signature, so it resolves the \
+                 body's own carrier — which is what makes the in-window zero meaningful"
+            );
+            // The sender's ONE per-nonce derivation must survive the whole retry
+            // sequence: an in-flight receipt routed through `claim_carrier_derivation`
+            // would have burned it and `Skip`ped every later honest receipt forever.
+            assert!(
+                record
+                    .in_window_store
+                    .0
+                    .iter()
+                    .any(|row| row.contains("outcome=InFlight")),
+                "the parked handler must have left an in-flight claim to answer against: {:?}",
+                record.in_window_store
+            );
+            assert!(
+                record
+                    .settled_store
+                    .0
+                    .iter()
+                    .any(|row| row.contains("outcome=Derived resolved_senders=[1]")),
+                "the settled receipt must be the one that spends sender 1's derivation: {:?}",
+                record.settled_store
+            );
+        }
+
+        assert_eq!(
+            normal_record, duress_record,
+            "a peer receipt injected during the out-of-lock PIN window must be answered \
+             identically under both pins — same replies, same retry count, same induced \
+             memory-hard work, same store, same /sign acknowledgement"
+        );
+    }
+
+    /// A passive receipt-side clock read must not manufacture the ABSENT generation
+    /// case. The nonce log intentionally does not ratchet on a request rejected during a
+    /// transient forward wall-clock excursion; if lookup nevertheless pruned the active
+    /// claim, it would answer this receipt ACCEPTED and the owner could reinstall the
+    /// memo and sign after the clock corrected. The sender would never retry its lost
+    /// holder claim, reopening the silent failed-arm defect.
+    #[test]
+    fn a_forward_receipt_clock_cannot_make_an_in_flight_claim_vacant_before_rollback() {
+        const SENDER: u16 = 1;
+
+        let fx = Fixture::new(3, 5);
+        let (node, _calls) = counted_duress_node(&fx);
+        let node = Arc::new(node);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        node.pin_window_a_midpoint(Arc::clone(&barrier));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "forward-receipt-clock");
+
+        // A differently-signed copy spends the sender's derivation claim once the owner
+        // settles, making the no-claim assertion during WINDOW A non-vacuous.
+        let mut relayed = request.clone();
+        fx.coord_resign(&mut relayed, 0xD1);
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(relayed));
+        let envelope = fx
+            .channel_state(SENDER)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+
+        let worker_node = Arc::clone(&node);
+        let worker_request = request.clone();
+        let worker = std::thread::spawn(move || {
+            crate::handle_sign_after_lock(&worker_node, &worker_request, stepping_clock([NOW, NOW]))
+                .expect("decodable request")
+        });
+
+        // The owner is parked after consuming freshness and publishing InFlight.
+        barrier.wait();
+        let channel = node.channel.as_ref().expect("channel");
+        assert_eq!(channel.intent_counts(), (0, 1));
+
+        // This node's wall clock jumps just past expiry for both processing and memo
+        // lookup. The relayed handler is rejected and therefore does NOT advance the
+        // nonce high-water; lookup must preserve the still-owned claim and ask for a
+        // retry instead of reporting false success.
+        let jumped =
+            crate::handle_channel_body_with_clocks(&node, &body, NOW, || EXPIRY, || EXPIRY);
+        assert_eq!(
+            jumped,
+            ChannelReply::RateLimited {
+                retry_after_secs: 1
+            }
+        );
+        assert!(
+            shape_rows(channel, "memo ")
+                .iter()
+                .any(|row| row.contains("outcome=InFlight")),
+            "the transient receipt clock must not destructively prune the owner"
+        );
+
+        // The clock corrects before the owner resumes. It may still sign, which is why
+        // the first receipt had to remain retriable rather than receive ACCEPTED.
+        barrier.wait();
+        assert!(matches!(
+            worker.join().expect("parked owner"),
+            SignResponse::Accepted(_)
+        ));
+        let retry_envelope = fx
+            .channel_state(SENDER)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+            .expect("fresh retry envelope");
+        let retry_body = serde_json::to_vec(&retry_envelope).expect("retry json");
+        assert_eq!(
+            crate::handle_channel_body_with_clocks(&node, &retry_body, NOW, || NOW, || NOW),
+            ChannelReply::Accepted,
+            "the sender's retry must be counted after the owner installs Derived"
+        );
+        assert!(
+            shape_rows(channel, "memo ")
+                .iter()
+                .any(|row| row.contains("outcome=Derived resolved_senders=[1]")),
+            "the forward read must not burn sender 1's eventual derivation claim"
+        );
+    }
+
+    /// The SECOND eviction site. `prune_intents`' unruled-owner exception covers the
+    /// lookup path; `confirm_carrier` evicts on its own bare `intent.expiry <= now`. That
+    /// clock has been through `NonceLog::effective_now`, which is only a rollback LOWER
+    /// bound, so a FORWARD excursion still passes through untouched. Refusing is correct
+    /// and must not change —
+    /// an expired carrier may never collect a holder — but DESTROYING a still-ruling
+    /// owner's intent on a transient forward step is the silent failed arm. It is worst
+    /// exactly where it is most reachable: the wrong-pin/lockout exit stages the carrier
+    /// and drops `sign_state`, so an intent sits `ready_to_propagate` (hence looked up as
+    /// `Exact`, not `AwaitingPropagation`) with its guard still live across the whole
+    /// backoff — and that is the fail-closed intent a locked-out node needs in order to
+    /// arm on confirmation at all.
+    #[test]
+    fn a_forward_receipt_clock_refuses_a_ruling_owners_intent_without_destroying_it() {
+        const SENDER: u16 = 1;
+        const CARRIER: &str = "carrier-still-ruling";
+
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: EPS,
+            combine_slack_secs: SLACK,
+        };
+        let generation = MemoGeneration {
+            signature_tag: [0x33; 32],
+            expiry: EXPIRY,
+        };
+
+        // An owner inside its COMMIT HOLD that has staged but not yet exited.
+        channel.record_arm_intent(true, CARRIER, "ruling-nonce", generation, NOW, NOW, timing);
+        channel.mark_carrier_propagated(CARRIER);
+        assert_eq!(channel.intent_counts(), (1, 1));
+
+        // A receipt whose clock has transiently stepped past the expiry. The nonce log's
+        // high-water never advanced, so this reading is not authoritative.
+        assert!(
+            !node.confirm_carrier(SENDER, CARRIER, EXPIRY).armed,
+            "an expired carrier must never collect a holder, ruling owner or not"
+        );
+        assert_eq!(
+            channel.intent_counts(),
+            (1, 1),
+            "the refusal must NOT destroy a still-ruling owner's intent: after the clock \
+             corrects the owner signs, and every later receipt would find Vacant, be \
+             answered ACCEPTED, and stop retrying — the node never reaches t"
+        );
+
+        // Once the owner has ruled, the ordinary eviction must still fire — otherwise
+        // this exception would leak an intent per expired carrier forever.
+        channel.end_carrier_ruling(CARRIER);
+        assert!(!node.confirm_carrier(SENDER, CARRIER, EXPIRY).armed);
+        assert_eq!(
+            channel.intent_counts(),
+            (0, 0),
+            "with no owner ruling, the expiry eviction is unchanged"
+        );
+    }
+
+    /// The negative control for the case above: the compared record must be ABLE to come
+    /// out different, or its `assert_eq!` is decoration. A run whose handler is NOT
+    /// parked in WINDOW A — the receipt arrives after the node has already ruled —
+    /// answers the very first receipt `ACCEPTED` instead of `RATE_LIMITED`.
+    #[test]
+    fn the_in_flight_receipt_record_can_tell_the_two_timings_apart() {
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "window-a-control");
+        let (parked, _) = in_flight_receipt_record(&fx, &request, 1);
+
+        // The same node and the same receipt, with no WINDOW A rendezvous installed.
+        let (node, _calls) = counted_duress_node(&fx);
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let mut relayed = request.clone();
+        fx.coord_resign(&mut relayed, 0xC7);
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(relayed));
+        let envelope = fx
+            .channel_state(1)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        let unparked_reply = crate::handle_channel_body(&node, &body, NOW);
+
+        assert_eq!(
+            parked.in_window_replies,
+            vec![ChannelReply::RateLimited {
+                retry_after_secs: 1
+            }],
+        );
+        assert_eq!(
+            unparked_reply,
+            ChannelReply::Accepted,
+            "a receipt that arrives after the handler ruled is counted immediately"
+        );
+        assert_ne!(
+            parked.in_window_replies[0], unparked_reply,
+            "the in-window reply must be distinguishable from the settled one, or comparing \
+             it across pins detects nothing"
+        );
+    }
+
+    /// THE RULING WINDOW AND ITS TWO ENDS. Between the COMMIT HOLD's memo upgrade and
+    /// `stage_spend_carrier` the carrier exists but is not confirmable, so a receipt must
+    /// RETRY — answering `ACCEPTED` there would stop `retry_loop` on a holder
+    /// confirmation this node never recorded. That window has to close when the HANDLER
+    /// closes it, in EITHER direction:
+    ///
+    ///  - it stages, and the carrier becomes confirmable AT ONCE, without a spurious
+    ///    retry for the sliver between staging and handler exit; or
+    ///  - it RULES AND REFUSES WITHOUT STAGING, which every federation-uniform policy
+    ///    refusal below the arm hook does deliberately — this node decided not to be a
+    ///    holder. `ready_to_propagate` then stays false until the intent's own expiry, so
+    ///    reading that bit alone as "still deciding" would answer a peer `RATE_LIMITED`
+    ///    once a second until `commitment_expiry` (up to `max_commitment_age_secs`)
+    ///    against an answer that will never change — self-inflicted denial of the
+    ///    `/channel` capacity honest partials and receipts need.
+    #[test]
+    fn the_awaiting_propagation_window_ends_with_its_handler_not_with_its_intent() {
+        const SENDER: u16 = 1;
+
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: EPS,
+            combine_slack_secs: SLACK,
+        };
+        let generation = MemoGeneration {
+            signature_tag: [0x51; 32],
+            expiry: EXPIRY,
+        };
+        let tag = generation.signature_tag;
+        let lookup = |nonce: &str| channel.carrier_memo_lookup(nonce, tag, SENDER, NOW);
+
+        // WINDOW A: claimed, no carrier yet.
+        channel.claim_nonce_in_flight("staged", generation, NOW);
+        assert!(matches!(lookup("staged"), CarrierMemoLookup::InFlight));
+
+        // COMMIT HOLD: the carrier exists, the handler still owns the ruling, nothing is
+        // staged. This is the state the receipt must be told to retry against.
+        assert_eq!(
+            channel.record_arm_intent(
+                true,
+                "carrier-staged",
+                "staged",
+                generation,
+                NOW,
+                NOW,
+                timing
+            ),
+            MemoUpgrade::Upgraded
+        );
+        assert!(matches!(
+            lookup("staged"),
+            CarrierMemoLookup::AwaitingPropagation
+        ));
+
+        // The handler stages: confirmable immediately, still inside its own ruling.
+        channel.mark_carrier_propagated("carrier-staged");
+        assert!(
+            matches!(lookup("staged"), CarrierMemoLookup::Exact(carrier) if carrier == "carrier-staged"),
+            "a staged carrier must be confirmable before its handler has finished returning"
+        );
+
+        // The other end: a second request whose handler rules WITHOUT staging.
+        let refused = MemoGeneration {
+            signature_tag: [0x52; 32],
+            expiry: EXPIRY,
+        };
+        channel.claim_nonce_in_flight("refused", refused, NOW);
+        channel.record_arm_intent(
+            true,
+            "carrier-refused",
+            "refused",
+            refused,
+            NOW,
+            NOW,
+            timing,
+        );
+        assert!(matches!(
+            channel.carrier_memo_lookup("refused", refused.signature_tag, SENDER, NOW),
+            CarrierMemoLookup::AwaitingPropagation
+        ));
+        channel.end_carrier_ruling("carrier-refused");
+        assert!(
+            matches!(
+                channel.carrier_memo_lookup("refused", refused.signature_tag, SENDER, NOW),
+                CarrierMemoLookup::Exact(carrier) if carrier == "carrier-refused"
+            ),
+            "once the handler has ruled, an unstaged intent must stop asking for retries: \
+             the node HAS answered, and `confirm_carrier` refuses it as the non-holder it is"
+        );
+        assert!(
+            !channel
+                .confirm_carrier(SENDER, "carrier-refused", 2, NOW, timing)
+                .committed,
+            "an unstaged carrier must still never be counted toward t"
+        );
+    }
+
+    /// A HANDLER THAT REFUSED WITHOUT STAGING, END TO END. A self-spend submitted as a
+    /// pinned `SpendRequest` classifies as a refresh and is refused
+    /// `transaction_class` — a federation-uniform refusal, so it deliberately never
+    /// stages the carrier and this node never becomes a holder for it.
+    ///
+    /// Before the ruling bit existed, the intent that refusal leaves behind
+    /// (`ready_to_propagate == false` until its own expiry) was indistinguishable from a
+    /// handler still working, so a peer relaying the same request was answered
+    /// `RATE_LIMITED{1}` and `retry_loop` re-sent it once a second until
+    /// `commitment_expiry`. Each of those retries costs the receiver a `sign_state`
+    /// acquisition and a coordinator-signature verify, and they compete for the same
+    /// per-peer `/channel` quota as that sender's honest partials and receipts.
+    #[test]
+    fn a_receipt_after_a_non_staging_refusal_is_answered_once_not_retried_to_expiry() {
+        const SENDER: u16 = 1;
+
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let self_spend = fx.spend_psbt(&fx.vault_spk, 7);
+        let request = fx.spend_request(&self_spend, EXPIRY, "ruled-not-staged");
+
+        match crate::handle_sign(&node, &request, NOW).expect("decodable") {
+            SignResponse::Refusal(r) => assert_eq!(
+                r.check, "transaction_class",
+                "this test needs the non-staging half of the refusal split"
+            ),
+            other => panic!("expected a class refusal, got {other:?}"),
+        }
+        assert_eq!(
+            shape_rows(channel, "intent "),
+            vec![format!(
+                "intent holders=[] ready_to_propagate=false owner_ruling=false first_seen={NOW} \
+                 spend_commitment_id= escape_commitment_id= expiry={EXPIRY} committed=false"
+            )],
+            "the arm hook recorded the intent, the refusal did not stage it, and the handler \
+             ended its ruling on the way out"
+        );
+        // Without this the test could pass vacuously: a VACANT memo also answers
+        // ACCEPTED, and it is `Derived` + unstaged that used to answer RATE_LIMITED.
+        assert_eq!(
+            shape_rows(channel, "memo "),
+            vec![format!(
+                "memo nonce=ruled-not-staged outcome=Derived resolved_senders=[] expiry={EXPIRY}"
+            )]
+        );
+
+        // The peer's relay of the very same request: its own ingress refuses as a nonce
+        // replay, and then the memo lookup decides what the sender is told.
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request));
+        let envelope = fx
+            .channel_state(SENDER)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        assert_eq!(
+            crate::handle_channel_body(&node, &body, NOW),
+            ChannelReply::Accepted,
+            "a node that has RULED must answer once; RATE_LIMITED here is a retry against a \
+             decision that cannot change, repeated until the commitment expires"
+        );
+    }
+
+    /// The unruled exception covers BOTH halves of a request, not just the `InFlight`
+    /// claim: a passive clock read that runs past a live carrier's expiry must not delete
+    /// the owner's intent or the `Derived` memo naming it. Deleting them would answer the
+    /// receipt that triggered the prune `ACCEPTED` against a vacant memo — the silent
+    /// false positive — and leave the owner's own registration with no intent to stage
+    /// into, so its candidate's holder gate could never open.
+    ///
+    /// The bound is the other half of the same rule: the exception is passive-only. Once
+    /// a later nonce is ACCEPTED — which advances the log's rollback high-water past the
+    /// expiries it forgets — the eviction is unconditional again.
+    #[test]
+    fn a_forward_clock_prune_cannot_delete_an_unruled_intent_or_its_memo() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: EPS,
+            combine_slack_secs: SLACK,
+        };
+        let generation = MemoGeneration {
+            signature_tag: [0x61; 32],
+            expiry: EXPIRY,
+        };
+
+        channel.claim_nonce_in_flight("unruled", generation, NOW);
+        channel.record_arm_intent(
+            true,
+            "carrier-unruled",
+            "unruled",
+            generation,
+            NOW,
+            NOW,
+            timing,
+        );
+
+        // A passive receipt-side read past the carrier's expiry. Both halves survive and
+        // the receipt is told to retry.
+        assert!(matches!(
+            channel.carrier_memo_lookup("unruled", generation.signature_tag, 1, EXPIRY + 1),
+            CarrierMemoLookup::AwaitingPropagation
+        ));
+        assert_eq!(
+            channel.intent_counts(),
+            (1, 1),
+            "a passive forward clock read must not evict state whose owner is still ruling"
+        );
+
+        // The handler rules. The same passive read now collects both halves normally.
+        channel.end_carrier_ruling("carrier-unruled");
+        assert!(matches!(
+            channel.carrier_memo_lookup("unruled", generation.signature_tag, 1, EXPIRY + 1),
+            CarrierMemoLookup::Vacant
+        ));
+        assert_eq!(channel.intent_counts(), (0, 0));
+
+        // THE BOUND: an ACCEPTED nonce evicts expired state even while its owner rules,
+        // so unruled entries cannot accumulate past the nonce log's own horizon.
+        let second = MemoGeneration {
+            signature_tag: [0x62; 32],
+            expiry: EXPIRY,
+        };
+        channel.claim_nonce_in_flight("still-unruled", second, NOW);
+        channel.record_arm_intent(
+            true,
+            "carrier-still-unruled",
+            "still-unruled",
+            second,
+            NOW,
+            NOW,
+            timing,
+        );
+        assert_eq!(channel.intent_counts(), (1, 1));
+        channel.claim_nonce_in_flight(
+            "fresher",
+            MemoGeneration {
+                signature_tag: [0x63; 32],
+                expiry: EXPIRY + 100,
+            },
+            EXPIRY + 1,
+        );
+        assert_eq!(
+            channel.intent_counts(),
+            (0, 1),
+            "the nonce-accepting prune is unconditional: only the fresh claim remains"
+        );
+    }
+
+    /// THE GENERATION GATE, all three cases. Two handler generations can share one
+    /// nonce key — `check_and_record` tests EXPIRY BEFORE REPLAY, so past expiry a
+    /// differently-signed body with a fresh expiry is accepted onto the same key while
+    /// the first handler is still in its out-of-lock window. A later accepted ingress
+    /// also prunes expired claims after advancing the nonce log's rollback high-water,
+    /// so a claim can be absent when its owner reaches the COMMIT HOLD.
+    ///
+    /// The three cases are NOT the same, which is why they are asserted separately.
+    /// What they share is that the ARM INTENT is recorded in every one: it is keyed by
+    /// carrier, a digest of the exact body, so a stale generation's intent is separately
+    /// keyed and harmless — while a staged carrier without an intent is the hollow
+    /// configuration `confirm_carrier` can never resolve.
+    #[test]
+    fn the_generation_gate_governs_the_memo_and_never_the_intent() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: EPS,
+            combine_slack_secs: SLACK,
+        };
+        let mine = MemoGeneration {
+            signature_tag: [0x11; 32],
+            expiry: EXPIRY,
+        };
+        let newer = MemoGeneration {
+            signature_tag: [0x22; 32],
+            expiry: EXPIRY + 1,
+        };
+        let memo_rows = |channel: &ChannelState| -> Vec<String> {
+            store_shape(channel)
+                .0
+                .into_iter()
+                .filter(|row| row.starts_with("memo "))
+                .collect()
+        };
+
+        // MATCHED — the ordinary path.
+        channel.claim_nonce_in_flight("shared", mine, NOW);
+        assert_eq!(
+            memo_rows(channel),
+            vec![format!(
+                "memo nonce=shared outcome=InFlight expiry={EXPIRY}"
+            )]
+        );
+        assert_eq!(
+            channel.record_arm_intent(true, "carrier-mine", "shared", mine, NOW, NOW, timing),
+            MemoUpgrade::Upgraded
+        );
+        assert_eq!(
+            memo_rows(channel),
+            vec![format!(
+                "memo nonce=shared outcome=Derived resolved_senders=[] expiry={EXPIRY}"
+            )]
+        );
+        assert_eq!(channel.intent_counts(), (1, 1));
+
+        // MISMATCHED — a NEWER generation has claimed the key while the stale handler
+        // was still running. It must neither reinsert nor delete, so the newer claim
+        // survives untouched; its own intent is recorded regardless.
+        channel.claim_nonce_in_flight("shared", newer, NOW);
+        assert_eq!(
+            channel.record_arm_intent(true, "carrier-stale", "shared", mine, NOW, NOW, timing),
+            MemoUpgrade::Superseded
+        );
+        assert_eq!(
+            memo_rows(channel),
+            vec![format!(
+                "memo nonce=shared outcome=InFlight expiry={}",
+                EXPIRY + 1
+            )],
+            "the stale handler must leave the newer generation's claim exactly as it found it"
+        );
+        assert_eq!(
+            channel.intent_counts(),
+            (2, 1),
+            "the stale handler still records its own separately-keyed intent"
+        );
+
+        // ABSENT — the claim was pruned mid-window. RECORD THE INTENT ANYWAY and
+        // re-install the memo directly as Derived. The alternative — reading absence as
+        // staleness and refusing — silently swallows a duress signal, which is the
+        // failure class the whole reorder exists to close.
+        assert_eq!(
+            channel.record_arm_intent(true, "carrier-pruned", "unclaimed", mine, NOW, NOW, timing),
+            MemoUpgrade::Reinstalled
+        );
+        assert!(
+            memo_rows(channel).contains(&format!(
+                "memo nonce=unclaimed outcome=Derived resolved_senders=[] expiry={EXPIRY}"
+            )),
+            "an absent claim must be re-installed as Derived, not refused: {:?}",
+            memo_rows(channel)
+        );
+        assert_eq!(channel.intent_counts(), (3, 2));
+    }
+
+    /// THE CLEANUP PREDICATE: a dropped claim removes ONLY a generation-matched
+    /// `InFlight` memo, NEVER a `Derived` one and never another generation's claim.
+    ///
+    /// Deleting a `Derived` memo on exit would recreate exactly the
+    /// silent-false-positive / failed-arm defect the `InFlight` variant exists to close:
+    /// a later receipt would find the nonce Vacant, be answered ACCEPTED against a
+    /// carrier this node does hold, and never be counted toward `t`.
+    #[test]
+    fn a_dropped_claim_removes_only_its_own_in_flight_memo() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: EPS,
+            combine_slack_secs: SLACK,
+        };
+        let mine = MemoGeneration {
+            signature_tag: [0x11; 32],
+            expiry: EXPIRY,
+        };
+        let newer = MemoGeneration {
+            signature_tag: [0x22; 32],
+            expiry: EXPIRY + 1,
+        };
+
+        // Its own live claim: removed.
+        channel.claim_nonce_in_flight("own", mine, NOW);
+        channel.release_nonce_claim("own", mine);
+        assert_eq!(channel.intent_counts().1, 0);
+
+        // A DERIVED memo under the very same generation: retained.
+        channel.claim_nonce_in_flight("derived", mine, NOW);
+        channel.record_arm_intent(false, "carrier-d", "derived", mine, NOW, NOW, timing);
+        channel.release_nonce_claim("derived", mine);
+        assert_eq!(
+            channel.intent_counts().1,
+            1,
+            "a Derived memo must survive a stale guard's Drop — removing it is the \
+             silent-false-positive defect the claim exists to prevent"
+        );
+
+        // A NEWER generation's claim on the same key: retained.
+        channel.claim_nonce_in_flight("taken", newer, NOW);
+        channel.release_nonce_claim("taken", mine);
+        assert_eq!(channel.intent_counts().1, 2);
+
+        // An unknown key: a no-op, not a panic.
+        channel.release_nonce_claim("never-seen", mine);
+        assert_eq!(channel.intent_counts().1, 2);
+    }
+
+    /// `InFlightMemoGuard` can run while another panic is already unwinding. A poisoned
+    /// store must therefore be recovered, not `expect`ed: a second panic in this Drop
+    /// would abort the process before the panic net can latch terminal Lockdown.
+    ///
+    /// BOTH halves of the guard take that lock — the memo claim and the carrier ruling —
+    /// so both are exercised here. A panicking handler that left `owner_ruling` set would
+    /// leave every peer receipt for that carrier answered RATE_LIMITED until the request
+    /// expired, which is the failure the ruling bit is a GUARD rather than a per-branch
+    /// action to prevent.
+    #[test]
+    fn an_in_flight_guard_cleans_a_poisoned_store_while_unwinding() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: EPS,
+            combine_slack_secs: SLACK,
+        };
+        let generation = MemoGeneration {
+            signature_tag: [0x31; 32],
+            expiry: EXPIRY,
+        };
+        channel.claim_nonce_in_flight("poisoned-drop", generation, NOW);
+        // A second, separately-keyed request whose intent this same handler is ruling on.
+        channel.record_arm_intent(
+            true,
+            "carrier-poisoned",
+            "ruled-nonce",
+            generation,
+            NOW,
+            NOW,
+            timing,
+        );
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _store = channel.store.lock().expect("acquire store to poison it");
+            panic!("intentionally poison store before guard unwind");
+        }));
+        assert!(poisoned.is_err());
+        assert!(channel.store.is_poisoned());
+
+        let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = crate::InFlightMemoGuard {
+                channel,
+                nonce: "poisoned-drop".to_string(),
+                generation,
+                owns_memo: true,
+                ruling_carrier: Some("carrier-poisoned".to_string()),
+            };
+            panic!("primary handler panic");
+        }));
+        assert!(
+            primary.is_err(),
+            "the primary panic must still unwind normally"
+        );
+
+        let store = channel.store.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !store.carriers_by_nonce.contains_key("poisoned-drop"),
+            "the poison-tolerant Drop must still remove its matched InFlight claim"
+        );
+        assert!(
+            !store
+                .intents
+                .get("carrier-poisoned")
+                .expect("the ruled intent survives the panic")
+                .owner_ruling,
+            "a panicking handler must still end its ruling, or peer receipts for that \
+             carrier retry until the request expires"
+        );
+    }
+
+    /// The COMMIT HOLD's Lockdown exit is the one refusal that deliberately does not
+    /// stage — and it must not strand its nonce claim either. A claim left behind would
+    /// answer every peer receipt for that nonce RATE_LIMITED throughout the sender's
+    /// retry horizon (then remain until a later accepted ingress pruned it), turning a
+    /// terminal transition into federation-wide censorship of one carrier.
+    #[test]
+    fn a_lockdown_during_the_pin_window_strands_no_claim() {
+        let fx = Fixture::new(3, 5);
+        let (node, _calls) = counted_duress_node(&fx);
+        let node = Arc::new(node);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        node.pin_window_a_midpoint(Arc::clone(&barrier));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "lockdown-mid-window");
+
+        let worker_node = Arc::clone(&node);
+        let worker_request = request.clone();
+        let worker = std::thread::spawn(move || {
+            crate::handle_sign(&worker_node, &worker_request, NOW).expect("decodable")
+        });
+
+        // Parked inside WINDOW A: the nonce is consumed and the claim is installed.
+        barrier.wait();
+        let channel = node.channel.as_ref().expect("channel");
+        assert_eq!(
+            channel.intent_counts(),
+            (0, 1),
+            "the parked handler must hold a claim and no intent yet"
+        );
+        // Terminal Lockdown wins the free `sign_state` while the handler is out of it.
+        node.enter_lockdown();
+        barrier.wait();
+
+        assert!(
+            matches!(
+                worker.join().expect("the parked /sign worker"),
+                SignResponse::Refusal(r) if r.code == vault_proto::RefusalCode::FraudSuspected
+            ),
+            "a Lockdown that lands during the PIN window refuses the request"
+        );
+        assert_eq!(
+            channel.intent_counts(),
+            (0, 0),
+            "the Lockdown exit records no intent and leaves no stranded claim"
+        );
+    }
+
+    /// A clock that returns `reads[i]` on its i-th call and `reads[1]` from then on.
+    ///
+    /// `handle_sign_after_lock` samples exactly three times — INGRESS HOLD, COMMIT HOLD,
+    /// post-preflight — so a two-element sequence steps the clock across WINDOW A and
+    /// nothing else. That is the only DETERMINISTIC seam onto the COMMIT HOLD's clock
+    /// predicates: `handle_sign` passes a FIXED clock, so `commit_raw_now == raw_now`
+    /// and every one of the three re-decides the comparison coordinator auth already
+    /// passed — none can ever fire under it. Only `handle_sign_now` reads a moving
+    /// clock, and waiting out a real expiry is not a test (codex round-2 P1).
+    fn stepping_clock(reads: [u64; 2]) -> impl Fn() -> u64 {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        move || {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            reads[call.min(1)]
+        }
+    }
+
+    /// Rows of `store_shape` with a given prefix — the projection the assertions below
+    /// read intents and nonce memos out of.
+    fn shape_rows(channel: &ChannelState, prefix: &str) -> Vec<String> {
+        store_shape(channel)
+            .0
+            .into_iter()
+            .filter(|row| row.starts_with(prefix))
+            .collect()
+    }
+
+    /// THE COMMIT HOLD'S THREE CLOCK PREDICATES, each one fired. They are what stops a
+    /// request whose out-of-lock PIN window outlived its own commitment from being
+    /// registered against a stale window, and every one of them must STAGE on the way
+    /// out: the arm intent is already recorded by then, so refusing without staging
+    /// leaves it hollow — `confirm_carrier` can never resolve it — and drops a duress
+    /// signal the coordinator already authenticated.
+    ///
+    /// The budget assertion pins the ordering the section table requires: the predicates
+    /// run BEFORE `pin_budget.charge`, which is what lets the superseded-generation case
+    /// below refuse without charging a second time.
+    #[test]
+    fn each_commit_hold_clock_predicate_refuses_and_stages_after_a_slow_pin_window() {
+        // (what happened during WINDOW A, the COMMIT-HOLD clock reading, expected code)
+        let cases = [
+            (
+                "the commitment expired",
+                EXPIRY,
+                vault_proto::RefusalCode::CommitmentExpired,
+            ),
+            (
+                "system time stepped BACKWARD past the future-expiry cap",
+                NOW - 1,
+                vault_proto::RefusalCode::CommitmentExpired,
+            ),
+            (
+                "the delivery horizon closed",
+                EXPIRY - 30,
+                vault_proto::RefusalCode::ExpiryTooShort,
+            ),
+        ];
+        for (case, commit_read, code) in cases {
+            let fx = Fixture::new(3, 5);
+            let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+            let channel = node.channel.as_ref().expect("channel");
+            let spend = fx.spend_psbt(&fx.hot_spk, 7);
+            let request = duress_request(&fx, &spend, &default_escape(&fx), "slow-pin-window");
+
+            let response =
+                crate::handle_sign_after_lock(&node, &request, stepping_clock([NOW, commit_read]))
+                    .expect("decodable");
+
+            match response {
+                SignResponse::Refusal(r) => assert_eq!(r.code, code, "{case}: refusal code"),
+                other => panic!("{case}: expected a refusal, got {other:?}"),
+            }
+            assert_eq!(
+                node.duress_arm_count(),
+                1,
+                "{case}: the arm hook must still have run — a case that refused BEFORE the \
+                 duress verdict would assert nothing about staging a duress signal"
+            );
+            assert_eq!(
+                channel.intent_counts(),
+                (1, 1),
+                "{case}: the intent is recorded and the nonce claim was upgraded, not stranded"
+            );
+            let memos = shape_rows(channel, "memo ");
+            assert_eq!(
+                memos,
+                vec![format!(
+                    "memo nonce=slow-pin-window outcome=Derived resolved_senders=[] \
+                     expiry={EXPIRY}"
+                )],
+                "{case}: the guard must have relinquished the memo it upgraded"
+            );
+            let intents = shape_rows(channel, "intent ");
+            assert_eq!(intents.len(), 1, "{case}: exactly one intent");
+            assert!(
+                intents[0].contains("holders=[0] ready_to_propagate=true"),
+                "{case}: the refusal must STAGE — a recorded intent without this node's own \
+                 holder claim is hollow and can never confirm: {intents:?}"
+            );
+            // Deliverable 6's two-clock mapping, pinned. Without this, substituting the
+            // COMMIT-HOLD reading for the INGRESS one at the `fire_arm_hook` call site
+            // passes the entire suite — every other test drives both clocks with the same
+            // value, so nothing distinguishes them.
+            assert!(
+                intents[0].contains(&format!("first_seen={NOW}")),
+                "{case}: `first_seen` must be the INGRESS-HOLD clock ({NOW}), never the \
+                 COMMIT-HOLD reading ({commit_read}). `T` is anchored to it \
+                 (`t = first_seen + duress_delay_secs`), so taking the later value would let \
+                 a WINDOW A stretched by `work_lock` contention push Lockdown at T further \
+                 out than the user was promised — an attacker-influenced delay, since R11 \
+                 leaves concurrent handler count unbounded: {intents:?}"
+            );
+            assert_eq!(
+                node.outbox.lock().expect("outbox").len(),
+                1,
+                "{case}: the authenticated carrier is forwarded even though it is not signed"
+            );
+            let state = node.sign_state.lock().expect("sign_state");
+            assert_eq!(
+                (state.pin_budget.charges(), state.pin_budget.fails()),
+                (0, 0),
+                "{case}: the clock predicates return before the attempt budget is charged"
+            );
+        }
+    }
+
+    /// THE MISMATCHED-GENERATION CASE, end to end through the real handler rather than
+    /// through `record_arm_intent` directly.
+    ///
+    /// Two handler generations legitimately share one nonce key: `check_and_record`
+    /// tests EXPIRY BEFORE REPLAY, so once the first handler's expiry has passed, a
+    /// differently-signed body carrying a fresh expiry is accepted onto the same key
+    /// while the first is still inside its out-of-lock PIN window. What the stale
+    /// handler must then do is specified in four parts, and all four are asserted here:
+    /// it must NEITHER reinsert NOR delete the newer generation's memo, must record its
+    /// own separately-keyed intent anyway, must refuse at the COMMIT-HOLD expiry
+    /// predicate and STAGE like every other expiry exit, and must NOT charge the attempt
+    /// budget a second time.
+    #[test]
+    fn a_superseded_generation_refuses_at_the_commit_hold_and_leaves_the_newer_memo_alone() {
+        const NONCE: &str = "shared-nonce";
+        // The stale handler's own window; the newer one arrives after it lapses. Both
+        // expiries clear `hold_secs + combine_slack_secs`, which registration enforces.
+        const STALE_EXPIRY: u64 = NOW + 7_200;
+        const FRESH_NOW: u64 = STALE_EXPIRY + 1;
+        const FRESH_EXPIRY: u64 = FRESH_NOW + 7_200;
+
+        let fx = Fixture::new(3, 5);
+        let (node, _calls) = counted_duress_node(&fx);
+        let node = Arc::new(node);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        node.pin_window_a_midpoint(Arc::clone(&barrier));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+
+        // Same nonce, same PSBTs, different EXPIRY — so the two bodies have different
+        // canonical bytes, hence a different signature tag AND a different carrier.
+        let duress_at = |expiry: u64| {
+            let mut r = fx.spend_request(&spend, expiry, NONCE);
+            r.escape_psbt = default_escape(&fx).to_string();
+            r.pin = "9999".into();
+            fx.coord_sign(&mut r, NONCE);
+            r
+        };
+        let stale = duress_at(STALE_EXPIRY);
+        let mut fresh = fx.spend_request(&spend, FRESH_EXPIRY, NONCE);
+        fresh.escape_psbt = default_escape(&fx).to_string();
+        fx.coord_sign(&mut fresh, NONCE);
+
+        let worker_node = Arc::clone(&node);
+        let worker_request = stale.clone();
+        let worker = std::thread::spawn(move || {
+            crate::handle_sign_after_lock(
+                &worker_node,
+                &worker_request,
+                // Its INGRESS HOLD reads a live clock; its COMMIT HOLD wakes up after
+                // the newer generation has already taken the key.
+                stepping_clock([NOW, FRESH_NOW]),
+            )
+            .expect("decodable")
+        });
+
+        // Parked in WINDOW A: nonce consumed, claim installed, `sign_state` free.
+        barrier.wait();
+        let channel = node.channel.as_ref().expect("channel");
+        assert_eq!(
+            channel.intent_counts(),
+            (0, 1),
+            "the stale handler must hold a claim and no intent yet"
+        );
+
+        // The newer generation runs to completion on the free lock. It is the ONE
+        // rendezvous the barrier serves, so this second `/sign` does not park.
+        let fresh_response = crate::handle_sign(&node, &fresh, FRESH_NOW).expect("decodable");
+        assert!(
+            matches!(fresh_response, SignResponse::Accepted(_)),
+            "the newer generation must be admitted onto the pruned nonce, or this case \
+             never reaches the mismatch it exists to test: {fresh_response:?}"
+        );
+        let after_fresh = shape_rows(channel, "memo ");
+        assert_eq!(
+            after_fresh,
+            vec![format!(
+                "memo nonce={NONCE} outcome=Derived resolved_senders=[] expiry={FRESH_EXPIRY}"
+            )],
+            "the newer generation owns the key before the stale handler resumes"
+        );
+
+        barrier.wait();
+        let stale_response = worker.join().expect("the parked /sign worker");
+
+        match stale_response {
+            SignResponse::Refusal(r) => {
+                assert_eq!(r.code, vault_proto::RefusalCode::CommitmentExpired);
+                assert_eq!(r.check, "commitment_expiry");
+            }
+            other => panic!("a superseded handler must refuse at expiry, got {other:?}"),
+        }
+        assert_eq!(
+            shape_rows(channel, "memo "),
+            after_fresh,
+            "the stale handler must leave the newer generation's memo EXACTLY as it found \
+             it — neither reinserted under its own generation nor deleted on the way out"
+        );
+        let intents = shape_rows(channel, "intent ");
+        assert_eq!(
+            intents.len(),
+            2,
+            "the stale handler still records its own carrier-keyed intent: {intents:?}"
+        );
+        assert!(
+            intents
+                .iter()
+                .all(|row| row.contains("holders=[0] ready_to_propagate=true")),
+            "both carriers are staged — the superseded one refuses like any other expiry \
+             exit, and refusing without staging would drop an authenticated duress signal: \
+             {intents:?}"
+        );
+        assert_eq!(
+            node.duress_arm_count(),
+            1,
+            "exactly the stale handler took the duress verdict"
+        );
+        let state = node.sign_state.lock().expect("sign_state");
+        assert_eq!(
+            (state.pin_budget.charges(), state.pin_budget.fails()),
+            (1, 0),
+            "only the newer generation charged the budget; the superseded handler must \
+             not charge it again"
         );
     }
 
@@ -16278,11 +18005,19 @@ mod duress {
                 false,
                 &format!("carrier-{i}"),
                 &format!("nonce-{i}"),
-                [i as u8; 32],
-                NOW + 1,
+                MemoGeneration {
+                    signature_tag: [i as u8; 32],
+                    expiry: NOW + 1,
+                },
+                NOW,
                 NOW,
                 timing,
             );
+            // Every real handler ends its ruling on the way out, and only a RULED intent
+            // is collectable by the passive prune this test is about. See
+            // `a_forward_clock_prune_cannot_delete_an_unruled_intent_or_its_memo` for the
+            // complementary bound on the unruled ones.
+            channel.end_carrier_ruling(&format!("carrier-{i}"));
         }
         assert_eq!(
             channel.intent_counts(),
@@ -16293,8 +18028,11 @@ mod duress {
             false,
             "next-generation",
             "next-nonce",
-            [0xA5; 32],
-            NOW + 100,
+            MemoGeneration {
+                signature_tag: [0xA5; 32],
+                expiry: NOW + 100,
+            },
+            NOW + 2,
             NOW + 2,
             timing,
         );

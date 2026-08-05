@@ -42,7 +42,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -70,8 +70,10 @@ use crate::http::{self, Error};
 ///  - `ENVELOPE_TAG`, [`envelope_preimage`]'s field layout and the message tags have
 ///    no such local oracle — they are checked LIVE, by an honest node
 ///    accepting an envelope this module built. That check is only as good as the
-///    callers, so every caller of [`CompromisedNode::relay_request`] and
-///    [`CompromisedNode::relay_partial`] must inspect the returned status rather than
+///    callers, so every caller of [`CompromisedNode::relay_request`] — today all of them
+///    reach it through [`CompromisedNode::relay_request_awaiting_ruling`], which returns
+///    the final response — and of [`CompromisedNode::relay_partial`] must inspect the
+///    returned status rather than
 ///    discarding it: an envelope a node rejected proves the mirror drifted, and
 ///    silently dropping that turns an attack into a vacuous pass. A drifted inbound
 ///    message tag is filed under `undecoded`, which every absence-based assertion
@@ -385,6 +387,80 @@ impl CompromisedNode {
     ) -> Result<http::Response, Error> {
         let payload = serde_json::to_vec(request)?;
         self.send(secp, peer, MSG_TYPE_REQUEST, &payload, recipient)
+    }
+
+    /// [`Self::relay_request`], honouring the channel's own `RATE_LIMITED` contract.
+    ///
+    /// `RATE_LIMITED` means TRY AGAIN, not "rejected". The production sender loops on it
+    /// and returns only on `Accepted`/`Rejected` (`vault_node::channel`'s `retry_loop`),
+    /// so a harness that read the first `429` as a refusal would be asserting a contract
+    /// the protocol never made — and would fail intermittently, on load, for a reason
+    /// that has nothing to do with the safety property under test.
+    ///
+    /// It became reachable for a holder confirmation with bead btc-policy-9zs: a request
+    /// whose nonce is claimed by a `/sign` handler still inside its out-of-lock PIN
+    /// window is answered `RATE_LIMITED` deliberately, because the node has consumed the
+    /// nonce but not yet RULED on it. Answering `ACCEPTED` there is the silent false
+    /// positive that variant exists to close — the sender would believe a peer holds a
+    /// carrier it never recorded — so the retry is the correct client behaviour, not a
+    /// workaround. Each attempt builds a FRESH envelope (new nonce and timestamp), so a
+    /// retry is never a channel replay.
+    ///
+    /// BOUNDED ON ELAPSED WALL TIME, not on attempt count, so a node that never rules
+    /// still fails its caller rather than hanging the scenario. Elapsed rather than
+    /// summed-sleep because each attempt also spends up to `http::post_json`'s 5s connect
+    /// plus 10s read/write timeout: a peer that returns every 429 slowly would keep an
+    /// accumulated-sleep counter under the ceiling for over an hour. The ceiling gates
+    /// whether a further attempt STARTS, so the true worst case is `MAX_TOTAL_WAIT` plus
+    /// one in-flight attempt (~15s) — bounded, and not worth threading a per-request
+    /// deadline through `http::post_json` to shave. The node's legitimate
+    /// claimed-but-unruled span is not just the PIN window: it ends when the handler
+    /// does, so it also covers the out-of-lock chain preflight, whose two RPC batches are
+    /// each bounded by `vault_node::chain`'s 60s timeout. An attempt cap of 10 against
+    /// the fixed 1s the node sends bounded the wait at 9s — INSIDE that span, so a slow
+    /// backend or a loaded box failed the scenario for exactly the reason this helper
+    /// exists to eliminate. The attempt cap survives only as a guard against a
+    /// pathological zero-wait loop; the wait ceiling is what actually binds.
+    pub(crate) fn relay_request_awaiting_ruling(
+        &self,
+        secp: &Secp256k1<All>,
+        peer: SocketAddr,
+        recipient: u16,
+        request: &TaggedRequest,
+    ) -> Result<http::Response, Error> {
+        const MAX_ATTEMPTS: usize = 256;
+        const MAX_TOTAL_WAIT: Duration = Duration::from_secs(150);
+
+        // ELAPSED wall time, not accumulated sleep: every attempt also spends up to
+        // `http::post_json`'s 5s connect plus 10s read/write timeout, and a peer that
+        // returns each 429 slowly would otherwise blow the ceiling by two orders of
+        // magnitude while `waited` stayed under it. `Instant` advances across the
+        // requests as well as the sleeps, so the deadline binds what the doc claims.
+        let deadline = Instant::now() + MAX_TOTAL_WAIT;
+        let mut response = self.relay_request(secp, peer, recipient, request)?;
+        for _ in 1..MAX_ATTEMPTS {
+            if response.status != 429 {
+                break;
+            }
+            // Honour the server's own value rather than a guess; every in-flight site
+            // sends the fixed 1s, and the floor keeps a malformed body from spinning.
+            // The body is the node's, so it is parsed as untrusted: the deadline check
+            // below uses `checked_add`, or a value near `u64::MAX` would panic the
+            // harness in `Instant`'s `Add` instead of failing its caller.
+            let wait = serde_json::from_str::<Value>(&response.body)
+                .ok()
+                .and_then(|body| body.get("retry_after_secs").and_then(Value::as_u64))
+                .map_or(Duration::from_secs(1), |secs| {
+                    Duration::from_secs(secs.max(1))
+                });
+            match Instant::now().checked_add(wait) {
+                Some(resume) if resume <= deadline => {}
+                _ => break,
+            }
+            std::thread::sleep(wait);
+            response = self.relay_request(secp, peer, recipient, request)?;
+        }
+        Ok(response)
     }
 
     /// Push one partial payload as this compromised signer. The live harness uses

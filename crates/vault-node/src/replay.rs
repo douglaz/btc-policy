@@ -28,10 +28,13 @@ struct Entry {
 /// pending log, bundled under ONE lock (`Mutex<SignState>` in [`crate::Node`]).
 ///
 /// The old sequential serve loop gave `handle_sign` end-to-end atomicity for
-/// free. Under axum requests are concurrent, so one lock protects two phases:
-/// coordinator freshness is consumed atomically before the out-of-lock chain
-/// preflight, then every replay/pending check-and-update runs under one continuous
-/// phase-2 guard. An exact replay cannot enter the gap because its nonce is already
+/// free. Under axum requests are concurrent, so one lock protects the handler's
+/// three separate holds (bead btc-policy-9zs): coordinator freshness is consumed
+/// atomically in the INGRESS hold, before the out-of-lock PIN window; the COMMIT
+/// hold re-decides Lockdown and the clock predicates after it; then every
+/// replay/pending check-and-update runs under one continuous registration guard
+/// after the out-of-lock chain preflight (the "phase 2" the older comments name).
+/// An exact replay cannot enter either gap because its nonce is already
 /// consumed. Two SEPARATE state locks remain forbidden: replay and pending updates
 /// must move together.
 #[derive(Default)]

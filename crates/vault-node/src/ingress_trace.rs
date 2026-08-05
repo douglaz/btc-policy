@@ -153,25 +153,53 @@ use std::cell::RefCell;
 /// the signing markers preserve operation order at the granularity the handler calls.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum IngressOp {
-    /// The one `/sign` lock is taken. Recorded twice per accepted request: phase 1
-    /// (auth + pin + intent) and phase 2 (validate + register), around the
-    /// out-of-lock chain preflight.
+    /// The one `/sign` lock is taken. Recorded THREE times per accepted request (bead
+    /// btc-policy-9zs): the INGRESS HOLD (auth + freshness + the two claims), the COMMIT
+    /// HOLD (Lockdown re-check + intent + predicates + budget) and the REGISTRATION HOLD
+    /// (validate + register, which the older comments call phase 2) — around the
+    /// out-of-lock PIN window and the out-of-lock chain preflight.
     SignStateLock,
-    /// The `/sign` lock is released at one of the handler's two EXPLICIT `drop`s: the
-    /// wrong-pin/lockout backoff (so a flood never pins the lock while it sleeps) and
-    /// the hand-off to the out-of-lock chain preflight.
+    /// The `/sign` lock is released at one of the handler's EXPLICIT `drop`s: every
+    /// refusal return in the INGRESS HOLD, the hand-off to the out-of-lock PIN window,
+    /// the COMMIT HOLD's Lockdown exit, the wrong-pin/lockout backoff (so a flood never
+    /// pins the lock while it sleeps) and the hand-off to the chain preflight.
     ///
-    /// So the log is asymmetric about lock RELEASE, and deliberately: an early `return`
-    /// between the phase-1 acquisition and either site drops the guard implicitly and
-    /// records nothing, so acquisitions can outnumber releases. That is sound for the
+    /// So the log is asymmetric about lock RELEASE, and deliberately: a `return` between
+    /// an acquisition and one of those sites drops the guard implicitly and records
+    /// nothing, so acquisitions can outnumber releases. The COMMIT HOLD's three clock
+    /// refusals are the standing example — each stages its carrier and returns while the
+    /// guard is still live, deliberately, so the outbox write stays linearized against
+    /// the Lockdown re-check that opened the same hold. That is sound for the
     /// property under test — the two pins must produce the IDENTICAL sequence, and a
     /// pin that took a different early return already differs in the ops leading up to
     /// it. Do not read a missing `SignStateUnlock` as a leaked lock.
     SignStateUnlock,
-    /// One in-flight-spend slot is claimed for the preflight (refresh subordination).
+    /// One in-flight-spend slot is claimed for the out-of-lock windows (refresh
+    /// subordination).
     PreflightEnter,
+    /// The in-flight-spend slot is released. Recorded by `SpendPreflightGuard::drop`,
+    /// so this also covers early returns and unwinding rather than only named exits.
+    PreflightExit,
+    /// The wrong-PIN/lockout path has released both `sign_state` and the preflight slot
+    /// and is about to apply its backoff (which may be zero in deterministic tests).
+    /// Its order after [`Self::PreflightExit`] is what prevents the backoff ladder from
+    /// subordinating unrelated refreshes.
+    PinBackoffBoundary,
+    /// The consumed coordinator nonce is claimed for the out-of-lock PIN window: an
+    /// `InFlight` memo is installed under the channel store lock (channel mode only).
+    NonceClaim,
     /// The out-of-lock prevout fetch runs.
     ChainPreflight,
+    /// The PIN compare's two Argon2id evaluations are about to run. Recorded at the
+    /// `pin::verify_pin` CALL SITE, immediately before the call, with nothing touching
+    /// `sign_state` in between — so the lock state at this marker is the lock state
+    /// during the evaluations. That is what makes the placement of BOTH memory-hard
+    /// operations relative to `SignStateLock`/`SignStateUnlock` structurally checkable.
+    ///
+    /// PLACEMENT ONLY. An ordered log has no clock in it; it can show that the
+    /// evaluations happen while the lock is not held, and it can NEVER show that any
+    /// elapsed time shrank. Do not cite it for the latter.
+    PinEvaluate,
     /// The memory-hard arm-carrier identity is derived (channel mode only).
     CarrierDerive,
     /// The duress arm-hook runs. Unconditional and constant-time-selected: it is the
