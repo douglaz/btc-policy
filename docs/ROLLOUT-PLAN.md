@@ -103,10 +103,15 @@ valuable drill: "coins arrived at a vault that can no longer sign" is a real inc
 deposit, a counterparty paying a stale address), and Recovery is its only exit. Do not instead
 arrange a deliberately failed sweep — that tests the escape's failure path, not Recovery's.
 
-## The recovery timelock is configurable
+## The recovery timelock must become configurable
 
-The 180-day timelock is a **default, not an invariant**. It is chosen per vault at creation, with
-a warning when a low value is used. Without this, "test all paths on signet" would mean 180 days
+NOT YET TRUE — this section describes the target state, and `btc-policy-wdu` is the work. Today the
+timelock is FROZEN: `policy_core::RECOVERY_TIMELOCK_NSEQUENCE` is a constant and
+`parse_vault_template` rejects any descriptor carrying a different `older(...)`, so every vault is
+180 days. That is why step 6 below is blocked on `wdu` (see line ~201).
+
+The target: the 180-day timelock becomes a **default, not an invariant** — chosen per vault at
+creation, with a warning when a low value is used. Without this, "test all paths on signet" would mean 180 days
 of wall-clock per Recovery test, and Recovery — the last exit when everything else has failed —
 would only ever be exercised against a faked clock on regtest.
 
