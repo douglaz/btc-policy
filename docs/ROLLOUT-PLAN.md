@@ -28,7 +28,7 @@ with a funding policy, not as a monotonic hardening curve.
 
 **Value-at-risk is a FOURTH axis, and it is not the same as "mainnet".** It also became the
 primary assurance mitigation, not merely a funding policy, once ADR-0017 removed external review
-#1 -- stages 3, 5 and 8 now run real funds in front of code no external reviewer has read. Mainnet can be exercised
+review #1 -- stages 3, 5 and 8 now run real funds in front of code no external reviewer has read. Mainnet can be exercised
 with dust. Reaching a mainnet rung is **not** authorisation to move meaningful savings; value moves
 last, after stage 9.
 

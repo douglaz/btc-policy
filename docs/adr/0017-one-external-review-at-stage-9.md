@@ -17,8 +17,11 @@ are not executable yet.
 
 ## Decision
 
-**ONE external human review, at stage 9.** It gates the freeze that precedes lifting the dust caps,
-which is the point where real savings become possible. Review #1 is removed.
+**ONE external human review, at stage 9.** The order is FREEZE, then REVIEW, then CAPS LIFT:
+the stage-9 freeze produces the artifact, the review reads that frozen artifact, and it is LIFTING
+THE DUST CAPS that the review gates — not the freeze. Saying the review gates the freeze would be
+circular, since a reviewer cannot be handed a frozen target by a freeze that is waiting on the
+review. Review #1 is removed.
 
 **Stage 1 keeps its FREEZE.** The stage-1 gate always bundled two mechanisms under one name, and
 only one of them needs a person:
@@ -74,8 +77,11 @@ red.
 
 - **SILENCE end-to-end.** The harness says so itself: "A green scorecard here is not by itself
   evidence that silence holds." It gates the wire — response bodies, sizes, `/events` — and reports
-  wall-clock timing as ADVISORY only. Pin-uniform ingress is gated by `cargo test` assertions that
-  `attack all` does not run.
+  wall-clock timing as ADVISORY only. The split is: `cargo test` covers the DETERMINISTIC property —
+  `channel::duress::normal_and_duress_ingress_op_sequences_*` assert that a normal and a duress
+  request perform the identical ingress operations in the identical order. `attack all` covers the
+  WIRE — response bodies, body sizes, `/events`. Neither covers end-to-end TIMING, which the
+  harness reports as advisory only. So running both still leaves the timing channel unmeasured.
 - **Human-factors executability of the duress runbook.** Nothing tests whether a stressed operator
   can follow it without the author's context. That was exactly `tv3` (d), and it now waits for
   `yt7`.
