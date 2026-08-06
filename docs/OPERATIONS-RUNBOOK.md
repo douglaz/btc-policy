@@ -128,8 +128,8 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 > **Most of this procedure cannot be executed with what ships today.** There is no sealed-vault
 > receive, balance, or spend command, and no operational code reads `manifest.json` at all
 > (threat-model R9). Steps 3-6 below describe what must happen, not commands you can run: until
-> `btc-policy-mby` (operator CLI core), `btc-policy-en1` (`recover`) AND `btc-policy-00i` (receive
-> addresses and balance reads) land, each is a manual operation against the descriptor and a block explorer or your own node. Read the whole section
+> `btc-policy-mby` (operator CLI core), `btc-policy-en1` (`recover`) AND `btc-policy-00i`
+> (receive addresses and balance reads) land, each is a manual operation against the descriptor and a block explorer or your own node. Read the whole section
 > before starting so you know what you are committing to.
 
 1. At `T`, the deadline driver unconditionally attempts Lockdown; the independent fire driver
@@ -144,12 +144,8 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    coerced hot spend can still finalize, and `hold_secs` has no positive lower bound — so "wait a
    few hours" is not safe advice in that case — and no check will tell you which case you are in,
    which is why the action below does not depend on knowing.
-   **Check `GET /healthz`, but do NOT treat it as proof, and do NOT act on it.** It reports
-   `locked_down` and `last_deadline_tick` and answers even while a node is jammed, which is useful
-   for triage. It is also unauthenticated, carries no identity claim, and is reached over the same
-   relay path as `/sign` (DESIGN.md's `/healthz` wire contract) — and that relay is the actor
-   assumed hostile after a wrench. Treat BOTH answers as unreliable: a hostile coordinator fakes
-   `true` to make you stand down, and fakes `false` to bait you into sending it something.
+   `GET /healthz` is fine to record for your own incident notes — it answers even while a node is
+   jammed — but it decides nothing here; why not is below, where it matters.
    Do NOT probe with a real spend or refresh: `FRAUD_SUSPECTED` is a postcondition of Lockdown, not
    a test for it, and on a node that has NOT locked down the spend can be registered and propagated
    and a refresh signed and released, RESETTING the recovery maturity step 5 depends on.
@@ -176,9 +172,12 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    any partial not yet released, which is the whole of what you can do. If the vault DID ARM, then
    hot-class finalization is already frozen and the coerced spend cannot finalize anyway — you do
    not need the switch, and using it would abort the in-flight escape combine that Lockdown
-   deliberately preserves (ADR-0012's Lockdown row). You cannot reliably tell which case
-   you are in — `/healthz` is untrustworthy in both directions, as above — so DO NOT try to judge
-   it. CUT POWER. That is the default because the two errors are not symmetric: cutting power while
+   deliberately preserves (ADR-0012's Lockdown row). You cannot reliably tell which case you are
+   in, and `/healthz` will not tell you: it is unauthenticated, carries no identity claim, and is
+   reached over the same relay path as `/sign` (DESIGN.md's `/healthz` wire contract) — the actor
+   assumed hostile after a wrench. Both answers are unreliable, and in opposite ways: it fakes
+   `true` to make you stand down, and `false` to bait you into sending it something. So DO NOT try
+   to judge it. CUT POWER. That is the default because the two errors are not symmetric: cutting power while
    the vault HAD armed only exchanges one already-safe outcome (the escape sweep) for another the
    design already accepts (the recovery branch, "the same trade the duress PIN makes"), whereas
    leaving it running when nothing armed risks the coerced spend finalizing outright. A wrongly

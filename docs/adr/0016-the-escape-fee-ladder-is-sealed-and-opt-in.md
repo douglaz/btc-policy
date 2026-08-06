@@ -152,8 +152,9 @@ is what composes the rungs a nonzero ceiling admits. A vault sealed with a nonze
 between therefore behaves as ladderless FOREVER — sealed loopback-only hosts take no upgrade —
 while its operator believes they opted in and priced that into their duress plan. So mby must
 REJECT a nonzero `escape_bump_max_fee_pct` until sqn ships, offering only the default 0, or the
-two must land together. Accepting a value the vault can never honour is the failure to avoid. Landing
-the ladder input while the timelock is invisible is the failure mode to avoid.
+two must land together. Accepting a value the vault can never honour is the failure to avoid here, just as landing the
+ladder input while the timelock is invisible is the failure to avoid above: both seal a choice the
+operator did not actually get to make.
 
 Both fields, and their descriptor / manifest / preimage representations, must be committed under ONE finalize boundary. They are independently represented but jointly chosen, so a ceremony interrupted mid-write must leave nothing sealed and be safely retriable — never half the joint choice, which no later edit can repair because the manifest is immutable.
 
