@@ -128,8 +128,8 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 > **Most of this procedure cannot be executed with what ships today.** There is no sealed-vault
 > receive, balance, or spend command, and no operational code reads `manifest.json` at all
 > (threat-model R9). Steps 3-6 below describe what must happen, not commands you can run: until
-> `btc-policy-mby` (operator CLI core) and `btc-policy-en1` (`recover`) land, each is a manual
-> operation against the descriptor and a block explorer or your own node. Read the whole section
+> `btc-policy-mby` (operator CLI core), `btc-policy-en1` (`recover`) AND `btc-policy-00i` (receive
+> addresses and balance reads) land, each is a manual operation against the descriptor and a block explorer or your own node. Read the whole section
 > before starting so you know what you are committing to.
 
 1. At `T`, the deadline driver unconditionally attempts Lockdown; the independent fire driver
@@ -142,8 +142,8 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    your own curiosity about whether Lockdown landed. Once you ARE safe, verify immediately rather
    than at leisure: if the carrier never reached `t` nodes then nothing armed and nothing froze, a
    coerced hot spend can still finalize, and `hold_secs` has no positive lower bound — so "wait a
-   few hours" is not safe advice in that case, and you cannot tell which case you are in until you
-   check.
+   few hours" is not safe advice in that case — and no check will tell you which case you are in,
+   which is why the action below does not depend on knowing.
    **Check `GET /healthz`, but do NOT treat it as proof, and do NOT act on it.** It reports
    `locked_down` and `last_deadline_tick` and answers even while a node is jammed, which is useful
    for triage. It is also unauthenticated, carries no identity claim, and is reached over the same
@@ -169,7 +169,9 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    DO NOT check the chain first. The state that decides whether this works — whether the coerced
    spend's partials have been released yet — is not visible on chain or in the mempool, so a check
    cannot tell you, and it spends the window in which the switch still helps.
-   The two ways this can go are settled by the state machine, and they do not overlap. If NOTHING
+   The two ways this can go are settled by the state machine. (Arming converges rather than flipping —
+   ADR-0012 describes a window where an early node is armed while the rest are not — but that
+   changes nothing here: the action below is the same in every one of those states.) If NOTHING
    ARMED, no sweep exists to interrupt and the coerced spend is the live threat: the switch stops
    any partial not yet released, which is the whole of what you can do. If the vault DID ARM, then
    hot-class finalization is already frozen and the coerced spend cannot finalize anyway — you do

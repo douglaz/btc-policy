@@ -144,7 +144,15 @@ question alone in front of an operator, and vaults sealed in that window are sea
 it the cheap way rather than by coupling the beads: `mby`'s prompt must show the recovery timelock
 alongside the ladder ceiling as a FIXED, displayed value (which is what it is today — 180 days, no
 setting), so the operator still reasons about both together and only the second value is
-selectable. `wdu` then turns that displayed constant into the second half of the question. Landing
+selectable. `wdu` then turns that displayed constant into the second half of the question.
+
+The same ordering trap applies to the ceiling's own value, and it is worse because it is silent.
+`btc-policy-mby` exposes this Ceremony input but submits `escape_bumps = []`; `btc-policy-sqn`
+is what composes the rungs a nonzero ceiling admits. A vault sealed with a nonzero ceiling in
+between therefore behaves as ladderless FOREVER — sealed loopback-only hosts take no upgrade —
+while its operator believes they opted in and priced that into their duress plan. So mby must
+REJECT a nonzero `escape_bump_max_fee_pct` until sqn ships, offering only the default 0, or the
+two must land together. Accepting a value the vault can never honour is the failure to avoid. Landing
 the ladder input while the timelock is invisible is the failure mode to avoid.
 
 Both fields, and their descriptor / manifest / preimage representations, must be committed under ONE finalize boundary. They are independently represented but jointly chosen, so a ceremony interrupted mid-write must leave nothing sealed and be safely retriable — never half the joint choice, which no later edit can repair because the manifest is immutable.
