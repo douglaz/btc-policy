@@ -132,11 +132,18 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    telling payers to stop announces that the duress response fired, and even the verification below
    reveals it to anyone watching your screen. Silence is the protection; do not spend it to satisfy
    your own curiosity about whether Lockdown landed.
-   **Verify Lockdown on every node.** `GET /healthz` must report `locked_down: true` with
-   `last_deadline_tick` advancing, and every spend or refresh must then return `FRAUD_SUSPECTED`.
-   If a node is not locked down the decision is still due and cannot be cancelled, and the driver
-   keeps retrying — but R11 gives no finite landing bound, so escalate rather than assume: until it
-   lands, hot-class finalization is still the thing being raced.
+   **Verify Lockdown on every node — with `GET /healthz` and NOTHING ELSE.** It must report
+   `locked_down: true` with `last_deadline_tick` advancing. `/healthz` reads three atomics and takes
+   no lock, so it answers even while a node is jammed. Do NOT submit a spend or refresh to see
+   whether it returns `FRAUD_SUSPECTED`: that is a postcondition of Lockdown, not a test for it, and
+   on a node that has NOT locked down — the case you are checking — the spend can be registered and
+   propagated, and a refresh can be signed and released immediately, RESETTING the recovery maturity
+   that step 5 depends on. Never probe this with a real transaction.
+   If a node reports `locked_down: false`, treat its state as UNKNOWN and escalate. Do not infer
+   which case you are in: a node that armed and is merely delayed by R11 lock contention is already
+   frozen and can release no hot partial, while a node that never armed has no Lockdown due at all
+   — and `locked_down: false` alone does not tell you which, so neither "it will land shortly" nor
+   "hot finalization is still racing" is a safe thing to assume.
    **Stop inbound payments to the old vault.** Its addresses stay payable after Lockdown, and
    anything arriving lands in a fresh recovery lock. You will have replacement addresses at step 4.
 3. **Read the old vault's remaining balance and the escape-wallet balance on-chain.** Do not infer
