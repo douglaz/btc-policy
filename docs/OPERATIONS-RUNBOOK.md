@@ -190,8 +190,13 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    usable one for you. Do not send it the normal PIN to find out. Step 5's recovery branch is the
    exit in BOTH cases, and it is the one path that owes the federation nothing: after the timelock
    matures, 2 of 3 recovery keys move the coins with no user key and no node quorum
-   (`policy-core/src/template.rs:10-12`), so neither a locked-down federation nor a hostile
-   coordinator can block or observe it. If step 3 found an escape balance, move
+   (`crates/policy-core/src/template.rs:10-12`), so neither a locked-down federation nor a hostile
+   coordinator can block, censor or delay it. It is NOT private, though, and do not plan as if it
+   were: the recovery spend is an ordinary public transaction, and this vault's own watchtowers
+   classify exactly that shape as `RecoveryPathSpend` (`crates/vault-cli/src/recovery.rs:197-216`).
+   Anyone watching the chain — including whoever coerced you — sees the coins move when it
+   confirms, and can tell it was the recovery branch. Assume that moment is visible to them and
+   time it accordingly. If step 3 found an escape balance, move
    it into the new vault once that check passes; otherwise migration waits for step 5's recoveries.
    Do not leave an escape balance there for months: it is a single-key holding pen. Give payers the
    new vault's addresses.
