@@ -93,10 +93,21 @@ runtime is co-located, "every node binds and is reached at `127.0.0.1:<port>`" o
 reconfiguration, no upgrade-in-place. `btc-policy-mby` is the first sealed-vault CLI that exists, so
 it is by construction absent from every host sealed before it, and cannot be installed there.
 
-Therefore NO pre-mby sealed vault is reachable by the operator CLI, whatever its manifest format,
-and the compatibility question is moot rather than answered. Do not build format dispatch, a v0
-vector, or a legacy parser for it: mby ships with the ceremony that seals a vault, and vaults sealed
-before mby exit through the 2-of-3 RECOVERY branch, per UTXO as each matures — NOT by rotation: UPGRADE-AND-ROTATION-POLICY.md's procedure step 3 moves the coins "as an ordinary spend through the OLD vault's normal path", and that path is precisely what no client can reach. (Two earlier drafts of this paragraph got this wrong in opposite
+Therefore no pre-mby sealed vault is reachable by any LIVE-NODE command, whatever its manifest
+format, and for those commands the compatibility question is moot rather than answered — no format
+dispatch, no v0 vector, no legacy parser.
+
+COLD RECOVERY IS THE EXCEPTION, and it is the one that matters, because it is the only exit those
+vaults have. `btc-policy-en1` runs with no federation at all — "it needs only the descriptor, the
+manifest, the recovery keys and a chain view" — and ROLLOUT-PLAN gates a stage on recovery being
+completable "from cold artifacts alone … no live federation". Loopback binding does not obstruct it,
+because it never talks to a node. But en1 is blocked on mby and shares its manifest-parsing
+substrate, so if that substrate rejects pre-mby manifests then those vaults have NO exit at all,
+which would make the paragraph below false. The incompatibility decision above is therefore scoped
+to live-node commands only: the cold-recovery path MUST accept a pre-mby manifest, or must be able
+to run from the descriptor and a chain view without one. Recorded in mby and en1.
+
+With that, vaults sealed before mby exit through the 2-of-3 RECOVERY branch, per UTXO as each matures — NOT by rotation: UPGRADE-AND-ROTATION-POLICY.md's procedure step 3 moves the coins "as an ordinary spend through the OLD vault's normal path", and that path is precisely what no client can reach. (Two earlier drafts of this paragraph got this wrong in opposite
 directions — first claiming "unaffected" without qualification, then prescribing a
 `protocol_version` dispatch that cannot work because `0f16d21` changed two preimages without a
 version bump. Both were reasoning about the hash while the actual barrier is the socket.)

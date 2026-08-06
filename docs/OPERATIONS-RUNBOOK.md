@@ -174,8 +174,13 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    any partial not yet released, which is the whole of what you can do. If the vault DID ARM, then
    hot-class finalization is already frozen and the coerced spend cannot finalize anyway — you do
    not need the switch, and using it would abort the in-flight escape combine that Lockdown
-   deliberately preserves (ADR-0012's Lockdown row). So: if you have any reason to believe the
-   federation armed, leave it running. If you do not, cut power now.
+   deliberately preserves (ADR-0012's Lockdown row). You cannot reliably tell which case
+   you are in — `/healthz` is untrustworthy in both directions, as above — so DO NOT try to judge
+   it. CUT POWER. That is the default because the two errors are not symmetric: cutting power while
+   the vault HAD armed only exchanges one already-safe outcome (the escape sweep) for another the
+   design already accepts (the recovery branch, "the same trade the duress PIN makes"), whereas
+   leaving it running when nothing armed risks the coerced spend finalizing outright. A wrongly
+   aborted sweep costs you time; a wrongly unfrozen theft costs you the coins.
    Afterwards, check the chain — not before. The switch cannot revoke a signature already released
    or un-broadcast a transaction already in the mempool, so the coerced spend may still land; there
    is no `hold_secs` floor and `hold_secs = 0` is a supported configuration where the fire event is
