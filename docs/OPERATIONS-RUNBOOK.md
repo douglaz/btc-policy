@@ -178,7 +178,9 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    host you ran the old vault from is the one this procedure has been treating as hostile since
    step 2. Running the ceremony on it can leak the new vault's secrets or tamper with the ceremony
    before a single sat is deposited, which would carry the compromise across the rotation and make
-   everything below pointless. New host, verified binaries, then: run the ceremony, then fund it
+   everything below pointless. New host, and binaries you obtained independently of the compromised one — note that
+   byte-identical rebuilds and signed artifacts are `btc-policy-oy3` and do NOT ship yet, so this
+   is a provenance judgement you have to make, not a check you can run. Then: run the ceremony, then fund it
    with a small deposit — from unrelated funds if step 3 found the escape
    wallet empty — and complete one honest spend end to end, waiting for it to CONFIRM rather than merely broadcast. Section 3 step 3's migration spend does
    not apply: Lockdown killed the old vault's normal path. If step 3 found an escape balance, move

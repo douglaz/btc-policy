@@ -86,7 +86,16 @@ hashing versus accepting that upgrading bricks a v0 vault. Both horns assume an 
 architecture forbids.) `base_manifest_bytes` computing ONE layout with `protocol_version` hashed in
 rather than switched on is therefore fine, and version-dispatched hashing is NOT required.
 
-What the version bump actually buys is a clear failure for the operator ERROR that remains possible:
+That settles the NODE side only, and the CLIENT side is a live requirement, not a corollary. The
+operator CLI `btc-policy-mby` is new software pointed at vaults that already exist: built with only
+the extended layout it cannot recompute or authenticate a v0 `manifest_hash`, and there is no older
+client to fall back on because a sealed-vault spend/escape CLI is the very thing mby introduces. So
+v0 vaults would be sealed, alive, running honest nodes, and unreachable by the only tool that can
+operate them. "Unaffected" must not be read as covering that. mby therefore has to dispatch manifest
+hashing and parsing on `protocol_version` and carry a v0 vector, or v0 vaults get no operator path
+at all — the decision belongs in mby, and it is recorded there.
+
+What the version bump buys on top is a clear failure for the operator ERROR that remains possible:
 pointing a new-binary node at an old manifest during a fresh deployment. Without it that misconfig
 surfaces as an opaque `manifest_hash` mismatch; with it, as a version rejection.
 
@@ -118,6 +127,8 @@ alongside the ladder ceiling as a FIXED, displayed value (which is what it is to
 setting), so the operator still reasons about both together and only the second value is
 selectable. `wdu` then turns that displayed constant into the second half of the question. Landing
 the ladder input while the timelock is invisible is the failure mode to avoid.
+
+Both fields, and their descriptor / manifest / preimage representations, must be committed under ONE finalize boundary. They are independently represented but jointly chosen, so a ceremony interrupted mid-write must leave nothing sealed and be safely retriable — never half the joint choice, which no later edit can repair because the manifest is immutable.
 
 **4a. The SIGNER checks the ladder against the sealed ceiling as composition validation, not as
 hostile-coordinator enforcement.** Nodes do not enforce `escape_bump_max_fee_pct`, and at the wrench
