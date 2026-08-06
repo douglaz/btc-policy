@@ -69,6 +69,9 @@ manifest_hash = H(canonical_bytes(BaseManifest))
 # THIS list + order, NOT a naive serialization of every field above:
 #   EVERY variable-length run is LENGTH-PREFIXED u32. Both counts below were missing from earlier
 #   drafts of this list; omitting either yields a different hash and WRONG_MANIFEST on every node.
+#   docs/PROTOCOL-VECTORS.md encodes this SAME contract with a worked byte vector and had both
+#   counts right while this list did not. The two MUST agree; if they ever diverge again, the
+#   vector wins, because it is executable against the code.
 #   wallet_id ‖ protocol_version(u32) ‖ coordinator_auth_pubkey ‖ max_msg_bytes(u64)
 #   ‖ hot_max_per_tx(u64) ‖ hot_max_per_window(u64) ‖ hot_window_secs(u64)
 #   ‖ hot_allowlist(u32 COUNT ‖ each descriptor, sorted+deduped)

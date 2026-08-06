@@ -182,11 +182,16 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    byte-identical rebuilds and signed artifacts are `btc-policy-oy3` and do NOT ship yet, so this
    is a provenance judgement you have to make, not a check you can run. Then: run the ceremony, then fund it
    with a small deposit — from unrelated funds if step 3 found the escape
-   wallet empty — and complete one honest spend end to end, waiting for it to CONFIRM rather than merely broadcast. Section 3 step 3's migration spend probably does
-   not apply, but check rather than assume: if Lockdown landed it killed the old vault's normal
-   path and that spend is impossible; if nothing ever armed — the failed-carrier case in step 2 —
-   the federation is still live and the ordinary migration spend is the cheaper route for whatever
-   the sweep left, subject to its allowlist and Hot budget. If step 3 found an escape balance, move
+   wallet empty — and complete one honest spend end to end, waiting for it to CONFIRM rather than merely broadcast. Section 3 step 3's migration spend does
+   NOT apply either way, and the reason is the same one that rules out the clawback above: it runs
+   through the coordinator. If Lockdown landed, the old vault's normal path is dead outright. If
+   nothing ever armed — the failed-carrier case in step 2 — the federation is still live, but the
+   relay you would reach it through is the one assumed hostile, so a live normal path is not a
+   usable one for you. Do not send it the normal PIN to find out. Step 5's recovery branch is the
+   exit in BOTH cases, and it is the one path that owes the federation nothing: after the timelock
+   matures, 2 of 3 recovery keys move the coins with no user key and no node quorum
+   (`policy-core/src/template.rs:10-12`), so neither a locked-down federation nor a hostile
+   coordinator can block or observe it. If step 3 found an escape balance, move
    it into the new vault once that check passes; otherwise migration waits for step 5's recoveries.
    Do not leave an escape balance there for months: it is a single-key holding pen. Give payers the
    new vault's addresses.
