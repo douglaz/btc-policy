@@ -161,12 +161,19 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    request of its own, letting the coerced spend release at its Hold. If Lockdown DID land the
    clawback cannot fire anyway: every spend then returns `FRAUD_SUSPECTED`, for that node's
    lifetime.
-   **So there is no action here, and that is by design, not an oversight.** If the carrier never
-   reached `t` nodes and the coordinator is hostile, a coerced hot spend may complete. That residual
-   is accepted and BOUNDED — by the Hot budget (ADR-0014, "the hot wallet is the risk budget"), which
-   is the enforced ceiling on what any such spend can take. Guaranteed delivery under a hostile
-   coordinator is the v1 direct user-to-node path (ADR-0012); it does not exist in v0. Everything
-   you can still do is on the recovery side, below.
+   **There is exactly one action, and it is not a message — it is the power switch.** If you still
+   control the hardware, POWER THE APPLIANCE OFF. The v0 federation is co-located on one host and
+   its keys are RAM-only: a rebooted node is a dead node (ADR-0007). Cutting power destroys all five
+   nodes' keys permanently, so an unarmed pending hot spend can never reach quorum and no further
+   spend can create change that resets recovery maturity. It needs no coordinator, no PIN and no
+   network, which is exactly why it is the one thing a hostile relay cannot interfere with.
+   Understand the trade before you do it: it finishes the vault. The coins then exit only through
+   the recovery branch, on each UTXO's own clock. That is the same trade the duress PIN makes, and
+   it is the right one when the alternative is a live hot spend you cannot otherwise stop.
+   If you do NOT control the hardware, then there is no action, and that is by design. A coerced hot
+   spend may complete; the residual is accepted and BOUNDED by the Hot budget (ADR-0014, "the hot
+   wallet is the risk budget"). Guaranteed delivery under a hostile coordinator is the v1 direct
+   user-to-node path (ADR-0012) and does not exist in v0. Everything else is on the recovery side.
    **Stop inbound payments to the old vault.** Its addresses stay payable after Lockdown, and
    anything arriving lands in a fresh recovery lock. You will have replacement addresses at step 4.
 3. **Read the old vault's remaining balance and the escape-wallet balance on-chain.** Do not infer

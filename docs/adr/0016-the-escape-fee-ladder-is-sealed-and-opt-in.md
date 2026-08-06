@@ -96,7 +96,7 @@ it is by construction absent from every host sealed before it, and cannot be ins
 Therefore NO pre-mby sealed vault is reachable by the operator CLI, whatever its manifest format,
 and the compatibility question is moot rather than answered. Do not build format dispatch, a v0
 vector, or a legacy parser for it: mby ships with the ceremony that seals a vault, and vaults sealed
-before mby exit by rotation. (Two earlier drafts of this paragraph got this wrong in opposite
+before mby exit through the 2-of-3 RECOVERY branch, per UTXO as each matures — NOT by rotation: UPGRADE-AND-ROTATION-POLICY.md's procedure step 3 moves the coins "as an ordinary spend through the OLD vault's normal path", and that path is precisely what no client can reach. (Two earlier drafts of this paragraph got this wrong in opposite
 directions — first claiming "unaffected" without qualification, then prescribing a
 `protocol_version` dispatch that cannot work because `0f16d21` changed two preimages without a
 version bump. Both were reasoning about the hash while the actual barrier is the socket.)
