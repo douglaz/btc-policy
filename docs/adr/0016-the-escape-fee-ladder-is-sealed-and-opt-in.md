@@ -42,7 +42,8 @@ ceiling, so at `0` the base still pays its own (nonzero) fee and the vault simpl
 Setup must say that plainly, because the Ceremony cannot show the number that would make it
 concrete: no Escape PSBT exists at seal time, and its fee depends on inputs, output shape and a
 feerate source chosen much later. So the Ceremony states that the ceiling governs rungs only, and
-the per-spend authorization UI displays the actual base fee when there is one.
+the per-spend authorization UI always displays the actual base fee at spend time, because that
+concrete fee cannot exist at seal time.
 
 **3. The Ceremony must reject a value that the vault's own nodes would refuse.** The node's
 fire-time guard is `fee ≤ 100 − escape_coverage_pct` (5% by default), already sealed in the
