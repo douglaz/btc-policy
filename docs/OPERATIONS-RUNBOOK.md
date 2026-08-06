@@ -126,23 +126,29 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 ### The user was coerced (duress PIN used)
 1. At `T`, the deadline driver unconditionally attempts Lockdown; the independent fire driver
    attempts the escape sweep. The sweep is BEST-EFFORT: it may not fire at all, and even when it
-   fires it need not move everything. Assume a partial result until you have checked.
-2. **Once safe.** Nothing below is time-critical in the first hours — the sweep and Lockdown
-   already ran without you. Do none of it while you are still with the attacker: step 4 generates
-   the new vault's keys and PINs, and telling payers to stop announces that the duress response
-   fired.
+   fires it need not move everything. Assume a partial result until you have checked — in step 2, not now.
+2. **Once safe — including the checks.** Nothing below is time-critical in the first hours. Do none
+   of it while you are still with the attacker: step 4 generates the new vault's keys and PINs,
+   telling payers to stop announces that the duress response fired, and even the verification below
+   reveals it to anyone watching your screen. Silence is the protection; do not spend it to satisfy
+   your own curiosity about whether Lockdown landed.
+   **Verify Lockdown on every node.** `GET /healthz` must report `locked_down: true` with
+   `last_deadline_tick` advancing, and every spend or refresh must then return `FRAUD_SUSPECTED`.
+   If a node is not locked down the decision is still due and cannot be cancelled, and the driver
+   keeps retrying — but R11 gives no finite landing bound, so escalate rather than assume: until it
+   lands, hot-class finalization is still the thing being raced.
    **Stop inbound payments to the old vault.** Its addresses stay payable after Lockdown, and
    anything arriving lands in a fresh recovery lock. You will have replacement addresses at step 4.
-3. **Read the old vault's remaining balance on-chain.** Do not infer it from whether the sweep
-   fired — ask the chain. Whatever reached the escape wallet is safe: that wallet is independent of
-   every vault key by construction (checked at ceremony time).
+3. **Read the old vault's remaining balance and the escape-wallet balance on-chain.** Do not infer
+   either from whether the sweep fired — ask the chain. Whatever reached the escape wallet is safe:
+   that wallet is independent of every vault key by construction (checked at ceremony time).
 4. **Stand up the new vault** using `docs/UPGRADE-AND-ROTATION-POLICY.md` §3 steps 1–2: run the
-   ceremony, then fund it with a small deposit and complete one honest spend end to end. Section 3
-   step 3's migration spend does not apply: Lockdown killed the old vault's normal path, so fund the
-   new vault from the escape wallet instead. Once that check passes, move the rest of the
-   escape-wallet balance into the new vault. Do not wait for step 5 — the escape wallet is a
-   single-key holding pen, not somewhere to leave funds for months. Give payers the new vault's
-   addresses.
+   ceremony, then fund it with a small deposit — from unrelated funds if step 3 found the escape
+   wallet empty — and complete one honest spend end to end. Section 3 step 3's migration spend does
+   not apply: Lockdown killed the old vault's normal path. If step 3 found an escape balance, move
+   it into the new vault once that check passes; otherwise migration waits for step 5's recoveries.
+   Do not leave an escape balance there for months: it is a single-key holding pen. Give payers the
+   new vault's addresses.
 5. **Recover whatever is still in the old vault, coin by coin, into the new one.** The locked-down
    vault's only exit is the recovery branch: 2 of the 3 recovery keys, after a lock that is
    BIP68-relative per UTXO — each coin matures 180 days (fixed for every vault; there is no

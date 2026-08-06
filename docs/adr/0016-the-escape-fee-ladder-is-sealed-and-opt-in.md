@@ -72,6 +72,12 @@ the JSON but absent from `base_manifest_bytes` is a value the Ceremony writes an
 to. So `btc-policy-mby` must amend the preimage and the node config startup parses, in the same
 change — otherwise this ADR's "sealed" is decoration.
 
+The canonical preimage is version-bound: adding `escape_bump_max_fee_pct` changes `manifest_hash`
+for otherwise-identical inputs, so it MUST ship with a protocol-version bump rather than continue
+to declare `PROTOCOL_VERSION_V0`. Existing sealed vaults are unaffected — their manifests are
+immutable and rotation creates a new vault — but a node carrying the extended preimage MUST refuse
+a manifest that declares the old version rather than silently surface a manifest-hash mismatch.
+
 **ADR-0013 §4's LIST MUST STAY AUTHORITATIVE.** It instructs reimplementers to work "from THIS list
 + order, NOT a naive serialization". That list previously omitted `escape_feerate_floor` and
 `escape_coverage_pct`, which the code hashes between `max_derivation_index` and the node count
