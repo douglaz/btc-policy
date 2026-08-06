@@ -170,8 +170,16 @@ _Avoid_: wallet backup, seed backup
 Added 2026-07-29 after a state review found two milestones fused under one name.
 
 **Core-proven**:
-The milestone the V0 plan gates ops work behind: full test matrix green, the Path suite driven on signet, and one external review of the **protocol core**. It means the protocol works — NOT that the system is deployable. Reached at Rollout stage 1.
-_Avoid_: v0 done, production-ready, launch-ready
+The milestone the V0 plan gates ops work behind: full test matrix green, the Path suite driven on signet, and the **Freeze** of the protocol core. It means the protocol works — NOT that the system is deployable, and NOT that anyone outside this project has read it. Reached at Rollout stage 1. (Until ADR-0017 this also required an external review; that moved to stage 9.)
+_Avoid_: v0 done, production-ready, launch-ready, audited
+
+**Freeze**:
+Stopping churn in a named artifact set — interfaces, threat model, ceremony and runbooks, protocol vectors, SBOM and dependency policy, upgrade/rotation policy, reproducible release — so later work builds on something stable. It is DISCIPLINE, not assurance: a freeze says the target stopped moving, never that anyone validated it. Owned by `btc-policy-gbw` at stage 1.
+_Avoid_: review, sign-off, audit, approval
+
+**External review**:
+One independent human security review, at Rollout stage 9, gating the lift of the dust caps. Singular since ADR-0017. It is the only assurance in this project that is not automated, and by construction it cannot be satisfied by this repo's own codex/Fable panels — those are CORRELATED automated review, and two models agreeing is not corroboration.
+_Avoid_: review #1 / #2 (there is one), AI review, panel, audit (unless a paid professional audit is meant)
 
 **Production-ready**:
 A separate, later milestone: the system is safe to hold meaningful savings. Requires an independently deployed Federation, a real Operator path, a resolved Node lifecycle, and a reviewed frozen release. Reached no earlier than Rollout stage 9.

@@ -161,7 +161,8 @@ and this record should be regenerated at that commit rather than cited as if it 
 - It is **one honest spend**. Duress, claw-back, reorg, and refusal behaviour on signet
   are not covered here; those remain proven on regtest (`attack all`, the demos).
 - Deliverable (2) (full matrix incl. proptest/fuzz with reproducible-release artifacts)
-  and deliverable (3) (**one genuine external human security review**) of bead
-  `btc-policy-9y5.8` are untouched by this record. Per the bead, correlated automated
+  and deliverable (3) of bead `btc-policy-9y5.8` are untouched by this record. Deliverable (3) is
+  now the FREEZE, not a review — ADR-0017 moved the single external human review to Rollout stage 9
+  (`btc-policy-yt7`). Per the bead, correlated automated
   review — including this repo's `codex` + Claude Fable panels — **does not** satisfy
   (3).

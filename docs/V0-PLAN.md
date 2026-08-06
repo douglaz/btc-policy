@@ -291,5 +291,11 @@ for using it, and a regtest exercise of the full path. Watchtower **detection** 
 unaffected.
 
 ## Core-proven gate (after V0-7)
-Full test matrix green + a confirmed signet spend through the federation + one
-external review — before any deployer/sealing/Tor/mTLS work (DESIGN.md 2.5).
+Full test matrix green + a confirmed signet spend through the federation + the FREEZE
+(`btc-policy-gbw`, prerequisite `btc-policy-9yf`) — before any deployer/sealing/Tor/mTLS work
+(DESIGN.md 2.5).
+
+**AMENDED by [ADR-0017](adr/0017-one-external-review-at-stage-9.md):** the external review is NO
+LONGER part of this gate. It moved to Rollout stage 9, and leaving it here would deadlock the
+ladder — sealing is required to REACH stage 9, so blocking sealing on a stage-9 review makes both
+unreachable.

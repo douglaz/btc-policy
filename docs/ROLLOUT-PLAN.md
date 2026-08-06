@@ -26,7 +26,9 @@ and 5 exist. What stages 3 and 5 actually buy is earlier exposure to mainnet fee
 paid for in real funds on topologies the design itself forbids. Read this table as a test matrix
 with a funding policy, not as a monotonic hardening curve.
 
-**Value-at-risk is a FOURTH axis, and it is not the same as "mainnet".** Mainnet can be exercised
+**Value-at-risk is a FOURTH axis, and it is not the same as "mainnet".** It also became the
+primary assurance mitigation, not merely a funding policy, once ADR-0017 removed external review
+#1 -- stages 3, 5 and 8 now run real funds in front of code no external reviewer has read. Mainnet can be exercised
 with dust. Reaching a mainnet rung is **not** authorisation to move meaningful savings; value moves
 last, after stage 9.
 
@@ -50,7 +52,7 @@ ADR-0012 already names as the severe residual.
 
 | Stage | Hosts | Hardening | Network | Notes |
 |---|---|---|---|---|
-| **1** | one machine | open | signet | Path suite on signet for the first time. **Freeze → external review #1 (protocol core).** |
+| **1** | one machine | open | signet | Path suite on signet for the first time. **Freeze (protocol core)** — the freeze only; external review #1 was REMOVED by [ADR-0017](adr/0017-one-external-review-at-stage-9.md). Prerequisite: `9yf`'s negative control. |
 | **2** | 5 machines, same provider | open | signet | First real network transport; loopback assumptions die here. Waived (ADR-0015). |
 | **3** | 5 machines, same provider | open | **mainnet** | First real funds, **dust cap**. Waived (ADR-0015). Requires `4y3`+`zzv`. |
 | **4** | 5 machines, same provider | **sealed** | signet | First sealed hosts. **Begin measuring attrition.** Waived (ADR-0015). |
@@ -58,7 +60,7 @@ ADR-0012 already names as the severe residual.
 | **6** | **many providers** | open | signet | Provider diversity — the ADR-0009 correlation-class requirement. |
 | **7** | many providers | **sealed** | signet | Attrition measurement continues under provider diversity. |
 | **8** | many providers | sealed | **mainnet** | **Run it for a while**, capped. The Survivor vault is the observation subject. |
-| **9** | many providers | sealed | mainnet | Full Path suite on the real configuration. Requires `bq6` (hardware signing) before the caps lift. **Freeze → external review #2 (deployed system).** |
+| **9** | many providers | sealed | mainnet | Full Path suite on the real configuration. Requires `bq6` (hardware signing) before the caps lift. **Freeze → THE external review (deployed system) — the only one, per ADR-0017.** |
 | **10** | — | — | — | Public alpha. |
 
 ## Per-stage testing: two vaults

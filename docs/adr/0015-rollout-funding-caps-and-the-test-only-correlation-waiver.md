@@ -1,5 +1,10 @@
 # Rollout funding caps, and a test-only waiver of ADR-0009
 
+**AMENDED by [ADR-0017](0017-one-external-review-at-stage-9.md):** the caps below now carry a
+SECOND load they were not designed for. External review #1 was removed from stage 1, so the dust
+cap is also the primary mitigation for the absence of any external human review before stage 9 --
+not only for the correlation waiver this ADR introduced it for. Read the two together.
+
 ADR-0009 forbids any correlation class from reaching quorum. The rollout ladder
 (`docs/ROLLOUT-PLAN.md`) nevertheless runs stages 2 through 5 with all five nodes at a **single
 hosting provider** — a correlation class holding quorum — and stages 3 and 5 put **real mainnet
@@ -90,7 +95,7 @@ real capability, and the reason it is acceptable here is precisely the dust cap:
 mitigation.** What such an attacker gets at stages 3–8 is dust.
 
 The consequence is that **`bq6` becomes mandatory before the caps are lifted**, and it gates the
-stage-9 freeze (`yt7`) — the last point before an alpha, and the artifact external review #2
+stage-9 freeze (`yt7`) — the last point before an alpha, and the artifact the external review
 examines. An auditor handed a "deployed system" whose user key is a file on the coordinator will
 say so immediately, and they will be right.
 

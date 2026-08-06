@@ -195,8 +195,10 @@ ephemeral keys. Sections of `docs/OPERATIONS-RUNBOOK.md` therefore describe acti
 currently perform. The runbook flags this inline, but a reader should know it up front: the
 protocol core is considerably more finished than the product around it.
 
-**R7 — No external human security review has happened yet.** This is the open half of the
-core-proven gate. Correlated automated review — including this repo's `codex` + Claude Fable
+**R7 — No external human security review has happened yet.** Since ADR-0017 it is no longer part of
+the core-proven gate at all: there is ONE external review, at Rollout stage 9, gating the lift of the
+dust caps. Everything up to and including the capped mainnet rungs (stages 3, 5, 8) therefore runs
+with NO outside eyes, deliberately, with the dust cap as the mitigation. Correlated automated review — including this repo's `codex` + Claude Fable
 panels, however adversarially prompted — **does not** substitute for it, and this document must
 not be read as evidence that it has.
 
