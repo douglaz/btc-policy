@@ -144,23 +144,29 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    coerced hot spend can still finalize, and `hold_secs` has no positive lower bound — so "wait a
    few hours" is not safe advice in that case, and you cannot tell which case you are in until you
    check.
-   **Check `GET /healthz`, but do NOT treat it as proof.** It reports `locked_down` and
-   `last_deadline_tick`, reads three atomics and takes no lock, so it answers even while a node is
-   jammed — useful. It is also unauthenticated, carries no identity claim, and is reached over the
-   same relay path as `/sign` (DESIGN.md's `/healthz` wire contract), and that relay is the actor
-   assumed hostile after a wrench. A hostile coordinator can therefore return `locked_down: true`
-   with an advancing tick while nothing ever armed. `true` is reassurance, not evidence; only
-   `false` is informative, because the adversary has no reason to fake it.
-   Do NOT probe with a real spend or refresh either: `FRAUD_SUSPECTED` is a postcondition of
-   Lockdown, not a test for it, and on a node that has NOT locked down — the case you are checking —
-   the spend can be registered and propagated and a refresh can be signed and released immediately,
-   RESETTING the recovery maturity step 5 depends on.
-   **So do not gate on the status. If any coins are still spendable by the hot path, claw them back
-   on-chain, where the result is verifiable and cannot be faked:** submit an escape-class spend of
-   the threatened coins under the **normal** PIN, per "An unauthorized spend is pending" below. It
-   fires immediately (`remaining_secs: 0`), so it defeats a pending hot spend well before its Hold
-   expires, and it works whether or not Lockdown ever landed. `demo theft-refused` act two performs
-   exactly this. Only once the chain shows those coins moved is the hot-path risk closed.
+   **Check `GET /healthz`, but do NOT treat it as proof, and do NOT act on it.** It reports
+   `locked_down` and `last_deadline_tick` and answers even while a node is jammed, which is useful
+   for triage. It is also unauthenticated, carries no identity claim, and is reached over the same
+   relay path as `/sign` (DESIGN.md's `/healthz` wire contract) — and that relay is the actor
+   assumed hostile after a wrench. Treat BOTH answers as unreliable: a hostile coordinator fakes
+   `true` to make you stand down, and fakes `false` to bait you into sending it something.
+   Do NOT probe with a real spend or refresh: `FRAUD_SUSPECTED` is a postcondition of Lockdown, not
+   a test for it, and on a node that has NOT locked down the spend can be registered and propagated
+   and a refresh signed and released, RESETTING the recovery maturity step 5 depends on.
+   **And do NOT attempt a normal-PIN clawback here, however tempting.** The clawback in "An
+   unauthorized spend is pending" below is written for a coordinator you still trust. After the
+   wrench you do not, and it is the only path you have to the nodes: sending it the normal PIN hands
+   over the one secret that stops pin substitution, and it already holds the user-signed spend, the
+   escape and the coordinator auth key — so it can censor your clawback and reissue a normal-PIN
+   request of its own, letting the coerced spend release at its Hold. If Lockdown DID land the
+   clawback cannot fire anyway: every spend then returns `FRAUD_SUSPECTED`, for that node's
+   lifetime.
+   **So there is no action here, and that is by design, not an oversight.** If the carrier never
+   reached `t` nodes and the coordinator is hostile, a coerced hot spend may complete. That residual
+   is accepted and BOUNDED — by the Hot budget (ADR-0014, "the hot wallet is the risk budget"), which
+   is the enforced ceiling on what any such spend can take. Guaranteed delivery under a hostile
+   coordinator is the v1 direct user-to-node path (ADR-0012); it does not exist in v0. Everything
+   you can still do is on the recovery side, below.
    **Stop inbound payments to the old vault.** Its addresses stay payable after Lockdown, and
    anything arriving lands in a fresh recovery lock. You will have replacement addresses at step 4.
 3. **Read the old vault's remaining balance and the escape-wallet balance on-chain.** Do not infer
@@ -195,6 +201,13 @@ This is what the Hold is for.
      **normal PIN**. Escape-class fires immediately (`remaining_secs: 0`), so the conflicting
      transaction defeats the pending spend well before its Hold expires, and the vault keeps
      working afterwards. This is the clawback `demo theft-refused` act two performs end to end.
+     **It assumes the coordinator SOFTWARE is still honest, which is not the same as the auth key
+     being safe.** A stolen auth key lets a thief inject requests, but your clawback still reaches
+     the nodes through your own honest relay and your normal PIN goes nowhere else — that is the
+     case above. If the coordinator ITSELF is compromised, as it is assumed to be after a wrench,
+     do NOT use this: the normal PIN is the secret that stops pin substitution, and handing it to
+     the relay lets it censor your clawback and reissue a normal-PIN request of its own. See "The
+     user was coerced" above, where there is deliberately no action for that case.
    - **If you are under coercion**, submit the **duress PIN** ceremony instead (above): it arms
      the escape sweep at `T` and locks the federation down unconditionally, and the ceremony is
      indistinguishable to the attacker. The vault is finished afterwards — that is the trade.
