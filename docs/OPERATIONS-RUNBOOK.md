@@ -144,18 +144,23 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    coerced hot spend can still finalize, and `hold_secs` has no positive lower bound — so "wait a
    few hours" is not safe advice in that case, and you cannot tell which case you are in until you
    check.
-   **Verify Lockdown on every node — with `GET /healthz` and NOTHING ELSE.** It must report
-   `locked_down: true` with `last_deadline_tick` advancing. `/healthz` reads three atomics and takes
-   no lock, so it answers even while a node is jammed. Do NOT submit a spend or refresh to see
-   whether it returns `FRAUD_SUSPECTED`: that is a postcondition of Lockdown, not a test for it, and
-   on a node that has NOT locked down — the case you are checking — the spend can be registered and
-   propagated, and a refresh can be signed and released immediately, RESETTING the recovery maturity
-   that step 5 depends on. Never probe this with a real transaction.
-   If a node reports `locked_down: false`, treat its state as UNKNOWN and escalate. Do not infer
-   which case you are in: a node that armed and is merely delayed by R11 lock contention is already
-   frozen and can release no hot partial, while a node that never armed has no Lockdown due at all
-   — and `locked_down: false` alone does not tell you which, so neither "it will land shortly" nor
-   "hot finalization is still racing" is a safe thing to assume.
+   **Check `GET /healthz`, but do NOT treat it as proof.** It reports `locked_down` and
+   `last_deadline_tick`, reads three atomics and takes no lock, so it answers even while a node is
+   jammed — useful. It is also unauthenticated, carries no identity claim, and is reached over the
+   same relay path as `/sign` (DESIGN.md's `/healthz` wire contract), and that relay is the actor
+   assumed hostile after a wrench. A hostile coordinator can therefore return `locked_down: true`
+   with an advancing tick while nothing ever armed. `true` is reassurance, not evidence; only
+   `false` is informative, because the adversary has no reason to fake it.
+   Do NOT probe with a real spend or refresh either: `FRAUD_SUSPECTED` is a postcondition of
+   Lockdown, not a test for it, and on a node that has NOT locked down — the case you are checking —
+   the spend can be registered and propagated and a refresh can be signed and released immediately,
+   RESETTING the recovery maturity step 5 depends on.
+   **So do not gate on the status. If any coins are still spendable by the hot path, claw them back
+   on-chain, where the result is verifiable and cannot be faked:** submit an escape-class spend of
+   the threatened coins under the **normal** PIN, per "An unauthorized spend is pending" below. It
+   fires immediately (`remaining_secs: 0`), so it defeats a pending hot spend well before its Hold
+   expires, and it works whether or not Lockdown ever landed. `demo theft-refused` act two performs
+   exactly this. Only once the chain shows those coins moved is the hot-path risk closed.
    **Stop inbound payments to the old vault.** Its addresses stay payable after Lockdown, and
    anything arriving lands in a fresh recovery lock. You will have replacement addresses at step 4.
 3. **Read the old vault's remaining balance and the escape-wallet balance on-chain.** Do not infer

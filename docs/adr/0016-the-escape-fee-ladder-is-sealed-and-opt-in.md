@@ -77,27 +77,18 @@ for otherwise-identical inputs, so it MUST ship with a protocol-version bump rat
 to declare `PROTOCOL_VERSION_V0`. Existing sealed vaults are unaffected — their manifests are
 immutable and rotation creates a new vault.
 
-Be precise about what "unaffected" does and does not mean, because the difference is a bricking
-risk. It means their sealed bytes stay valid and no manifest needs rewriting. It does NOT mean an
-upgraded node can still serve them: `base_manifest_bytes` computes ONE layout and dispatches on
-nothing — `protocol_version` is hashed IN as a parameter, not switched on — so a node built with
-the extended preimage derives a different `manifest_hash` from the same v0 `manifest.json` and
-cannot serve that vault, whether it fails as a version error or as a hash mismatch. So one of two
-things must be decided and written down before the field lands: either the hashing becomes
-version-DISPATCHED, so an extended node reproduces the v0 preimage for a v0 anchor (with a
-cross-version vector proving it), or upgrading past this change is accepted as bricking a v0 vault
-and the migration is rotation to a new vault — which is consistent with "there is no in-place
-rotation in v0", but must be stated rather than left to be discovered by an operator whose nodes
-stop recognising their own manifest after a restart. `btc-policy-mby` owns the decision.
+Existing sealed vaults are unaffected in the strong sense, and the reason is ADR-0005, not care in
+the rollout: a sealed node has "no reset, no reconfiguration, **no upgrade-in-place** — any change to
+the federation means rotating to a new vault". So a v0 vault's nodes keep running the binary they
+were sealed with and keep computing the v0 preimage; there is no path by which the extended layout
+reaches them. (An earlier draft of this paragraph posed a false dilemma here — version-dispatched
+hashing versus accepting that upgrading bricks a v0 vault. Both horns assume an upgrade that the
+architecture forbids.) `base_manifest_bytes` computing ONE layout with `protocol_version` hashed in
+rather than switched on is therefore fine, and version-dispatched hashing is NOT required.
 
-That refusal is NOT implementable today, and `btc-policy-mby` owns closing the gap rather than
-assuming it. Nothing feeds a declared version into a node at startup: `ConfigFile`/`ChannelConfig`
-carry no `protocol_version`, nodes never read `manifest.json` at all, and manifest hashing injects
-`PROTOCOL_VERSION_V0` internally — so an extended node handed an old anchor can only report the
-opaque hash mismatch, which is the failure this paragraph wants to avoid. Adding the field
-therefore means adding a version-bearing startup input and an explicit old-version rejection path,
-with a cross-version vector test, in the same change. Bumping the compile-time constant alone
-changes the hash and nothing else.
+What the version bump actually buys is a clear failure for the operator ERROR that remains possible:
+pointing a new-binary node at an old manifest during a fresh deployment. Without it that misconfig
+surfaces as an opaque `manifest_hash` mismatch; with it, as a version rejection.
 
 **ADR-0013 §4's LIST MUST STAY AUTHORITATIVE.** It instructs reimplementers to work "from THIS list
 + order, NOT a naive serialization". That list previously omitted `escape_feerate_floor` and
