@@ -184,8 +184,12 @@ sealed escape descriptor, so the signer cannot derive which is "spend" and which
 destinations or wallet membership. It MUST approve every otherwise-valid pair and display both as
 generic escape-destination transactions, making no positional role claim. It MUST NOT reject on the
 ground that the roles are indistinguishable: sealed state cannot distinguish the roles of ANY valid
-pair, so that branch rejects every escape-class spend and disables the incident `escape`/clawback
-path the runbook directs a user under duress to take. Unauthenticated role is a display limit, not
+pair, so that branch rejects every escape-class spend and disables the escape-class
+path entirely — including the FREE-TO-ACT clawback in OPERATIONS-RUNBOOK's "An unauthorized spend
+is pending", which is the honest-coordinator case and the one that must keep working. (Do NOT cite
+the duress case here: after a wrench the same runbook forbids the normal-PIN clawback, because the
+relay is hostile and would learn the normal PIN. The escape-class SHAPE must stay admissible; the
+duress-time USE of it does not.) Unauthenticated role is a display limit, not
 an admissibility defect.
 
 **5. Nothing pin-dependent crosses the signing seam.** The seam takes no PIN parameter, so no signer

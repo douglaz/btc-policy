@@ -181,8 +181,13 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    Afterwards, check the chain. The switch cannot revoke a signature already released or
    un-broadcast a transaction already in the mempool, so the coerced spend may still land; there is
    no `hold_secs` floor and `hold_secs = 0` is a supported configuration where the fire event is
-   ingress itself. Watch for late confirmations: one landing post-shutdown creates vault change and
-   restarts THAT output's recovery clock, changing the dates in step 5.
+   ingress itself. Watch for late confirmations on BOTH transactions, not just the coerced
+   one. A coerced spend landing post-shutdown creates vault change and restarts THAT output's
+   recovery clock, changing the dates in step 5. And an ESCAPE that was broadcast but still
+   unconfirmed when you cut power does not leave its peers' mempools when the nodes die — it can
+   confirm afterwards, so a sweep that step 3 read as absent may land in the escape wallet later.
+   Re-read both balances after things settle rather than trusting step 3's single reading, or a
+   full sweep sits unnoticed in a single-key wallet.
    If you do NOT control the hardware, there is no action, and that is by design. A coerced hot
    spend may complete; the residual is accepted and BOUNDED by the Hot budget (ADR-0014, "the hot
    wallet is the risk budget"). Guaranteed delivery under a hostile coordinator is the v1 direct
