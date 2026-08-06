@@ -134,7 +134,7 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 
 1. At `T`, the deadline driver unconditionally attempts Lockdown; the independent fire driver
    attempts the escape sweep. The sweep is BEST-EFFORT: it may not fire at all, and even when it
-   fires it need not move everything. Assume a partial result until you have checked — in step 2, not now.
+   fires it need not move everything. Assume a partial result until you have checked — step 3 reads the balances; not now.
 2. **Once safe — including the checks. But do not linger.** Do none of this while you are still
    with the attacker: step 4 generates the new vault's keys and PINs,
    telling payers to stop announces that the duress response fired, and even the verification below
@@ -161,23 +161,26 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    request of its own, letting the coerced spend release at its Hold. If Lockdown DID land the
    clawback cannot fire anyway: every spend then returns `FRAUD_SUSPECTED`, for that node's
    lifetime.
-   **There is one action available, and it is not a message — it is the power switch. It is also
-   narrower than it looks, so read the whole of this before using it.** If you still control the
-   hardware, cutting power destroys all five nodes' keys permanently: the v0 federation is
-   co-located on one host and its keys are RAM-only, so a rebooted node is a dead node (ADR-0007).
-   It needs no coordinator, no PIN and no network, which is why a hostile relay cannot interfere
-   with it.
-   What it does: stops any partial that has NOT yet been released. What it CANNOT do: revoke a
-   signature already released, or un-broadcast a transaction already in the mempool. So CHECK THE
-   CHAIN AND MEMPOOL FIRST. If the coerced spend's Hold has already elapsed, its partials are out
-   and it can be combined and broadcast without any node — killing the box will not stop it, and
-   with `hold_secs = 0` (a supported configuration; the fire event is ingress itself) that window
-   closed the moment the request was accepted. Recheck for late confirmations afterwards too: a
-   transaction that lands post-shutdown creates vault change and restarts THAT output's recovery
-   clock, which changes the dates in step 5.
-   And do not do it while your own escape sweep is in flight. Lockdown deliberately does NOT block
-   the in-flight escape combine the Firing job needs (ADR-0012's Lockdown row); powering off does,
-   so you would abort the sweep that was busy rescuing your coins.
+   **There is one action available, and it is not a message — it is the power switch. Use it
+   promptly; do not research first.** If you still control the hardware, cutting power destroys all
+   five nodes' keys permanently: the v0 federation is co-located on one host and its keys are
+   RAM-only, so a rebooted node is a dead node (ADR-0007). It needs no coordinator, no PIN and no
+   network, which is why a hostile relay cannot interfere with it.
+   DO NOT check the chain first. The state that decides whether this works — whether the coerced
+   spend's partials have been released yet — is not visible on chain or in the mempool, so a check
+   cannot tell you, and it spends the window in which the switch still helps.
+   The two ways this can go are settled by the state machine, and they do not overlap. If NOTHING
+   ARMED, no sweep exists to interrupt and the coerced spend is the live threat: the switch stops
+   any partial not yet released, which is the whole of what you can do. If the vault DID ARM, then
+   hot-class finalization is already frozen and the coerced spend cannot finalize anyway — you do
+   not need the switch, and using it would abort the in-flight escape combine that Lockdown
+   deliberately preserves (ADR-0012's Lockdown row). So: if you have any reason to believe the
+   federation armed, leave it running. If you do not, cut power now.
+   Afterwards, check the chain — not before. The switch cannot revoke a signature already released
+   or un-broadcast a transaction already in the mempool, so the coerced spend may still land; there
+   is no `hold_secs` floor and `hold_secs = 0` is a supported configuration where the fire event is
+   ingress itself. Watch for late confirmations: one that lands post-shutdown creates vault change
+   and restarts THAT output's recovery clock, which changes the dates in step 5.
    Understand the trade before you do it: it finishes the vault. The coins then exit only through
    the recovery branch, on each UTXO's own clock. That is the same trade the duress PIN makes, and
    it is the right one when a hot spend is still assemblable and you cannot otherwise stop it.
