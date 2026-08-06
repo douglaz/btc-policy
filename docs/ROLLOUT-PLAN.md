@@ -60,7 +60,7 @@ ADR-0012 already names as the severe residual.
 | **6** | **many providers** | open | signet | Provider diversity — the ADR-0009 correlation-class requirement. |
 | **7** | many providers | **sealed** | signet | Attrition measurement continues under provider diversity. |
 | **8** | many providers | sealed | **mainnet** | **Run it for a while**, capped. The Survivor vault is the observation subject. |
-| **9** | many providers | sealed | mainnet | Full Path suite on the real configuration. Requires `bq6` (hardware signing) before the caps lift. **Freeze → external review #2 (deployed system).** |
+| **9** | many providers | sealed | mainnet | Full Path suite on the real configuration. Requires `bq6` (hardware signing) before the caps lift. **Freeze → THE external review (deployed system) — the only one, per ADR-0017.** |
 | **10** | — | — | — | Public alpha. |
 
 ## Per-stage testing: two vaults

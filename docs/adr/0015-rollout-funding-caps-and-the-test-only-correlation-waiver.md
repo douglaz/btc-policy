@@ -95,7 +95,7 @@ real capability, and the reason it is acceptable here is precisely the dust cap:
 mitigation.** What such an attacker gets at stages 3–8 is dust.
 
 The consequence is that **`bq6` becomes mandatory before the caps are lifted**, and it gates the
-stage-9 freeze (`yt7`) — the last point before an alpha, and the artifact external review #2
+stage-9 freeze (`yt7`) — the last point before an alpha, and the artifact the external review
 examines. An auditor handed a "deployed system" whose user key is a file on the coordinator will
 say so immediately, and they will be right.
 
