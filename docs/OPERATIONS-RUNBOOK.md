@@ -128,9 +128,18 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    attempts the best-effort escape sweep.
    The sweep may not fire if a fire-time admissibility check fails; the coins then remain frozen
    and exit through the Recovery path.
-2. Once safe, confirm on-chain where the coins went — the escape wallet is independent of every
-   vault key by construction (checked at ceremony time).
-3. The old vault is finished. Stand up a new one (`docs/UPGRADE-AND-ROTATION-POLICY.md` §3).
+2. Once safe, confirm on-chain **whether the sweep actually landed**. Both branches end with the
+   old vault finished, but they are not the same procedure and step 1 does not tell you which one
+   you are in.
+   - **Swept.** The coins are in the escape wallet, which is independent of every vault key by
+     construction (checked at ceremony time). Go to step 3.
+   - **Not swept.** The coins are still in the old, locked-down vault. There is no destination to
+     confirm and nothing to migrate yet: wait out that vault's configured relative timelock (180
+     days by default — check the manifest), complete Recovery through the 2-of-3 recovery branch,
+     and only then go to step 3. Do NOT abandon the vault before Recovery completes — it still
+     holds the funds.
+3. The old vault is finished. Stand up a new one (`docs/UPGRADE-AND-ROTATION-POLICY.md` §3) and
+   move the funds you now control into it.
 
 ### An unauthorized spend is pending and the Hold has not expired
 This is what the Hold is for.
