@@ -24,8 +24,9 @@ escape and recovery keys, and the operator preimages that derive node keys.
 
 Coins sit in a P2WSH descriptor with two branches: **3-of-5 federation signatures plus the user
 key**, or — after a ~180-day relative timelock — a **2-of-3 recovery** branch. Five independent
-`vault-node` daemons each hold one federation key. A spend is submitted through an untrusted
-**coordinator** relay; each node independently re-runs every policy gate, signs at ingress, and
+`vault-node` daemons each hold one federation key. A spend is submitted through a **coordinator**
+relay that the threat model trusts during normal operation and treats as hostile from the wrench
+attack onward; each node independently re-runs every policy gate, signs at ingress, and
 holds its partial signature until the **Hold** elapses. Nodes then release partials to each
 other, and whichever node first holds `t` of them combines and broadcasts. Every spend request
 carries a **PIN**; a second, distinct *duress* PIN silently arms an escape sweep that claws the
@@ -36,21 +37,22 @@ consolidated architecture.
 
 | # | Adversary | Holds | Design answer |
 |---|---|---|---|
-| A1 | **Remote attacker / malware on the coordinator** | The coordinator relay, network position | The coordinator is untrusted by construction (ADR-0010). It holds no signing key, cannot finalize, and cannot broadcast — nodes assemble and broadcast. Every request is re-validated per node. |
+| A1 | **Remote attacker / malware on the coordinator** | The coordinator relay, network position | This is a **pre-wrench trust failure**, not an adversary answered by assuming the coordinator was always untrusted: malware that observes the normal PIN nullifies duress (R8b). Independent node validation still limits what it can authorize, and it holds no federation signing key, cannot finalize, and cannot broadcast — nodes assemble and broadcast. |
 | A2 | **Thief with the user key** | User key, but no PIN | Cannot produce a valid request: the PIN gate is independent of the key. Destination allowlist and Hot budget bound anything that does pass. |
 | A3 | **Thief with user key + normal PIN** | Both | Bounded, not prevented. The destination allowlist, per-tx cap, and velocity ledger (ADR-0014) bound the loss; the **Hold** gives the user a window to notice and claw back with the duress PIN. This is the `demo theft-refused` scenario. |
 | A4 | **Coercion / wrench attack** | The user, under duress, plus everything they know | The **duress PIN** (ADR-0008): a spend ceremony that looks and sounds identical to the attacker, but silently arms an escape sweep at `T` and locks the federation down unconditionally. This is the design's centrepiece. |
 | A5 | **Compromise of `c < t` nodes** | Up to 2 of 5 federation keys | Cannot reach quorum alone. ADR-0009 requires no correlation class (host, OS, location, operator) reach `t`. The Hot budget's routing bound is stated for `c < t` explicitly (ADR-0014). |
 | A6 | **Compromise of `≥ t` nodes** | 3+ federation keys **and** the user key | **Out of scope — this breaks the vault.** The federation threshold is the security boundary; nothing below it recovers from `t` honest-key compromise combined with the user key. |
 | A7 | **Coordinator-auth-key thief** | User key + PIN + coordinator auth key | Can feed one node directly and rely on propagation to arm the federation. Loss is bounded by allowlist/Hot budget/Hold, and every node's pin-uniform `GET /pending` projection makes the accepted candidate visible without relying on the coordinator relay. |
-| A8 | **Chain-level adversary** | Miners, mempool, fee market | Cannot steal. Can *delay*: fee spikes, censorship, and reorgs are handled by the RBF escape ladder, the re-broadcast path, and reorg-aware settlement — and every failure degrades to "funds frozen → recovery", never to theft. |
+| A8 | **Chain-level adversary** | Miners, mempool, fee market | Cannot steal. Can *delay*: fee spikes, censorship, and reorgs are handled by the RBF escape ladder, the re-broadcast path, and reorg-aware settlement — and every failure degrades to "funds frozen → recovery", never to theft. **How much of the ladder ships today:** `escape_fee_ladder`'s only caller is the in-process demo; the signet driver and the adversarial harness both submit empty ladders, and the operator CLI does not exist yet. ADR-0016 decides the shipped posture — opt-in and default-off per vault, landing with `btc-policy-mby`/`btc-policy-sqn` — after which a default vault's admissible sweep fires at its base fee only and a spike is absorbed by the Recovery path. |
 | A9 | **Supply chain** | A dependency, or the build | Bounded by a deliberately small dependency set and a policy that every dependency must beat writing it (`docs/SBOM-AND-DEPENDENCY-POLICY.md`). **Weakly defended — see R4.** |
 
 ## 4. Trust boundaries
 
-1. **User ↔ coordinator.** The coordinator authenticates requests with its own key but is
-   *untrusted*: it is a relay whose signature only proves "this vault's coordinator authored this
-   request", never that the request is legitimate.
+1. **User ↔ coordinator.** The coordinator is trusted to act honestly before the wrench and may
+   turn hostile from that moment (ADR-0012). Its authentication key proves only "this vault's
+   coordinator authored this request", never that the request is legitimate, so nodes still
+   validate every request independently.
 2. **Coordinator ↔ node.** The hard boundary. Every node independently re-runs coord-auth,
    freshness, the PIN, the chain preflight, the user signature, destination class, and the
    Hot budget (§6 gives the order; the preflight precedes validation).

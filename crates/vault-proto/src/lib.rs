@@ -501,8 +501,8 @@ impl<'a> CoordRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignRequest {
     /// Base64 PSBT of the spend being requested. On the wire this is `spend`:
-    /// ADR-0013 §2 names the tagged arm's fields `{spend, escape, pin, nonce,
-    /// expiry, policy_version}` and supersedes the old untagged `{psbt,
+    /// ADR-0013 §2 names the tagged arm's fields `{spend, escape, escape_bumps,
+    /// pin, nonce, expiry, policy_version}` and supersedes the old untagged `{psbt,
     /// escape_psbt, pin}` body. The Rust name is left alone (it is the whole
     /// workspace's word for this PSBT); only the wire is pinned to the ADR. The
     /// coord-auth preimage is unaffected either way — [`CoordRequest::canonical_bytes`]

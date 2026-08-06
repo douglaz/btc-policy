@@ -6394,9 +6394,12 @@ struct RegisterPair<'a> {
     confirmation_required: bool,
     escape: &'a Psbt,
     /// The escape's validated fee-bump ladder (bead btc-policy-9y5.7), ascending by
-    /// fee; empty when the request authorized no bump. A self-paired request (its
-    /// escape IS its spend) always passes an empty slice — [`ensure_escape_ladder`]
-    /// refuses a ladder there, so the collapsed single candidate never carries one.
+    /// fee; empty when the request authorized no bump. Empty for a REFRESH BY
+    /// CONSTRUCTION, not by validation: `RefreshRequest` carries no ladder field and
+    /// the refresh path passes `&[]` as a literal. [`ensure_escape_ladder`] has one
+    /// call site and it is the SPEND handler, so it never runs here — do not rely on
+    /// it if the refresh shape ever gains a ladder. A self-paired SPEND is refused at
+    /// ingress by `escape_class_residual` and never reaches this struct at all.
     escape_bumps: &'a [Psbt],
     escape_commitment_id: &'a str,
     /// The SPEND's fire window. The escape's delayed slot is installed atomically
@@ -6457,9 +6460,11 @@ fn register_pair(node: &Node, pair: RegisterPair) -> Result<(), SignResponse> {
             fire: Some(pair.fire),
             expiry: pair.expiry,
         }),
-        // A SELF-PAIRED request collapses to ONE candidate: an escape-class spend
-        // byte-identical to its mandatory escape, OR a refresh (escape == spend,
-        // ADR-0013 §2 gives a refresh no escape). The spend candidate already carries
+        // A SELF-PAIRED request collapses to ONE candidate. In practice that means a
+        // REFRESH (ADR-0013 §2 gives a refresh no escape, so escape == spend): an
+        // escape-class SPEND byte-identical to its mandatory escape cannot reach here,
+        // because `escape_class_residual` refuses it at ingress — its mandatory Escape
+        // must be a distinct, disjoint residual. The spend candidate already carries
         // the immediate fire window; registering a SECOND Escape-role candidate under
         // the SAME exact commitment id collides in the store — `register` keys on
         // `commitment_id`, so the two rows (differing only in `role`) surface
@@ -7337,9 +7342,11 @@ fn psbt_fee(psbt: &Psbt) -> Option<u64> {
 ///  - **RBF-signalling with `nLockTime == 0`,** for the whole ladder including the
 ///    base — see [`ESCAPE_RBF_SEQUENCE`]. A ladder whose base cannot be replaced
 ///    could never escalate past its first broadcast.
-///  - **Not on a self-paired request.** An escape-class spend IS its own escape and
-///    completes immediately at ingress; there is no delayed sweep to bump, and the
-///    collapsed single candidate has no escape role to hang a ladder on.
+///  - **Not on a self-paired request.** Such a request is refused outright by
+///    `escape_class_residual` — an escape-class spend's mandatory Escape must be a
+///    DISTINCT, DISJOINT residual — so it completes nothing and reaches no chain.
+///    This arm only runs first because the ladder is checked before that refusal:
+///    defence in depth, not a description of a shape that can succeed.
 ///
 /// A ladder-less request is untouched: the escape keeps `Sequence::MAX`, which is
 /// non-signalling and final, exactly as before this bead.
@@ -7360,9 +7367,17 @@ fn ensure_escape_ladder(
         return Ok(());
     }
     if self_paired {
+        // DEFENSIVE, and the wording matters: a self-paired request is not a legitimate
+        // shape that merely lacks a sweep — `escape_class_residual` below refuses it
+        // outright, because an escape-class spend's mandatory Escape must be a distinct
+        // disjoint residual (test `an_escape_class_spend_cannot_equal_its_mandatory_residual`).
+        // This arm only runs first because the ladder is checked before that refusal.
+        // Earlier wording here described self-pairing as the normal shape of an
+        // escape-class spend. It is not, and that wording propagated: keep this arm and
+        // the `escape_class_residual` refusal describing the same rule.
         return bad(
-            "an escape-class spend is its own escape and completes at ingress, so it has no \
-             delayed sweep to fee-bump"
+            "a self-paired request has no delayed sweep to fee-bump; its spend and escape \
+             are the same transaction, which `escape_class_residual` refuses outright"
                 .into(),
         );
     }

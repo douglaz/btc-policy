@@ -54,7 +54,7 @@ each node VALIDATES the coordinator-composed, user-signed tx against its own cha
 signs, gathers the other partials over the channel, combines, and broadcasts via
 its V0-6 chain backend. The coordinator (vault-cli) stops combining/finalizing/
 broadcasting — it relays the **coordinator-SIGNED tagged request**
-(`SpendRequest{spend, escape, pin, nonce, expiry, policy_version}` or
+(`SpendRequest{spend, escape, escape_bumps, pin, nonce, expiry, policy_version}` or
 `RefreshRequest{refresh, nonce, expiry, policy_version}` — escape mandatory,
 coordinator signature over a fresh nonce + expiry; ADR-0013 §2) and pulls
 alerts. Rework the
@@ -192,13 +192,16 @@ broadcast). **The mechanism is now fully specified in [ADR-0012](adr/0012-model-
   flips only an **internal** fire bit. **Combine-at-broadcast** (do not pre-assemble the escape on the
   response path). Shared with V0-8. (ADR-0012.)
 - **Node-derived transaction-class predicate + reject-mixed (ADR-0013 §3; shared with V0-5)** — class
-  comes from the spend's **outputs**, never a coordinator label: escape-class iff *every* output pays the
-  escape descriptor, refresh-class iff every output pays the vault descriptor, else hot-class; **mixed →
-  reject (`PSBT_INCONSISTENT`)** (closes the 99%-hot + dust-to-escape bypass).
+  comes from the spend's **outputs**, never a coordinator label. Vault change is permitted in every
+  class and excluded from classification: escape-class iff every *destination* output pays the escape
+  descriptor, refresh-class iff every output pays the vault descriptor, and hot-class iff every
+  *destination* output pays a hot-allowlist descriptor; **mixed → reject (`PSBT_INCONSISTENT`)**
+  (closes the 99%-hot + dust-to-escape bypass).
 - **RAMDISK ARMING state + unconditional Lockdown-at-T on every failure branch** (reboot-death/tmpfs,
   2026-07-16) — hold the armed bit + `T` in RAMDISK node state, no persistence: a rebooted armed node is
-  DEAD and contributes no partial; the surviving armed set fires the sweep at `T` if ≥ t remain, else
-  lockdown-only → recovery (ADR-0007); enter Lockdown at `T` even if fire/broadcast fails (not only after
+  DEAD and contributes no partial; if ≥ t remain, the surviving armed set attempts the best-effort
+  sweep at `T`; below quorum or on any fire-time failure, it is lockdown-only → recovery (ADR-0007).
+  Enter Lockdown at `T` even if fire/broadcast fails (not only after
   confirm); the pin is **never persisted in the envelope** (ADR-0012 duress state machine).
 - **Two-track duress state machine — the arm VERDICT is keyed on the valid DURESS PIN ALONE**
   (chain-view-independent), and the arm is **COMMITTED at t-of-n confirmation** (V0-4b §0): a valid
@@ -228,9 +231,11 @@ for input ownership, change, and allowlist (DESIGN.md Policy model).
 
 **Newly-specified work (fresh-eyes review; ADR-0013):**
 - **Node-derived transaction-class predicate + reject-mixed (ADR-0013 §3; shared with V0-4).** Reuse
-  V0-5's own-descriptor re-derivation to classify the spend from its **outputs**: escape-class iff every
-  output pays the escape descriptor, refresh-class iff every output pays the vault descriptor, else
-  hot-class; **reject mixed (`PSBT_INCONSISTENT`)**. Never trust a coordinator label.
+  V0-5's own-descriptor re-derivation to classify the spend from its **outputs**. Vault change is
+  permitted in every class and excluded from classification: escape-class iff every *destination*
+  output pays the escape descriptor, refresh-class iff every output pays the vault descriptor, and
+  hot-class iff every *destination* output pays a hot-allowlist descriptor; **reject mixed
+  (`PSBT_INCONSISTENT`)**. Never trust a coordinator label.
 - **Refresh min-interval + tight fee cap (ADR-0013 §6; shared with V0-3).** Enforce
   `refresh_min_interval_secs` and `refresh_max_feerate` on refresh-class spends.
 
@@ -262,7 +267,8 @@ The manifest is the **root of channel + coordinator trust**, so it is load-beari
 - **Per-vault manifest (ADR-0013 §4):** written once at setup, hash-pinned, distributed to every node +
   backed up with the descriptor; **immutable** (any change = a new vault). Fields: wallet_id, canonical
   `vault_descriptor`, policy_version, `coordinator_auth_pubkey`, per-node {signing_pubkey, channel_pubkey,
-  transport_endpoints}, t/n, recovery_timelock, hot_allowlist, escape_descriptor. Each
+  transport_endpoints}, t/n, recovery_timelock, hot_allowlist, escape_descriptor,
+  `escape_feerate_floor`, `escape_coverage_pct`. Each
   `channel_pubkey` **endorsed by that node's Bitcoin signing key** over a domain-separated tuple (ADR-0012
   channel identity) so the coordinator cannot mint/impersonate a node. Shared with V0-8.
 - **Full node config schema (ADR-0013 §5):** the security-load-bearing superset of DESIGN's TOML — pin

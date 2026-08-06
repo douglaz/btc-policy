@@ -124,7 +124,9 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 ## 6. Incidents
 
 ### The user was coerced (duress PIN used)
-1. The escape sweep arms and fires at `T`; every node locks down. This is automatic.
+1. At `T`, the deadline driver unconditionally attempts Lockdown and a best-effort escape sweep.
+   The sweep may not fire if a fire-time admissibility check fails; the coins then remain frozen
+   and exit through the Recovery path.
 2. Once safe, confirm on-chain where the coins went — the escape wallet is independent of every
    vault key by construction (checked at ceremony time).
 3. The old vault is finished. Stand up a new one (`docs/UPGRADE-AND-ROTATION-POLICY.md` §3).

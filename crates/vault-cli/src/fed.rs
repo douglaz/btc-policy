@@ -249,11 +249,15 @@ const _: () = assert!(ESCAPE_BUMP_MULTIPLIERS.len() <= vault_proto::MAX_ESCAPE_B
 
 /// The share of the swept value the top ladder rung may pay in fee.
 ///
-/// The node's own guard is the coverage check (fee ≤ `100 − escape_coverage_pct`
-/// percent, i.e. 5% by default), enforced at fire time on whichever rung is
-/// selected. This coordinator-side bound sits an order of magnitude below it, so a
-/// composed ladder never proposes a rung the node would refuse and never brushes
-/// the policy fee cap either.
+/// The node's own guard is the coverage check, enforced at fire time on whichever
+/// rung is selected. Under full coverage it allows a fee of at most
+/// `100 − escape_coverage_pct` percent of the protected value (5% by default), while
+/// this coordinator-side bound caps a rung at 1% of `total_in`: FIVE TIMES lower
+/// under that assumption (an earlier version of this comment said "an order of
+/// magnitude", which is wrong). That is headroom, not an admissibility guarantee:
+/// the node compares delivered value against its fire-time `protected_value`, so a
+/// deposit during the Hold can make even a composed rung fail coverage. The 1% bound
+/// does stay well below the policy fee cap.
 const ESCAPE_BUMP_MAX_FEE_PCT: u64 = 1;
 
 /// Below this the reduced escape output would be dust, so the rung is dropped.
