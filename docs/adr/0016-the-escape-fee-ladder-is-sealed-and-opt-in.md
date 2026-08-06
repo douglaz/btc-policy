@@ -91,9 +91,22 @@ operator CLI `btc-policy-mby` is new software pointed at vaults that already exi
 the extended layout it cannot recompute or authenticate a v0 `manifest_hash`, and there is no older
 client to fall back on because a sealed-vault spend/escape CLI is the very thing mby introduces. So
 v0 vaults would be sealed, alive, running honest nodes, and unreachable by the only tool that can
-operate them. "Unaffected" must not be read as covering that. mby therefore has to dispatch manifest
-hashing and parsing on `protocol_version` and carry a v0 vector, or v0 vaults get no operator path
-at all — the decision belongs in mby, and it is recorded there.
+operate them. "Unaffected" must not be read as covering that.
+
+And `protocol_version` alone CANNOT carry that dispatch, because it has already failed once as a
+compatibility signal. The production setup ceremony landed in `6f053c9` (2026-07-26), so vaults
+could be sealed from that point; `0f16d21` (2026-07-27) then changed BOTH `base_manifest_bytes` and
+`CoordRequest::canonical_bytes` for the fee-bump ladder and did NOT bump the version. Two
+incompatible wire formats therefore both declare `PROTOCOL_VERSION_V0 == 0`, and no dispatch keyed
+on that field can tell them apart. This is also the strongest argument FOR the bump §3a now
+requires: it would be the first time the field is actually used for what it is for.
+
+So NARROW the claim rather than build a dispatch that cannot work. `btc-policy-mby` must operate
+vaults sealed at or after `0f16d21` and carry a vector for that format. Vaults sealed in the
+`6f053c9..0f16d21` window are NOT supported and their exit is rotation to a new vault — acceptable
+because the window is one day, pre-mainnet, before this repo was public, and rollout stage 1 is
+signet with dust. If any such vault is ever found to hold value, reconstructing its preimage from
+`0f16d21^` is the remedy, and that is a decision to take then, not scaffolding to build now.
 
 What the version bump buys on top is a clear failure for the operator ERROR that remains possible:
 pointing a new-binary node at an old manifest during a fresh deployment. Without it that misconfig
