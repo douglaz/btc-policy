@@ -6462,9 +6462,10 @@ fn register_pair(node: &Node, pair: RegisterPair) -> Result<(), SignResponse> {
         }),
         // A SELF-PAIRED request collapses to ONE candidate. In practice that means a
         // REFRESH (ADR-0013 §2 gives a refresh no escape, so escape == spend): an
-        // escape-class SPEND byte-identical to its mandatory escape cannot reach here,
-        // because `escape_class_residual` refuses it at ingress — its mandatory Escape
-        // must be a distinct, disjoint residual. The spend candidate already carries
+        // escape-class SPEND byte-identical to its mandatory escape cannot reach here:
+        // `escape_class_residual` refuses that equal-commitment shape at ingress,
+        // while a distinct residual's input disjointness is checked at fire time.
+        // The spend candidate already carries
         // the immediate fire window; registering a SECOND Escape-role candidate under
         // the SAME exact commitment id collides in the store — `register` keys on
         // `commitment_id`, so the two rows (differing only in `role`) surface

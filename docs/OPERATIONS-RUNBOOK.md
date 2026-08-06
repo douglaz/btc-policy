@@ -124,7 +124,8 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 ## 6. Incidents
 
 ### The user was coerced (duress PIN used)
-1. At `T`, the deadline driver unconditionally attempts Lockdown and a best-effort escape sweep.
+1. At `T`, the deadline driver unconditionally attempts Lockdown; the independent fire driver
+   attempts the best-effort escape sweep.
    The sweep may not fire if a fire-time admissibility check fails; the coins then remain frozen
    and exit through the Recovery path.
 2. Once safe, confirm on-chain where the coins went — the escape wallet is independent of every
