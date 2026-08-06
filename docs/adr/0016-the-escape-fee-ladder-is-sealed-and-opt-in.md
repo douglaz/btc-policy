@@ -77,6 +77,19 @@ for otherwise-identical inputs, so it MUST ship with a protocol-version bump rat
 to declare `PROTOCOL_VERSION_V0`. Existing sealed vaults are unaffected — their manifests are
 immutable and rotation creates a new vault.
 
+Be precise about what "unaffected" does and does not mean, because the difference is a bricking
+risk. It means their sealed bytes stay valid and no manifest needs rewriting. It does NOT mean an
+upgraded node can still serve them: `base_manifest_bytes` computes ONE layout and dispatches on
+nothing — `protocol_version` is hashed IN as a parameter, not switched on — so a node built with
+the extended preimage derives a different `manifest_hash` from the same v0 `manifest.json` and
+cannot serve that vault, whether it fails as a version error or as a hash mismatch. So one of two
+things must be decided and written down before the field lands: either the hashing becomes
+version-DISPATCHED, so an extended node reproduces the v0 preimage for a v0 anchor (with a
+cross-version vector proving it), or upgrading past this change is accepted as bricking a v0 vault
+and the migration is rotation to a new vault — which is consistent with "there is no in-place
+rotation in v0", but must be stated rather than left to be discovered by an operator whose nodes
+stop recognising their own manifest after a restart. `btc-policy-mby` owns the decision.
+
 That refusal is NOT implementable today, and `btc-policy-mby` owns closing the gap rather than
 assuming it. Nothing feeds a declared version into a node at startup: `ConfigFile`/`ChannelConfig`
 carry no `protocol_version`, nodes never read `manifest.json` at all, and manifest hashing injects
@@ -104,6 +117,16 @@ them as TWO independent fields.** The coupling is a presentation affordance, not
 `recovery_timelock` and `escape_bump_max_fee_pct` are separate manifest entries, independently
 validated, and the Ceremony displays the resulting value of each explicitly before sealing. An
 implementation that encodes both in a single field is building the wrong thing.
+
+The bead ordering can violate this MUST in an intermediate release, and the result is irreversible.
+`btc-policy-mby` adds the ladder's Ceremony input; `btc-policy-wdu` is what later makes the recovery
+timelock a choice and merges the two prompts. Between them the Ceremony would put the ladder
+question alone in front of an operator, and vaults sealed in that window are sealed forever. Resolve
+it the cheap way rather than by coupling the beads: `mby`'s prompt must show the recovery timelock
+alongside the ladder ceiling as a FIXED, displayed value (which is what it is today — 180 days, no
+setting), so the operator still reasons about both together and only the second value is
+selectable. `wdu` then turns that displayed constant into the second half of the question. Landing
+the ladder input while the timelock is invisible is the failure mode to avoid.
 
 **4a. The SIGNER checks the ladder against the sealed ceiling as composition validation, not as
 hostile-coordinator enforcement.** Nodes do not enforce `escape_bump_max_fee_pct`, and at the wrench
