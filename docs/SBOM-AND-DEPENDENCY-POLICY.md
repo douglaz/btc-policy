@@ -23,7 +23,7 @@ the signing key, and each one is a supply-chain entry point. The bar rises with 
 | `policy-core` (the pure refusal core) | Essentially closed. It has exactly two deps (`bitcoin`, `miniscript`) and stays pure — no I/O, no chain, no clock, no crypto beyond what the descriptor needs. |
 | `vault-proto` (wire types) | Serialization and zeroization only. Anything that could change *what a byte means* belongs upstream in the schema, not in a crate. |
 | `vault-node` (the signer daemon) | Justified case-by-case, and only for things that are genuinely hard to get right: consensus encoding, Argon2, constant-time comparison, async I/O. |
-| `vault-cli` (coordinator/harness) | Same bar. The coordinator is untrusted (ADR-0010), but it still handles the ceremony. |
+| `vault-cli` (coordinator/harness) | Same bar. The coordinator is trusted during normal operation and may turn hostile at the wrench (ADR-0012); it also handles the trusted ceremony. |
 
 Concrete rules:
 

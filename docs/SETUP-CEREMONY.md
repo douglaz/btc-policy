@@ -117,6 +117,7 @@ the enrolled PIN digests, the chain backend, and the policy numbers:
     "max_commitment_age_secs": 172800,
     "policy_version": 1,
     "escape_feerate_floor": 20,
+    "escape_coverage_pct": 95,
     "hot_max_per_tx": 50000000,
     "hot_max_per_window": 100000000,
     "hot_window_secs": 172800,

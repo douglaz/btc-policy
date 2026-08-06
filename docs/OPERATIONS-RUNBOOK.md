@@ -124,10 +124,117 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 ## 6. Incidents
 
 ### The user was coerced (duress PIN used)
-1. The escape sweep arms and fires at `T`; every node locks down. This is automatic.
-2. Once safe, confirm on-chain where the coins went — the escape wallet is independent of every
-   vault key by construction (checked at ceremony time).
-3. The old vault is finished. Stand up a new one (`docs/UPGRADE-AND-ROTATION-POLICY.md` §3).
+
+> **Most of this procedure cannot be executed with what ships today.** There is no sealed-vault
+> receive, balance, or spend command, and no operational code reads `manifest.json` at all
+> (threat-model R9). Steps 3-6 below describe what must happen, not commands you can run: until
+> `btc-policy-mby` (operator CLI core), `btc-policy-en1` (`recover`) and `btc-policy-00i` (receive
+> addresses, balance reads) land, each is a manual operation against the descriptor and a block
+> explorer or your own node. Read the whole section before starting so you know what you are
+> committing to.
+
+1. At `T`, the deadline driver unconditionally attempts Lockdown; the independent fire driver
+   attempts the escape sweep. The sweep is BEST-EFFORT: it may not fire at all, and even when it
+   fires it need not move everything. Assume a partial result until you have checked — step 3 reads the balances; not now.
+2. **Once safe — including the checks. But do not linger.** Do none of this while you are still
+   with the attacker: step 4 generates the new vault's keys and PINs,
+   telling payers to stop announces that the duress response fired, and even the verification below
+   reveals it to anyone watching your screen. Silence is the protection; do not spend it to satisfy
+   your own curiosity about whether Lockdown landed. Once you ARE safe, act immediately rather than
+   at leisure: if the carrier never reached `t` nodes then nothing armed and nothing froze, a
+   coerced hot spend can still finalize, and `hold_secs` has no positive lower bound — so "wait a
+   few hours" is not safe advice in that case — and no check will tell you which case you are in,
+   which is why the action below does not depend on knowing.
+   Do NOT probe with a real spend or refresh: `FRAUD_SUSPECTED` is a postcondition of Lockdown, not
+   a test for it, and on a node that has NOT locked down the spend can be registered and propagated
+   and a refresh signed and released, RESETTING the recovery maturity step 5 depends on.
+   **And do NOT attempt a normal-PIN clawback here, however tempting.** The clawback in "An
+   unauthorized spend is pending" below is written for a coordinator you still trust. After the
+   wrench you do not, and it is the only path you have to the nodes: sending it the normal PIN hands
+   over the one secret that stops pin substitution, and it already holds the user-signed spend, the
+   escape and the coordinator auth key — so it can censor your clawback and reissue a normal-PIN
+   request of its own, letting the coerced spend release at its Hold. If Lockdown DID land the
+   clawback cannot fire anyway: every spend then returns `FRAUD_SUSPECTED`, for that node's
+   lifetime.
+   **There is one action, and it is not a message — it is the power switch. If you still control
+   the hardware, CUT POWER NOW.** Know the trade as you do it, not after: this finishes the vault.
+   The coins then exit only through the recovery branch, on each UTXO's own clock — the same trade
+   the duress PIN makes, and the right one while a hot spend is still assemblable.
+   It works because the v0 federation is co-located on one host with RAM-only keys, so a rebooted
+   node is a dead node (ADR-0007): cutting power destroys all five nodes' keys permanently and
+   stops any partial not yet released. It needs no coordinator, no PIN and no network, which is
+   why a hostile relay cannot interfere with it.
+   Do not research first — nothing you can consult will tell you whether to do it. The chain and
+   mempool cannot: whether the coerced spend's partials have been released is not visible there.
+   `/healthz` cannot either: it is unauthenticated, carries no identity claim, and is reached over
+   the same relay path as `/sign` (DESIGN.md's `/healthz` wire contract) — the actor assumed
+   hostile after a wrench. A hostile COORDINATOR fakes `true` to make you stand down, and fakes
+   `false` to bait you into sending it something. Both answers are worthless to this decision.
+   Cut power anyway, because the two errors are not symmetric. If the vault DID arm, hot-class
+   finalization is already frozen and you did not need the switch — you have only exchanged one
+   safe outcome (the escape sweep) for another the design already accepts, at the cost of aborting
+   an in-flight escape combine Lockdown deliberately preserves (ADR-0012's Lockdown row). If
+   NOTHING armed, the coerced spend is live and the switch is the whole of what you can do. A
+   wrongly aborted sweep costs you time; a wrongly unfrozen theft costs you the coins. (Arming
+   converges rather than flipping — ADR-0012 describes a window where an early node is armed and
+   the rest are not — which changes nothing: the action is the same in every one of those states.)
+   Afterwards, check the chain. The switch cannot revoke a signature already released or
+   un-broadcast a transaction already in the mempool, so the coerced spend may still land; there is
+   no `hold_secs` floor and `hold_secs = 0` is a supported configuration where the fire event is
+   ingress itself. Watch for late confirmations on BOTH transactions, not just the coerced
+   one. A coerced spend landing post-shutdown creates vault change and restarts THAT output's
+   recovery clock, changing the dates in step 5. And an ESCAPE that was broadcast but still
+   unconfirmed when you cut power does not leave its peers' mempools when the nodes die — it can
+   confirm afterwards, so a sweep that step 3 read as absent may land in the escape wallet later.
+   Re-read both balances after things settle rather than trusting step 3's single reading, or a
+   full sweep sits unnoticed in a single-key wallet.
+   If you do NOT control the hardware, there is no action, and that is by design. A coerced hot
+   spend may complete; the residual is accepted and BOUNDED by the Hot budget (ADR-0014, "the hot
+   wallet is the risk budget"). Guaranteed delivery under a hostile coordinator is the v1 direct
+   user-to-node path (ADR-0012) and does not exist in v0. Everything else is on the recovery side.
+   **Stop inbound payments to the old vault.** Its addresses stay payable after Lockdown, and
+   anything arriving lands in a fresh recovery lock. You will have replacement addresses at step 4.
+3. **Read the old vault's remaining balance and the escape-wallet balance on-chain.** Do not infer
+   either from whether the sweep fired — ask the chain. Whatever reached the escape wallet is safe:
+   that wallet is independent of every vault key by construction (checked at ceremony time).
+4. **Rebuild the coordinator and ceremony environment from trusted media FIRST, then stand up the
+   new vault** using `docs/UPGRADE-AND-ROTATION-POLICY.md` §3 steps 1–2. The setup ceremony is a
+   trusted phase — it generates the successor's PINs, user key and coordinator auth key — and the
+   host you ran the old vault from is the one this procedure has been treating as hostile since
+   step 2. Running the ceremony on it can leak the new vault's secrets or tamper with the ceremony
+   before a single sat is deposited, which would carry the compromise across the rotation and make
+   everything below pointless. New host, and binaries you obtained independently of the compromised one — note that
+   byte-identical rebuilds and signed artifacts are `btc-policy-oy3` and do NOT ship yet, so this
+   is a provenance judgement you have to make, not a check you can run. Then: run the ceremony, then fund it
+   with a small deposit — from unrelated funds if step 3 found the escape
+   wallet empty — and complete one honest spend end to end, waiting for it to CONFIRM rather than merely broadcast. Section 3 step 3's migration spend does
+   NOT apply either way, and the reason is the same one that rules out the clawback above: it runs
+   through the coordinator. If Lockdown landed, the old vault's normal path is dead outright. If
+   nothing ever armed — the failed-carrier case in step 2 — the federation is still live, but the
+   relay you would reach it through is the one assumed hostile, so a live normal path is not a
+   usable one for you. Do not send it the normal PIN to find out. Step 5's recovery branch is the
+   exit in BOTH cases, and it is the one path that owes the federation nothing: after the timelock
+   matures, 2 of 3 recovery keys move the coins with no user key and no node quorum
+   (`crates/policy-core/src/template.rs:10-12`), so neither a locked-down federation nor a hostile
+   coordinator can block, censor or delay it. It is NOT private, though, and do not plan as if it
+   were: the recovery spend is an ordinary public transaction, and this vault's own watchtowers
+   classify exactly that shape as `RecoveryPathSpend` (`crates/vault-cli/src/recovery.rs:197-216`).
+   Anyone watching the chain — including whoever coerced you — sees the coins move when it
+   confirms, and can tell it was the recovery branch. Assume that moment is visible to them and
+   time it accordingly. If step 3 found an escape balance, move
+   it into the new vault once that check passes; otherwise migration waits for step 5's recoveries.
+   Do not leave an escape balance there for months: it is a single-key holding pen. Give payers the
+   new vault's addresses.
+5. **Recover whatever is still in the old vault, coin by coin, into the new one.** The locked-down
+   vault's only exit is the recovery branch: 2 of the 3 recovery keys, after a lock that is
+   BIP68-relative per UTXO — each coin matures 180 days (fixed for every vault; there is no
+   setting) after its own confirmation or last refresh, so compute each straggler's own date: a
+   coin refreshed 170 days ago matures in ~10 days. No shipped tool performs this spend — check
+   whether `btc-vault recover` (bead `btc-policy-en1`) exists yet; until it does, this is a manual
+   PSBT against the descriptor, using `build_recovery_spend` in `crates/vault-cli/src/recovery.rs`
+   as the recipe (`demo recovery-drill` proves the path on its own throwaway regtest and cannot
+   touch your vault).
+6. The old vault is finished when its balance is zero.
 
 ### An unauthorized spend is pending and the Hold has not expired
 This is what the Hold is for.
@@ -140,6 +247,13 @@ This is what the Hold is for.
      **normal PIN**. Escape-class fires immediately (`remaining_secs: 0`), so the conflicting
      transaction defeats the pending spend well before its Hold expires, and the vault keeps
      working afterwards. This is the clawback `demo theft-refused` act two performs end to end.
+     **It assumes the coordinator SOFTWARE is still honest, which is not the same as the auth key
+     being safe.** A stolen auth key lets a thief inject requests, but your clawback still reaches
+     the nodes through your own honest relay and your normal PIN goes nowhere else — that is the
+     case above. If the coordinator ITSELF is compromised, as it is assumed to be after a wrench,
+     do NOT use this: the normal PIN is the secret that stops pin substitution, and handing it to
+     the relay lets it censor your clawback and reissue a normal-PIN request of its own. See "The
+     user was coerced" above, where there is deliberately no action for that case.
    - **If you are under coercion**, submit the **duress PIN** ceremony instead (above): it arms
      the escape sweep at `T` and locks the federation down unconditionally, and the ceremony is
      indistinguishable to the attacker. The vault is finished afterwards — that is the trade.
@@ -154,8 +268,12 @@ sees it.
 
 ### The normal path is bricked (coordinator auth key lost)
 No request can be authenticated ever again — the manifest pins that pubkey and is immutable. The
-only exit is the recovery branch after that vault's configured relative timelock (180 days by default — check the manifest). `demo recovery-drill`
-exercises it. Start the clock immediately; there is no faster path.
+only exit is the recovery branch, after the fixed 180-day recovery lock. There is no faster path.
+The clock is not something this incident starts: the lock is BIP68-relative and has been accruing
+per UTXO since each coin's own confirmation or last refresh, and no further refresh can be
+authenticated now — so work out each coin's remaining maturity rather than assuming a full
+timelock from today. Recovery itself is the manual PSBT operation described under "The user was coerced" above;
+`demo recovery-drill` exercises the path but cannot spend your vault.
 
 ### A node will not boot
 Read the startup error before changing anything.

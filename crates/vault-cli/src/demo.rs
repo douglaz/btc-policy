@@ -463,9 +463,11 @@ impl Federation {
     /// User-sign both halves — and the escape's fee-bump ladder — then
     /// coordinator-authenticate the pair.
     ///
-    /// A self-paired request (an escape-class spend, whose escape IS its spend) gets
-    /// no ladder: it completes at ingress, so there is no delayed sweep to bump, and
-    /// the node refuses a ladder there.
+    /// A self-paired request — spend and escape the same transaction — gets no ladder.
+    /// Note this is NOT the shape of a valid escape-class spend: a node refuses a
+    /// self-paired spend outright (`escape_class_residual`), because an escape-class
+    /// spend's mandatory Escape must be a distinct, disjoint residual for the T-time
+    /// sweep. The branch is defensive.
     fn request(&self, spend: &Psbt, escape: &Psbt, pin: &str) -> Result<SignRequest, Error> {
         let mut spend = spend.clone();
         let self_paired = spend.unsigned_tx == escape.unsigned_tx;

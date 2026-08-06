@@ -67,6 +67,10 @@ makes the federation-uniform values *provably* uniform.
 **Field order** (this is the whole schema):
 
 ```
+# This block and ADR-0013 §4's canonical list encode the SAME preimage. ADR-0013's copy has been
+# wrong three times (missing escape_feerate_floor, escape_coverage_pct, and both u32 counts);
+# this one has not. THIS DOCUMENT IS THE AUTHORITY: on any divergence the vector wins, because it
+# is executable against the code. ADR-0013 §4 and ADR-0016 §3a both defer here.
 wallet_id                     fixed 32
 protocol_version              u32
 coordinator_auth_pubkey       fixed 33   (compressed)
@@ -84,7 +88,7 @@ nodes                         u32 count, then per node:
                                 node_id          u16
                                 signing_pubkey   fixed 33
                                 channel_pubkey   fixed 33
-                                endpoints        endpoints(...)
+                                endpoints        u32 count, then each as var (UTF-8)
 ```
 
 **Vector** — `wallet_id = 0x22*32`, `protocol_version = 0`, coordinator pubkey `03 8a3b…`,
@@ -131,7 +135,7 @@ trusted *because* this endorsement verifies — the wire envelope carries no end
 
 ```
 fields : wallet_id(32) ‖ manifest_hash(32) ‖ node_id(u16) ‖ channel_pubkey(33)
-         ‖ protocol_version(u32) ‖ endpoints(...)
+         ‖ protocol_version(u32) ‖ endpoints(u32 count, then each as var UTF-8)
 
 preimage:
 2222222222222222222222222222222222222222222222222222222222222222

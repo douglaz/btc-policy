@@ -70,7 +70,7 @@
 //! | digest (tag)                                    | preimage fields, in order (LE; `var`=u32-len+bytes; `eps`=u32-count then each `var`) |
 //! |-------------------------------------------------|-------------------------------------------------------------------------------------|
 //! | channel-key  `btc-policy/channel-key/v0`        | `node_seckey[32]` (then `‖ counter:u8` on retry)                                    |
-//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), `max_msg_bytes:u64`, Hot-budget triple, canonical hot allowlist, escape descriptor, `max_derivation_index:u32`, node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
+//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), `max_msg_bytes:u64`, Hot-budget triple, canonical hot allowlist, escape descriptor, `max_derivation_index:u32`, `escape_feerate_floor:u64`, `escape_coverage_pct:u8`, node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
 //! | endorsement  `btc-policy/channel-endorsement/v0`| `wallet_id[32]`, `manifest_hash[32]`, `node_id:u16`, `channel_pubkey[33]`, `protocol_version:u32`, `endpoints:eps` |
 //! | envelope     `btc-policy/channel-envelope/v0`   | `msg_type:var`, `protocol_version:u32`, `wallet_id[32]`, `manifest_hash[32]`, `sender_node_id:u16`, `recipient_node_id:u16`, `payload_b64_bytes:var`, `nonce:var`, `timestamp:u64` |
 //! | user-sig     `btc-policy/user-sig-hash/v0`      | per input in order: `user_der_sig:var`, `sighash_type:u8`                            |
@@ -6599,7 +6599,8 @@ mod golden {
         // wallet_id[32], protocol_version:u32, coordinator_auth_pubkey[33],
         // max_msg_bytes:u64, hot_max_per_tx:u64, hot_max_per_window:u64,
         // hot_window_secs:u64, canonical hot descriptors, escape descriptor,
-        // max_derivation_index:u32, node-count:u32, then each node by id. The
+        // max_derivation_index:u32, escape_feerate_floor:u64,
+        // escape_coverage_pct:u8, node-count:u32, then each node by id. The
         // coordinator key is unconditional
         // — every vault is sealed to exactly one coordinator — so it always occupies offsets 36..69, the federation-uniform
         // `max_msg_bytes` (V0-4b §0) follows it at 69..77, and the ADR-0014 Hot
