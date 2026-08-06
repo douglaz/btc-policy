@@ -67,10 +67,14 @@ BaseManifest {                     # everything EXCEPT endorsements and config_h
 manifest_hash = H(canonical_bytes(BaseManifest))
 # canonical_bytes preimage — v0 AUTHORITATIVE (vault-node `base_manifest_bytes`); reimplement from
 # THIS list + order, NOT a naive serialization of every field above:
-#   wallet_id ‖ protocol_version ‖ coordinator_auth_pubkey ‖ max_msg_bytes ‖ hot_max_per_tx
-#   ‖ hot_max_per_window ‖ hot_window_secs ‖ (hot_allowlist sorted+deduped) ‖ escape_descriptor
-#   ‖ max_derivation_index ‖ escape_feerate_floor ‖ escape_coverage_pct
-#   ‖ [ node_id, signing_pubkey, channel_pubkey, endpoints ]…
+#   EVERY variable-length run is LENGTH-PREFIXED u32. Both counts below were missing from earlier
+#   drafts of this list; omitting either yields a different hash and WRONG_MANIFEST on every node.
+#   wallet_id ‖ protocol_version(u32) ‖ coordinator_auth_pubkey ‖ max_msg_bytes(u64)
+#   ‖ hot_max_per_tx(u64) ‖ hot_max_per_window(u64) ‖ hot_window_secs(u64)
+#   ‖ hot_allowlist(u32 COUNT ‖ each descriptor, sorted+deduped)
+#   ‖ escape_descriptor ‖ max_derivation_index(u32) ‖ escape_feerate_floor(u64)
+#   ‖ escape_coverage_pct(u8)
+#   ‖ nodes(u32 COUNT ‖ [ node_id(u16), signing_pubkey, channel_pubkey, endpoints ]…)
 # NOT serialized separately (bound TRANSITIVELY via wallet_id = H(canonical descriptor)):
 #   vault_descriptor, t, n, recovery_timelock. NOT manifest-pinned at all: policy_version — it is
 #   enforced per-request (commitment + request.policy_version), so it is absent from the preimage.
