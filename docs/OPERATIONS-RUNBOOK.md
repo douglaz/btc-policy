@@ -158,8 +158,12 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    lifetime.
    **There is one action, and it is not a message — it is the power switch. If you still control
    the hardware, CUT POWER NOW.** Know the trade as you do it, not after: this finishes the vault.
-   The coins then exit only through the recovery branch, on each UTXO's own clock — the same trade
-   the duress PIN makes, and the right one while a hot spend is still assemblable.
+   Whatever is still IN the vault then exits only through the recovery branch, on each UTXO's own
+   clock — the same trade the duress PIN makes, and the right one while a hot spend is still
+   assemblable. That is not necessarily everything: a spend whose partials were already released,
+   or either transaction already sitting in a mempool, can still confirm after the power is cut,
+   and those coins never take the recovery path. The late-confirmation check below is how you find
+   out which world you are in.
    It works because the v0 federation is co-located on one host with RAM-only keys, so a rebooted
    node is a dead node (ADR-0007): cutting power destroys all five nodes' keys permanently and
    stops any partial not yet released. It needs no coordinator, no PIN and no network, which is
