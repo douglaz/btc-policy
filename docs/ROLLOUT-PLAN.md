@@ -115,7 +115,7 @@ creation, with a warning when a low value is used. Without this, "test all paths
 of wall-clock per Recovery test, and Recovery — the last exit when everything else has failed —
 would only ever be exercised against a faked clock on regtest.
 
-This is a deliberate loosening: `parse_vault_template` previously *required* exactly
+This is a deliberate loosening: `parse_vault_template` today *requires* exactly
 `RECOVERY_TIMELOCK_NSEQUENCE`. A short timelock is a weaker vault (a thief holding 2-of-3
 recovery keys waits hours instead of months), which is what the warning is for. Tracked in
 `btc-policy-wdu`.

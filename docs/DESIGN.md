@@ -269,7 +269,7 @@ Decisions locked in the grilling pass (2026-07-14, user; full rationale in repo 
 - **Reboot = node death** (ADR-0007): accepted for MVP; the entire deployment runs from tmpfs, so a reboot leaves a bare machine and recovery is full re-provisioning (reboot-death/tmpfs, 2026-07-16); 3-of-5 is the budget; coordinator polling doubles as liveness monitoring; `/unseal` REJECTED outright.
 - **Duress PINs** (ADR-0008): a PIN on every spend (doubling as a second factor — a stolen user key alone can no longer get anything signed); two-transaction signing ceremony; `duress_response ∈ {lockdown, sweep_and_lockdown}` (default `sweep_and_lockdown`) chosen at creation; fraud-flavored refusals as cover story; lockdown has no reset on sealed nodes — the exit is the recovery path.
 - **No correlation class reaches quorum** (ADR-0009): deployer-enforced; wizard preaches 5 sealed VPSes across ≥3 providers; the coordinator laptop must not itself become a correlation class (no saved provider-console sessions).
-- **Recovery timelock**: per-vault descriptor parameter, 180-day preached default; refresh nags at 120/150 days.
+- **Recovery timelock (target state, gated on `btc-policy-wdu`)**: per-vault descriptor parameter, 180-day preached default; refresh nags at 120/150 days.
 - **v0.1 walking skeleton killed**: one v0 core milestone on the real protocol, with an internal "first light" checkpoint; the demo ships once, with both acts.
 
 ## Wallet Topology
