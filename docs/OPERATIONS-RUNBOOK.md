@@ -124,14 +124,26 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 ## 6. Incidents
 
 ### The user was coerced (duress PIN used)
+
+> **Most of this procedure cannot be executed with what ships today.** There is no sealed-vault
+> receive, balance, or spend command, and no operational code reads `manifest.json` at all
+> (threat-model R9). Steps 3-6 below describe what must happen, not commands you can run: until
+> `btc-policy-mby` (operator CLI core) and `btc-policy-en1` (`recover`) land, each is a manual
+> operation against the descriptor and a block explorer or your own node. Read the whole section
+> before starting so you know what you are committing to.
+
 1. At `T`, the deadline driver unconditionally attempts Lockdown; the independent fire driver
    attempts the escape sweep. The sweep is BEST-EFFORT: it may not fire at all, and even when it
    fires it need not move everything. Assume a partial result until you have checked — in step 2, not now.
-2. **Once safe — including the checks.** Nothing below is time-critical in the first hours. Do none
-   of it while you are still with the attacker: step 4 generates the new vault's keys and PINs,
+2. **Once safe — including the checks. But do not linger.** Do none of this while you are still
+   with the attacker: step 4 generates the new vault's keys and PINs,
    telling payers to stop announces that the duress response fired, and even the verification below
    reveals it to anyone watching your screen. Silence is the protection; do not spend it to satisfy
-   your own curiosity about whether Lockdown landed.
+   your own curiosity about whether Lockdown landed. Once you ARE safe, verify immediately rather
+   than at leisure: if the carrier never reached `t` nodes then nothing armed and nothing froze, a
+   coerced hot spend can still finalize, and `hold_secs` has no positive lower bound — so "wait a
+   few hours" is not safe advice in that case, and you cannot tell which case you are in until you
+   check.
    **Verify Lockdown on every node — with `GET /healthz` and NOTHING ELSE.** It must report
    `locked_down: true` with `last_deadline_tick` advancing. `/healthz` reads three atomics and takes
    no lock, so it answers even while a node is jammed. Do NOT submit a spend or refresh to see
