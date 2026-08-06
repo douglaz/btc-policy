@@ -172,9 +172,15 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 3. **Read the old vault's remaining balance and the escape-wallet balance on-chain.** Do not infer
    either from whether the sweep fired — ask the chain. Whatever reached the escape wallet is safe:
    that wallet is independent of every vault key by construction (checked at ceremony time).
-4. **Stand up the new vault** using `docs/UPGRADE-AND-ROTATION-POLICY.md` §3 steps 1–2: run the
-   ceremony, then fund it with a small deposit — from unrelated funds if step 3 found the escape
-   wallet empty — and complete one honest spend end to end. Section 3 step 3's migration spend does
+4. **Rebuild the coordinator and ceremony environment from trusted media FIRST, then stand up the
+   new vault** using `docs/UPGRADE-AND-ROTATION-POLICY.md` §3 steps 1–2. The setup ceremony is a
+   trusted phase — it generates the successor's PINs, user key and coordinator auth key — and the
+   host you ran the old vault from is the one this procedure has been treating as hostile since
+   step 2. Running the ceremony on it can leak the new vault's secrets or tamper with the ceremony
+   before a single sat is deposited, which would carry the compromise across the rotation and make
+   everything below pointless. New host, verified binaries, then: run the ceremony, then fund it
+   with a small deposit — from unrelated funds if step 3 found the escape
+   wallet empty — and complete one honest spend end to end, waiting for it to CONFIRM rather than merely broadcast. Section 3 step 3's migration spend does
    not apply: Lockdown killed the old vault's normal path. If step 3 found an escape balance, move
    it into the new vault once that check passes; otherwise migration waits for step 5's recoveries.
    Do not leave an escape balance there for months: it is a single-key holding pen. Give payers the
