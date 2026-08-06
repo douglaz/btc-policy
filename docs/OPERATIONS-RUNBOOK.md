@@ -128,9 +128,10 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 > **Most of this procedure cannot be executed with what ships today.** There is no sealed-vault
 > receive, balance, or spend command, and no operational code reads `manifest.json` at all
 > (threat-model R9). Steps 3-6 below describe what must happen, not commands you can run: until
-> `btc-policy-mby` (operator CLI core), `btc-policy-en1` (`recover`) AND `btc-policy-00i`
-> (receive addresses and balance reads) land, each is a manual operation against the descriptor and a block explorer or your own node. Read the whole section
-> before starting so you know what you are committing to.
+> `btc-policy-mby` (operator CLI core), `btc-policy-en1` (`recover`) and `btc-policy-00i` (receive
+> addresses, balance reads) land, each is a manual operation against the descriptor and a block
+> explorer or your own node. Read the whole section before starting so you know what you are
+> committing to.
 
 1. At `T`, the deadline driver unconditionally attempts Lockdown; the independent fire driver
    attempts the escape sweep. The sweep is BEST-EFFORT: it may not fire at all, and even when it
@@ -139,13 +140,11 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    with the attacker: step 4 generates the new vault's keys and PINs,
    telling payers to stop announces that the duress response fired, and even the verification below
    reveals it to anyone watching your screen. Silence is the protection; do not spend it to satisfy
-   your own curiosity about whether Lockdown landed. Once you ARE safe, verify immediately rather
-   than at leisure: if the carrier never reached `t` nodes then nothing armed and nothing froze, a
+   your own curiosity about whether Lockdown landed. Once you ARE safe, act immediately rather than
+   at leisure: if the carrier never reached `t` nodes then nothing armed and nothing froze, a
    coerced hot spend can still finalize, and `hold_secs` has no positive lower bound — so "wait a
    few hours" is not safe advice in that case — and no check will tell you which case you are in,
    which is why the action below does not depend on knowing.
-   `GET /healthz` is fine to record for your own incident notes — it answers even while a node is
-   jammed — but it decides nothing here; why not is below, where it matters.
    Do NOT probe with a real spend or refresh: `FRAUD_SUSPECTED` is a postcondition of Lockdown, not
    a test for it, and on a node that has NOT locked down the spend can be registered and propagated
    and a refresh signed and released, RESETTING the recovery maturity step 5 depends on.
@@ -157,40 +156,34 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    request of its own, letting the coerced spend release at its Hold. If Lockdown DID land the
    clawback cannot fire anyway: every spend then returns `FRAUD_SUSPECTED`, for that node's
    lifetime.
-   **There is one action available, and it is not a message — it is the power switch. Use it
-   promptly; do not research first.** If you still control the hardware, cutting power destroys all
-   five nodes' keys permanently: the v0 federation is co-located on one host and its keys are
-   RAM-only, so a rebooted node is a dead node (ADR-0007). It needs no coordinator, no PIN and no
-   network, which is why a hostile relay cannot interfere with it.
-   DO NOT check the chain first. The state that decides whether this works — whether the coerced
-   spend's partials have been released yet — is not visible on chain or in the mempool, so a check
-   cannot tell you, and it spends the window in which the switch still helps.
-   The two ways this can go are settled by the state machine. (Arming converges rather than flipping —
-   ADR-0012 describes a window where an early node is armed while the rest are not — but that
-   changes nothing here: the action below is the same in every one of those states.) If NOTHING
-   ARMED, no sweep exists to interrupt and the coerced spend is the live threat: the switch stops
-   any partial not yet released, which is the whole of what you can do. If the vault DID ARM, then
-   hot-class finalization is already frozen and the coerced spend cannot finalize anyway — you do
-   not need the switch, and using it would abort the in-flight escape combine that Lockdown
-   deliberately preserves (ADR-0012's Lockdown row). You cannot reliably tell which case you are
-   in, and `/healthz` will not tell you: it is unauthenticated, carries no identity claim, and is
-   reached over the same relay path as `/sign` (DESIGN.md's `/healthz` wire contract) — the actor
-   assumed hostile after a wrench. Both answers are unreliable, and in opposite ways: it fakes
-   `true` to make you stand down, and `false` to bait you into sending it something. So DO NOT try
-   to judge it. CUT POWER. That is the default because the two errors are not symmetric: cutting power while
-   the vault HAD armed only exchanges one already-safe outcome (the escape sweep) for another the
-   design already accepts (the recovery branch, "the same trade the duress PIN makes"), whereas
-   leaving it running when nothing armed risks the coerced spend finalizing outright. A wrongly
-   aborted sweep costs you time; a wrongly unfrozen theft costs you the coins.
-   Afterwards, check the chain — not before. The switch cannot revoke a signature already released
-   or un-broadcast a transaction already in the mempool, so the coerced spend may still land; there
-   is no `hold_secs` floor and `hold_secs = 0` is a supported configuration where the fire event is
-   ingress itself. Watch for late confirmations: one that lands post-shutdown creates vault change
-   and restarts THAT output's recovery clock, which changes the dates in step 5.
-   Understand the trade before you do it: it finishes the vault. The coins then exit only through
-   the recovery branch, on each UTXO's own clock. That is the same trade the duress PIN makes, and
-   it is the right one when a hot spend is still assemblable and you cannot otherwise stop it.
-   If you do NOT control the hardware, then there is no action, and that is by design. A coerced hot
+   **There is one action, and it is not a message — it is the power switch. If you still control
+   the hardware, CUT POWER NOW.** Know the trade as you do it, not after: this finishes the vault.
+   The coins then exit only through the recovery branch, on each UTXO's own clock — the same trade
+   the duress PIN makes, and the right one while a hot spend is still assemblable.
+   It works because the v0 federation is co-located on one host with RAM-only keys, so a rebooted
+   node is a dead node (ADR-0007): cutting power destroys all five nodes' keys permanently and
+   stops any partial not yet released. It needs no coordinator, no PIN and no network, which is
+   why a hostile relay cannot interfere with it.
+   Do not research first — nothing you can consult will tell you whether to do it. The chain and
+   mempool cannot: whether the coerced spend's partials have been released is not visible there.
+   `/healthz` cannot either: it is unauthenticated, carries no identity claim, and is reached over
+   the same relay path as `/sign` (DESIGN.md's `/healthz` wire contract) — the actor assumed
+   hostile after a wrench. A hostile COORDINATOR fakes `true` to make you stand down, and fakes
+   `false` to bait you into sending it something. Both answers are worthless to this decision.
+   Cut power anyway, because the two errors are not symmetric. If the vault DID arm, hot-class
+   finalization is already frozen and you did not need the switch — you have only exchanged one
+   safe outcome (the escape sweep) for another the design already accepts, at the cost of aborting
+   an in-flight escape combine Lockdown deliberately preserves (ADR-0012's Lockdown row). If
+   NOTHING armed, the coerced spend is live and the switch is the whole of what you can do. A
+   wrongly aborted sweep costs you time; a wrongly unfrozen theft costs you the coins. (Arming
+   converges rather than flipping — ADR-0012 describes a window where an early node is armed and
+   the rest are not — which changes nothing: the action is the same in every one of those states.)
+   Afterwards, check the chain. The switch cannot revoke a signature already released or
+   un-broadcast a transaction already in the mempool, so the coerced spend may still land; there is
+   no `hold_secs` floor and `hold_secs = 0` is a supported configuration where the fire event is
+   ingress itself. Watch for late confirmations: one landing post-shutdown creates vault change and
+   restarts THAT output's recovery clock, changing the dates in step 5.
+   If you do NOT control the hardware, there is no action, and that is by design. A coerced hot
    spend may complete; the residual is accepted and BOUNDED by the Hot budget (ADR-0014, "the hot
    wallet is the risk budget"). Guaranteed delivery under a hostile coordinator is the v1 direct
    user-to-node path (ADR-0012) and does not exist in v0. Everything else is on the recovery side.
