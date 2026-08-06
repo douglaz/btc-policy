@@ -75,8 +75,16 @@ change — otherwise this ADR's "sealed" is decoration.
 The canonical preimage is version-bound: adding `escape_bump_max_fee_pct` changes `manifest_hash`
 for otherwise-identical inputs, so it MUST ship with a protocol-version bump rather than continue
 to declare `PROTOCOL_VERSION_V0`. Existing sealed vaults are unaffected — their manifests are
-immutable and rotation creates a new vault — but a node carrying the extended preimage MUST refuse
-a manifest that declares the old version rather than silently surface a manifest-hash mismatch.
+immutable and rotation creates a new vault.
+
+That refusal is NOT implementable today, and `btc-policy-mby` owns closing the gap rather than
+assuming it. Nothing feeds a declared version into a node at startup: `ConfigFile`/`ChannelConfig`
+carry no `protocol_version`, nodes never read `manifest.json` at all, and manifest hashing injects
+`PROTOCOL_VERSION_V0` internally — so an extended node handed an old anchor can only report the
+opaque hash mismatch, which is the failure this paragraph wants to avoid. Adding the field
+therefore means adding a version-bearing startup input and an explicit old-version rejection path,
+with a cross-version vector test, in the same change. Bumping the compile-time constant alone
+changes the hash and nothing else.
 
 **ADR-0013 §4's LIST MUST STAY AUTHORITATIVE.** It instructs reimplementers to work "from THIS list
 + order, NOT a naive serialization". That list previously omitted `escape_feerate_floor` and
