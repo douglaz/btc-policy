@@ -74,7 +74,8 @@ manifest_hash = H(canonical_bytes(BaseManifest))
 #   ‖ hot_allowlist(u32 COUNT ‖ each descriptor, sorted+deduped)
 #   ‖ escape_descriptor ‖ max_derivation_index(u32) ‖ escape_feerate_floor(u64)
 #   ‖ escape_coverage_pct(u8)
-#   ‖ nodes(u32 COUNT ‖ [ node_id(u16), signing_pubkey, channel_pubkey, endpoints ]…)
+#   ‖ nodes(u32 COUNT ‖ [ node_id(u16), signing_pubkey(33B compressed SEC1),
+#     channel_pubkey(33B compressed SEC1), endpoints(u32 COUNT ‖ each u32-len-prefixed UTF-8) ]…)
 # NOT serialized separately (bound TRANSITIVELY via wallet_id = H(canonical descriptor)):
 #   vault_descriptor, t, n, recovery_timelock. NOT manifest-pinned at all: policy_version — it is
 #   enforced per-request (commitment + request.policy_version), so it is absent from the preimage.

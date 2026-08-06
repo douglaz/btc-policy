@@ -86,27 +86,20 @@ hashing versus accepting that upgrading bricks a v0 vault. Both horns assume an 
 architecture forbids.) `base_manifest_bytes` computing ONE layout with `protocol_version` hashed in
 rather than switched on is therefore fine, and version-dispatched hashing is NOT required.
 
-That settles the NODE side only, and the CLIENT side is a live requirement, not a corollary. The
-operator CLI `btc-policy-mby` is new software pointed at vaults that already exist: built with only
-the extended layout it cannot recompute or authenticate a v0 `manifest_hash`, and there is no older
-client to fall back on because a sealed-vault spend/escape CLI is the very thing mby introduces. So
-v0 vaults would be sealed, alive, running honest nodes, and unreachable by the only tool that can
-operate them. "Unaffected" must not be read as covering that.
+That settles the NODE side, and the CLIENT side turns out not to need settling — for a reason that
+subsumes the manifest question entirely. A v0 node binds `127.0.0.1` ONLY (`main.rs:61`) and the v0
+runtime is co-located, "every node binds and is reached at `127.0.0.1:<port>`" on one hardened box
+(SETUP-CEREMONY). So any client must run ON that host — and ADR-0005 seals it: no reset, no
+reconfiguration, no upgrade-in-place. `btc-policy-mby` is the first sealed-vault CLI that exists, so
+it is by construction absent from every host sealed before it, and cannot be installed there.
 
-And `protocol_version` alone CANNOT carry that dispatch, because it has already failed once as a
-compatibility signal. The production setup ceremony landed in `6f053c9` (2026-07-26), so vaults
-could be sealed from that point; `0f16d21` (2026-07-27) then changed BOTH `base_manifest_bytes` and
-`CoordRequest::canonical_bytes` for the fee-bump ladder and did NOT bump the version. Two
-incompatible wire formats therefore both declare `PROTOCOL_VERSION_V0 == 0`, and no dispatch keyed
-on that field can tell them apart. This is also the strongest argument FOR the bump §3a now
-requires: it would be the first time the field is actually used for what it is for.
-
-So NARROW the claim rather than build a dispatch that cannot work. `btc-policy-mby` must operate
-vaults sealed at or after `0f16d21` and carry a vector for that format. Vaults sealed in the
-`6f053c9..0f16d21` window are NOT supported and their exit is rotation to a new vault — acceptable
-because the window is one day, pre-mainnet, before this repo was public, and rollout stage 1 is
-signet with dust. If any such vault is ever found to hold value, reconstructing its preimage from
-`0f16d21^` is the remedy, and that is a decision to take then, not scaffolding to build now.
+Therefore NO pre-mby sealed vault is reachable by the operator CLI, whatever its manifest format,
+and the compatibility question is moot rather than answered. Do not build format dispatch, a v0
+vector, or a legacy parser for it: mby ships with the ceremony that seals a vault, and vaults sealed
+before mby exit by rotation. (Two earlier drafts of this paragraph got this wrong in opposite
+directions — first claiming "unaffected" without qualification, then prescribing a
+`protocol_version` dispatch that cannot work because `0f16d21` changed two preimages without a
+version bump. Both were reasoning about the hash while the actual barrier is the socket.)
 
 What the version bump buys on top is a clear failure for the operator ERROR that remains possible:
 pointing a new-binary node at an old manifest during a fresh deployment. Without it that misconfig

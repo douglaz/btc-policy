@@ -182,8 +182,11 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    byte-identical rebuilds and signed artifacts are `btc-policy-oy3` and do NOT ship yet, so this
    is a provenance judgement you have to make, not a check you can run. Then: run the ceremony, then fund it
    with a small deposit — from unrelated funds if step 3 found the escape
-   wallet empty — and complete one honest spend end to end, waiting for it to CONFIRM rather than merely broadcast. Section 3 step 3's migration spend does
-   not apply: Lockdown killed the old vault's normal path. If step 3 found an escape balance, move
+   wallet empty — and complete one honest spend end to end, waiting for it to CONFIRM rather than merely broadcast. Section 3 step 3's migration spend probably does
+   not apply, but check rather than assume: if Lockdown landed it killed the old vault's normal
+   path and that spend is impossible; if nothing ever armed — the failed-carrier case in step 2 —
+   the federation is still live and the ordinary migration spend is the cheaper route for whatever
+   the sweep left, subject to its allowlist and Hot budget. If step 3 found an escape balance, move
    it into the new vault once that check passes; otherwise migration waits for step 5's recoveries.
    Do not leave an escape balance there for months: it is a single-key holding pen. Give payers the
    new vault's addresses.
