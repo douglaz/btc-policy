@@ -126,28 +126,31 @@ either already swept to the escape wallet, or they are frozen and exit via the r
 ### The user was coerced (duress PIN used)
 1. At `T`, the deadline driver unconditionally attempts Lockdown; the independent fire driver
    attempts the escape sweep. The sweep is BEST-EFFORT: it may not fire at all, and even when it
-   fires it need not move everything.
-2. **Stop inbound payments to the old vault, now.** Its addresses stay payable after Lockdown, and
-   anything arriving lands in a fresh recovery lock. Retire the old addresses and tell anyone who
-   might pay you.
+   fires it need not move everything. Assume a partial result until you have checked.
+2. **Stop inbound payments to the old vault.** Its addresses stay payable after Lockdown, and
+   anything arriving lands in a fresh recovery lock. You will have replacement addresses at step 4.
 3. **Read the old vault's remaining balance on-chain.** Do not infer it from whether the sweep
    fired — ask the chain. Whatever reached the escape wallet is safe: that wallet is independent of
-   every vault key by construction (checked at ceremony time). What matters now is what is still in
-   the old vault.
-4. **Recover what remains, coin by coin.** The locked-down vault's only exit is the recovery
-   branch. Its lock is BIP68-**relative** and runs per UTXO from that coin's own confirmation or
-   last refresh, so every straggler has its own maturity date: a coin last refreshed 170 days ago
-   matures in about 10 days, not 180. The duration is FIXED at 180 days — it is the constant
-   `policy_core::RECOVERY_TIMELOCK_NSEQUENCE`, not a per-vault setting, and it is NOT in
-   `manifest.json`; the descriptor in `descriptor.txt` carries `older(4224679)`, a raw `nSequence`
-   with the BIP68 type-flag set, so do not read `4224679` as blocks or seconds.
+   every vault key by construction (checked at ceremony time).
+4. **Stand up the new vault now** (`docs/UPGRADE-AND-ROTATION-POLICY.md` §3) and move the
+   escape-wallet balance into it immediately. Do not wait for step 5 — the escape wallet is a
+   single-key holding pen, not somewhere to leave funds for months. Give payers its addresses.
+5. **Recover whatever is still in the old vault, coin by coin, into the new one.** The locked-down
+   vault's only exit is the recovery branch. Its lock is BIP68-**relative** and runs per UTXO from
+   that coin's own confirmation or last refresh, so every straggler has its own maturity date: a
+   coin last refreshed 170 days ago matures in about 10 days, not 180. The duration is FIXED at
+   180 days — `policy_core::RECOVERY_TIMELOCK_NSEQUENCE`, not a per-vault setting. Read the value
+   from `descriptor.txt` (the `older(4224679)` argument) or, if that backup is lost, from
+   `manifest.json` (`recovery_timelock`, and the whole `vault_descriptor` string): every
+   well-formed manifest says 4224679, because it is read back from the descriptor rather than
+   chosen. It is a raw `nSequence` with the BIP68 type-flag set — do NOT read 4224679 as blocks or
+   seconds.
    **No shipped tool performs this spend.** `demo recovery-drill` proves the path but builds its
    own regtest chain with fresh random keys and cannot touch your vault. Recovery is today a MANUAL
-   PSBT operation against `descriptor.txt`; use `build_recovery_spend` in
-   `crates/vault-cli/src/recovery.rs` as the recipe. Bead `btc-policy-en1` is the operator `recover`
-   command that will replace this paragraph.
-5. Only once you control every recoverable coin is the old vault finished. Stand up a new one
-   (`docs/UPGRADE-AND-ROTATION-POLICY.md` §3) and move the funds into it.
+   PSBT operation against the descriptor; use `build_recovery_spend` in
+   `crates/vault-cli/src/recovery.rs` as the recipe. Bead `btc-policy-en1` is the operator
+   `recover` command that will replace this paragraph.
+6. The old vault is finished when its balance is zero.
 
 ### An unauthorized spend is pending and the Hold has not expired
 This is what the Hold is for.
@@ -178,8 +181,8 @@ only exit is the recovery branch, after the fixed 180-day recovery lock. There i
 The clock is not something this incident starts: the lock is BIP68-relative and has been accruing
 per UTXO since each coin's own confirmation or last refresh, and no further refresh can be
 authenticated now — so work out each coin's remaining maturity rather than assuming a full
-timelock from today. Recovery itself is the manual PSBT operation described in §6; `demo
-recovery-drill` exercises the path but cannot spend your vault.
+timelock from today. Recovery itself is the manual PSBT operation described under "The user was coerced" above;
+`demo recovery-drill` exercises the path but cannot spend your vault.
 
 ### A node will not boot
 Read the startup error before changing anything.

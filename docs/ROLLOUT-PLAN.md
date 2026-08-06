@@ -108,7 +108,7 @@ arrange a deliberately failed sweep — that tests the escape's failure path, no
 NOT YET TRUE — this section describes the target state, and `btc-policy-wdu` is the work. Today the
 timelock is FROZEN: `policy_core::RECOVERY_TIMELOCK_NSEQUENCE` is a constant and
 `parse_vault_template` rejects any descriptor carrying a different `older(...)`, so every vault is
-180 days. That is why step 6 below is blocked on `wdu` (see line ~201).
+180 days. That is why the signet Recovery rehearsal is blocked on `wdu`, listed among the gating beads at the end of this document.
 
 The target: the 180-day timelock becomes a **default, not an invariant** — chosen per vault at
 creation, with a warning when a low value is used. Without this, "test all paths on signet" would mean 180 days
