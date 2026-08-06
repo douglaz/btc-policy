@@ -105,7 +105,9 @@ What the version bump buys on top is a clear failure for the operator ERROR that
 pointing a new-binary node at an old manifest during a fresh deployment. Without it that misconfig
 surfaces as an opaque `manifest_hash` mismatch; with it, as a version rejection.
 
-**ADR-0013 §4's LIST MUST STAY AUTHORITATIVE.** It instructs reimplementers to work "from THIS list
+**ADR-0013 §4's LIST MUST STAY CORRECT — but `docs/PROTOCOL-VECTORS.md` IS THE AUTHORITY.**
+One tie-break, stated in one place: the vector wins, because it is executable against the code and
+ADR-0013 §4's prose copy has been wrong three times. ADR-0013 §4 and this ADR both defer to it. It instructs reimplementers to work "from THIS list
 + order, NOT a naive serialization". That list previously omitted `escape_feerate_floor` and
 `escape_coverage_pct`, which the code hashes between `max_derivation_index` and the node count
 (`channel.rs:499-501`) and which `docs/UPGRADE-AND-ROTATION-POLICY.md` already listed as preimage

@@ -69,7 +69,8 @@ makes the federation-uniform values *provably* uniform.
 ```
 # This block and ADR-0013 §4's canonical list encode the SAME preimage. ADR-0013's copy has been
 # wrong three times (missing escape_feerate_floor, escape_coverage_pct, and both u32 counts);
-# this one has not. Keep them in sync, and prefer this one — it carries a worked vector.
+# this one has not. THIS DOCUMENT IS THE AUTHORITY: on any divergence the vector wins, because it
+# is executable against the code. ADR-0013 §4 and ADR-0016 §3a both defer here.
 wallet_id                     fixed 32
 protocol_version              u32
 coordinator_auth_pubkey       fixed 33   (compressed)
