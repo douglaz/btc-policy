@@ -128,18 +128,22 @@ either already swept to the escape wallet, or they are frozen and exit via the r
    attempts the best-effort escape sweep.
    The sweep may not fire if a fire-time admissibility check fails; the coins then remain frozen
    and exit through the Recovery path.
-2. Once safe, confirm on-chain **whether the sweep actually landed**. Both branches end with the
-   old vault finished, but they are not the same procedure and step 1 does not tell you which one
-   you are in.
-   - **Swept.** The coins are in the escape wallet, which is independent of every vault key by
-     construction (checked at ceremony time). Go to step 3.
-   - **Not swept.** The coins are still in the old, locked-down vault. There is no destination to
-     confirm and nothing to migrate yet: wait out that vault's configured relative timelock (180
-     days by default — check the manifest), complete Recovery through the 2-of-3 recovery branch,
-     and only then go to step 3. Do NOT abandon the vault before Recovery completes — it still
-     holds the funds.
-3. The old vault is finished. Stand up a new one (`docs/UPGRADE-AND-ROTATION-POLICY.md` §3) and
-   move the funds you now control into it.
+2. Once safe, **read the old vault's remaining balance on-chain.** Do not infer it from whether
+   the sweep fired — ask the chain. A sweep that never fired leaves everything; a sweep that
+   landed can still leave coins behind, because the Escape only has to cover `escape_coverage_pct`
+   (95 by default) of the balance the node saw, and vault change plus any deposit that arrived
+   after the Escape was signed sit outside it. Whatever the escape wallet received is safe — it is
+   independent of every vault key by construction (checked at ceremony time). What matters now is
+   what did NOT leave.
+3. **Recover whatever remains, straggler by straggler.** The locked-down vault's only exit is the
+   recovery branch, and its timelock is a BIP68 **relative** lock measured per UTXO from that
+   coin's own confirmation — refresh resets it. So maturity is per coin, not one deadline for the
+   incident: a coin last refreshed 170 days ago under a 180-day vault matures in about 10 days,
+   not 180. Compute each remaining coin's own maturity (`older(n)` in the manifest — 180 days by
+   default), wait it out, and complete Recovery through the 2-of-3 branch. Do NOT abandon the
+   vault while any coin is still recoverable.
+4. Only once you control every recoverable coin is the old vault finished. Stand up a new one
+   (`docs/UPGRADE-AND-ROTATION-POLICY.md` §3) and move the funds into it.
 
 ### An unauthorized spend is pending and the Hold has not expired
 This is what the Hold is for.
@@ -166,8 +170,12 @@ sees it.
 
 ### The normal path is bricked (coordinator auth key lost)
 No request can be authenticated ever again — the manifest pins that pubkey and is immutable. The
-only exit is the recovery branch after that vault's configured relative timelock (180 days by default — check the manifest). `demo recovery-drill`
-exercises it. Start the clock immediately; there is no faster path.
+only exit is the recovery branch after that vault's configured relative timelock (180 days by
+default — check the manifest). `demo recovery-drill` exercises it. There is no faster path. Note
+that the clock is not something this incident starts: the lock is BIP68-relative and has been
+accruing per UTXO since each coin's own confirmation or last refresh, and no further refresh can
+be authenticated now, so work out each coin's remaining maturity rather than assuming one full
+timelock from today.
 
 ### A node will not boot
 Read the startup error before changing anything.
