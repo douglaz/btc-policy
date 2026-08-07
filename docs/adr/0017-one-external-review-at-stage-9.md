@@ -81,7 +81,7 @@ red.
   `channel::duress::normal_and_duress_ingress_op_sequences_*` assert that a normal and a duress
   request perform the identical ingress operations in the identical order. `attack all` covers the
   WIRE — response bodies, body sizes, `/events`. Neither covers end-to-end TIMING, which the
-  harness reports as advisory only. So running both still leaves the timing channel unmeasured.
+  harness reports as advisory only. So running both leaves the timing channel MEASURED BUT UNGATED, which is the distinction that matters to a reviewer: `two_spend_probe` does collect and compare normal/duress latency samples and emits the skew (`crates/vault-cli/src/attack.rs`), but the samples are noisy and form no hard gate — THREAT-MODEL R10 owns that gap. A stage-9 reviewer has evidence here; what they do not have is a pass/fail.
 - **Human-factors executability of the duress runbook.** Nothing tests whether a stressed operator
   can follow it without the author's context. That was exactly `tv3` (d), and it now waits for
   `yt7`.
