@@ -268,7 +268,7 @@ The manifest is the **root of channel + coordinator trust**, so it is load-beari
   backed up with the descriptor; **immutable** (any change = a new vault). Fields: wallet_id, canonical
   `vault_descriptor`, policy_version, `coordinator_auth_pubkey`, per-node {signing_pubkey, channel_pubkey,
   transport_endpoints}, t/n, recovery_timelock, hot_allowlist, escape_descriptor,
-  `escape_feerate_floor`, `escape_coverage_pct` — plus `protocol_version`, `max_msg_bytes`,
+  `escape_feerate_floor`, `escape_coverage_pct` — plus `protocol_version`, `max_derivation_index`, `max_msg_bytes`,
   `hot_max_per_tx`, `hot_max_per_window` and `hot_window_secs`, which the hash preimage also binds
   (docs/PROTOCOL-VECTORS.md is authoritative for the exact set and order). Each
   `channel_pubkey` **endorsed by that node's Bitcoin signing key** over a domain-separated tuple (ADR-0012
