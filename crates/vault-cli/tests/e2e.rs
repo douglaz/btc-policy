@@ -4,7 +4,12 @@
 //! [`attack_harness_exits_zero`] along with all three demos (first-light,
 //! theft-refused, recovery-drill):
 //!
-//!   nix develop -c cargo test -p vault-cli -- --ignored --test-threads=1
+//!   nix develop -c cargo test --locked -p vault-cli -- --ignored --test-threads=1
+//!
+//! `--locked` is not optional here: without it cargo silently REGENERATES `Cargo.lock`
+//! when it has drifted, so the custody gate would run against a dependency graph that is
+//! not the committed one. CI carries it on every leg, and the launch-gate job additionally
+//! asserts the committed lockfiles are current before anything builds.
 
 #[test]
 #[ignore = "spawns bitcoind and 5 vault-node processes; run with --ignored"]

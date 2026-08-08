@@ -1,7 +1,7 @@
 //! Opt-in integration test for the bitcoind `ChainBackend` impl. Like the demo
 //! e2e test it spawns a real regtest bitcoind, so it is `#[ignore]`d by default:
 //!
-//!   nix develop -c cargo test -p vault-node -- --ignored
+//!   nix develop -c cargo test --locked -p vault-node --test bitcoind_backend -- --ignored --test-threads=1
 //!
 //! It exercises the backend against live chain data: `test_package_accept`
 //! parses Core's real `testmempoolaccept` response, `broadcast` pushes a
