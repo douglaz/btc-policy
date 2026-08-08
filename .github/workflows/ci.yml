@@ -22,7 +22,10 @@
 #
 # Nothing in this workspace overrides `[profile.*]`, so "debug" means Cargo's own dev
 # defaults, and two of them are load-bearing for custody code: `debug-assertions` keeps
-# the workspace's 19 `debug_assert!`s live, and `overflow-checks` turns a wrapping
+# the workspace's 17 debug assertions live (6 `debug_assert!` + 11 `debug_assert_eq!`;
+# a bare `grep -c debug_assert` says 19, but two of those are prose in comments — the
+# distinction matters in a block whose whole point is that a claim matches its
+# mechanism), and `overflow-checks` turns a wrapping
 # amount/fee arithmetic bug into a panic instead of a silently wrong number. A release
 # gate compiles both out, so it would prove strictly LESS about the same commit.
 #

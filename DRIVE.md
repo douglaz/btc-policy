@@ -28,8 +28,11 @@ attack harness's calibration constants, or new CI jobs. The release-artifact gap
 belongs to `oy3`/`gbw` — it is named as a residual, not closed here.
 
 ## Next
-Close `9yf` → unblocks `rt0` and `gbw` → then the widest unblocker on the P1 frontier
-(`mby`, which unblocks 10 beads).
+Closing `9yf` makes `rt0` ready. It does **not** make `gbw` ready — `gbw` carries eight
+`blocks` edges, and after `9yf` closes five are still open (`rt0`, `oy3`, `wdu`, `mby`,
+`sqn`), which is correct: the stage-1 freeze must not name a commit that predates the
+operator CLI. So the frontier after this bead is `rt0`, then the widest unblocker on the
+P1 set — `mby`, which blocks 10 beads including `gbw` itself.
 
 ## Open questions for the human
 - none
