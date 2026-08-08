@@ -5,7 +5,7 @@ then the P1 set (`imb`, `mby`, `cod`, `oy3`, `rry`, `5ag`, `wqd`, `q6v`). One be
 branch = one PR. Beads outside that frontier are NOT in scope for this drive.
 **Phase:** HARDEN · **Bead:** btc-policy-9yf · **Branch:** fix/9yf-launch-gate
 **Pending:** metadata PR douglaz/btc-policy#6 — `9yf` closes when it merges, not before
-**Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'` · last green 2026-08-08 (exit 0, 685 passed / 0 failed)
+**Gate:** `nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'` (matches CI's `check` matrix — see AGENTS.md) · last green 2026-08-08 (exit 0, 685 passed / 0 failed)
 
 ## Done
 - (nothing closed by this drive yet)

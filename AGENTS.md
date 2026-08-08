@@ -46,7 +46,21 @@ done.
 watch it go red against the unfixed code first. A test asserting behaviour that
 was already correct is indistinguishable from a test asserting nothing.
 
-Gate for this repo: `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
+Gate for this repo — the same three checks CI's `check` matrix runs, in the same form:
+
+```
+nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'
+```
+
+Keep it matching `.github/workflows/ci.yml`. A weaker local gate is worse than none: it
+returns 0 on a tree CI will reject, so "I ran the gate" stops meaning "CI will pass". Both
+details here are load-bearing — without `fmt` a non-rustfmt-clean edit passes locally and
+fails CI, and without `--locked` cargo silently *regenerates* `Cargo.lock` on drift instead
+of reporting it, validating a dependency graph that is not the committed one.
+
+Not included: the `regtest-backend` job, which needs `bitcoind` and runs `#[ignore]`d tests,
+and the `launch-gate` job (`attack all` + all three demos, ~40 min). Run those when touching
+chain-facing or custody-critical code; CI runs them on every push regardless.
 
 <!-- end-agent-discipline -->
 
