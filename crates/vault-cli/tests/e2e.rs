@@ -8,8 +8,11 @@
 //!
 //! `--locked` is not optional here: without it cargo silently REGENERATES `Cargo.lock`
 //! when it has drifted, so the custody gate would run against a dependency graph that is
-//! not the committed one. CI carries it on every leg, and the launch-gate job additionally
-//! asserts the committed lockfiles are current before anything builds.
+//! not the committed one. CI carries it on every invocation that RESOLVES dependencies —
+//! clippy, test, regtest-backend, and the launch gate's `cargo metadata`/`build`/`run` — but
+//! not on the fmt leg, which cannot take it (`cargo fmt --locked` errors with "unexpected
+//! argument") and never reads the lockfile anyway. The launch-gate job additionally asserts
+//! the committed lockfiles are current before anything builds.
 
 #[test]
 #[ignore = "spawns bitcoind and 5 vault-node processes; run with --ignored"]
