@@ -3,9 +3,9 @@
 **Scope:** the `br ready` frontier, highest priority first — currently `btc-policy-9yf` (P0),
 then the P1 set (`imb`, `mby`, `cod`, `oy3`, `rry`, `5ag`, `wqd`, `q6v`). One bead = one
 branch = one PR. Beads outside that frontier are NOT in scope for this drive.
-**Phase:** BUILD · **Bead:** btc-policy-9yf · **Branch:** fix/9yf-launch-gate
-**Pending:** —
-**Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'`
+**Phase:** HARDEN · **Bead:** btc-policy-9yf · **Branch:** fix/9yf-launch-gate
+**Pending:** metadata PR douglaz/btc-policy#6 — `9yf` closes when it merges, not before
+**Gate:** `nix develop -c bash -c 'cargo clippy --all-targets -- -D warnings && cargo test'` · last green 2026-08-08 (exit 0, 685 passed / 0 failed)
 
 ## Done
 - (nothing closed by this drive yet)
@@ -20,8 +20,13 @@ branch = one PR. Beads outside that frontier are NOT in scope for this drive.
 3. **Demo coverage.** The CLI has three demos; the gate ran two. → `demo recovery-drill`
    is now a gate step, with its source and its scorecard section in the artifact.
 
-Budget: 5 files (`.github/workflows/ci.yml`, `crates/vault-cli/tests/e2e.rs`,
-`docs/TEST-PLAN.md`, `AGENTS.md`, `DRIVE.md`), ~140 LOC. Round 1 of max 4.
+All three now have evidence. Round 4 of max 4 — stopping here; the finding stream went from
+P1-class substance to one P3 and bookkeeping contradictions, which is the gold-plating signal.
+
+Panel on `c22e544`: codex clean ×4, fable clean, consistency clean — all on the same tree.
+CI on `c22e544`: 5/5 jobs green, launch gate ran all three demos + `attack all`, every step
+exit 0. Files: `.github/workflows/ci.yml`, `crates/vault-cli/tests/e2e.rs`, `docs/TEST-PLAN.md`,
+`docs/adr/0017-*.md`, `AGENTS.md`, `DRIVE.md`, `.beads/issues.jsonl`.
 
 Do NOT build: a self-hosted-runner migration, a release-profile CI matrix, any change to the
 attack harness's calibration constants, or new CI jobs. The release-artifact gap is real and
