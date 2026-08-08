@@ -294,7 +294,23 @@ fn check_inputs(psbt: &Psbt, params: &CheckParams) -> Result<(), Violation> {
 /// non-allowlisted destination, OP_RETURN, or anything else → `DestNotAllowed`
 /// (DESIGN.md, "Destination allowlist" / "Verified change"). The bip32 label is
 /// never trusted — it only decides which refusal to report.
+#[allow(unreachable_code, unused_variables)]
 fn check_destinations(psbt: &Psbt, params: &CheckParams) -> Result<(), Violation> {
+    // ────────────────────────────────────────────────────────────────────────────────
+    // DELIBERATE SAFETY REGRESSION — NEGATIVE CONTROL FOR bead btc-policy-9yf.
+    // MUST NEVER MERGE. This branch exists only to be pushed and watched go RED.
+    //
+    // This one line disables the destination allowlist, which is a real theft path:
+    // every output is admitted, so a spend pays wherever the coordinator asked. It is
+    // exactly what `demo theft-refused` act one asserts against (the DEST_NOT_ALLOWED
+    // refusal of a sweep to an unknown address).
+    //
+    // The `allow` above is deliberate and is part of the experiment: without it the
+    // dead code below trips `-D warnings` and the `check` job goes red on a LINT. The
+    // question this branch asks is whether the gate catches a BEHAVIOURAL regression,
+    // so the lint noise is suppressed to keep the signal clean.
+    // ────────────────────────────────────────────────────────────────────────────────
+    return Ok(());
     let max = params.max_derivation_index;
     for (index, (txout, out_map)) in psbt
         .unsigned_tx
