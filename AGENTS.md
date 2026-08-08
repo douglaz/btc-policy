@@ -28,11 +28,14 @@ grep for the result afterwards.
 is the last command's, and `tail` always succeeds, so a failing build reports
 exit 0. Redirect and capture the real code:
 
-```
+```bash
 <gate> > /tmp/gate.log 2>&1; echo "EXIT=$?"
 ```
 
-Then read the log. Note the `;` — not `|`.
+Then read the log. Note the `;` — not `|`. This line is for a human or agent to RUN and
+READ — `$?` is the gate's status and `echo` prints it. Do not embed it in a script and
+branch on the pipeline's status, which is `echo`'s and therefore always 0; if you need to
+propagate the result, capture it (`status=$?`) and exit with it.
 
 **"Passing", "clean", "working", "verified", and "done" require a command and an
 exit code.** If you cannot show one, say what you actually observed instead. This
@@ -117,12 +120,24 @@ br sync --status      # Check sync status
 **Before ending any session, run this checklist:**
 
 ```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync --flush-only    # Export beads changes to JSONL
-git commit -m "..."     # Commit everything
-git push                # Push to remote
+git status                                    # Check what changed
+br sync --flush-only || exit 1                # Export beads to JSONL FIRST — see below
+git add <files> .beads/issues.jsonl           # Stage code AND the fresh export
+git status                                    # Confirm the export is staged
+git commit -m "..."                           # Commit everything
+git push                                      # Push to remote
 ```
+
+**The order matters and this block had it backwards.** `br sync --flush-only` REWRITES
+`.beads/issues.jsonl`, so staging before syncing commits the pre-sync file and silently
+drops the bead updates — the work is closed in the local DB and open in the repo. Sync
+first, then stage, then confirm. And check the sync's exit code: the automatic flush that
+follows a mutating command like `br close` swallows its own error, so `br close` can exit 0
+with nothing written; only an explicit `br sync --flush-only` reports the failure.
+
+<!-- LOCAL EDIT: this sits inside the br-managed block and `br agents --update` will revert
+     it. Tracked as btc-policy-gc8 to push the fix upstream. -->
+
 
 ### Best Practices
 

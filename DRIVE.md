@@ -11,22 +11,36 @@ branch = one PR. Beads outside that frontier are NOT in scope for this drive.
 - (nothing closed by this drive yet)
 
 ## Now
-`btc-policy-9yf` (P0) — the launch gate has never been shown to FAIL. Three deliverables:
+`btc-policy-9yf` (P0). The problem AS FILED — history, not current state: the launch gate had
+never been shown to FAIL, the debug-vs-release profile was undecided, and `recovery-drill` was
+ungated. All three now have evidence:
 
-1. **Negative control.** A deliberately broken branch must turn the `launch-gate` job RED.
-   Until that exists, "green" means "did not report a failure", not "would report one".
-2. **Build profile.** Decide debug vs release for the gate and write it down. → DEBUG,
-   recorded in the `.github/workflows/ci.yml` header with its rationale and its residual.
-3. **Demo coverage.** The CLI has three demos; the gate ran two. → `demo recovery-drill`
-   is now a gate step, with its source and its scorecard section in the artifact.
+1. **Negative control — DONE.** `test/9yf-negative-control` removed the destination allowlist;
+   CI run 31238105663 turned the `launch-gate` job RED at step 9 `demo first-light`, while
+   fmt/clippy/regtest-backend stayed green, so the failure was attributable. Read it precisely:
+   the spend was still refused by the independent output-derived class check (ADR-0013 §3), so
+   what is shown is *a weakened control is detected*, NOT *funds leave*.
+2. **Build profile — DONE.** DEBUG, recorded in the `.github/workflows/ci.yml` header with its
+   rationale and its residual (the shipped artifact is release; that gap is `gbw`/`oy3`).
+3. **Demo coverage — DONE.** `demo recovery-drill` is a gate step, with its source and its
+   scorecard section in the artifact.
 
-All three now have evidence. Round 4 of max 4 — stopping here; the finding stream went from
-P1-class substance to one P3 and bookkeeping contradictions, which is the gold-plating signal.
+Reviewed on tip `2052ea9`, all on the same tree:
 
-Panel on `c22e544`: codex clean ×4, fable clean, consistency clean — all on the same tree.
-CI on `c22e544`: 5/5 jobs green, launch gate ran all three demos + `attack all`, every step
-exit 0. Files: `.github/workflows/ci.yml`, `crates/vault-cli/tests/e2e.rs`, `docs/TEST-PLAN.md`,
-`docs/adr/0017-*.md`, `AGENTS.md`, `DRIVE.md`, `.beads/issues.jsonl`.
+- `codex review --base origin/main -c model=gpt-5.6-sol -c model_reasoning_effort=xhigh`
+  → exit 0, no findings (9 consecutive passes)
+- `claude -p <review prompt> --model fable --effort high` → exit 0, `No findings.`
+- consistency pass (fable, whole-artifact) → 2 findings, both dispositioned below
+- `nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace
+  --all-targets -- -D warnings && cargo test --locked --workspace'` → **EXIT=0**,
+  685 passed / 0 failed
+- CI run 31266297634 on `4b39fd4` → 5/5 jobs, launch gate steps 9-12 (`first-light`,
+  `theft-refused`, `recovery-drill`, `attack all`) each `conclusion=success`
+
+Files changed (9): `.github/workflows/ci.yml`, `crates/vault-cli/tests/e2e.rs`,
+`crates/vault-node/tests/bitcoind_backend.rs`, `docs/TEST-PLAN.md`, `docs/PROTOCOL-VECTORS.md`,
+`docs/adr/0017-one-external-review-at-stage-9.md`, `AGENTS.md`, `DRIVE.md`,
+`.beads/issues.jsonl`.
 
 Do NOT build: a self-hosted-runner migration, a release-profile CI matrix, any change to the
 attack harness's calibration constants, or new CI jobs. The release-artifact gap is real and
