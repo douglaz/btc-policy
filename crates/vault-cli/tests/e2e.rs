@@ -1,7 +1,8 @@
 //! The demo IS the e2e test. Every test here needs bitcoind on PATH, which a plain
 //! `cargo test --workspace` does not provide, so all of them are `#[ignore]`d and
 //! opted into together — this one command IS the launch gate, and it runs
-//! [`attack_harness_exits_zero`] along with the two demos:
+//! [`attack_harness_exits_zero`] along with all three demos (first-light,
+//! theft-refused, recovery-drill):
 //!
 //!   nix develop -c cargo test -p vault-cli -- --ignored --test-threads=1
 
