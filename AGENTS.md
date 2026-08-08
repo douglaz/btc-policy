@@ -46,7 +46,7 @@ done.
 watch it go red against the unfixed code first. A test asserting behaviour that
 was already correct is indistinguishable from a test asserting nothing.
 
-Gate for this repo — the same three checks CI's `check` matrix runs, in the same form:
+Gate for this repo — three of the four legs of CI's `check` matrix, in the same form:
 
 ```
 nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'
@@ -58,9 +58,12 @@ details here are load-bearing — without `fmt` a non-rustfmt-clean edit passes 
 fails CI, and without `--locked` cargo silently *regenerates* `Cargo.lock` on drift instead
 of reporting it, validating a dependency graph that is not the committed one.
 
-Not included: the `regtest-backend` job, which needs `bitcoind` and runs `#[ignore]`d tests,
-and the `launch-gate` job (`attack all` + all three demos, ~40 min). Run those when touching
-chain-facing or custody-critical code; CI runs them on every push regardless.
+Not included, and this is the gap to hold in mind: the matrix's fourth leg `regtest-backend`,
+which needs `bitcoind` and runs `#[ignore]`d tests, and the separate `launch-gate` job
+(`attack all` + all three demos, ~47 min measured). So a tree that breaks the bitcoind backend
+passes this gate while CI goes red — the one case where "I ran the gate" does not imply "CI
+will pass". Run those two when touching chain-facing or custody-critical code; CI runs them on
+every push regardless.
 
 <!-- end-agent-discipline -->
 

@@ -67,7 +67,7 @@ defects — this repo's own history includes a canonical manifest-preimage list 
 times and an escape self-pairing model wrong across seven sites, all caught by automated review.
 
 **PREREQUISITE, and it is load-bearing now rather than optional:** `btc-policy-9yf`'s negative
-control gates the stage-1 freeze. As written 2026-08-07, "16/16 scenarios held" rested on a gate
+control gates the stage-1 freeze. As written 2026-08-06 (commit 539dd87), "16/16 scenarios held" rested on a gate
 that had never been observed to FAIL, which made it a statement that the run did not report a
 failure — not that it would report one. With a human at stage 1 that gap was tolerable. Without one
 it is the foundation, so the freeze could not complete until a deliberately introduced fault was
