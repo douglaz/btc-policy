@@ -67,6 +67,10 @@ BaseManifest {                     # everything EXCEPT endorsements and config_h
 manifest_hash = H(canonical_bytes(BaseManifest))
 # canonical_bytes preimage — v0 AUTHORITATIVE (vault-node `base_manifest_bytes`); reimplement from
 # THIS list + order, NOT a naive serialization of every field above:
+#   ROLLOUT BOUNDARY: `escape_bump_max_fee_pct` is NOT in this v0 preimage and must not be added here
+#   until btc-policy-mby adds it to the code in the same change (ADR-0016 §3a). It is absent from
+#   `base_manifest_bytes` today; listing it early would make every reimplementer compute a hash no
+#   node agrees with. `escape_coverage_pct` is the final v0 field before the node count.
 #   EVERY variable-length run is LENGTH-PREFIXED u32. Both counts below were missing from earlier
 #   drafts of this list; omitting either yields a different hash and WRONG_MANIFEST on every node.
 #   docs/PROTOCOL-VECTORS.md encodes this SAME contract with a worked byte vector and had both

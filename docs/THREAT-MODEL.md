@@ -28,7 +28,10 @@ key**, or — after a ~180-day relative timelock — a **2-of-3 recovery** branc
 relay that the threat model trusts during normal operation and treats as hostile from the wrench
 attack onward; each node independently re-runs every policy gate, signs at ingress, and
 holds its partial signature until the **Hold** elapses. Nodes then release partials to each
-other, and whichever node first holds `t` of them combines and broadcasts. Every spend request
+other — but only once the candidate's carrier has itself reached `t` holders and been confirmed
+(ADR-0012's confirmation-gated arming), not on Hold expiry alone — and whichever node first holds
+`t` partials combines and broadcasts. A duress confirmation arriving in that window suppresses a
+scheduled hot spend rather than letting it release. Every spend request
 carries a **PIN**; a second, distinct *duress* PIN silently arms an escape sweep that claws the
 coins into an independent escape wallet and locks the federation down. See ADR-0012 for the
 consolidated architecture.

@@ -160,7 +160,7 @@ constant there, reject the value here — so do not let a later edit collapse th
 Both fields, and their descriptor / manifest / preimage representations, must be committed under ONE finalize boundary. They are independently represented but jointly chosen, so a ceremony interrupted mid-write must leave nothing sealed and be safely retriable — never half the joint choice, which no later edit can repair because the manifest is immutable.
 
 **4a. The SIGNER checks the ladder against the sealed ceiling as composition validation, not as
-hostile-coordinator enforcement.** Nodes do not enforce `escape_bump_max_fee_pct`, and at the wrench
+hostile-coordinator enforcement.** "SIGNER" here means the component behind `btc-policy-mby`'s signing seam — a software key on signet, hardware later via `btc-policy-bq6` — not a node and not the composing CLI. Nodes do NOT enforce `escape_bump_max_fee_pct` at all — that single omission is what this paragraph is about, and it is not a claim that nodes skip other rung validation: every rung still passes `verify_escape`, `policy_core::MAX_FEE_PERCENT` and the fire-time coverage guard, and at the wrench
 the Coordinator composes the authorization object the Operator is asked to sign. The signer
 therefore compares each supplied ladder with the ceiling from its own authenticated manifest and
 refuses a directly presented over-ceiling ladder. That catches an honest-path composition mistake
