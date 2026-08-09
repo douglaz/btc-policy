@@ -8,10 +8,21 @@ audit the first against it.
 Regenerate the inventory with:
 
 ```bash
-set -o pipefail   # REQUIRED — see below
+set -o pipefail                                  # REQUIRED — see below
+nix flake metadata --no-update-lock-file >/dev/null   # REQUIRED, and FIRST — see below
 nix develop -c cargo tree --locked --workspace --prefix none --no-dedupe \
   | sed 's/ (.*//;s/^ *//' | sort -u
 ```
+
+Three lines, three different ways this recipe can silently document a dependency graph the
+repo does not commit — which is the one thing this file exists to prevent.
+
+`nix flake metadata --no-update-lock-file` must come FIRST, before anything enters the dev
+shell. `nix develop` will refresh a `flake.lock` that has drifted from `flake.nix` and then
+run happily inside the refreshed environment; `cargo tree --locked` would succeed against an
+uncommitted TOOLCHAIN, so the Rust lock being pinned proves nothing about which compiler and
+which `nixpkgs` produced the inventory. `--no-write-lock-file` is not a substitute: it warns
+and passes.
 
 Both halves of that first line are load-bearing, and each defeats the other's absence.
 `--locked` makes `cargo tree` FAIL when `Cargo.lock` has drifted from `Cargo.toml` instead of
