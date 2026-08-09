@@ -75,7 +75,8 @@ confirmed to turn the gate red.
 
 **SATISFIED 2026-08-08** (`btc-policy-9yf`, PR #6). A branch carrying one real safety regression —
 the destination allowlist removed — turned the `launch gate` job RED at `demo first-light`
-(CI run 31238105663), while fmt/clippy/regtest-backend stayed green, so the failure was
+(CI run 31238105663). The `test` job went red too — 4 policy-core unit tests, exit 101 — so
+TWO independent jobs caught the regression, while fmt, clippy and regtest-backend stayed green, so the failure was
 attributable rather than a blanket red. Read the demonstration precisely, because it proves less
 than the shortest summary of it: the spend was still refused, by the independent output-derived
 class check (ADR-0013 §3), so what was shown is **that a weakened control is detected**, not that

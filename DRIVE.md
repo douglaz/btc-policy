@@ -17,7 +17,9 @@ ungated. All three now have evidence:
 
 1. **Negative control — DONE.** `test/9yf-negative-control` removed the destination allowlist;
    CI run 31238105663 turned the `launch-gate` job RED at step 9 `demo first-light`, while
-   fmt/clippy/regtest-backend stayed green, so the failure was attributable. Read it precisely:
+   the `test` job also went red (4 policy-core tests, exit 101) while fmt, clippy and
+   regtest-backend stayed green — two independent jobs caught it, and the result was
+   attributable rather than a blanket red. Read it precisely:
    the spend was still refused by the independent output-derived class check (ADR-0013 §3), so
    what is shown is *a weakened control is detected*, NOT *funds leave*.
 2. **Build profile — DONE.** DEBUG, recorded in the `.github/workflows/ci.yml` header with its

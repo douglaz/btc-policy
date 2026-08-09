@@ -56,9 +56,17 @@ on:
   push:
   pull_request:
   # Manual re-run. Added 2026-07-31 (bead btc-policy-9yf): with no dispatch trigger, a
-  # gate that fails for an INFRASTRUCTURE reason — 44/44 runs died at job startup with
-  # zero steps recorded, while Actions itself was enabled — cannot be retried without
-  # manufacturing a commit. That is part of how the failure stayed invisible.
+  # gate that fails for an INFRASTRUCTURE reason cannot be retried without manufacturing a
+  # commit. That is part of how the failure stayed invisible.
+  #
+  # The bead filed this as "44/44 runs died at job startup with zero steps recorded". That
+  # quantifier is wrong and is corrected here rather than left to propagate (re-measured
+  # 2026-08-09 from the retained run history): of the 46 runs before the first success,
+  # 24 finished in seconds — the startup-death signature — and 22 ran ~46 minutes and
+  # failed, so they plainly executed. Both regimes were red and Actions was enabled
+  # throughout, but "died at startup" and "ran and failed" are different defects, and only
+  # the first is the one this trigger exists for. Duration is the proxy used; a 2756-second
+  # run cannot have recorded zero steps.
   workflow_dispatch:
 
 # Coalesce runs so a superseded push on a feature branch/PR does not keep a runner busy
