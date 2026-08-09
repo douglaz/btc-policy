@@ -67,11 +67,21 @@ defects — this repo's own history includes a canonical manifest-preimage list 
 times and an escape self-pairing model wrong across seven sites, all caught by automated review.
 
 **PREREQUISITE, and it is load-bearing now rather than optional:** `btc-policy-9yf`'s negative
-control gates the stage-1 freeze. Today "16/16 scenarios held" rests on a gate that has never been
-observed to FAIL, which makes it a statement that the run did not report a failure — not that it
-would report one. With a human at stage 1 that gap was tolerable. Without one it is the foundation,
-so the freeze cannot complete until a deliberately introduced fault is confirmed to turn the gate
-red.
+control gates the stage-1 freeze. As written 2026-08-06 (commit 539dd87), "16/16 scenarios held" rested on a gate
+that had never been observed to FAIL, which made it a statement that the run did not report a
+failure — not that it would report one. With a human at stage 1 that gap was tolerable. Without one
+it is the foundation, so the freeze could not complete until a deliberately introduced fault was
+confirmed to turn the gate red.
+
+**SATISFIED 2026-08-08** (`btc-policy-9yf`, PR #6). A branch carrying one real safety regression —
+the destination allowlist removed — turned the `launch gate` job RED at `demo first-light`
+(CI run 31238105663). The `test` job went red too — 4 policy-core unit tests, exit 101 — so
+TWO independent jobs caught the regression, while fmt, clippy and regtest-backend stayed green, so the failure was
+attributable rather than a blanket red. Read the demonstration precisely, because it proves less
+than the shortest summary of it: the spend was still refused, by the independent output-derived
+class check (ADR-0013 §3), so what was shown is **that a weakened control is detected**, not that
+funds leave. That is the property this prerequisite needed — the gate reports a regression — and it
+is not a claim that any single control is sufficient alone.
 
 **NOT covered, by anything, until stage 9:**
 

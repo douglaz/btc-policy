@@ -191,8 +191,8 @@ share a coordinator key.
 ## How to verify these
 
 ```
-nix develop -c cargo test -p vault-node --lib vector_is_frozen
-nix develop -c cargo test -p vault-proto
+nix develop -c cargo test --locked -p vault-node --lib vector_is_frozen
+nix develop -c cargo test --locked -p vault-proto
 ```
 
 An independent implementation should reproduce every digest above from the field descriptions

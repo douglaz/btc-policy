@@ -2,19 +2,55 @@
 #
 # Two jobs, and the split is the point:
 #
-#   `check`      — fmt, clippy -D warnings, and the whole test suite (including the
-#                  V0-7 property/fuzz suites, which live in the workspace). Fast,
-#                  and the thing every push should be able to wait for.
+#   `check`      — FOUR matrix legs: fmt, clippy -D warnings, the whole test suite
+#                  (including the V0-7 property/fuzz suites, which live in the
+#                  workspace), and `regtest-backend`. The fourth is not covered by the
+#                  third and the distinction is the point: `cargo test` SKIPS the
+#                  `#[ignore]`d bitcoind-backend tests, so without its own leg the
+#                  backend's live-Core behaviour is ungated. Fast, and the thing every
+#                  push should be able to wait for.
 #
-#   `launch-gate` — `attack all` (every adversarial scenario) plus BOTH demos. This
-#                  is the custody claim itself: "no theft path, safety track held".
-#                  It is slow, so it is a separate job — but it runs on EVERY push,
-#                  because a launch gate nobody runs is a launch gate that has
-#                  already rotted, and for custody code that rot is silent.
+#   `launch-gate` — `attack all` (every adversarial scenario) plus ALL THREE demos
+#                  (first-light, theft-refused, recovery-drill). This is the custody
+#                  claim itself: "no theft path, safety track held, recovery exit
+#                  reachable". It is slow, so it is a separate job — but it runs on
+#                  EVERY push, because a launch gate nobody runs is a launch gate
+#                  that has already rotted, and for custody code that rot is silent.
 #
 # Everything runs inside the repo's own Nix devShell (`flake.nix`), which is where
 # the pinned toolchain and bitcoind come from. There is no second source of truth
 # for the build environment, and CI must not become one.
+#
+# ---------------------------------------------------------------------------------
+# BUILD PROFILE — the gate is the DEBUG build, deliberately (bead btc-policy-9yf).
+#
+# Nothing in this workspace overrides `[profile.*]`, so "debug" means Cargo's own dev
+# defaults, and two of them are load-bearing for custody code: `debug-assertions` keeps
+# the workspace's 17 debug assertions live (6 `debug_assert!` + 11 `debug_assert_eq!`;
+# a bare `grep -c debug_assert` says 19, but two of those are prose in comments — the
+# distinction matters in a block whose whole point is that a claim matches its
+# mechanism), and `overflow-checks` turns a wrapping
+# amount/fee arithmetic bug into a panic instead of a silently wrong number. A release
+# gate compiles both out, so it would prove strictly LESS about the same commit.
+#
+# The objection this answers (bead btc-policy-9yf) is that the adversarial harness's pin
+# calibration adapts to machine speed and build profile, so a debug CI run and a release
+# local run exercise different memory costs. True, and it is the one thing the harness
+# already handles rather than ignores: `calibrate_pin_cost`
+# (crates/vault-cli/src/attack.rs) derives the enrolled Argon2 cost PER MACHINE so one
+# evaluation lands near `PIN_COST_TARGET` whatever the profile — explicitly "because the
+# same constant means entirely different things in a release build and an unoptimized
+# one" — and it hard-fails at its floor and at its handler-deadline ceiling rather than
+# running a control that cannot tell a correctly-configured node from a fixture. So the
+# profile does not silently change what the timing assertions MEAN; it changes how much
+# memory the calibration must buy for them to mean it.
+#
+# RESIDUAL, stated rather than closed: what would ship is a RELEASE binary, and this gate
+# never executes one. That gap is real, and it is not this workflow's to close — it
+# belongs to the release-candidate freeze (bead btc-policy-gbw) and the reproducible-build
+# pipeline (bead btc-policy-oy3), which run against one named frozen commit. Do not read a
+# green launch-gate run as evidence about a release artifact.
+# ---------------------------------------------------------------------------------
 name: CI
 
 # Both triggers: `push` is what the launch gate must not miss, `pull_request` is
@@ -24,9 +60,20 @@ on:
   push:
   pull_request:
   # Manual re-run. Added 2026-07-31 (bead btc-policy-9yf): with no dispatch trigger, a
-  # gate that fails for an INFRASTRUCTURE reason — 44/44 runs died at job startup with
-  # zero steps recorded, while Actions itself was enabled — cannot be retried without
-  # manufacturing a commit. That is part of how the failure stayed invisible.
+  # gate that fails for an INFRASTRUCTURE reason cannot be retried without manufacturing a
+  # commit. That is part of how the failure stayed invisible.
+  #
+  # The bead filed this as "44/44 runs died at job startup with zero steps recorded". That
+  # quantifier is wrong and is corrected here rather than left to propagate. ONE run set is
+  # used everywhere this history is cited (here, docs/TEST-PLAN.md, and the btc-policy-9yf
+  # bead), re-measured 2026-08-09: the runs before the first success, window
+  # 2026-07-25T16:13:38Z .. 2026-08-01T21:45:51Z, 48 runs, all red. Of those, 24 finished in
+  # seconds — the startup-death signature — and 24 ran ~46 minutes and failed, so they
+  # plainly executed. Both regimes were red and Actions was enabled throughout, but "died at
+  # startup" and "ran and failed" are different defects, and only the first is what this
+  # trigger exists for. Duration is the proxy; a 2756-second run cannot have recorded zero
+  # steps. Any other window (e.g. "before 2026-08-01") yields a different total and must not
+  # be described as "before the first success".
   workflow_dispatch:
 
 # Coalesce runs so a superseded push on a feature branch/PR does not keep a runner busy
@@ -90,12 +137,13 @@ jobs:
       - run: ${{ matrix.check.run }}
 
   launch-gate:
-    name: launch gate (attack all + both demos)
+    name: launch gate (attack all + all three demos)
     runs-on: ubuntu-latest
     # `attack all` stands up a fresh 5-node federation per scenario and waits out
-    # real Holds, hostage windows, and combine windows; the two demos add a real
-    # regtest Hold each. Generous, so a slow runner reports a FAILURE rather than a
-    # cancellation nobody can attribute.
+    # real Holds, hostage windows, and combine windows; first-light and theft-refused
+    # add a real regtest Hold each, and recovery-drill additionally advances
+    # median-time-past past a 180-day relative lock. Generous, so a slow runner reports
+    # a FAILURE rather than a cancellation nobody can attribute.
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
@@ -133,6 +181,10 @@ jobs:
           # repo at $GITHUB_SHA (codex 9y5.4 review).
           cp crates/vault-cli/src/attack.rs artifacts/attack-harness-source.rs
           cp crates/vault-cli/src/demo.rs artifacts/demo-source.rs
+          # recovery-drill is a gated demo but does NOT live in demo.rs, so the copy above
+          # does not cover it. Without this line the artifact would silently describe two
+          # of the three demos it gates (bead btc-policy-9yf).
+          cp crates/vault-cli/src/recovery.rs artifacts/recovery-drill-source.rs
           {
             echo "commit:  $GITHUB_SHA"
             echo "ref:     $GITHUB_REF"
@@ -192,6 +244,21 @@ jobs:
           echo "demo theft-refused: exit $status" >> artifacts/exit-codes.txt
           exit $status
 
+      # The V0-10 recovery exit. Added 2026-08-08 (bead btc-policy-9yf): the CLI has had
+      # three demos since recovery-drill landed, while this job gated two — and `attack
+      # recovery` only OVERLAPS it, so the named demo the docs point operators at was
+      # never itself run here. It sits before `attack all` for the same reason the other
+      # two do: a fast, attributable failure ahead of the ~40-minute scenario sweep.
+      - name: demo recovery-drill
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          nix develop -c cargo run --locked -q -p vault-cli --bin btc-vault -- demo recovery-drill \
+            2>&1 | tee artifacts/demo-recovery-drill.log || status=$?
+          echo "demo recovery-drill: exit $status" >> artifacts/exit-codes.txt
+          exit $status
+
       - name: attack all
         shell: bash
         run: |
@@ -235,7 +302,7 @@ jobs:
             echo
             echo "# Per-scenario knobs are compile-time constants (crates/vault-cli/src/attack.rs,"
             echo "# struct Setup); the exact source is captured in artifacts/attack-harness-source.rs"
-            echo "# (and demo-source.rs) above, pinned to commit $GITHUB_SHA."
+            echo "# (plus demo-source.rs and recovery-drill-source.rs) above, pinned to commit $GITHUB_SHA."
           } > artifacts/effective-config.txt
           {
             echo "# Launch gate — $GITHUB_SHA"
@@ -264,6 +331,15 @@ jobs:
             echo
             grep -E 'ACT (ONE|TWO) OK|FIRST LIGHT COMPLETE' artifacts/demo-first-light.log \
               | indent || echo '    (first light produced no act lines)'
+            echo
+            echo '## Demo: recovery-drill'
+            echo
+            # This demo prints no scorecard block; its record IS its numbered step lines,
+            # so the slice is the `[n/6]` headers plus the completion banner. A grep that
+            # matches nothing is not an error here (`|| echo`) — an incomplete list is the
+            # attributable evidence of WHERE it stopped, which is the point of the artifact.
+            grep -E '^\[[0-9]+/6\]|RECOVERY DRILL COMPLETE' artifacts/demo-recovery-drill.log \
+              | indent || echo '    (recovery drill produced no step lines)'
           } > artifacts/scorecard.md
           cat artifacts/scorecard.md
 

@@ -34,8 +34,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        // The adversarial harness. `attack all` is the launch gate; a single
-        // scenario name runs just that one, for iterating on a failure.
+        // The adversarial harness. `attack all` is the LARGEST PART of the launch gate,
+        // not the whole of it: the gate is `attack all` plus all three demos
+        // (first-light, theft-refused, recovery-drill), each a step of the `launch-gate`
+        // job in .github/workflows/ci.yml. `attack recovery` only OVERLAPS the
+        // recovery-drill demo, which is why that demo is gated in its own right
+        // (bead btc-policy-9yf). A single scenario name runs just that one, for
+        // iterating on a failure.
         ["attack"] | ["attack", "all"] => attack::run(None),
         ["attack", scenario] => attack::run(Some(scenario)),
         // The production setup ceremony (ADR-0013 §4). Distinct from the demo
