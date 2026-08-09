@@ -44,7 +44,11 @@ predating the operator CLI.
   have never been falsified.
 - `btc-policy-gc8` (P3) — push the AGENTS.md fixes upstream; they sit in tool-managed blocks
   that `br agents --update` and the `agents-md` skill regenerate, so the local fix reverts.
-- `btc-policy-o97` (P3) — DESIGN.md still prescribes the retired nine-scenario attack set.
+- `btc-policy-o97` (P3) — a DESIGN.md audit: it still schedules the shipped harness as future
+  work and describes a CI weaker than the one that runs. Rescoped from a site list to a sweep
+  after three review passes each found sites the previous enumeration had missed (2 → 5 → 8).
+- `btc-policy-8sq` — CLOSED as a duplicate of the pre-existing `tf0` (README/IDEA drift). Filed
+  in error after a reviewer had already named `tf0`.
 
 ## Open questions for the human
 - none
