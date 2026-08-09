@@ -7,10 +7,19 @@ audit the first against it.
 
 Regenerate the inventory with:
 
-```
+```bash
+set -o pipefail   # REQUIRED — see below
 nix develop -c cargo tree --locked --workspace --prefix none --no-dedupe \
   | sed 's/ (.*//;s/^ *//' | sort -u
 ```
+
+Both halves of that first line are load-bearing, and each defeats the other's absence.
+`--locked` makes `cargo tree` FAIL when `Cargo.lock` has drifted from `Cargo.toml` instead of
+silently regenerating it — without it, the inventory can describe a dependency graph the repo
+does not commit, which is the one thing this document exists to prevent. But a pipeline's exit
+status is its LAST command's, and `sort` succeeds on empty input, so without `pipefail` the
+`--locked` failure is swallowed and the recipe reports success while emitting a truncated or
+empty inventory. Check the exit status, not the output's plausibility.
 
 ## The policy
 
