@@ -2,9 +2,13 @@
 #
 # Two jobs, and the split is the point:
 #
-#   `check`      — fmt, clippy -D warnings, and the whole test suite (including the
-#                  V0-7 property/fuzz suites, which live in the workspace). Fast,
-#                  and the thing every push should be able to wait for.
+#   `check`      — FOUR matrix legs: fmt, clippy -D warnings, the whole test suite
+#                  (including the V0-7 property/fuzz suites, which live in the
+#                  workspace), and `regtest-backend`. The fourth is not covered by the
+#                  third and the distinction is the point: `cargo test` SKIPS the
+#                  `#[ignore]`d bitcoind-backend tests, so without its own leg the
+#                  backend's live-Core behaviour is ungated. Fast, and the thing every
+#                  push should be able to wait for.
 #
 #   `launch-gate` — `attack all` (every adversarial scenario) plus ALL THREE demos
 #                  (first-light, theft-refused, recovery-drill). This is the custody
