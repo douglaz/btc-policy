@@ -186,17 +186,25 @@ mainnet funds behind either.
 Deciding now, without the attrition numbers, is what this defers. The risk it accepts is possibly
 rebuilding the node lifecycle mid-ladder.
 
-## Where the two reviews sit
+## Where the review sits
 
-- **After stage 1** — the protocol core, against a frozen artifact. Early because a core finding
-  discovered at stage 9 invalidates everything built on top of it.
+**Singular.** [ADR-0017](adr/0017-one-external-review-at-stage-9.md) removed external review #1;
+there is ONE external human review, before stage 10, and the order is FREEZE → REVIEW → CAPS LIFT.
+
 - **Before stage 10** — the deployed system, against a frozen artifact. Late because an alpha
   needs the thing users will actually run reviewed, not a single-machine prototype.
 
-Both must target a **frozen, reproducible** build (`btc-policy-gbw`), not a moving branch. Neither
-is satisfied by automated review: correlated AI panels — including this repo's own codex + Fable
-loops, however adversarially prompted — are explicitly not a substitute (`docs/THREAT-MODEL.md`
-R7).
+This section previously described a second review "after stage 1", which ADR-0017 deleted on
+2026-08-06 — the rest of this file was swept then (see the stage-1 row and the stage-9 row) and
+this heading was missed. What stage 1 keeps is the **freeze**, which is discipline rather than
+assurance; the review is what moved. ADR-0017 records what that costs: stages 3, 5 and 8 put real
+(dust-capped) mainnet funds in front of code no external human has read, and the dust cap now
+carries assurance weight it was not designed for.
+
+The review must target a **frozen, reproducible** build (`btc-policy-gbw`), not a moving branch,
+and is not satisfied by automated review: correlated AI panels — including this repo's own
+codex + Fable loops, however adversarially prompted — are explicitly not a substitute
+(`docs/THREAT-MODEL.md` R7).
 
 ## What stage 1 needs that does not exist yet
 
