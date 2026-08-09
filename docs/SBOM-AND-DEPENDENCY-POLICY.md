@@ -8,14 +8,22 @@ audit the first against it.
 Regenerate the inventory with:
 
 ```bash
-set -o pipefail                                  # REQUIRED — see below
+set -eo pipefail                                      # BOTH flags — see below
 nix flake metadata --no-update-lock-file >/dev/null   # REQUIRED, and FIRST — see below
 nix develop -c cargo tree --locked --workspace --prefix none --no-dedupe \
   | sed 's/ (.*//;s/^ *//' | sort -u
 ```
 
-Three lines, three different ways this recipe can silently document a dependency graph the
-repo does not commit — which is the one thing this file exists to prevent.
+Three lines, three different ways this recipe can silently document a dependency graph the repo
+does not commit — which is the one thing this file exists to prevent. Each was found separately,
+by review, after the previous fix looked sufficient.
+
+`set -e` and `set -o pipefail` are BOTH needed and neither implies the other. `pipefail` makes a
+pipeline report its first failing stage instead of `sort`'s success — without it, a failing
+`cargo tree` yields exit 0 because `sort` succeeds on empty input. `-e` makes the recipe STOP at
+the assertion below — without it, `pipefail` alone lets a failed stale-flake check fall through to
+the next line, which enters the dev shell, refreshes the lock, and finishes with a green
+pipeline.
 
 `nix flake metadata --no-update-lock-file` must come FIRST, before anything enters the dev
 shell. `nix develop` will refresh a `flake.lock` that has drifted from `flake.nix` and then
