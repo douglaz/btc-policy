@@ -61,7 +61,9 @@ be a guess wearing the costume of a mitigation.
 Named here because "no external review" is only half a statement; the other half is what is being
 relied on instead.
 
-**Relied on:** the stage-1 freeze (`gbw`); the adversarial harness (`attack all`, 16 scenarios);
+**Relied on:** the stage-1 freeze (`gbw`); the adversarial harness (`attack all`, 16 scenarios —
+and read the caveat below before weighting this: the harness itself has never been shown red on a
+deliberately introduced fault, `btc-policy-nia`);
 proptest and fuzz suites; the full CI matrix; and multi-model AI review panels, which do find real
 defects — this repo's own history includes a canonical manifest-preimage list found wrong three
 times and an escape self-pairing model wrong across seven sites, all caught by automated review.
@@ -85,6 +87,17 @@ than the shortest summary of it: the spend was still refused, by the independent
 class check (ADR-0013 §3), so what was shown is **that a weakened control is detected**, not that
 funds leave. That is the property this prerequisite needed — the gate reports a regression — and it
 is not a claim that any single control is sufficient alone.
+
+**What this does NOT cover, and it matters most to whoever reads this ADR** — because the
+"Relied on" list above names the harness, and a stage-9 reviewer is being told what carries
+assurance in the absence of human review. The launch-gate job stops at its first failing step, and
+this control failed at step 9 (`demo first-light`), so **step 12, `attack all`, never executed**.
+The 16-scenario harness — the largest part of the gate and the sole support for every "16/16 held"
+claim in this repo — has therefore never been shown red on a deliberately introduced fault. It HAS
+failed spontaneously (`btc-policy-rt0`, `escape-class-sequences` at 15/16), so it is not vacuously
+green; what is unproven is its sensitivity to an injected safety regression. The output-derived
+class check that actually refused the spend here has never been falsified at all. Both are tracked
+as `btc-policy-nia` (P1), and neither is closed by this prerequisite.
 
 **NOT covered, by anything, until stage 9:**
 
