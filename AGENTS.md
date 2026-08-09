@@ -49,7 +49,8 @@ done.
 watch it go red against the unfixed code first. A test asserting behaviour that
 was already correct is indistinguishable from a test asserting nothing.
 
-Gate for this repo — three of the four legs of CI's `check` matrix, in the same form:
+Gate for this repo — the stale-flake assertion (from CI's `launch-gate` job) plus three of
+the four legs of CI's `check` matrix, each in the same form CI runs it:
 
 ```bash
 nix flake metadata --no-update-lock-file >/dev/null && \
