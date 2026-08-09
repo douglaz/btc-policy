@@ -8,7 +8,7 @@ audit the first against it.
 Regenerate the inventory with:
 
 ```
-nix develop -c cargo tree --workspace --prefix none --no-dedupe \
+nix develop -c cargo tree --locked --workspace --prefix none --no-dedupe \
   | sed 's/ (.*//;s/^ *//' | sort -u
 ```
 

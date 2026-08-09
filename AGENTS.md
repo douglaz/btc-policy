@@ -73,7 +73,9 @@ of reporting it, validating a dependency graph that is not the committed one.
 
 Not included, and this is the gap to hold in mind: the matrix's fourth leg `regtest-backend`,
 which needs `bitcoind` and runs `#[ignore]`d tests, and the separate `launch-gate` job
-(`attack all` + all three demos, ~47 min measured).
+(`attack all` + all three demos, ~47 min — measured on the THREE-demo gate, runs 31292932691
+on the merged `037022b` (47.3), 31266297634 (47.2) and 31239283223 (47.5); the two-demo gate ran
+47.1, so adding recovery-drill cost essentially nothing).
 
 So this gate can go green on a tree CI rejects, and the honest framing is a rule rather than a
 list: **anything exercised only by `regtest-backend` or by `launch-gate` is untested here.** Two
