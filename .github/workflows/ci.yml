@@ -60,13 +60,16 @@ on:
   # commit. That is part of how the failure stayed invisible.
   #
   # The bead filed this as "44/44 runs died at job startup with zero steps recorded". That
-  # quantifier is wrong and is corrected here rather than left to propagate (re-measured
-  # 2026-08-09 from the retained run history): of the 46 runs before the first success,
-  # 24 finished in seconds — the startup-death signature — and 22 ran ~46 minutes and
-  # failed, so they plainly executed. Both regimes were red and Actions was enabled
-  # throughout, but "died at startup" and "ran and failed" are different defects, and only
-  # the first is the one this trigger exists for. Duration is the proxy used; a 2756-second
-  # run cannot have recorded zero steps.
+  # quantifier is wrong and is corrected here rather than left to propagate. ONE run set is
+  # used everywhere this history is cited (here, docs/TEST-PLAN.md, and the btc-policy-9yf
+  # bead), re-measured 2026-08-09: the runs before the first success, window
+  # 2026-07-25T16:13:38Z .. 2026-08-01T21:45:51Z, 48 runs, all red. Of those, 24 finished in
+  # seconds — the startup-death signature — and 24 ran ~46 minutes and failed, so they
+  # plainly executed. Both regimes were red and Actions was enabled throughout, but "died at
+  # startup" and "ran and failed" are different defects, and only the first is what this
+  # trigger exists for. Duration is the proxy; a 2756-second run cannot have recorded zero
+  # steps. Any other window (e.g. "before 2026-08-01") yields a different total and must not
+  # be described as "before the first success".
   workflow_dispatch:
 
 # Coalesce runs so a superseded push on a feature branch/PR does not keep a runner busy
