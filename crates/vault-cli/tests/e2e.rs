@@ -1,8 +1,13 @@
 //! The demo IS the e2e test. Every test here needs bitcoind on PATH, which a plain
 //! `cargo test --workspace` does not provide, so all of them are `#[ignore]`d and
-//! opted into together — this one command IS the launch gate, and it runs
-//! [`attack_harness_exits_zero`] along with all three demos (first-light,
-//! theft-refused, recovery-drill):
+//! opted into together — this one command runs the same four things the launch gate does,
+//! [`attack_harness_exits_zero`] along with all three demos (first-light, theft-refused,
+//! recovery-drill). It is NOT the launch gate itself, and the difference matters in the
+//! direction that bites: the `launch-gate` job additionally asserts the committed lockfiles
+//! are current, records the resolved toolchain and binary hashes, invokes the four commands
+//! directly rather than through one test binary, and uploads the artifacts a failed gate is
+//! attributable from. A green run here does not imply a green gate — see AGENTS.md, which
+//! rules out exactly that inference:
 //!
 //!   nix develop -c cargo test --locked -p vault-cli -- --ignored --test-threads=1
 //!

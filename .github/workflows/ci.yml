@@ -306,7 +306,14 @@ jobs:
           {
             echo "commit: $GITHUB_SHA"
             echo
-            echo "# The federation each demo provisioned (printed by its own bring-up)"
+            # Two of the three, not each: first-light and theft-refused stand up a 5-node
+            # federation and print its config at bring-up; recovery-drill spawns no vault-node
+            # at all (it drives a regtest bitcoind in-process), so it has no federation to
+            # record and contributes nothing here. Said explicitly because the sibling
+            # source-copy step above exists precisely because an artifact that silently
+            # describes two of the three demos it gates is the failure mode to avoid.
+            echo "# The federation the 5-node demos provisioned (printed by their own bring-up;"
+            echo "# recovery-drill has none — it spawns no vault-node)"
             grep -h '^ *config:' artifacts/demo-*.log || echo "(no demo reached bring-up)"
             echo
             echo "# The adversarial harness federation"
