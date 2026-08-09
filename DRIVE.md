@@ -43,10 +43,12 @@ what this bead exists to stop:
   are documentation-only, but "documentation-only" is a claim about the diff, not a gate
   result. The merge is gated on a green run of the actual merged tip, not on this one.
 
-Files changed (9): `.github/workflows/ci.yml`, `crates/vault-cli/tests/e2e.rs`,
-`crates/vault-node/tests/bitcoind_backend.rs`, `docs/TEST-PLAN.md`, `docs/PROTOCOL-VECTORS.md`,
-`docs/adr/0017-one-external-review-at-stage-9.md`, `AGENTS.md`, `DRIVE.md`,
-`.beads/issues.jsonl`.
+Files changed: `git diff origin/main --name-only`.
+
+That is deliberately a command and not a list. A hand-maintained inventory of the branch's own
+files is a copy of something git already knows, so it can only ever drift — and it did, twice
+in three commits (7 named when it was 9, then 9 when it was 10), each time costing a review
+round and a CI cycle to correct a fact that was never worth recording by hand. Derive it.
 
 Do NOT build: a self-hosted-runner migration, a release-profile CI matrix, any change to the
 attack harness's calibration constants, or new CI jobs. The release-artifact gap is real and
