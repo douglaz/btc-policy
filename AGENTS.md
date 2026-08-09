@@ -51,9 +51,18 @@ was already correct is indistinguishable from a test asserting nothing.
 
 Gate for this repo — three of the four legs of CI's `check` matrix, in the same form:
 
-```
+```bash
+nix flake metadata --no-update-lock-file >/dev/null && \
 nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'
 ```
+
+The `nix flake metadata` line comes FIRST and is not decoration. `nix develop` will happily
+REFRESH a `flake.lock` that has drifted from `flake.nix` and then run every check against the
+refreshed environment — so all three inner checks go green while CI's launch-gate rejects the
+committed tree at its own stale-lock assertion (`ci.yml`, "Assert the committed lockfiles are
+current"). `--no-update-lock-file` makes nix exit non-zero instead; `--no-write-lock-file`
+only warns and passes. This is the same failure as omitting `--locked`, one level up:
+`--locked` pins the Rust dependency graph, this pins the toolchain the whole gate runs on.
 
 Keep it matching `.github/workflows/ci.yml`. A weaker local gate is worse than none: it
 returns 0 on a tree CI will reject, so "I ran the gate" stops meaning "CI will pass". Both
