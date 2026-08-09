@@ -73,10 +73,12 @@ of reporting it, validating a dependency graph that is not the committed one.
 
 Not included, and this is the gap to hold in mind: the matrix's fourth leg `regtest-backend`,
 which needs `bitcoind` and runs `#[ignore]`d tests, and the separate `launch-gate` job
-(`attack all` + all three demos, ~47 min measured). So a tree that breaks the bitcoind backend
-passes this gate while CI goes red — the one case where "I ran the gate" does not imply "CI
-will pass". Run those two when touching chain-facing or custody-critical code; CI runs them on
-every push regardless.
+(`attack all` + all three demos, ~47 min measured). Both omissions are cases where "I ran the
+gate" does not imply "CI will pass", and there are exactly two: a tree that breaks the bitcoind
+backend passes this gate while `regtest-backend` goes red, and a tree that breaks a launch-gate
+scenario or demo passes it too, because every one of those tests is `#[ignore]`d and a plain
+`cargo test` skips them. Run those two jobs when touching chain-facing or custody-critical code;
+CI runs them on every push regardless.
 
 <!-- end-agent-discipline -->
 
