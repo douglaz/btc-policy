@@ -25,7 +25,9 @@ ungated. All three now have evidence:
 3. **Demo coverage — DONE.** `demo recovery-drill` is a gate step, with its source and its
    scorecard section in the artifact.
 
-Reviewed on tip `2052ea9`, all on the same tree:
+Review evidence. The three reviewers below all ran on the SAME tree, tip `2052ea9`; the CI
+line is deliberately separate because it names a different commit, and conflating the two is
+what this bead exists to stop:
 
 - `codex review --base origin/main -c model=gpt-5.6-sol -c model_reasoning_effort=xhigh`
   → exit 0, no findings (9 consecutive passes)
@@ -34,8 +36,12 @@ Reviewed on tip `2052ea9`, all on the same tree:
 - `nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace
   --all-targets -- -D warnings && cargo test --locked --workspace'` → **EXIT=0**,
   685 passed / 0 failed
-- CI run 31266297634 on `4b39fd4` → 5/5 jobs, launch gate steps 9-12 (`first-light`,
-  `theft-refused`, `recovery-drill`, `attack all`) each `conclusion=success`
+- CI: the last FULL launch-gate run is 31266297634 on commit `4b39fd4` (tree
+  `1396e654`) → 5/5 jobs, launch gate steps 9-12 (`first-light`, `theft-refused`,
+  `recovery-drill`, `attack all`) each `conclusion=success`. That is NOT the reviewed tip
+  `2052ea9` (tree `0eafe57`) and must not be read as evidence about it: the commits since
+  are documentation-only, but "documentation-only" is a claim about the diff, not a gate
+  result. The merge is gated on a green run of the actual merged tip, not on this one.
 
 Files changed (9): `.github/workflows/ci.yml`, `crates/vault-cli/tests/e2e.rs`,
 `crates/vault-node/tests/bitcoind_backend.rs`, `docs/TEST-PLAN.md`, `docs/PROTOCOL-VECTORS.md`,
