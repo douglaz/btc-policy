@@ -65,8 +65,12 @@ on:
   #
   # The bead filed this as "44/44 runs died at job startup with zero steps recorded". That
   # quantifier is wrong and is corrected here rather than left to propagate. ONE run set is
-  # used everywhere this history is cited (here, docs/TEST-PLAN.md, and the btc-policy-9yf
-  # bead), re-measured 2026-08-09: the runs before the first success — from
+  # used everywhere this history is cited. THIS FILE OWNS THE FIGURE; anything else that states
+  # it must reference this block rather than restate it, and before citing it, grep the repo and
+  # the beads for "44/44", "never ran", and this window's timestamps — the citation sites are not
+  # a list anyone has managed to keep complete (an earlier version of this comment named three;
+  # btc-policy-rt0 was a fourth, still carrying the retracted quantifier). Re-measured
+  # 2026-08-09: the runs before the first success — from
   # 2026-07-25T16:13:38Z up to but NOT INCLUDING the first green run, which is the one created
   # at 2026-08-01T21:45:51Z — 48 runs, all red. The upper bound names the first GREEN run and is
   # exclusive; it is not the last red one. Of those, 24 finished in
