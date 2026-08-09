@@ -73,12 +73,24 @@ of reporting it, validating a dependency graph that is not the committed one.
 
 Not included, and this is the gap to hold in mind: the matrix's fourth leg `regtest-backend`,
 which needs `bitcoind` and runs `#[ignore]`d tests, and the separate `launch-gate` job
-(`attack all` + all three demos, ~47 min measured). Both omissions are cases where "I ran the
-gate" does not imply "CI will pass", and there are exactly two: a tree that breaks the bitcoind
-backend passes this gate while `regtest-backend` goes red, and a tree that breaks a launch-gate
-scenario or demo passes it too, because every one of those tests is `#[ignore]`d and a plain
-`cargo test` skips them. Run those two jobs when touching chain-facing or custody-critical code;
-CI runs them on every push regardless.
+(`attack all` + all three demos, ~47 min measured).
+
+So this gate can go green on a tree CI rejects, and the honest framing is a rule rather than a
+list: **anything exercised only by `regtest-backend` or by `launch-gate` is untested here.** Two
+earlier versions of this paragraph tried to enumerate the cases — "the one case", then "exactly
+two" — and both were wrong, because the set is not bounded by what the tests cover. Worked
+example that neither enumeration caught: rename `crates/vault-cli/src/recovery.rs`, updating the
+`mod` declaration. It is a pure refactor, it compiles, every test passes, this gate returns 0 —
+and `launch-gate` dies at its source-copy step with `cp: cannot stat`, because that step names
+the path literally. The job's setup steps are part of CI's contract too, not just its tests.
+
+Run both jobs when touching chain-facing or custody-critical code, when moving or renaming files
+the workflow references by path, or when changing the workflow itself; CI runs them on every push
+regardless.
+
+<!-- LOCAL EDIT: everything from "Gate for this repo" onward is repo-local content inside the
+     tool-managed agent-discipline-v1 block, whose canonical source ends at the one-line gate.
+     `agents-md` will revert it. Tracked as btc-policy-gc8. -->
 
 <!-- end-agent-discipline -->
 
