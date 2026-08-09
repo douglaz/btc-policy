@@ -201,9 +201,17 @@ assurance; the review is what moved. ADR-0017 records what that costs: stages 3,
 (dust-capped) mainnet funds in front of code no external human has read, and the dust cap now
 carries assurance weight it was not designed for.
 
-The review must target a **frozen, reproducible** build (`btc-policy-gbw`), not a moving branch,
-and is not satisfied by automated review: correlated AI panels — including this repo's own
-codex + Fable loops, however adversarially prompted — are explicitly not a substitute
+The review must target a **frozen, reproducible** artifact, not a moving branch — and specifically
+**`btc-policy-yt7`'s stage-9 artifact, NOT `btc-policy-gbw`'s stage-1 freeze.** That distinction is
+load-bearing and was got wrong in this file on 2026-08-09: `gbw` is the stage-1 freeze, its commit
+predates the operator CLI and carries no `bq6` dependency, so it predates hardware signing too.
+Sending the one external review there would review a build missing most of what a reviewer needs
+to see. `gbw`'s own record says so — "The external reviewers are NOT pointed here — they read
+btc-policy-yt7's stage-9 artifact (ADR-0017)". The `gbw` reference was correct while review #1
+existed at stage 1; removing that review made it wrong.
+
+The review is not satisfied by automated review either: correlated AI panels — including this
+repo's own codex + Fable loops, however adversarially prompted — are explicitly not a substitute
 (`docs/THREAT-MODEL.md` R7).
 
 ## What stage 1 needs that does not exist yet
