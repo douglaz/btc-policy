@@ -65,11 +65,18 @@ on:
   #
   # The bead filed this as "44/44 runs died at job startup with zero steps recorded". That
   # quantifier is wrong and is corrected here rather than left to propagate. ONE run set is
-  # used everywhere this history is cited. THIS FILE OWNS THE FIGURE; anything else that states
-  # it must reference this block rather than restate it, and before citing it, grep the repo and
-  # the beads for "44/44", "never ran", and this window's timestamps — the citation sites are not
-  # a list anyone has managed to keep complete (an earlier version of this comment named three;
-  # btc-policy-rt0 was a fourth, still carrying the retracted quantifier). Re-measured
+  # used everywhere this history is cited. THIS FILE OWNS THE FIGURE; anything else that states it
+  # must reference this block rather than restate it.
+  #
+  # THE RETRACTED CLAIM IS "the gate never executed", in ANY phrasing — do not go looking for
+  # particular strings. An earlier version of this comment told the next reader to grep for
+  # "44/44" and "never ran"; the next two sites found used neither, saying "the first CI run that
+  # has ever actually executed" (btc-policy-c9r) and "CI only started executing again around
+  # 2026-07-31" (btc-policy-rt0's notes, contradicting rt0's own description). Every attempt to
+  # enumerate this — the citation sites, then the phrasings — has been incomplete, so the
+  # instruction is semantic: before writing or trusting ANY statement about CI history before
+  # 2026-08-01, check it against this block. About half those runs executed the full gate and
+  # failed; only the other half died at startup. Re-measured
   # 2026-08-09: the runs before the first success — from
   # 2026-07-25T16:13:38Z up to but NOT INCLUDING the first green run, which is the one created
   # at 2026-08-01T21:45:51Z — 48 runs, all red. The upper bound names the first GREEN run and is
