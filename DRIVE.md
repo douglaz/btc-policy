@@ -20,8 +20,10 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
     was attributable.
   - It does NOT show funds could leave: the spend was still refused by the independent
     output-derived class check (ADR-0013 §3).
-  - It does NOT cover `attack all`, which was SKIPPED when the gate stopped at step 9. The
-    16-scenario harness has still never been shown to fail → `btc-policy-nia` (P1).
+  - It does NOT cover `attack all`, which was SKIPPED when the gate stopped at step 9. Precisely:
+    the harness HAS been seen to fail (`rt0` records `escape-class-sequences` at 15/16), so it is
+    not vacuously green — but it has never failed on a DELIBERATE fault, which is the property a
+    negative control establishes → `btc-policy-nia` (P1).
   - Build profile is DEBUG, with the release-artifact residual left open for `gbw`/`oy3`.
 
 ## Now
