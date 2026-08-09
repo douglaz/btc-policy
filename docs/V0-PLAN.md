@@ -294,7 +294,7 @@ unaffected.
 
 ## Core-proven gate (after V0-7)
 Full test matrix green + a confirmed signet spend through the federation + the FREEZE
-(`btc-policy-gbw`, prerequisite `btc-policy-9yf`) — before any deployer/sealing/Tor/mTLS work
+(`btc-policy-gbw`, prerequisite `btc-policy-9yf` (CLOSED 2026-08-09 — it settled only the launch-gate JOB; the harness residue is `btc-policy-nia`, which now blocks `gbw` directly and IS the live gate)) — before any deployer/sealing/Tor/mTLS work
 (DESIGN.md 2.5).
 
 **AMENDED by [ADR-0017](adr/0017-one-external-review-at-stage-9.md):** the external review is NO

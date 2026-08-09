@@ -120,7 +120,9 @@ as `btc-policy-nia` (P1), and neither is closed by this prerequisite.
 
 ## Consequences
 
-- Stage 1 unblocks on the freeze alone, with `9yf` as its prerequisite.
+- Stage 1 unblocks on the freeze alone. Its prerequisite bead is `btc-policy-nia` as of
+  2026-08-09, NOT `9yf` — see the PREREQUISITE section above; `9yf` is closed and covered
+  only the launch-gate job, not the harness.
 - No human sees this system until stage 9. That is a choice, recorded here, not an oversight.
 - If the stage-9 review finds a protocol-core flaw, the rework spans eight stages. That cost is
   accepted deliberately: rework is absorbable, loss is not, and the caps are what keep the
