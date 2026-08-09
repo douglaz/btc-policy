@@ -40,8 +40,10 @@ Otherwise the widest unblocker is `mby` (blocks 10 beads, including `gbw`).
 predating the operator CLI.
 
 ## Filed during this drive, not fixed here
-- `btc-policy-nia` (P1) — mutation-test the harness itself; `attack all` and the class check
-  have never been falsified.
+- `btc-policy-nia` (P1) — mutation-test the harness itself. Precisely: `attack all` has never
+  failed on a DELIBERATE fault (it has failed spontaneously — `rt0`, 15/16 — so "can it emit
+  red at all" is already answered and is NOT what this bead asks), and the output-derived class
+  check that independently refused the spend during 9yf's control has never been falsified at all.
 - `btc-policy-gc8` (P3) — push the AGENTS.md fixes upstream; they sit in tool-managed blocks
   that `br agents --update` and the `agents-md` skill regenerate, so the local fix reverts.
 - `btc-policy-o97` (P3) — a DESIGN.md audit: it still schedules the shipped harness as future
