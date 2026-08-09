@@ -35,9 +35,14 @@ runs since. Assess before starting; it may need rescoping rather than fixing.
 Otherwise the widest unblocker is `mby` (blocks 10 beads, including `gbw`).
 
 ## Next
-`gbw` is NOT unblocked by `9yf`. It carries eight `blocks` edges and five remain open
-(`rt0`, `oy3`, `wdu`, `mby`, `sqn`) — correctly, since the stage-1 freeze must not name a commit
-predating the operator CLI.
+`gbw` is NOT unblocked by `9yf` — verify with `br show btc-policy-gbw` rather than trusting a
+count here, since this line has already gone stale once. Open blockers at the time of writing:
+`rt0`, `oy3`, `wdu`, `mby`, `sqn`, and now `nia`. The `nia` edge was added on this branch because
+`gbw` depended on `9yf` specifically for the negative control, and `9yf`'s closure concedes that
+`attack all` was never covered by it — so closing `9yf` alone would have let the stage-1 freeze
+proceed with the admitted assurance gap still open. `9y5.8` depends on `gbw`, so it inherits the
+gate. The rest is correct as it stands: the freeze must not name a commit predating the operator
+CLI.
 
 ## Filed during this drive, not fixed here
 - `btc-policy-nia` (P1) — mutation-test the harness itself. Precisely: `attack all` has never
