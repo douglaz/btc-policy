@@ -68,7 +68,11 @@ proptest and fuzz suites; the full CI matrix; and multi-model AI review panels, 
 defects — this repo's own history includes a canonical manifest-preimage list found wrong three
 times and an escape self-pairing model wrong across seven sites, all caught by automated review.
 
-**PREREQUISITE, and it is load-bearing now rather than optional:** `btc-policy-9yf`'s negative
+**PREREQUISITE, and it is load-bearing now rather than optional** — and as of 2026-08-09 the bead
+that carries it is `btc-policy-nia`, NOT `btc-policy-9yf`. `9yf` is closed and satisfied the half
+it could; `nia` holds the half it could not (see the section below) and now `blocks`
+`btc-policy-gbw`, the stage-1 freeze, directly. Do not read `9yf`'s closure as clearing this
+gate. The original framing follows: `btc-policy-9yf`'s negative
 control gates the stage-1 freeze. As written 2026-08-06 (commit 539dd87), "16/16 scenarios held"
 rested on a gate that had never been observed to fail ON A DELIBERATELY INTRODUCED FAULT, which
 made it a statement that the run did not report a failure — not that it would report one. (Stated

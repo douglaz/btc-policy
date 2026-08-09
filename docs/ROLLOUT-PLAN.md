@@ -52,7 +52,7 @@ ADR-0012 already names as the severe residual.
 
 | Stage | Hosts | Hardening | Network | Notes |
 |---|---|---|---|---|
-| **1** | one machine | open | signet | Path suite on signet for the first time. **Freeze (protocol core)** — the freeze only; external review #1 was REMOVED by [ADR-0017](adr/0017-one-external-review-at-stage-9.md). Prerequisite: `9yf`'s negative control. |
+| **1** | one machine | open | signet | Path suite on signet for the first time. **Freeze (protocol core)** — the freeze only; external review #1 was REMOVED by [ADR-0017](adr/0017-one-external-review-at-stage-9.md). Prerequisite: `9yf`'s negative control — CLOSED 2026-08-09, but it did NOT settle the whole of this gate. `9yf` proved the launch-gate JOB reports a deliberately introduced regression; its control stopped at step 9, so `attack all` never ran and the 16-scenario harness has still never been mutation-tested. That residue is `btc-policy-nia`, which now `blocks` `gbw` (this freeze) directly. Read the gate as `nia`, not as `9yf`. |
 | **2** | 5 machines, same provider | open | signet | First real network transport; loopback assumptions die here. Waived (ADR-0015). |
 | **3** | 5 machines, same provider | open | **mainnet** | First real funds, **dust cap**. Waived (ADR-0015). Requires `4y3`+`zzv`. |
 | **4** | 5 machines, same provider | **sealed** | signet | First sealed hosts. **Begin measuring attrition.** Waived (ADR-0015). |
