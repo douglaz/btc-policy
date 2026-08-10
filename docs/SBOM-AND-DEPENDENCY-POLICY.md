@@ -7,10 +7,45 @@ audit the first against it.
 
 Regenerate the inventory with:
 
-```
-nix develop -c cargo tree --workspace --prefix none --no-dedupe \
+```bash
+set -eo pipefail                                      # BOTH flags — see below
+nix flake metadata --no-update-lock-file >/dev/null   # REQUIRED, and FIRST — see below
+nix develop -c cargo tree --locked --workspace --prefix none --no-dedupe \
   | sed 's/ (.*//;s/^ *//' | sort -u
 ```
+
+Three lines, three different ways this recipe can silently document a dependency graph the repo
+does not commit — which is the one thing this file exists to prevent. Each was found separately,
+by review, after the previous fix looked sufficient.
+
+`set -e` and `set -o pipefail` are BOTH needed and neither implies the other. `pipefail` makes a
+pipeline report its RIGHTMOST failing stage instead of `sort`'s success — the last command to exit
+non-zero, not the first, which is what `bash(1)` specifies and what
+`bash -c 'set -o pipefail; (exit 3) | (exit 4) | true; echo $?'` prints (4, not 3). Here that
+distinction does not change which failure is reported, since `cargo tree` is the only stage that
+fails from the drift this recipe exists to catch — `sed` and `sort` can still fail on an I/O or
+resource error, and `pipefail` catches those too, which is the point of using it rather than
+checking `cargo tree` alone. A reader who adds a stage should know which failure would be
+reported. Without `pipefail` a failing `cargo tree` yields exit 0 because `sort` succeeds on empty
+input. `-e` makes the recipe STOP at
+the assertion below — without it, `pipefail` alone lets a failed stale-flake check fall through to
+the next line, which enters the dev shell, refreshes the lock, and finishes with a green
+pipeline.
+
+`nix flake metadata --no-update-lock-file` must come FIRST, before anything enters the dev
+shell. `nix develop` will refresh a `flake.lock` that has drifted from `flake.nix` and then
+run happily inside the refreshed environment; `cargo tree --locked` would succeed against an
+uncommitted TOOLCHAIN, so the Rust lock being pinned proves nothing about which compiler and
+which `nixpkgs` produced the inventory. `--no-write-lock-file` is not a substitute: it warns
+and passes.
+
+Both halves of that first line are load-bearing, and each defeats the other's absence.
+`--locked` makes `cargo tree` FAIL when `Cargo.lock` has drifted from `Cargo.toml` instead of
+silently regenerating it — without it, the inventory can describe a dependency graph the repo
+does not commit, which is the one thing this document exists to prevent. But a pipeline's exit
+status is its LAST command's, and `sort` succeeds on empty input, so without `pipefail` the
+`--locked` failure is swallowed and the recipe reports success while emitting a truncated or
+empty inventory. Check the exit status, not the output's plausibility.
 
 ## The policy
 

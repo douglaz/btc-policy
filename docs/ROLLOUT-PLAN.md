@@ -52,7 +52,7 @@ ADR-0012 already names as the severe residual.
 
 | Stage | Hosts | Hardening | Network | Notes |
 |---|---|---|---|---|
-| **1** | one machine | open | signet | Path suite on signet for the first time. **Freeze (protocol core)** — the freeze only; external review #1 was REMOVED by [ADR-0017](adr/0017-one-external-review-at-stage-9.md). Prerequisite: `9yf`'s negative control. |
+| **1** | one machine | open | signet | Path suite on signet for the first time. **Freeze (protocol core)** — the freeze only; external review #1 was REMOVED by [ADR-0017](adr/0017-one-external-review-at-stage-9.md). Prerequisite: `9yf`'s negative control — CLOSED 2026-08-09, but it did NOT settle the whole of this gate. `9yf` proved the launch-gate JOB reports a deliberately introduced regression; its control stopped at step 9, so `attack all` never ran and the 16-scenario harness has still never been mutation-tested. That residue is `btc-policy-nia`, which now `blocks` `gbw` (this freeze) directly. Read the gate as `nia`, not as `9yf`. |
 | **2** | 5 machines, same provider | open | signet | First real network transport; loopback assumptions die here. Waived (ADR-0015). |
 | **3** | 5 machines, same provider | open | **mainnet** | First real funds, **dust cap**. Waived (ADR-0015). Requires `4y3`+`zzv`. |
 | **4** | 5 machines, same provider | **sealed** | signet | First sealed hosts. **Begin measuring attrition.** Waived (ADR-0015). |
@@ -186,17 +186,33 @@ mainnet funds behind either.
 Deciding now, without the attrition numbers, is what this defers. The risk it accepts is possibly
 rebuilding the node lifecycle mid-ladder.
 
-## Where the two reviews sit
+## Where the review sits
 
-- **After stage 1** — the protocol core, against a frozen artifact. Early because a core finding
-  discovered at stage 9 invalidates everything built on top of it.
+**Singular.** [ADR-0017](adr/0017-one-external-review-at-stage-9.md) removed external review #1;
+there is ONE external human review, before stage 10, and the order is FREEZE → REVIEW → CAPS LIFT.
+
 - **Before stage 10** — the deployed system, against a frozen artifact. Late because an alpha
   needs the thing users will actually run reviewed, not a single-machine prototype.
 
-Both must target a **frozen, reproducible** build (`btc-policy-gbw`), not a moving branch. Neither
-is satisfied by automated review: correlated AI panels — including this repo's own codex + Fable
-loops, however adversarially prompted — are explicitly not a substitute (`docs/THREAT-MODEL.md`
-R7).
+This section previously described a second review "after stage 1", which ADR-0017 deleted on
+2026-08-06 — the rest of this file was swept then (see the stage-1 row and the stage-9 row) and
+this heading was missed. What stage 1 keeps is the **freeze**, which is discipline rather than
+assurance; the review is what moved. ADR-0017 records what that costs: stages 3, 5 and 8 put real
+(dust-capped) mainnet funds in front of code no external human has read, and the dust cap now
+carries assurance weight it was not designed for.
+
+The review must target a **frozen, reproducible** artifact, not a moving branch — and specifically
+**`btc-policy-yt7`'s stage-9 artifact, NOT `btc-policy-gbw`'s stage-1 freeze.** That distinction is
+load-bearing and was got wrong in this file on 2026-08-09: `gbw` is the stage-1 freeze, its commit
+predates the operator CLI and carries no `bq6` dependency, so it predates hardware signing too.
+Sending the one external review there would review a build missing most of what a reviewer needs
+to see. `gbw`'s own record says so — "The external reviewers are NOT pointed here — they read
+btc-policy-yt7's stage-9 artifact (ADR-0017)". The `gbw` reference was correct while review #1
+existed at stage 1; removing that review made it wrong.
+
+The review is not satisfied by automated review either: correlated AI panels — including this
+repo's own codex + Fable loops, however adversarially prompted — are explicitly not a substitute
+(`docs/THREAT-MODEL.md` R7).
 
 ## What stage 1 needs that does not exist yet
 
