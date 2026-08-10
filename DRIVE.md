@@ -23,9 +23,19 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Landing `nia`. Docs touched: ADR-0017 (four sites — the retired "never shown red" claim, the
-Relied-on ordering, the prerequisite, the consequence), TEST-PLAN, ROLLOUT-PLAN, and two beads
-(`ytl`'s citation, `nia`'s own title, which asserted what its results disprove).
+Landing `nia`. Do NOT hand-maintain the change set here — derive it, because the hand-written
+version of this line was wrong twice (it omitted two files and undercounted the beads by three):
+
+```
+git diff --stat origin/main..HEAD                    # files
+git show origin/main:.beads/issues.jsonl > /tmp/b    # then compare PARSED records, not lines:
+                                                     # br rewrites the JSONL, so a line diff
+                                                     # reports ~34 ids when 5 records changed
+```
+
+The bead ledger in particular must be computed semantically — parse both sides and compare
+`title/description/status/priority` per id. At the time of writing that yields: `u98` added;
+`nia`, `9y5`, `9y5.8`, `ytl` changed.
 
 ## Next
 `mby` (Operator CLI core) — the widest unblocker: 10 direct / 21 transitive, and the v0
