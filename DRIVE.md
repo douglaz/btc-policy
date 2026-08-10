@@ -26,7 +26,7 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
 Landing `nia`. Do NOT hand-maintain the change set here — derive it, because the hand-written
 version of this line was wrong twice (it omitted two files and undercounted the beads by three):
 
-```
+```shell
 git diff --stat origin/main..HEAD                    # files
 git show origin/main:.beads/issues.jsonl > /tmp/b    # then compare PARSED records, not lines:
                                                      # br rewrites the JSONL, so a line diff

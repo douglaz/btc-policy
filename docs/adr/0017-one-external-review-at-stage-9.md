@@ -62,15 +62,21 @@ Named here because "no external review" is only half a statement; the other half
 relied on instead.
 
 **Relied on**, and the ORDER is deliberate as of 2026-08-10 — it used to name the harness first,
-and the one duress bypass measured against both was caught by the proptest suites and missed by all
-sixteen scenarios (`btc-policy-nia`): the stage-1 freeze (`gbw`); proptest and fuzz suites; the
+and the MIXED-CLASS EXTRACTION fault (`classify`'s own comment calls a misclassification "a duress
+bypass") was caught by the proptest suites and missed by all sixteen scenarios. Naming it, because
+`nia` injected TWO faults and both are duress-related: the other, a Lockdown-at-T regression, the
+harness DID catch (`btc-policy-nia`): the stage-1 freeze (`gbw`); proptest and fuzz suites; the
 adversarial harness (`attack all`, 16 scenarios — and read the caveat below before weighting this:
 the harness HAS been shown red on a deliberately introduced fault, and has also been shown BLIND to
 a second one); the full CI matrix; and multi-model AI review panels, which do find real
 defects — this repo's own history includes a canonical manifest-preimage list found wrong three
 times and an escape self-pairing model wrong across seven sites, all caught by automated review.
 
-**PREREQUISITE — SATISFIED IN BOTH HALVES as of 2026-08-10, and no longer gates the freeze.**
+**PREREQUISITE — SATISFIED IN BOTH HALVES as of 2026-08-10, and no longer gates the freeze. Read
+"satisfied" narrowly: `nia` records two of its three VERIFY criteria as unmet AS WRITTEN — the
+class-check half did not turn `attack all` red, and the recorded-CI-run criterion was superseded by
+choice — and `btc-policy-u98` is an open coverage gap. What is satisfied is the property the gate
+existed for, not every line of the bead's checklist.**
 `btc-policy-9yf` (closed 2026-08-09) settled the launch-gate JOB; `btc-policy-nia` (closed
 2026-08-10) settled the HARNESS, which `9yf` could not reach. Both halves are now evidenced, so the
 stage-1 freeze is no longer waiting on a negative control. Both `blocks` edges on `btc-policy-gbw`
