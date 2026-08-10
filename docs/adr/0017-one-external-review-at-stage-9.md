@@ -61,12 +61,12 @@ be a guess wearing the costume of a mitigation.
 Named here because "no external review" is only half a statement; the other half is what is being
 relied on instead.
 
-**Relied on:** the stage-1 freeze (`gbw`); the adversarial harness (`attack all`, 16 scenarios —
-and read the caveat below before weighting this: as of 2026-08-10 the harness HAS been shown red on
-a deliberately introduced fault, and has also been shown BLIND to a second one, `btc-policy-nia`);
-proptest and fuzz suites — which this ADR used to list after the harness, and should not: the one
-duress bypass measured against both, the mixed-class extraction path, was caught by the proptest
-suites and missed by all sixteen scenarios; the full CI matrix; and multi-model AI review panels, which do find real
+**Relied on**, and the ORDER is deliberate as of 2026-08-10 — it used to name the harness first,
+and the one duress bypass measured against both was caught by the proptest suites and missed by all
+sixteen scenarios (`btc-policy-nia`): the stage-1 freeze (`gbw`); proptest and fuzz suites; the
+adversarial harness (`attack all`, 16 scenarios — and read the caveat below before weighting this:
+the harness HAS been shown red on a deliberately introduced fault, and has also been shown BLIND to
+a second one); the full CI matrix; and multi-model AI review panels, which do find real
 defects — this repo's own history includes a canonical manifest-preimage list found wrong three
 times and an escape self-pairing model wrong across seven sites, all caught by automated review.
 
@@ -79,8 +79,13 @@ existed is worth more than a tidy dependency list, and `br ready` counts only OP
 
 `nia` did find a second thing on its way — `attack all` is blind to the mixed-class extraction path
 (`btc-policy-u98`, P2). That is deliberately NOT made a freeze blocker, and the reason is recorded
-here rather than left to inference: the gate this prerequisite existed to close was "the harness has
-never been shown capable of failing", and that is now closed. `u98` is one missing scenario whose
+here rather than left to inference. State the gate precisely, because the loose version — "the
+harness has never been shown capable of failing" — is one this ADR retracts in the "Stated
+precisely, 2026-08-09" parenthesis below: `rt0`'s 15/16 already answered that, and `nia`'s own
+description records the loose phrasing as corrected on the same date. What this prerequisite gated
+was SENSITIVITY TO AN INJECTED SAFETY REGRESSION, and that is what is now closed. (Referred to by
+its wording, not by "the paragraph below" — this ADR has been edited enough times that positional
+pointers go stale.) `u98` is one missing scenario whose
 underlying regression CI still catches in an independent job. Promoting every coverage hole
 discovered by a negative control into a freeze blocker would make the freeze unreachable by
 construction, which is the failure mode ADR-0017 was written to avoid in the first place.
@@ -113,14 +118,21 @@ The 16-scenario harness was therefore not covered by THIS prerequisite at all. I
 separately by `btc-policy-nia`, and the paragraph below records what that found.
 
 **MEASURED 2026-08-10 (`btc-policy-nia`), and it cuts both ways.** Two faults were injected
-locally — never pushed, so no branch carried a live safety regression — and each was first
-confirmed to clear gate steps 9-11, so that step 12 genuinely ran.
+locally — never pushed, so no branch carried a live safety regression. For each, the three demos
+(gate steps 9-11) were run first and confirmed to exit 0, and then a full `attack all` (step 12)
+was run: not a single scenario, because the full-run dispatch takes a path a selected run never
+reaches. The demos clearing it is what makes step 12 reachable in the gate's own ordering, and it
+is exactly the constraint `9yf`'s fault failed.
 
 - **The harness IS sensitive.** With Lockdown at T made never-due in
-  `channel::ChannelState::lockdown_due`, all three demos still exited 0 and `attack arm-split-closed`
-  went from PASS (1/1) to FAIL (0/1, exit 1), naming itself and citing the invariant: "did not enter
-  Lockdown at T; lockdown at T is unconditional (ADR-0012 invariant i)". So "16/16 held" is a
-  statement the harness is capable of retracting.
+  `channel::ChannelState::lockdown_due`, all three demos still exited 0 and a full `attack all` came
+  back **1/16, exit 1** — "ADVERSARIAL HARNESS FAILED — a duress safety assertion did not hold" —
+  with fifteen scenarios each naming itself and citing the invariant: "did not enter Lockdown at T;
+  lockdown at T is unconditional (ADR-0012 invariant i)". So "16/16 held" is a statement the harness
+  is capable of retracting. The single survivor is the part worth reading: `reorg-watchtower-cursor`
+  is the one scenario that never asserts Lockdown, so the harness went red exactly where the broken
+  property is asserted and stayed green where it is not — the reds are attributable to the injected
+  invariant, which a fault that reddened all sixteen could not have shown.
 - **Its sensitivity is UNEVEN.** With `classify`'s mixed-class arm returning `Hot` instead of
   refusing — the 99%-to-hot + dust-to-escape extraction path that `classify`'s own doc comment
   names — `attack all` held **16/16 and exited 0**, printing "No theft path, safety track held"
@@ -134,8 +146,11 @@ the properties the sixteen scenarios actually construct, and the harness's own s
 overstates itself: it printed "No theft path" over a live extraction path. Second, this particular
 regression was still caught by CI, because `cargo test` runs in the `check` matrix, an independent
 job with no `needs:` on `launch-gate` — so read the gate as a set of independent detectors, not as
-the harness plus decoration. The output-derived class check itself is no longer unfalsified: it was
-broken deliberately and three tests refused it.
+the harness plus decoration. And read the class-check result narrowly: ONE ARM of `classify` was
+broken — the mixed-class arm — and three tests refused it. That is NOT the arm that carried `9yf`'s
+refusal. `9yf` removed `check_destinations`, so its spend was refused by the UNRECOGNIZED-OUTPUT
+branch, which `nia` deliberately left untouched. The path this ADR credits above with keeping
+`9yf`'s demonstration honest is therefore still unfalsified.
 
 **NOT covered, by anything, until stage 9:**
 
