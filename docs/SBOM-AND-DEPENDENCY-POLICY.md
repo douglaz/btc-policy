@@ -22,9 +22,12 @@ by review, after the previous fix looked sufficient.
 pipeline report its RIGHTMOST failing stage instead of `sort`'s success — the last command to exit
 non-zero, not the first, which is what `bash(1)` specifies and what
 `bash -c 'set -o pipefail; (exit 3) | (exit 4) | true; echo $?'` prints (4, not 3). Here that
-distinction does not change the outcome, since `cargo tree` is the only stage that can fail — but a
-reader who adds a stage should know which failure the recipe would report. Without `pipefail` a
-failing `cargo tree` yields exit 0 because `sort` succeeds on empty input. `-e` makes the recipe STOP at
+distinction does not change which failure is reported, since `cargo tree` is the only stage that
+fails from the drift this recipe exists to catch — `sed` and `sort` can still fail on an I/O or
+resource error, and `pipefail` catches those too, which is the point of using it rather than
+checking `cargo tree` alone. A reader who adds a stage should know which failure would be
+reported. Without `pipefail` a failing `cargo tree` yields exit 0 because `sort` succeeds on empty
+input. `-e` makes the recipe STOP at
 the assertion below — without it, `pipefail` alone lets a failed stale-flake check fall through to
 the next line, which enters the dev shell, refreshes the lock, and finishes with a green
 pipeline.
