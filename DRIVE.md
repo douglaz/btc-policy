@@ -17,8 +17,9 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
 
   The one-line version, and both halves must travel together: the harness DOES go red on an
   injected Lockdown-at-T fault, after all three demos cleared it, and is BLIND to an injected
-  mixed-class duress bypass that `cargo test` caught instead. Figures deliberately omitted — the
-  ADR owns them, and a copy here is how the last one drifted.
+  mixed-class EXTRACTION path — a spend that completes instantly under the duress PIN — which
+  `cargo test` caught instead. Figures deliberately omitted — the ADR owns them, and a copy here is
+  how the last one drifted.
   Neither fault was ever pushed — both controls ran locally, which is a deliberate change of method
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
@@ -48,7 +49,7 @@ in the graph deliberately — `br ready` counts only open blockers, and the reco
 existed is worth more than a tidy list.
 
 ## Filed during this drive, not fixed here
-- `btc-policy-u98` (P2) — `attack all` is blind to a mixed hot+escape spend because no scenario
+- `btc-policy-u98` (P1, raised from P2) — `attack all` is blind to a mixed hot+escape spend because no scenario
   builds one. Cheap: `build_spend_n` already takes a general output slice. Its done-definition
   requires re-injecting the fault to prove the new scenario CAN go red.
 - `btc-policy-gc8` (P3) — push the AGENTS.md fixes upstream; they sit in tool-managed blocks that

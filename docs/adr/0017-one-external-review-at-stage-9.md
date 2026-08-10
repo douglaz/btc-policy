@@ -84,7 +84,9 @@ remain in the graph and are satisfied by closure rather than deleted — the rec
 existed is worth more than a tidy dependency list, and `br ready` counts only OPEN blockers.
 
 `nia` did find a second thing on its way — `attack all` is blind to the mixed-class extraction path
-(`btc-policy-u98`, P2). That is deliberately NOT made a freeze blocker, and the reason is recorded
+(`btc-policy-u98`, P1 — raised from P2 once the fault was corrected and the gap turned out to be an
+extraction path rather than a lost refusal). That is deliberately NOT made a freeze blocker, and
+the reason is recorded
 here rather than left to inference. State the gate precisely, because the loose version — "the
 harness has never been shown capable of failing" — is one this ADR retracts in the "Stated
 precisely, 2026-08-09" parenthesis below: `rt0`'s 15/16 already answered that, and `nia`'s own
@@ -139,13 +141,23 @@ is exactly the constraint `9yf`'s fault failed.
   is the one scenario that never asserts Lockdown, so the harness went red exactly where the broken
   property is asserted and stayed green where it is not — the reds are attributable to the injected
   invariant, which a fault that reddened all sixteen could not have shown.
-- **Its sensitivity is UNEVEN.** With `classify`'s mixed-class arm returning `Hot` instead of
-  refusing — the 99%-to-hot + dust-to-escape extraction path that `classify`'s own doc comment
-  names — `attack all` held **16/16 and exited 0**, printing "No theft path, safety track held"
-  with the bypass live. All three demos were blind too. What caught it was `cargo test`: 682
-  passed, 3 failed, exit 101, including a differential oracle over arbitrary output sets. The cause
-  is scenario coverage, not architecture — every harness spend has exactly one destination class,
-  so nothing ever reaches the mixed arm (`btc-policy-u98`).
+- **Its sensitivity is UNEVEN, and the gap is an EXTRACTION PATH.** With `classify`'s mixed-class
+  arm returning `Escape` instead of refusing, a 99%-to-hot + dust-to-escape spend completes
+  IMMEDIATELY UNDER THE DURESS PIN — escape-class fires at `now` rather than taking the Hold, the
+  Hot budget and the duress freeze. That is the bypass `classify`'s own doc comment describes.
+  `attack all` held **16/16 and exited 0**, printing "No theft path, safety track held" with the
+  extraction path live. All three demos were blind too, including `demo theft-refused` — the repo's
+  NAMED v0 acceptance artifact. What caught it was `cargo test`: 681 passed, 4 failed, exit 101,
+  including a differential oracle over arbitrary output sets and a test asserting attacker-controlled
+  outputs are only ever hot-or-refused. The cause is scenario coverage, not architecture — every
+  harness spend has exactly one destination class, so nothing ever reaches the mixed arm
+  (`btc-policy-u98`, P1).
+
+  **Corrected 2026-08-10, and the correction is instructive.** The first run of this control made
+  the arm return `Hot` and called that the bypass. It is not: `Hot` takes the Hold, the Hot budget
+  and the duress freeze, so nothing could be extracted and the harness's green run on THAT fault
+  was correct rather than blind. Caught in review of PR #8. The distinction is the whole point of
+  the class check, so getting it wrong while testing the class check is worth recording.
 
 **A stage-9 reviewer should take two things from that.** First, a green scorecard is evidence about
 the properties the sixteen scenarios actually construct, and the harness's own summary line
@@ -153,7 +165,7 @@ overstates itself: it printed "No theft path" over a live extraction path. Secon
 regression was still caught by CI, because `cargo test` runs in the `check` matrix, an independent
 job with no `needs:` on `launch-gate` — so read the gate as a set of independent detectors, not as
 the harness plus decoration. And read the class-check result narrowly: ONE ARM of `classify` was
-broken — the mixed-class arm — and three tests refused it. That is NOT the arm that carried `9yf`'s
+broken — the mixed-class arm — and four tests refused it. That is NOT the arm that carried `9yf`'s
 refusal. `9yf` removed `check_destinations`, so its spend was refused by the UNRECOGNIZED-OUTPUT
 branch, which `nia` deliberately left untouched. The path this ADR credits above with keeping
 `9yf`'s demonstration honest is therefore still unfalsified.
