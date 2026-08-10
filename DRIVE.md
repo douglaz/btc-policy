@@ -16,8 +16,9 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   `docs/adr/0017-one-external-review-at-stage-9.md`, which owns them.
 
   The one-line version, and both halves must travel together: the harness DOES go red on an
-  injected Lockdown-at-T fault (`arm-split-closed` FAIL, after all three demos cleared it), and is
-  BLIND to an injected mixed-class duress bypass (16/16 held, exit 0, while `cargo test` caught it).
+  injected Lockdown-at-T fault, after all three demos cleared it, and is BLIND to an injected
+  mixed-class duress bypass that `cargo test` caught instead. Figures deliberately omitted — the
+  ADR owns them, and a copy here is how the last one drifted.
   Neither fault was ever pushed — both controls ran locally, which is a deliberate change of method
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
