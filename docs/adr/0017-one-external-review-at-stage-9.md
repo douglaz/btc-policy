@@ -62,17 +62,30 @@ Named here because "no external review" is only half a statement; the other half
 relied on instead.
 
 **Relied on:** the stage-1 freeze (`gbw`); the adversarial harness (`attack all`, 16 scenarios —
-and read the caveat below before weighting this: the harness itself has never been shown red on a
-deliberately introduced fault, `btc-policy-nia`);
-proptest and fuzz suites; the full CI matrix; and multi-model AI review panels, which do find real
+and read the caveat below before weighting this: as of 2026-08-10 the harness HAS been shown red on
+a deliberately introduced fault, and has also been shown BLIND to a second one, `btc-policy-nia`);
+proptest and fuzz suites — which this ADR used to list after the harness, and should not: the one
+duress bypass measured against both, the mixed-class extraction path, was caught by the proptest
+suites and missed by all sixteen scenarios; the full CI matrix; and multi-model AI review panels, which do find real
 defects — this repo's own history includes a canonical manifest-preimage list found wrong three
 times and an escape self-pairing model wrong across seven sites, all caught by automated review.
 
-**PREREQUISITE, and it is load-bearing now rather than optional** — and as of 2026-08-09 the bead
-that carries it is `btc-policy-nia`, NOT `btc-policy-9yf`. `9yf` is closed and satisfied the half
-it could; `nia` holds the half it could not (see the section below) and now `blocks`
-`btc-policy-gbw`, the stage-1 freeze, directly. Do not read `9yf`'s closure as clearing this
-gate. The original framing follows: `btc-policy-9yf`'s negative
+**PREREQUISITE — SATISFIED IN BOTH HALVES as of 2026-08-10, and no longer gates the freeze.**
+`btc-policy-9yf` (closed 2026-08-09) settled the launch-gate JOB; `btc-policy-nia` (closed
+2026-08-10) settled the HARNESS, which `9yf` could not reach. Both halves are now evidenced, so the
+stage-1 freeze is no longer waiting on a negative control. Both `blocks` edges on `btc-policy-gbw`
+remain in the graph and are satisfied by closure rather than deleted — the record that this gate
+existed is worth more than a tidy dependency list, and `br ready` counts only OPEN blockers.
+
+`nia` did find a second thing on its way — `attack all` is blind to the mixed-class extraction path
+(`btc-policy-u98`, P2). That is deliberately NOT made a freeze blocker, and the reason is recorded
+here rather than left to inference: the gate this prerequisite existed to close was "the harness has
+never been shown capable of failing", and that is now closed. `u98` is one missing scenario whose
+underlying regression CI still catches in an independent job. Promoting every coverage hole
+discovered by a negative control into a freeze blocker would make the freeze unreachable by
+construction, which is the failure mode ADR-0017 was written to avoid in the first place.
+
+The original framing follows: `btc-policy-9yf`'s negative
 control gates the stage-1 freeze. As written 2026-08-06 (commit 539dd87), "16/16 scenarios held"
 rested on a gate that had never been observed to fail ON A DELIBERATELY INTRODUCED FAULT, which
 made it a statement that the run did not report a failure — not that it would report one. (Stated
@@ -96,12 +109,33 @@ is not a claim that any single control is sufficient alone.
 "Relied on" list above names the harness, and a stage-9 reviewer is being told what carries
 assurance in the absence of human review. The launch-gate job stops at its first failing step, and
 this control failed at step 9 (`demo first-light`), so **step 12, `attack all`, never executed**.
-The 16-scenario harness — the largest part of the gate and the sole support for every "16/16 held"
-claim in this repo — has therefore never been shown red on a deliberately introduced fault. It HAS
-failed spontaneously (`btc-policy-rt0`, `escape-class-sequences` at 15/16), so it is not vacuously
-green; what is unproven is its sensitivity to an injected safety regression. The output-derived
-class check that actually refused the spend here has never been falsified at all. Both are tracked
-as `btc-policy-nia` (P1), and neither is closed by this prerequisite.
+The 16-scenario harness was therefore not covered by THIS prerequisite at all. It was covered
+separately by `btc-policy-nia`, and the paragraph below records what that found.
+
+**MEASURED 2026-08-10 (`btc-policy-nia`), and it cuts both ways.** Two faults were injected
+locally — never pushed, so no branch carried a live safety regression — and each was first
+confirmed to clear gate steps 9-11, so that step 12 genuinely ran.
+
+- **The harness IS sensitive.** With Lockdown at T made never-due in
+  `channel::ChannelState::lockdown_due`, all three demos still exited 0 and `attack arm-split-closed`
+  went from PASS (1/1) to FAIL (0/1, exit 1), naming itself and citing the invariant: "did not enter
+  Lockdown at T; lockdown at T is unconditional (ADR-0012 invariant i)". So "16/16 held" is a
+  statement the harness is capable of retracting.
+- **Its sensitivity is UNEVEN.** With `classify`'s mixed-class arm returning `Hot` instead of
+  refusing — the 99%-to-hot + dust-to-escape extraction path that `classify`'s own doc comment
+  names — `attack all` held **16/16 and exited 0**, printing "No theft path, safety track held"
+  with the bypass live. All three demos were blind too. What caught it was `cargo test`: 682
+  passed, 3 failed, exit 101, including a differential oracle over arbitrary output sets. The cause
+  is scenario coverage, not architecture — every harness spend has exactly one destination class,
+  so nothing ever reaches the mixed arm (`btc-policy-u98`).
+
+**A stage-9 reviewer should take two things from that.** First, a green scorecard is evidence about
+the properties the sixteen scenarios actually construct, and the harness's own summary line
+overstates itself: it printed "No theft path" over a live extraction path. Second, this particular
+regression was still caught by CI, because `cargo test` runs in the `check` matrix, an independent
+job with no `needs:` on `launch-gate` — so read the gate as a set of independent detectors, not as
+the harness plus decoration. The output-derived class check itself is no longer unfalsified: it was
+broken deliberately and three tests refused it.
 
 **NOT covered, by anything, until stage 9:**
 
@@ -120,9 +154,10 @@ as `btc-policy-nia` (P1), and neither is closed by this prerequisite.
 
 ## Consequences
 
-- Stage 1 unblocks on the freeze alone. Its prerequisite bead is `btc-policy-nia` as of
-  2026-08-09, NOT `9yf` — see the PREREQUISITE section above; `9yf` is closed and covered
-  only the launch-gate job, not the harness.
+- Stage 1 unblocks on the freeze alone, and as of 2026-08-10 its negative-control prerequisite is
+  fully satisfied: `9yf` (the launch-gate job) and `nia` (the harness) are both closed, so neither
+  gates the freeze any longer. `btc-policy-u98`, the coverage hole `nia` found, is deliberately not
+  a blocker — see the PREREQUISITE section for why.
 - No human sees this system until stage 9. That is a choice, recorded here, not an oversight.
 - If the stage-9 review finds a protocol-core flaw, the rework spans eight stages. That cost is
   accepted deliberately: rework is absorbable, loss is not, and the caps are what keep the
