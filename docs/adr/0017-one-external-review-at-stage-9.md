@@ -61,11 +61,12 @@ be a guess wearing the costume of a mitigation.
 Named here because "no external review" is only half a statement; the other half is what is being
 relied on instead.
 
-**Relied on**, and the ORDER is deliberate as of 2026-08-10 — it used to name the harness first,
-and the MIXED-CLASS EXTRACTION fault (`classify`'s own comment calls a misclassification "a duress
-bypass") was caught by the proptest suites and missed by all sixteen scenarios. Naming it, because
-`nia` injected TWO faults and both are duress-related: the other, a Lockdown-at-T regression, the
-harness DID catch (`btc-policy-nia`): the stage-1 freeze (`gbw`); proptest and fuzz suites; the
+**Relied on**, and the ORDER is deliberate as of 2026-08-10 — the harness used to sit SECOND, ahead
+of the proptest suites, and now sits third behind them, because the MIXED-CLASS EXTRACTION fault
+(`classify`'s own comment calls a misclassification "a duress bypass") was caught by the proptest
+suites and missed by all sixteen scenarios. The freeze was first before and is first still. Naming
+the fault, because `nia` injected TWO and both are duress-related: the other, a Lockdown-at-T
+regression, the harness DID catch (`btc-policy-nia`): the stage-1 freeze (`gbw`); proptest and fuzz suites; the
 adversarial harness (`attack all`, 16 scenarios — and read the caveat below before weighting this:
 the harness HAS been shown red on a deliberately introduced fault, and has also been shown BLIND to
 a second one); the full CI matrix; and multi-model AI review panels, which do find real
@@ -142,9 +143,20 @@ is exactly the constraint `9yf`'s fault failed.
   property is asserted and stayed green where it is not — the reds are attributable to the injected
   invariant, which a fault that reddened all sixteen could not have shown.
 - **Its sensitivity is UNEVEN, and the gap is an EXTRACTION PATH.** With `classify`'s mixed-class
-  arm returning `Escape` instead of refusing, a 99%-to-hot + dust-to-escape spend completes
+  arm returning `Escape` instead of refusing, a mostly-to-hot + dust-to-escape spend completes
   IMMEDIATELY UNDER THE DURESS PIN — escape-class fires at `now` rather than taking the Hold, the
-  Hot budget and the duress freeze. That is the bypass `classify`'s own doc comment describes.
+  ROLLING-WINDOW half of the Hot budget, or the duress freeze, all three of which key on
+  `class == Hot`.
+
+  **State the magnitude precisely, because the obvious phrasing overstates it** (and `classify`'s
+  own doc comment at `lib.rs:74-79` overstates it the same way, saying "99%-to-hot"): the
+  PER-TRANSACTION half of the Hot budget is class-INDEPENDENT — `evaluate` calls `check_hot_budget`
+  unconditionally and it takes no class argument — so a single such spend is still capped at
+  `hot_max_per_tx`, shipped as 0.5 BTC. What the misclassification defeats is not the cap but
+  everything that bounds REPETITION: no Hold, no rolling-window reserve, no freeze, and each
+  transaction settles instantly. So it is drain-at-the-cap-per-transaction, repeatable without
+  limit under the duress PIN — not the whole vault in one spend. Still a total defeat of duress
+  protection; the rate is what changes.
   `attack all` held **16/16 and exited 0**, printing "No theft path, safety track held" with the
   extraction path live. All three demos were blind too, including `demo theft-refused` — the repo's
   NAMED v0 acceptance artifact. What caught it was `cargo test`: 681 passed, 4 failed, exit 101,
