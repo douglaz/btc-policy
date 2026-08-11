@@ -35,7 +35,7 @@ git show origin/main:.beads/issues.jsonl > /tmp/b    # then compare PARSED recor
 ```
 
 The bead ledger in particular must be computed semantically — parse both sides and compare
-`title/description/status/priority` per id. At the time of writing that yields: `u98` added;
+`title/description/status/priority` per id. At the time of writing that yields: `u98` and `yh7` added;
 `nia`, `9y5`, `9y5.8`, `ytl` changed.
 
 ## Next
@@ -52,6 +52,10 @@ existed is worth more than a tidy list.
 - `btc-policy-u98` (P1, raised from P2) — `attack all` is blind to a mixed hot+escape spend because no scenario
   builds one. Cheap: `build_spend_n` already takes a general output slice. Its done-definition
   requires re-injecting the fault to prove the new scenario CAN go red.
+- `btc-policy-yh7` (P3) — `classify`'s TxClass doc comment, the doc comment on the test that
+  catches the fault, and `docs/adr/0012`:24 all say a 99%-to-hot spend COMPLETES under the
+  duress PIN. It cannot: the per-transaction Hot budget is class-independent. Mechanism right,
+  magnitude wrong — and ADR-0017 inherited it before review caught it.
 - `btc-policy-gc8` (P3) — push the AGENTS.md fixes upstream; they sit in tool-managed blocks that
   `br agents --update` and the `agents-md` skill regenerate, so the local fix reverts.
 - `btc-policy-o97` (P3) — a DESIGN.md audit, rescoped from a site list to a sweep after three

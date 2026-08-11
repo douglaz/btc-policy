@@ -148,15 +148,32 @@ is exactly the constraint `9yf`'s fault failed.
   ROLLING-WINDOW half of the Hot budget, or the duress freeze, all three of which key on
   `class == Hot`.
 
-  **State the magnitude precisely, because the obvious phrasing overstates it** (and `classify`'s
-  own doc comment at `lib.rs:74-79` overstates it the same way, saying "99%-to-hot"): the
-  PER-TRANSACTION half of the Hot budget is class-INDEPENDENT — `evaluate` calls `check_hot_budget`
-  unconditionally and it takes no class argument — so a single such spend is still capped at
-  `hot_max_per_tx`, shipped as 0.5 BTC. What the misclassification defeats is not the cap but
-  everything that bounds REPETITION: no Hold, no rolling-window reserve, no freeze, and each
-  transaction settles instantly. So it is drain-at-the-cap-per-transaction, repeatable without
-  limit under the duress PIN — not the whole vault in one spend. Still a total defeat of duress
-  protection; the rate is what changes.
+  **State the magnitude precisely.** Three drafts of this paragraph overstated it in three
+  different ways, so here it is bounded from both sides. What the misclassification DEFEATS is the
+  CLASS-GATED half of the safety track: no Hold, no rolling-window reserve, no duress freeze, so
+  each spend settles instantly. What it does NOT defeat:
+
+  - the PER-TRANSACTION Hot budget, which is class-INDEPENDENT — `evaluate` calls
+    `check_hot_budget` unconditionally and it takes no class argument, and that function re-sums
+    the outflow itself rather than reading the classification — so each spend is still capped at
+    `hot_max_per_tx`. That cap is MANDATORY operator config with no default (`docs/DESIGN.md`
+    §"The Hot budget"); 50,000,000 sat is the documented EXAMPLE, not a shipped value.
+  - **arming and terminal Lockdown at `T`, which are gated on the DURESS PIN and take no class at
+    all.** `fire_arm_hook` runs unconditionally on a valid duress pin and BEFORE `classify` is
+    reached; `lockdown_due` is `armed.active & (now >= fire_at)` with no class term. So the drain
+    is bounded by the duress-delay window from the first coerced carrier, after which Lockdown is
+    terminal and every spend and refresh answers `FRAUD_SUSPECTED` for the node's lifetime.
+
+  So: drain at the cap, repeatable **for the duress-delay window**, then terminal Lockdown — not
+  "without limit", and not a total defeat of the safety track, whose second half survives untouched.
+  One aggravator points the other way and belongs here rather than being left out because it is
+  inconvenient: because the misclassified spend is not hot-class, it leaves no pending hot Hold, so
+  `T`'s `min(..., earliest pending hot Hold-expiry − ε)` shrink input never applies and `T` sits at
+  its MAXIMUM. The window is as long as that federation's configuration permits.
+
+  `classify`'s own doc comment at `lib.rs:74-79` carries the "99%-to-hot" version of this
+  overstatement, and so does the doc comment on the very test that catches the fault
+  (`lib.rs:937-941`) and `docs/adr/0012-...:24` — tracked as `btc-policy-yh7`.
   `attack all` held **16/16 and exited 0**, printing "No theft path, safety track held" with the
   extraction path live. All three demos were blind too, including `demo theft-refused` — the repo's
   NAMED v0 acceptance artifact. What caught it was `cargo test`: 681 passed, 4 failed, exit 101,
