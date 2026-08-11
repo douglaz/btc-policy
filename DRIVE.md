@@ -17,7 +17,8 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
 
   The one-line version, and both halves must travel together: the harness DOES go red on an
   injected Lockdown-at-T fault, after all three demos cleared it, and is BLIND to an injected
-  mixed-class EXTRACTION path — a spend that completes instantly under the duress PIN — which
+  mixed-class EXTRACTION path — a spend that completes instantly under the duress PIN, and which is
+  extraction only WITH STOLEN HOT KEYS, since its outputs pay the user's own hot wallet — which
   `cargo test` caught instead. Figures deliberately omitted — the ADR owns them, and a copy here is
   how the last one drifted.
   Neither fault was ever pushed — both controls ran locally, which is a deliberate change of method
