@@ -142,7 +142,11 @@ is exactly the constraint `9yf`'s fault failed.
   is the one scenario that never asserts Lockdown, so the harness went red exactly where the broken
   property is asserted and stayed green where it is not — the reds are attributable to the injected
   invariant, which a fault that reddened all sixteen could not have shown.
-- **Its sensitivity is UNEVEN, and the gap is an EXTRACTION PATH.** With `classify`'s mixed-class
+- **Its sensitivity is UNEVEN, and the gap is an EXTRACTION PATH — with the precondition every
+  other statement of it carries: STOLEN HOT KEYS.** The misclassified spend's destinations are
+  hot-allowlist descriptors, i.e. the user's OWN hot wallet, so absent those keys the outcome is a
+  hot-wallet move at the cap rather than attacker receipt. `classify`'s comment and ADR-0012 both
+  say "with stolen hot keys"; this ADR was dropping it. With `classify`'s mixed-class
   arm returning `Escape` instead of refusing, a mostly-to-hot + dust-to-escape spend completes
   IMMEDIATELY UNDER THE DURESS PIN — escape-class fires at `now` rather than taking the Hold, the
   ROLLING-WINDOW half of the Hot budget, or the duress freeze, all three of which key on
@@ -160,11 +164,18 @@ is exactly the constraint `9yf`'s fault failed.
     the outflow itself rather than reading the classification — so each spend is still capped at
     `hot_max_per_tx`. That cap is MANDATORY operator config with no default (`docs/DESIGN.md`
     §"The Hot budget"); 50,000,000 sat is the documented EXAMPLE, not a shipped value.
-  - **arming and terminal Lockdown at `T`, which are gated on the DURESS PIN and take no class at
-    all.** `fire_arm_hook` runs unconditionally on a valid duress pin and BEFORE `classify` is
-    reached; `lockdown_due` is `armed.active & (now >= fire_at)` with no class term. So the drain
-    is bounded by the duress-delay window from the first coerced carrier, after which Lockdown is
-    terminal and every spend and refresh answers `FRAUD_SUSPECTED` for the node's lifetime.
+  - **arming and terminal Lockdown at `T`, neither of which takes a class at all.** State the
+    arming mechanism correctly, because the obvious version is the SUPERSEDED one: `fire_arm_hook`
+    fires on a valid duress pin before `classify` is reached, but it **records intent and does not
+    arm** (V0-4b §0). The one write that sets the arm bit is `confirm_carrier`, and it fires only
+    after `t` distinct members hold the carrier AND a duress verdict. `lockdown_due` is then
+    `armed.active & (now >= fire_at)`, with no class term.
+
+    That makes the bound stronger than a PIN-gated one, not weaker: **the drain itself supplies the
+    confirmations.** Completing a spend needs `t` signers, each of which records intent and stages
+    the carrier on the path every signed spend takes — so an attacker who gets enough signatures to
+    extract has, by construction, armed the federation. Then `T` arrives, Lockdown is terminal, and
+    every spend and refresh answers `FRAUD_SUSPECTED` for the node's lifetime.
 
   So: drain at the cap, repeatable **for the duress-delay window**, then terminal Lockdown — not
   "without limit", and not a total defeat of the safety track, whose second half survives untouched.

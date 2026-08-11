@@ -53,9 +53,10 @@ existed is worth more than a tidy list.
   builds one. Cheap: `build_spend_n` already takes a general output slice. Its done-definition
   requires re-injecting the fault to prove the new scenario CAN go red.
 - `btc-policy-yh7` (P3) — `classify`'s TxClass doc comment, the doc comment on the test that
-  catches the fault, and `docs/adr/0012`:24 all say a 99%-to-hot spend COMPLETES under the
-  duress PIN. It cannot: the per-transaction Hot budget is class-independent. Mechanism right,
-  magnitude wrong — and ADR-0017 inherited it before review caught it.
+  catches the fault, and `docs/adr/0012`:24 all assert UNCONDITIONALLY that a 99%-to-hot spend
+  completes under the duress PIN. The class-independent per-transaction Hot budget refuses it
+  whenever its outflow exceeds the configured cap — so the claim is not absolute, and that is
+  the defect. Mechanism right, magnitude wrong; ADR-0017 inherited it before review caught it.
 - `btc-policy-gc8` (P3) — push the AGENTS.md fixes upstream; they sit in tool-managed blocks that
   `br agents --update` and the `agents-md` skill regenerate, so the local fix reverts.
 - `btc-policy-o97` (P3) — a DESIGN.md audit, rescoped from a site list to a sweep after three
