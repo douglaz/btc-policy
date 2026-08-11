@@ -151,7 +151,9 @@ is exactly the constraint `9yf`'s fault failed.
   **State the magnitude precisely.** Three drafts of this paragraph overstated it in three
   different ways, so here it is bounded from both sides. What the misclassification DEFEATS is the
   CLASS-GATED half of the safety track: no Hold, no rolling-window reserve, no duress freeze, so
-  each spend settles instantly. What it does NOT defeat:
+  each spend is signed, combined and BROADCAST immediately instead of waiting out the Hold.
+  ("Settles" would overstate it — confirmation still needs a block; what the fault removes is the
+  delay the Hold exists to impose.) What it does NOT defeat:
 
   - the PER-TRANSACTION Hot budget, which is class-INDEPENDENT — `evaluate` calls
     `check_hot_budget` unconditionally and it takes no class argument, and that function re-sums
@@ -166,10 +168,18 @@ is exactly the constraint `9yf`'s fault failed.
 
   So: drain at the cap, repeatable **for the duress-delay window**, then terminal Lockdown — not
   "without limit", and not a total defeat of the safety track, whose second half survives untouched.
-  One aggravator points the other way and belongs here rather than being left out because it is
-  inconvenient: because the misclassified spend is not hot-class, it leaves no pending hot Hold, so
-  `T`'s `min(..., earliest pending hot Hold-expiry − ε)` shrink input never applies and `T` sits at
-  its MAXIMUM. The window is as long as that federation's configuration permits.
+  Two qualifications point the other way and belong here rather than being dropped for being
+  inconvenient:
+
+  - Because the misclassified spend is not hot-class it leaves no pending hot Hold of its own, so
+    `T`'s `min(..., earliest pending hot Hold-expiry − ε)` shrink input gets nothing from it and `T`
+    MAY remain at its maximum. Not "does" — another pending hot spend, from before the coercion or
+    alongside it, would still supply a smaller deadline.
+  - The duress-delay bound assumes Lockdown actually fires on schedule, and **THREAT-MODEL R11 says
+    the delay before Lockdown at `T` has no finite bound.** Composed with a lock-starvation attack
+    that defers the transition, the repetition window is not bounded by configuration at all. So
+    "bounded by the duress-delay window" is the single-fault statement; it is not a statement about
+    an adversary who also holds R11.
 
   `classify`'s own doc comment at `lib.rs:74-79` carries the "99%-to-hot" version of this
   overstatement, and so does the doc comment on the very test that catches the fault

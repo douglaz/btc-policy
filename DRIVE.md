@@ -31,7 +31,7 @@ version of this line was wrong twice (it omitted two files and undercounted the 
 git diff --stat origin/main..HEAD                    # files
 git show origin/main:.beads/issues.jsonl > /tmp/b    # then compare PARSED records, not lines:
                                                      # br rewrites the JSONL, so a line diff
-                                                     # reports ~34 ids when 5 records changed
+                                                     # reports ~34 ids when 6 records differ
 ```
 
 The bead ledger in particular must be computed semantically — parse both sides and compare
