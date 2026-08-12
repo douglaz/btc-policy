@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Fail if any sentence making btc-policy-nia's extraction claim omits its precondition.
+
+WHY THIS EXISTS, and why it is a script rather than a habit. The claim "the harness is
+blind to a mixed-class EXTRACTION path" is true only WITH STOLEN HOT KEYS: the
+misclassified spend's outputs pay hot-allowlist descriptors, i.e. the user's own hot
+wallet, so absent those keys the outcome is a capped move into that wallet, not attacker
+receipt (docs/adr/0017-one-external-review-at-stage-9.md, and classify's own doc comment).
+
+Stated flat, a reader infers that the duress PIN plus the classification fault alone pay
+an attacker. They do not. That omission was filed by review FIVE times across this PR, on
+five different surfaces, because each fix landed on a detailed statement while a summary
+of it stayed flat.
+
+Round six is why this file exists rather than a checklist: a sweep WAS run, its output
+listed the stale lines, and the output was skimmed. A sweep a human reads is a report.
+This one exits non-zero.
+
+Round seven is why it is case-insensitive: the first version of this check was
+case-sensitive, so `EXTRACTION PATH` in a bead's opening line did not match `extraction
+path`, the check went green, and the green stopped the search. A wrong passing check is
+worse than no check.
+
+Deliberately NARROW. It matches only this claim. Broader patterns hit unrelated
+pre-existing uses — ADR-0012's "burn/extraction channel", ADR-0014's outflow definition —
+which are correct as written and must not be rewritten to satisfy a grep.
+"""
+
+import glob
+import json
+import re
+import sys
+
+CLAIM = re.compile(r"[^.]*(extraction path|mixed-class extraction)[^.]*\.", re.IGNORECASE)
+PRECONDITION = re.compile(r"stolen", re.IGNORECASE)
+
+TEXT_SURFACES = sorted(
+    set(glob.glob("docs/**/*.md", recursive=True))
+    | {"DRIVE.md", "CONTEXT.md", "README.md", "AGENTS.md"}
+)
+BEADS = ".beads/issues.jsonl"
+
+
+def sentences(blob):
+    """Whitespace-normalised, because a line break already hid one of these from an audit."""
+    return CLAIM.finditer(re.sub(r"\s+", " ", blob))
+
+
+def main():
+    unqualified = []
+
+    for path in TEXT_SURFACES:
+        try:
+            blob = open(path, encoding="utf-8").read()
+        except OSError:
+            continue
+        for match in sentences(blob):
+            if not PRECONDITION.search(match.group(0)):
+                unqualified.append((path, match.group(0).strip()))
+
+    # Bead records are a citation surface too, and `close_reason` is a SEPARATE field that
+    # went stale twice while its description was being corrected.
+    try:
+        for line in open(BEADS, encoding="utf-8"):
+            try:
+                bead = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            blob = (bead.get("description") or "") + " " + str(bead.get("close_reason") or "")
+            for match in sentences(blob):
+                if not PRECONDITION.search(match.group(0)):
+                    unqualified.append((bead.get("id", "?"), match.group(0).strip()))
+    except OSError:
+        pass
+
+    for where, sentence in unqualified:
+        print(f"UNQUALIFIED  {where}\n             {sentence[:160]}")
+    if unqualified:
+        print(f"\n{len(unqualified)} site(s) state the extraction claim without its precondition.")
+        return 1
+    print(f"ok: every extraction-claim sentence carries the precondition "
+          f"({len(TEXT_SURFACES)} text surfaces + bead records)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
