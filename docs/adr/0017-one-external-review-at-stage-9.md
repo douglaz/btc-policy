@@ -63,7 +63,8 @@ relied on instead.
 
 **Relied on**, and the ORDER is deliberate as of 2026-08-10 — the harness used to sit SECOND, ahead
 of the proptest suites, and now sits third behind them, because the MIXED-CLASS EXTRACTION fault
-(`classify`'s own comment calls a misclassification "a duress bypass") was caught by the proptest
+(`classify`'s own comment calls a misclassification "a duress bypass"; extraction throughout this ADR is
+conditional on STOLEN HOT KEYS — see below) was caught by the proptest
 suites and missed by all sixteen scenarios. The freeze was first before and is first still. Naming
 the fault, because `nia` injected TWO and both are duress-related: the other, a Lockdown-at-T
 regression, the harness DID catch (`btc-policy-nia`): the stage-1 freeze (`gbw`); proptest and fuzz suites; the
@@ -84,9 +85,9 @@ stage-1 freeze is no longer waiting on a negative control. Both `blocks` edges o
 remain in the graph and are satisfied by closure rather than deleted — the record that this gate
 existed is worth more than a tidy dependency list, and `br ready` counts only OPEN blockers.
 
-`nia` did find a second thing on its way — `attack all` is blind to the mixed-class extraction path
-(`btc-policy-u98`, P1 — raised from P2 once the fault was corrected and the gap turned out to be an
-extraction path rather than a lost refusal). That is deliberately NOT made a freeze blocker, and
+`nia` did find a second thing on its way — `attack all` is blind to the mixed-class extraction path,
+extraction being conditional on STOLEN HOT KEYS throughout (`btc-policy-u98`, P1 — raised from P2
+once the fault was corrected and the gap turned out to be that rather than a lost refusal). That is deliberately NOT made a freeze blocker, and
 the reason is recorded
 here rather than left to inference. State the gate precisely, because the loose version — "the
 harness has never been shown capable of failing" — is one this ADR retracts in the "Stated
@@ -196,7 +197,8 @@ is exactly the constraint `9yf`'s fault failed.
   overstatement, and so does the doc comment on the very test that catches the fault
   (`lib.rs:937-941`) and `docs/adr/0012-...:24` — tracked as `btc-policy-yh7`.
   `attack all` held **16/16 and exited 0**, printing "No theft path, safety track held" with the
-  extraction path live. All three demos were blind too, including `demo theft-refused` — the repo's
+  extraction path live — extraction on the stolen-hot-keys precondition above; the misclassification
+  alone moves value into the user's own hot wallet at the cap. All three demos were blind too, including `demo theft-refused` — the repo's
   NAMED v0 acceptance artifact. What caught it was `cargo test`: 681 passed, 4 failed, exit 101,
   including a differential oracle over arbitrary output sets and a test asserting attacker-controlled
   outputs are only ever hot-or-refused. The cause is scenario coverage, not architecture — every
@@ -211,7 +213,8 @@ is exactly the constraint `9yf`'s fault failed.
 
 **A stage-9 reviewer should take two things from that.** First, a green scorecard is evidence about
 the properties the sixteen scenarios actually construct, and the harness's own summary line
-overstates itself: it printed "No theft path" over a live extraction path. Second, this particular
+overstates itself: it printed "No theft path" over a live extraction path (again: extraction with
+stolen hot keys; without them, a capped move into the user's own hot wallet). Second, this particular
 regression was still caught by CI, because `cargo test` runs in the `check` matrix, an independent
 job with no `needs:` on `launch-gate` — so read the gate as a set of independent detectors, not as
 the harness plus decoration. And read the class-check result narrowly: ONE ARM of `classify` was
