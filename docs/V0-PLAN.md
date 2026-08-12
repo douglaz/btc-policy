@@ -294,7 +294,7 @@ unaffected.
 
 ## Core-proven gate (after V0-7)
 Full test matrix green + a confirmed signet spend through the federation + the FREEZE
-(`btc-policy-gbw`, prerequisite `btc-policy-9yf` (CLOSED 2026-08-09 — it settled only the launch-gate JOB; the harness residue is `btc-policy-nia`, which now blocks `gbw` directly and IS the live gate)) — before any deployer/sealing/Tor/mTLS work
+(`btc-policy-gbw`, prerequisite `btc-policy-9yf` (both CLOSED — `9yf` 2026-08-09 for the launch-gate JOB, `btc-policy-nia` 2026-08-10 for the harness residue it left, so the negative-control prerequisite no longer gates this freeze; `docs/adr/0017-one-external-review-at-stage-9.md` is the authoritative source for the gate state and the measurements. Other planning docs may restate the gate state for local context; the FIGURES are what they must not copy, and within `docs/` the ADR is the only place that carries them. The `btc-policy-nia`, `btc-policy-u98` and `btc-policy-yh7` bead records carry figures too, so a figure edit must check the bead graph as well — and derive that list rather than trusting this one, which has already gone stale once)) — before any deployer/sealing/Tor/mTLS work
 (DESIGN.md 2.5).
 
 **AMENDED by [ADR-0017](adr/0017-one-external-review-at-stage-9.md):** the external review is NO

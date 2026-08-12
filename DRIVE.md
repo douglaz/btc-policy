@@ -2,60 +2,67 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** BUILD · **Bead:** (selecting) · **Branch:** —
-**Pending:** metadata PR douglaz/btc-policy#7 — this record and the `9yf` closure land with it
+**Phase:** HARDEN · **Bead:** btc-policy-nia · **Branch:** fix/nia-harness-negative-control
+**Pending:** —
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 (the stale-flake assertion plus three of the four legs of CI's `check` matrix; `regtest-backend`
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
-- `btc-policy-9yf` (P0) — the launch gate can now be shown to FAIL. Merged #6 (squash `037022b`).
-  Closed on the merge, which is the condition the bead set for itself; it forbids closing on
-  green runs, having been closed that way once and reopened.
+- `btc-policy-9yf` (P0) — the launch-gate JOB can be shown to FAIL. Merged #6 (`037022b`) and #7
+  (`8f1979c`).
+- `btc-policy-nia` (P1) — the HARNESS mutation-tested, both ways. Read the closure reason in
+  `br show btc-policy-nia`; it is not restated here, and the numbers live in
+  `docs/adr/0017-one-external-review-at-stage-9.md`, which owns them.
 
-  What it established, and what it deliberately does not claim:
-  - The gate is sensitive to a deliberately introduced policy regression — CI run 31238105663
-    turned the `launch gate` job RED at `demo first-light` AND the `test` job red, while fmt,
-    clippy and regtest-backend stayed green, so two independent jobs caught it and the result
-    was attributable.
-  - It does NOT show funds could leave: the spend was still refused by the independent
-    output-derived class check (ADR-0013 §3).
-  - It does NOT cover `attack all`, which was SKIPPED when the gate stopped at step 9. Precisely:
-    the harness HAS been seen to fail (`rt0` records `escape-class-sequences` at 15/16), so it is
-    not vacuously green — but it has never failed on a DELIBERATE fault, which is the property a
-    negative control establishes → `btc-policy-nia` (P1).
-  - Build profile is DEBUG, with the release-artifact residual left open for `gbw`/`oy3`.
+  The one-line version, and both halves must travel together: the harness DOES go red on an
+  injected Lockdown-at-T fault, after all three demos cleared it, and is BLIND to an injected
+  mixed-class EXTRACTION path — a spend that completes instantly under the duress PIN, and which is
+  extraction only WITH STOLEN HOT KEYS, since its outputs pay the user's own hot wallet — which
+  `cargo test` caught instead. Figures deliberately omitted — the ADR owns them, and a copy here is
+  how the last one drifted.
+  Neither fault was ever pushed — both controls ran locally, which is a deliberate change of method
+  from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Selecting the next bead from the ready frontier. `rt0` is unblocked by this closure but may not
-be drainable as written — its own notes say the failure is load-sensitivity on this shared box
-while CI passes that scenario, and its title ("cannot currently pass") is falsified by the green
-runs since. Assess before starting; it may need rescoping rather than fixing.
+Landing `nia`. Do NOT hand-maintain the change set here — derive it, because the hand-written
+version of this line was wrong twice (it omitted two files and undercounted the beads by three):
 
-Otherwise the widest unblocker is `mby` (blocks 10 beads, including `gbw`).
+```shell
+git diff --stat origin/main..HEAD                    # files
+git show origin/main:.beads/issues.jsonl > /tmp/b    # then compare PARSED records, not lines:
+                                                     # br rewrites the JSONL, so a line diff
+                                                     # reports ~34 ids when 6 records differ
+```
+
+The bead ledger in particular must be computed semantically — parse both sides and compare
+`title/description/status/priority` per id. At the time of writing that yields: `u98` and `yh7` added;
+`nia`, `9y5`, `9y5.8`, `ytl` changed.
 
 ## Next
-`gbw` is NOT unblocked by `9yf` — verify with `br show btc-policy-gbw` rather than trusting a
-count here, since this line has already gone stale once. Open blockers at the time of writing:
-`rt0`, `oy3`, `wdu`, `mby`, `sqn`, and now `nia`. The `nia` edge was added on this branch because
-`gbw` depended on `9yf` specifically for the negative control, and `9yf`'s closure concedes that
-`attack all` was never covered by it — so closing `9yf` alone would have let the stage-1 freeze
-proceed with the admitted assurance gap still open. `9y5.8` depends on `gbw`, so it inherits the
-gate. The rest is correct as it stands: the freeze must not name a commit predating the operator
-CLI.
+`mby` (Operator CLI core) — the widest unblocker: 10 direct / 21 transitive, and the v0
+operator-path gap (the vault can be sealed but never spent from). Re-derive the frontier before
+starting rather than trusting this line.
+
+`gbw`'s open blockers, computed from the dependency graph 2026-08-10, not counted by hand:
+`mby`, `oy3`, `rt0`, `sqn`, `wdu`. `6nq`, `9yf`, `c9r` and `nia` are closed. The closed edges stay
+in the graph deliberately — `br ready` counts only open blockers, and the record that the gate
+existed is worth more than a tidy list.
 
 ## Filed during this drive, not fixed here
-- `btc-policy-nia` (P1) — mutation-test the harness itself. Precisely: `attack all` has never
-  failed on a DELIBERATE fault (it has failed spontaneously — `rt0`, 15/16 — so "can it emit
-  red at all" is already answered and is NOT what this bead asks), and the output-derived class
-  check that independently refused the spend during 9yf's control has never been falsified at all.
-- `btc-policy-gc8` (P3) — push the AGENTS.md fixes upstream; they sit in tool-managed blocks
-  that `br agents --update` and the `agents-md` skill regenerate, so the local fix reverts.
-- `btc-policy-o97` (P3) — a DESIGN.md audit: it still schedules the shipped harness as future
-  work and describes a CI weaker than the one that runs. Rescoped from a site list to a sweep
-  after three review passes each found sites the previous enumeration had missed (2 → 5 → 8).
-- `btc-policy-8sq` — CLOSED as a duplicate of the pre-existing `tf0` (README/IDEA drift). Filed
-  in error after a reviewer had already named `tf0`.
+- `btc-policy-u98` (P1, raised from P2) — `attack all` is blind to a mixed hot+escape spend because no scenario
+  builds one. Cheap: `build_spend_n` already takes a general output slice. Its done-definition
+  requires re-injecting the fault to prove the new scenario CAN go red.
+- `btc-policy-yh7` (P3) — `classify`'s TxClass doc comment, the doc comment on the test that
+  catches the fault, and `docs/adr/0012`:24 all assert UNCONDITIONALLY that a 99%-to-hot spend
+  completes under the duress PIN. The class-independent per-transaction Hot budget refuses it
+  whenever its outflow exceeds the configured cap — so the claim is not absolute, and that is
+  the defect. Mechanism right, magnitude wrong; ADR-0017 inherited it before review caught it.
+- `btc-policy-gc8` (P3) — push the AGENTS.md fixes upstream; they sit in tool-managed blocks that
+  `br agents --update` and the `agents-md` skill regenerate, so the local fix reverts.
+- `btc-policy-o97` (P3) — a DESIGN.md audit, rescoped from a site list to a sweep after three
+  review passes each found sites the previous enumeration had missed (2 → 5 → 8).
+- `btc-policy-8sq` — CLOSED as a duplicate of the pre-existing `tf0`.
 
 ## Open questions for the human
 - none

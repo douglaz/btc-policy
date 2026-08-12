@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Fail if any sentence making btc-policy-nia's extraction claim omits its precondition.
+
+WHY THIS EXISTS. The claim "the harness is blind to a mixed-class EXTRACTION path" is true
+only WITH STOLEN HOT KEYS: the misclassified spend's outputs pay hot-allowlist descriptors,
+i.e. the user's own hot wallet, so absent those keys the outcome is a capped move into that
+wallet, not attacker receipt (docs/adr/0017-one-external-review-at-stage-9.md, and
+`classify`'s own doc comment). Stated flat, a reader infers that the duress PIN plus the
+classification fault alone pay an attacker. They do not.
+
+That omission was filed by review SIX times across one PR, on six surfaces, because each
+fix landed on a detailed statement while a summary of it stayed flat.
+
+THREE FALSE GREENS THIS FILE HAS ALREADY PRODUCED, each caught by review, none by me:
+  1. A sweep printed the stale lines and the output was skimmed. A sweep a human reads is a
+     report. Hence: a script that exits non-zero.
+  2. The pattern was case-SENSITIVE, so `EXTRACTION PATH` did not match `extraction path`;
+     it exited 0 and the green stopped the search. Hence: re.IGNORECASE.
+  3. Paths were relative and their errors swallowed, so running from any other directory
+     read NOTHING and still exited 0; and only `description`/`close_reason` were scanned,
+     while the defect had already appeared in a bead's opening line and `title` is prose.
+     Hence: repo-root anchoring, hard failure on unreadable inputs, and all prose fields.
+
+The lesson those three share is the one this repo's btc-policy-nia bead is about: a guard
+that has not been shown to fail — along the axis that matters — is not a guard. The
+negative control below therefore exercises three axes, not one.
+
+Deliberately NARROW in what it matches. Broader patterns hit unrelated pre-existing uses —
+ADR-0012's "burn/extraction channel", ADR-0014's outflow definition — which are correct as
+written and must not be rewritten to satisfy a grep.
+"""
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+CLAIM = re.compile(r"[^.]*(extraction path|mixed-class extraction)[^.]*\.", re.IGNORECASE)
+PRECONDITION = re.compile(r"stolen", re.IGNORECASE)
+
+# Every string-valued field of a bead is user-facing prose. `title` and `notes` were
+# skipped by the first version; the defect had already appeared in an opening summary.
+BEAD_PROSE_FIELDS = ("title", "description", "close_reason", "notes", "design", "acceptance_criteria")
+
+EXTRA_FILES = ("DRIVE.md", "CONTEXT.md", "README.md", "AGENTS.md")
+BEADS = ".beads/issues.jsonl"
+
+
+def repo_root():
+    """Anchor to the repo, not to the caller's cwd. Relative paths silently read nothing."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, check=True,
+        )
+        return out.stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        # Fall back to the script's parent, which is scripts/ -> repo root.
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def sentences(blob):
+    """Whitespace-normalised: a line break already hid one of these from an audit."""
+    return CLAIM.finditer(re.sub(r"\s+", " ", blob))
+
+
+def main():
+    root = repo_root()
+    os.chdir(root)
+
+    surfaces = sorted(set(glob.glob("docs/**/*.md", recursive=True)) | set(EXTRA_FILES))
+    # A guard that reads nothing must fail, not pass. This is defect (3) above.
+    if len(surfaces) < 5 or not os.path.exists(BEADS):
+        print(f"FAILED TO READ INPUTS from {root}: {len(surfaces)} text surface(s), "
+              f"beads present={os.path.exists(BEADS)}")
+        return 2
+
+    unqualified, scanned = [], 0
+
+    for path in surfaces:
+        try:
+            blob = open(path, encoding="utf-8").read()
+        except OSError as exc:
+            print(f"FAILED TO READ {path}: {exc}")
+            return 2
+        scanned += 1
+        for match in sentences(blob):
+            if not PRECONDITION.search(match.group(0)):
+                unqualified.append((path, match.group(0).strip()))
+
+    beads = 0
+    with open(BEADS, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                bead = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            beads += 1
+            blob = " ".join(str(bead.get(f) or "") for f in BEAD_PROSE_FIELDS)
+            for match in sentences(blob):
+                if not PRECONDITION.search(match.group(0)):
+                    unqualified.append((bead.get("id", "?"), match.group(0).strip()))
+
+    for where, sentence in unqualified:
+        print(f"UNQUALIFIED  {where}\n             {sentence[:160]}")
+    if unqualified:
+        print(f"\n{len(unqualified)} site(s) state the extraction claim without its precondition.")
+        return 1
+    print(f"ok: {scanned} text surface(s) + {beads} bead record(s) "
+          f"({', '.join(BEAD_PROSE_FIELDS)}) — every extraction-claim sentence carries the precondition")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
