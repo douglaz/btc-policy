@@ -2479,7 +2479,7 @@ impl Drop for SpendPreflightGuard<'_> {
 /// this handler's claim on the REQUEST: the carrier it just derived is not confirmable
 /// until `stage_spend_carrier` stages it, so the guard also carries the intent's ruling
 /// ([`channel::ArmIntent::owner_ruling`]) from the arm hook to the exit. That is what
-/// bounds a peer's `RATE_LIMITED` retry by one handler's lifetime rather than by the
+/// bounds a NON-STAGING refusal's `RATE_LIMITED` retry by one handler's lifetime, not
 /// request expiry — a handler that ruled and refused WITHOUT staging, which every
 /// federation-uniform policy refusal below the hook does on purpose, must not keep
 /// answering "ask again in a second" until the commitment expires.
@@ -2504,7 +2504,7 @@ impl InFlightMemoGuard<'_> {
     /// Take ownership of `carrier`'s propagation ruling, which the arm hook just
     /// recorded. Set in ALL THREE `MemoUpgrade` cases — the intent is recorded in all
     /// three — and released on every exit below, which is what bounds a peer's retry
-    /// against this carrier by this handler's own lifetime instead of by the request
+    /// after a NON-STAGING refusal by this handler's lifetime, not request
     /// expiry. See [`channel::ArmIntent::owner_ruling`].
     fn rules_carrier(&mut self, carrier: &str) {
         self.ruling_carrier = Some(carrier.to_string());
@@ -4423,10 +4423,7 @@ pub(crate) fn handle_channel_body(node: &Node, body: &[u8], now: u64) -> Channel
 /// genuinely new), and local processing. Tests use [`handle_channel_body`] with one
 /// fixed clock so boundary cases stay deterministic.
 ///
-/// `confirmation_clock` is read TWICE — once to resolve the carrier memo and again
-/// immediately before the commit — because everything between them (signature
-/// verification, and on the conflicting-signature path a memory-hard derivation) is
-/// unbounded local work. See [`handle_channel_body_with_clocks`].
+/// `confirmation_clock` samples before lookup, after KDF, and before commit; all are PIN-uniform.
 pub(crate) fn handle_channel_body_now(node: &Node, body: &[u8]) -> ChannelReply {
     let received_at = channel::unix_now();
     handle_channel_body_with_clocks(
@@ -4534,15 +4531,15 @@ fn handle_channel_body_with_clocks(
                     && ensure_request_propagatable(node, request.as_ref()).is_ok()
                     && verify_coord_signature(node, spend.coord_request(), &spend.coord_sig).is_ok()
                 {
+                    let signature_tag = arm_signature_tag(&spend.coord_sig);
                     match channel.carrier_memo_lookup(
                         &spend.nonce,
-                        arm_signature_tag(&spend.coord_sig),
+                        signature_tag,
+                        spend.expiry,
                         sender,
                         lookup_now,
                     ) {
                         channel::CarrierMemoLookup::Exact(carrier) => Some(carrier),
-                        // Post-processing vacancy means the authoritative handler did
-                        // not record an intent (invalid/expired/capacity-refused), so
                         // there is nothing this receipt can confirm and no reason to
                         // pay the carrier KDF.
                         channel::CarrierMemoLookup::Vacant | channel::CarrierMemoLookup::Skip => {
@@ -4609,7 +4606,10 @@ fn handle_channel_body_with_clocks(
                         // `coord_sig`. Derive the body identity once for this sender;
                         // a genuinely different body under a reused nonce resolves to
                         // a carrier for which this node has no intent.
-                        channel::CarrierMemoLookup::DeriveForConfirmation { memoized_carrier } => {
+                        channel::CarrierMemoLookup::DeriveForConfirmation {
+                            memoized_carrier,
+                            generation,
+                        } => {
                             // A hostile coordinator plus one compromised peer can
                             // manufacture conflicting signatures across thousands of
                             // live nonces. Never let those memory-hard resolutions all
@@ -4637,10 +4637,36 @@ fn handle_channel_body_with_clocks(
                                     spend.coord_request().auth_digest(&node.wallet_id),
                                 );
                                 let stretched = reservation.derive(&digest);
-                                Some(
+                                let derived =
                                     vault_proto::tagged_hash(ARM_CARRIER_TAG, stretched.as_slice())
-                                        .to_lower_hex_string(),
-                                )
+                                        .to_lower_hex_string();
+                                if derived != memoized_carrier
+                                    || !channel.record_carrier_derivation_result(
+                                        &spend.nonce,
+                                        sender,
+                                        signature_tag,
+                                        generation,
+                                        &memoized_carrier,
+                                    )
+                                {
+                                    None
+                                } else {
+                                    match channel.carrier_memo_lookup(
+                                        &spend.nonce,
+                                        signature_tag,
+                                        spend.expiry,
+                                        sender,
+                                        confirmation_clock(),
+                                    ) {
+                                        channel::CarrierMemoLookup::Exact(carrier) => Some(carrier),
+                                        channel::CarrierMemoLookup::AwaitingPropagation => {
+                                            return ChannelReply::RateLimited {
+                                                retry_after_secs: 1,
+                                            };
+                                        }
+                                        _ => None,
+                                    }
+                                }
                             }
                         }
                     }

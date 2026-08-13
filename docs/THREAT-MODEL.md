@@ -243,13 +243,23 @@ read "unconditional Lockdown at T" everywhere it appears as a statement about th
 about its latency.
 
 The same unbounded concurrency has one further cost the bead added, stated here rather than left in
-a code comment: a peer receipt for a nonce whose handler has not yet RULED on it — the out-of-lock
-PIN window, and then the chain preflight and registration until the carrier is staged — is
-answered `RATE_LIMITED` with a fixed 1 s retry (it must be — answering `ACCEPTED` would be the
-silent false positive that loses a holder receipt). Both spans end when that one handler exits,
-including on a panic, so the retries are bounded by handler LIFETIMES; a handler that ruled and
-refused without staging the carrier is not in either span and gets the single `ACCEPTED` it got
-before, never a retry against a decision that can no longer change. Both Argon2 consumers share one node-wide work
+a code comment. A peer receipt for a nonce whose handler has not yet RULED — during the out-of-lock
+PIN window, then chain preflight and registration until staging — gets `RATE_LIMITED` with a fixed
+1 s retry; answering `ACCEPTED` would silently lose a holder receipt. Those spans end when that
+handler exits, including on panic. Separately, a completed STAGED memo for the same authenticated
+generation gets the same 1 Hz retry if the receiver's raw clock sample says it is expired: it can
+become confirmable after correction, so its ceiling is clock correction or the sender's signed
+deadline rather than any handler's lifetime. Read that as an UPPER bound on the pressure, not as a
+recovery claim: on today's code a sustained excursion is cut far shorter, by two receiver-side
+mechanisms that both LOSE the receipt rather than deliver it. The node's own 1 Hz fire sweep prunes
+at the same raw wall clock (`fire_tick` -> `prune_store` -> `prune_intents`, which shelters only
+`owner_ruling` state), so a ruled staged intent and its memo are gone within about one tick and the
+next retry reads `Vacant` and stops on a terminal `ACCEPTED`; and an excursion past the 300 s
+envelope past-tolerance refuses the receipt `STALE_TIMESTAMP`, which the sender's `retry_loop`
+treats as permanent. That loss is the residual btc-policy-q6v did NOT close, tracked as bead
+btc-policy-sxt. A completed NON-STAGING refusal is final and gets one
+terminal `ACCEPTED`, even under that forward sample. Both retry shapes remain subject to the
+existing per-peer envelope quota. Both Argon2 consumers share one node-wide work
 slot, so that window stretches with the number of concurrent `/sign` handlers, and the retries a
 flood induces therefore grow roughly with the SQUARE of that number. What binds that traffic first
 is NOT `max_concurrent_channel_requests` but the PER-PEER ENVELOPE QUOTA: `check_and_consume`
@@ -263,7 +273,7 @@ ingress before the memo lookup, so reaching that `NONCE_REPLAYED` means TAKING `
 `C² × peers` retries are therefore `C² × peers` further *successive* acquisitions of the very lock
 this residual is about, and pre-9zs the receipt took one `ACCEPTED` and stopped. It is still not a
 new capability — a hostile coordinator can already mint unbounded `/sign` requests directly, and
-these retries come from HONEST senders and stop at `commitment_expiry` — so it is additional
+all these retries come from HONEST senders and stop at handler exit, clock correction, or `commitment_expiry` — so it is additional
 contention under R11's existing unbounded-acquisition residual, bounded only by the same missing
 `/sign` admission control (bead btc-policy-1y2), not independently.
 
