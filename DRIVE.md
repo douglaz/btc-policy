@@ -2,13 +2,18 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** HARDEN · **Bead:** btc-policy-q6v · **Branch:** fix/q6v-passive-receipt-clock
+**Phase:** SELECT · **Bead:** btc-policy-sxt · **Branch:** —
 **Pending:** —
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 (the stale-flake assertion plus three of the four legs of CI's `check` matrix; `regtest-backend`
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-q6v` (P1) — passive carrier-receipt lookup is non-destructive under forward
+  clock excursions, retained retries are generation/sender scoped, and conflicting signatures
+  resolve through the bounded memory-hard carrier path without retaining a fast PIN verifier.
+  Merged #9 (`8bd896d`); the reviewed Rust implementation plus tests reached the 430-line hard
+  cap, with the remaining clock-authority paths tracked separately as `btc-policy-sxt`.
 - `btc-policy-9yf` (P0) — the launch-gate JOB can be shown to FAIL. Merged #6 (`037022b`) and #7
   (`8f1979c`).
 - `btc-policy-nia` (P1) — the HARNESS mutation-tested, both ways. Read the closure reason in
@@ -25,28 +30,14 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-`q6v`: make passive receipt lookup non-destructive under a forward raw-clock sample, return a
-retryable reply for the matching request generation, and retain bounded cleanup at accepted-nonce
-transitions. Budget: all Rust implementation and test changes count together, with a soft 400 /
-hard 430 gross-line checkpoint. Summing additions and deletions from
-`git diff --numstat origin/main -- '*.rs'` gives 430 gross Rust lines, at the cap; adding
-`docs/THREAT-MODEL.md` to that command gives a 456-line audited product/doc diff.
-Do NOT build: clock service/persistence/schema changes, candidate-expiry redesign, `/sign`
-admission control, or the other destructive clock-pruning paths.
-
-The production residual outside q6v's passive-lookup seam is tracked as P1 bug `btc-policy-sxt`,
-which depends on q6v. Its acceptance criteria cover the 1 Hz fire sweep, post-acceptance clock
-re-reads, and the two-sample confirmation straddle with red/green production-path evidence.
+From fresh main after q6v's closure lands, claim `sxt` and enter SPEC for the remaining
+clock-authority theft residual: the 1 Hz fire sweep, post-acceptance clock re-reads, and the
+two-sample confirmation straddle.
 
 ## Next
-Finish q6v HARDEN on this exact tree: Codex + Fable clean together, then independently run the
-exact AGENTS.md gate, ignored regtest backend, and full launch gate. LAND only the reviewed tree;
-close q6v through the reviewed metadata path.
-
-After q6v lands, re-derive the P1 frontier. `sxt` becomes ready and carries the remaining
-clock-authority theft residual. `mby` remains the widest product unblocker but must first be
-distilled into a bounded rb-lite task; do not hand its ~30k-character accumulated record directly
-to an implementation run.
+Re-derive a bounded rb-lite budget for `sxt` before implementation. `mby` remains the widest
+product unblocker but must first be distilled; do not hand its ~30k-character accumulated record
+directly to an implementation run.
 
 `gbw`'s open blockers, computed from the dependency graph 2026-08-10, not counted by hand:
 `mby`, `oy3`, `rt0`, `sqn`, `wdu`. `6nq`, `9yf`, `c9r` and `nia` are closed. The closed edges stay
