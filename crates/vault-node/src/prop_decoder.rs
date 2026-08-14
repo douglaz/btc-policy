@@ -362,7 +362,7 @@ fn a_valid_envelope_with_one_mutated_field_is_rejected_for_the_exact_right_reaso
 
 /// Two envelope bodies carry the SAME message when every field the node acts on
 /// agrees. The four hex fields are compared CASE-FOLDED, because the decoders they
-/// pass through (`from_hex_32` / `from_hex_16` / `from_hex_vec`, `channel.rs:321`)
+/// pass through (`from_hex_32` / `from_hex_16` / `from_hex_vec`)
 /// are case-insensitive: `…8d4b…` and `…8D4b…` are the same 32 bytes, so they are
 /// one wallet id / manifest hash / nonce / signature, not two.
 fn assert_same_message(survived: &Envelope, original: &Envelope) -> Result<(), TestCaseError> {
@@ -385,7 +385,7 @@ fn assert_same_message(survived: &Envelope, original: &Envelope) -> Result<(), T
         original.channel_sig.to_lowercase()
     );
     // Compared without ever printing it: a `request` payload carries the PIN, which
-    // is why `Envelope`'s own `Debug` redacts this field (`channel.rs:621`).
+    // is why `Envelope`'s own `Debug` redacts this field.
     prop_assert!(
         *survived.payload_b64 == *original.payload_b64,
         "the payload changed"
@@ -439,8 +439,8 @@ fn no_single_byte_corruption_of_a_valid_envelope_changes_what_the_node_acts_on()
             // case-insensitive, and `xor = 32` is the ASCII case bit, so flipping it
             // on a hex letter (`'d'` -> `'D'`) re-encodes the SAME bytes. Such a body
             // authenticates because it IS the original message, and accepting it is
-            // correct — the replay key is the DECODED nonce (`channel.rs:2277`,
-            // consumed at `channel.rs:4110`), never the hex string, so case-folding
+            // correct — `IngressGuards::check_and_consume` keys replay state by the decoded
+            // nonce, never the hex string, so case-folding
             // cannot mint a second identity for one envelope.
             //
             // So the property is semantic rather than byte-level, and keeps its

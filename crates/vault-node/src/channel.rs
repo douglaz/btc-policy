@@ -1370,7 +1370,7 @@ enum MemoOutcome {
         /// nonce. Bounds the work a hostile coordinator can induce (see
         /// [`CarrierMemoLookup::DeriveForConfirmation`]) without letting one
         /// compromised peer spend the budget honest peers' confirmations need.
-        resolved_senders: HashSet<u16>,
+        resolved_senders: HashMap<u16, [u8; 32]>,
     },
 }
 
@@ -1427,8 +1427,6 @@ pub(crate) enum MemoUpgrade {
 /// still finalized. That is theft, not censorship, so a mismatch must resolve the
 /// real carrier by derivation instead of skipping the confirmation.
 pub(crate) enum CarrierMemoLookup {
-    /// Nonce unseen after the authoritative ingress handler returned: that handler
-    /// did not record an intent (for example freshness/capacity refused it), so
     /// there is no carrier this receipt can confirm.
     Vacant,
     /// A CONCURRENT handler has claimed this nonce and has not yet ruled on it
@@ -1462,7 +1460,7 @@ pub(crate) enum CarrierMemoLookup {
     AwaitingPropagation,
     /// This exact signature is memoized; reuse its carrier with no derivation.
     Exact(String),
-    /// A different valid signature under a live nonce. Derive the incoming body's own
+    /// A different valid signature under a live or passively retained nonce. Derive the body's
     /// carrier and confirm THAT — it is correct whether the body is the memoized one
     /// re-signed (same carrier, receipt counts) or a different body under a reused
     /// nonce (different carrier, no local intent, confirmation is a no-op).
@@ -1473,7 +1471,10 @@ pub(crate) enum CarrierMemoLookup {
     /// legitimate fan-out costs zero derivations, while hostile re-signing can cost at
     /// most `n−1` for one nonce. Cross-nonce work remains bounded by the 4,096 live
     /// memos and, separately, by the one-active/zero-queued global KDF reservation.
-    DeriveForConfirmation { memoized_carrier: String },
+    DeriveForConfirmation {
+        memoized_carrier: String,
+        generation: MemoGeneration,
+    },
     /// Nothing here can be confirmed: this sender already spent its one derivation.
     Skip,
 }
@@ -3702,7 +3703,7 @@ impl ChannelState {
                 // (nonce, sender) against a memo that already resolves to a carrier; an
                 // upgrade inherits no such spend, and seeding this from anywhere would
                 // Skip a peer receipt that never got its one derivation.
-                resolved_senders: HashSet::new(),
+                resolved_senders: HashMap::new(),
             },
             expiry: generation.expiry,
         };
@@ -3854,18 +3855,23 @@ impl ChannelState {
         &self,
         nonce: &str,
         signature_tag: [u8; 32],
+        request_expiry: u64,
         sender: u16,
         now: u64,
     ) -> CarrierMemoLookup {
-        let mut store = self.store.lock().expect("store lock poisoned");
-        // Passive receipt clocks may step forward and then correct without advancing
-        // the nonce log's rollback high-water. `prune_intents` therefore retains state
-        // whose owner has not ruled, so the match below answers RATE_LIMITED until it has.
-        store.prune_intents(now);
+        let store = self.store.lock().expect("store lock poisoned");
+        // Passive raw-clock reads are non-destructive; accepted-nonce insertions first prune both maps.
         let Some(memo) = store.carriers_by_nonce.get(nonce) else {
             return CarrierMemoLookup::Vacant;
         };
-        if let MemoOutcome::Derived { carrier, .. } = &memo.outcome {
+        let raw_expired = memo.expiry <= now;
+        if raw_expired && memo.expiry != request_expiry {
+            return CarrierMemoLookup::Vacant;
+        }
+        if !raw_expired {
+            let MemoOutcome::Derived { carrier, .. } = &memo.outcome else {
+                return CarrierMemoLookup::InFlight;
+            };
             // BOTH conditions, and the second is what bounds the retry. `owner_ruling`
             // alone would answer a receipt for an already-staged carrier RATE_LIMITED for
             // the sliver between staging and handler exit; `!ready_to_propagate` alone
@@ -3886,31 +3892,49 @@ impl ChannelState {
             // make: a claimed-but-unruled nonce has no carrier to confirm yet, and
             // spending the sender's one derivation on it would Skip its own retry.
             MemoOutcome::InFlight { .. } => CarrierMemoLookup::InFlight,
-            MemoOutcome::Derived {
-                carrier,
-                signature_tag: remembered,
-                ..
-            } if *remembered == signature_tag => CarrierMemoLookup::Exact(carrier.clone()),
             // A sender becomes spent only AFTER the caller owns the global
             // derivation reservation. Contention must leave it retryable; otherwise a
             // RATE_LIMITED response would consume the one receipt the retry exists to
             // deliver.
             MemoOutcome::Derived {
                 carrier,
+                signature_tag: remembered,
                 resolved_senders,
-                ..
             } => {
-                if resolved_senders.contains(&sender) {
+                let resolved = resolved_senders.get(&sender);
+                if *remembered == signature_tag || resolved == Some(&signature_tag) {
+                    return if raw_expired {
+                        Self::raw_expired_retry(&store, carrier, sender)
+                    } else {
+                        CarrierMemoLookup::Exact(carrier.clone())
+                    };
+                }
+                if resolved.is_some() {
                     CarrierMemoLookup::Skip
                 } else {
                     CarrierMemoLookup::DeriveForConfirmation {
                         memoized_carrier: carrier.clone(),
+                        generation: MemoGeneration {
+                            signature_tag: *remembered,
+                            expiry: memo.expiry,
+                        },
                     }
                 }
             }
         }
     }
 
+    fn raw_expired_retry(store: &PartialStore, carrier: &str, sender: u16) -> CarrierMemoLookup {
+        if store.intents.get(carrier).is_some_and(|intent| {
+            (intent.owner_ruling || intent.ready_to_propagate)
+                && !intent.committed
+                && !intent.holders.contains(&sender)
+        }) {
+            CarrierMemoLookup::AwaitingPropagation
+        } else {
+            CarrierMemoLookup::Vacant
+        }
+    }
     /// Spend one sender's conflicting-signature derivation budget after the caller has
     /// reserved the global KDF slot. `memoized_carrier` binds the claim to the memo the
     /// lookup observed: if expiry pruning and nonce reuse replaced it while admission
@@ -3928,9 +3952,11 @@ impl ChannelState {
         match &mut memo.outcome {
             MemoOutcome::Derived {
                 carrier,
+                signature_tag,
                 resolved_senders,
-                ..
-            } if carrier == memoized_carrier => resolved_senders.insert(sender),
+            } if carrier == memoized_carrier => {
+                resolved_senders.insert(sender, *signature_tag).is_none()
+            }
             MemoOutcome::Derived { .. } => false,
             // An in-flight claim replaced the memo between the lookup and here. There is
             // no carrier to charge the derivation against, so refuse the claim without
@@ -3942,6 +3968,35 @@ impl ChannelState {
         }
     }
 
+    pub(crate) fn record_carrier_derivation_result(
+        &self,
+        nonce: &str,
+        sender: u16,
+        signature_tag: [u8; 32],
+        generation: MemoGeneration,
+        memoized_carrier: &str,
+    ) -> bool {
+        let mut store = self.store.lock().expect("store lock poisoned");
+        match store.carriers_by_nonce.get_mut(nonce) {
+            Some(CarrierMemo {
+                outcome:
+                    MemoOutcome::Derived {
+                        carrier,
+                        signature_tag: remembered,
+                        resolved_senders,
+                    },
+                expiry,
+            }) if carrier == memoized_carrier
+                && *remembered == generation.signature_tag
+                && *expiry == generation.expiry
+                && resolved_senders.get(&sender) == Some(&generation.signature_tag) =>
+            {
+                resolved_senders.insert(sender, signature_tag);
+                true
+            }
+            _ => false,
+        }
+    }
     /// The shared `T` computation + fixed-shape overlay write, under an already-held
     /// store lock. `arm` is the internal fire bit: ingress always passes `false`
     /// (cover), and the §0 confirmation commit passes `true`. `first_seen` is the
@@ -12657,7 +12712,7 @@ mod duress {
                     signature_tag: _signature_tag,
                     resolved_senders,
                 } => {
-                    let mut senders: Vec<u16> = resolved_senders.iter().copied().collect();
+                    let mut senders: Vec<u16> = resolved_senders.keys().copied().collect();
                     senders.sort_unstable();
                     format!("outcome=Derived resolved_senders={senders:?}")
                 }
@@ -13880,8 +13935,195 @@ mod duress {
         );
     }
 
-    /// The SECOND eviction site. `prune_intents`' unruled-owner exception covers the
-    /// lookup path; `confirm_carrier` evicts on its own bare `intent.expiry <= now`. That
+    #[test]
+    fn a_resignature_resamples_after_kdf_and_preserves_expired_state() {
+        let fx = Fixture::new(3, 5);
+        let (node, request) = memoized_duress(&fx, "ruled-receipt-clock");
+        let channel = node.channel.as_ref().expect("channel");
+        let mut resigned = request.clone();
+        fx.coord_resign(&mut resigned, 0xA1);
+        assert_ne!(resigned.coord_sig, request.coord_sig);
+        let derivations = node.carrier_derivation_count();
+        const RULED_AND_STAGED: &str = "intent holders=[0] ready_to_propagate=true \
+                                        owner_ruling=false";
+        assert!(
+            shape_rows(channel, "intent ").iter().any(|row| {
+                row.starts_with(RULED_AND_STAGED) && row.contains(&format!("expiry={EXPIRY}"))
+            }),
+            "requires ruled staged state: {:?}",
+            shape_rows(channel, "intent ")
+        );
+        let expired = deliver_receipt_at(&fx, &node, &resigned, 1, || EXPIRY + 1);
+        assert_eq!(
+            expired,
+            ChannelReply::RateLimited {
+                retry_after_secs: 1
+            },
+            "a post-KDF sample still past expiry must remain retriable"
+        );
+        assert_eq!(
+            channel.intent_counts(),
+            (1, 1),
+            "the expired post-KDF refusal must preserve the ruled intent and memo"
+        );
+        assert_eq!(node.carrier_derivation_count(), derivations + 1);
+        let repeat = deliver_receipt_at(&fx, &node, &resigned, 1, || EXPIRY + 1);
+        assert_eq!(
+            repeat, expired,
+            "the recognized retry must stay retriable, and without a second derivation"
+        );
+        assert_eq!(node.carrier_derivation_count(), derivations + 1);
+
+        let clock_reads = std::sync::atomic::AtomicUsize::new(0);
+        let corrected = deliver_receipt_at(&fx, &node, &resigned, 2, || {
+            let call = clock_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            [EXPIRY + 1, NOW][call.min(1)]
+        });
+        assert_eq!(
+            corrected,
+            ChannelReply::Accepted,
+            "the corrected post-KDF sample must count this request without a retry"
+        );
+        assert_eq!(
+            clock_reads.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "pre-KDF lookup, post-KDF lookup, and final confirmation each sample once"
+        );
+        assert_eq!(node.carrier_derivation_count(), derivations + 2);
+        assert!(shape_rows(channel, "intent ").iter().any(|row| row
+            .starts_with("intent holders=[0, 2] ready_to_propagate=true owner_ruling=false")));
+        assert_eq!(
+            deliver_receipt_at(&fx, &node, &resigned, 1, || NOW),
+            ChannelReply::Accepted,
+            "the first sender's retained recognition must count after correction"
+        );
+        assert_eq!(node.carrier_derivation_count(), derivations + 2);
+        let armed = channel
+            .armed_snapshot()
+            .expect("the receipts after the correction must still reach t and arm");
+        assert_eq!(
+            armed.fire_at,
+            NOW + DELAY,
+            "the forward read must not alter ingress first_seen"
+        );
+        let next = generation([0xA2; 32], EXPIRY + 30);
+        channel.claim_nonce_in_flight(&request.nonce, next, EXPIRY + 1);
+        assert_eq!(
+            shape_rows(channel, "memo "),
+            vec![format!(
+                "memo nonce={} outcome=InFlight expiry={}",
+                request.nonce, next.expiry
+            )],
+            "replacement must discard every prior generation's recognition"
+        );
+    }
+    fn deliver_receipt_at(
+        fx: &Fixture,
+        node: &crate::Node,
+        request: &SignRequest,
+        sender: u16,
+        confirmation_clock: impl Fn() -> u64,
+    ) -> ChannelReply {
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request.clone()));
+        let envelope = fx
+            .channel_state(sender)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, EXPIRY + 1)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        crate::handle_channel_body_with_clocks(node, &body, EXPIRY + 1, || NOW, confirmation_clock)
+    }
+    fn memoized_duress(fx: &Fixture, nonce: &str) -> (crate::Node, SignRequest) {
+        let node = duress_node(fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(fx, &spend, &default_escape(fx), nonce);
+        assert!(matches!(
+            crate::handle_sign(&node, &request, NOW).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        (node, request)
+    }
+
+    #[test]
+    fn a_different_same_expiry_body_derives_once_then_stops() {
+        let fx = Fixture::new(3, 5);
+        let (node, original) = memoized_duress(&fx, "reused-nonce");
+        let channel = node.channel.as_ref().expect("channel");
+        let mut different = original.clone();
+        different.pin = "1234".into();
+        fx.coord_resign(&mut different, 0xA0);
+        assert_eq!(different.expiry, original.expiry);
+        let before = channel.intent_counts();
+        let derivations = node.carrier_derivation_count();
+        for _ in 0..2 {
+            let reply = deliver_receipt_at(&fx, &node, &different, 1, || EXPIRY + 1);
+            assert_eq!(reply, ChannelReply::Accepted);
+            assert_eq!(channel.intent_counts(), before, "lookup is non-destructive");
+            let count = node.carrier_derivation_count();
+            assert_eq!(count, derivations + 1, "one bounded KDF per sender");
+        }
+    }
+
+    #[test]
+    fn accepted_nonce_pruning_bounds_passive_carrier_state() {
+        const BACKLOG: usize = 5;
+        const ROUNDS: u64 = 8;
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: EPS,
+            combine_slack_secs: SLACK,
+        };
+        for i in 0..BACKLOG {
+            let generation = generation([i as u8; 32], EXPIRY);
+            let nonce = format!("backlog-{i}");
+            let carrier = format!("carrier-backlog-{i}");
+            channel.claim_nonce_in_flight(&nonce, generation, NOW);
+            channel.record_arm_intent(true, &carrier, &nonce, generation, NOW, NOW, timing);
+            channel.mark_carrier_propagated(&carrier);
+            channel.end_carrier_ruling(&carrier);
+            assert!(matches!(
+                memo_lookup(channel, &nonce, generation, 1, EXPIRY + 1),
+                CarrierMemoLookup::AwaitingPropagation
+            ));
+        }
+        assert_eq!(
+            channel.intent_counts(),
+            (BACKLOG, BACKLOG),
+            "one entry per ACCEPTED nonce: passive reads neither add nor remove any"
+        );
+        channel.claim_nonce_in_flight(
+            "collector",
+            generation([0xC0; 32], EXPIRY + 100),
+            EXPIRY + 1,
+        );
+        assert_eq!(
+            channel.intent_counts(),
+            (0, 1),
+            "the authorized evictor must collect every expired entry the reads retained"
+        );
+        for round in 0..ROUNDS {
+            let now = EXPIRY + 10 + round * 10;
+            let generation = generation([0xE0u8.wrapping_add(round as u8); 32], now + 5);
+            let nonce = format!("round-{round}");
+            let carrier = format!("carrier-round-{round}");
+            channel.claim_nonce_in_flight(&nonce, generation, now);
+            channel.record_arm_intent(true, &carrier, &nonce, generation, now, now, timing);
+            channel.mark_carrier_propagated(&carrier);
+            channel.end_carrier_ruling(&carrier);
+            assert!(matches!(
+                memo_lookup(channel, &nonce, generation, 1, now + 1_000),
+                CarrierMemoLookup::AwaitingPropagation
+            ));
+            assert_eq!(
+                channel.intent_counts(),
+                (1, 2),
+                "round {round}: the accept-path prune must keep residency flat"
+            );
+        }
+    }
+    /// q6v left `confirm_carrier`'s bare `intent.expiry <= now` eviction for sxt; its
     /// clock has been through `NonceLog::effective_now`, which is only a rollback LOWER
     /// bound, so a FORWARD excursion still passes through untouched. Refusing is correct
     /// and must not change —
@@ -13939,7 +14181,6 @@ mod duress {
             "with no owner ruling, the expiry eviction is unchanged"
         );
     }
-
     /// The negative control for the case above: the compared record must be ABLE to come
     /// out different, or its `assert_eq!` is decoration. A run whose handler is NOT
     /// parked in WINDOW A — the receipt arrives after the node has already ruled —
@@ -14016,8 +14257,7 @@ mod duress {
             signature_tag: [0x51; 32],
             expiry: EXPIRY,
         };
-        let tag = generation.signature_tag;
-        let lookup = |nonce: &str| channel.carrier_memo_lookup(nonce, tag, SENDER, NOW);
+        let lookup = |nonce: &str| memo_lookup(channel, nonce, generation, SENDER, NOW);
 
         // WINDOW A: claimed, no carrier yet.
         channel.claim_nonce_in_flight("staged", generation, NOW);
@@ -14065,13 +14305,13 @@ mod duress {
             timing,
         );
         assert!(matches!(
-            channel.carrier_memo_lookup("refused", refused.signature_tag, SENDER, NOW),
+            memo_lookup(channel, "refused", refused, SENDER, NOW),
             CarrierMemoLookup::AwaitingPropagation
         ));
         channel.end_carrier_ruling("carrier-refused");
         assert!(
             matches!(
-                channel.carrier_memo_lookup("refused", refused.signature_tag, SENDER, NOW),
+                memo_lookup(channel, "refused", refused, SENDER, NOW),
                 CarrierMemoLookup::Exact(carrier) if carrier == "carrier-refused"
             ),
             "once the handler has ruled, an unstaged intent must stop asking for retries: \
@@ -14141,11 +14381,12 @@ mod duress {
             .expect("envelope");
         let body = serde_json::to_vec(&envelope).expect("json");
         assert_eq!(
-            crate::handle_channel_body(&node, &body, NOW),
+            crate::handle_channel_body_with_clocks(&node, &body, NOW, || NOW, || EXPIRY + 1,),
             ChannelReply::Accepted,
             "a node that has RULED must answer once; RATE_LIMITED here is a retry against a \
              decision that cannot change, repeated until the commitment expires"
         );
+        assert_eq!(channel.intent_counts(), (1, 1), "lookup is non-destructive");
     }
 
     /// The unruled exception covers BOTH halves of a request, not just the `InFlight`
@@ -14187,7 +14428,7 @@ mod duress {
         // A passive receipt-side read past the carrier's expiry. Both halves survive and
         // the receipt is told to retry.
         assert!(matches!(
-            channel.carrier_memo_lookup("unruled", generation.signature_tag, 1, EXPIRY + 1),
+            memo_lookup(channel, "unruled", generation, 1, EXPIRY + 1),
             CarrierMemoLookup::AwaitingPropagation
         ));
         assert_eq!(
@@ -14196,13 +14437,44 @@ mod duress {
             "a passive forward clock read must not evict state whose owner is still ruling"
         );
 
-        // The handler rules. The same passive read now collects both halves normally.
+        channel.mark_carrier_propagated("carrier-unruled");
         channel.end_carrier_ruling("carrier-unruled");
         assert!(matches!(
-            channel.carrier_memo_lookup("unruled", generation.signature_tag, 1, EXPIRY + 1),
-            CarrierMemoLookup::Vacant
+            memo_lookup(channel, "unruled", generation, 1, EXPIRY + 1),
+            CarrierMemoLookup::AwaitingPropagation
         ));
-        assert_eq!(channel.intent_counts(), (0, 0));
+        assert_eq!(
+            channel.intent_counts(),
+            (1, 1),
+            "a passive read must preserve state until the raw clock corrects"
+        );
+
+        let first_receipt = channel.confirm_carrier(1, "carrier-unruled", 3, NOW, timing);
+        assert!(!first_receipt.committed);
+        let already_held_is_terminal = matches!(
+            memo_lookup(channel, "unruled", generation, 1, EXPIRY + 1),
+            CarrierMemoLookup::Vacant
+        );
+        assert!(matches!(
+            memo_lookup(channel, "unruled", generation, 2, EXPIRY + 1),
+            CarrierMemoLookup::AwaitingPropagation
+        ));
+        let duplicate_receipt = channel.confirm_carrier(1, "carrier-unruled", 3, NOW, timing);
+        assert!(!duplicate_receipt.committed);
+        let second_distinct_receipt = channel.confirm_carrier(2, "carrier-unruled", 3, NOW, timing);
+        assert!(
+            second_distinct_receipt.committed,
+            "the repeated sender must remain idempotent; the second distinct sender reaches t=3"
+        );
+        let committed_is_terminal = matches!(
+            memo_lookup(channel, "unruled", generation, 3, EXPIRY + 1),
+            CarrierMemoLookup::Vacant
+        );
+        assert!(
+            already_held_is_terminal && committed_is_terminal,
+            "expired lookup: already-held terminal={already_held_is_terminal}, \
+             committed terminal={committed_is_terminal}"
+        );
 
         // THE BOUND: an ACCEPTED nonce evicts expired state even while its owner rules,
         // so unruled entries cannot accumulate past the nonce log's own horizon.
@@ -14220,7 +14492,12 @@ mod duress {
             NOW,
             timing,
         );
-        assert_eq!(channel.intent_counts(), (1, 1));
+        assert_eq!(
+            channel.intent_counts(),
+            (2, 2),
+            "this claim's own accept-path prune runs at NOW, which is before either \
+             generation's expiry, so both pairs are legitimately resident"
+        );
         channel.claim_nonce_in_flight(
             "fresher",
             MemoGeneration {
@@ -14531,6 +14808,23 @@ mod duress {
             .into_iter()
             .filter(|row| row.starts_with(prefix))
             .collect()
+    }
+
+    fn memo_lookup(
+        channel: &ChannelState,
+        nonce: &str,
+        g: MemoGeneration,
+        sender: u16,
+        now: u64,
+    ) -> CarrierMemoLookup {
+        channel.carrier_memo_lookup(nonce, g.signature_tag, g.expiry, sender, now)
+    }
+
+    fn generation(signature_tag: [u8; 32], expiry: u64) -> MemoGeneration {
+        MemoGeneration {
+            signature_tag,
+            expiry,
+        }
     }
 
     /// THE COMMIT HOLD'S THREE CLOCK PREDICATES, each one fired. They are what stops a

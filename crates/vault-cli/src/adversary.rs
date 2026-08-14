@@ -20,7 +20,7 @@
 //! **Nothing here is a signing oracle.** Be exact about what that prohibition says,
 //! because the arm-split scenarios depend on the difference. It is NOT "a relayed
 //! message never results in a signature": a propagated carrier is the *user's*
-//! authorization in transit, and `vault-node/src/lib.rs:2606` dispatches it to the
+//! authorization in transit, and `handle_channel_body_with_clocks` dispatches it to the
 //! same `handle_sign_after_lock` a direct `/sign` reaches, so an honest node that
 //! receives a valid carrier over this channel does sign it at ingress — pin-
 //! independently, which is what keeps signing itself from being a duress oracle.

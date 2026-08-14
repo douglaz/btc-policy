@@ -2528,7 +2528,7 @@ fn arm_split_closed() -> Result<String, Error> {
     // independently re-runs every ingress gate and may sign it; neither the sender's
     // claim nor its manufactured receipts authorize signature creation or release.
     // What must not happen is the target handing back its partial before this exact
-    // candidate's authorized fire event (`vault-node/src/lib.rs:2596-2607` dispatches
+    // candidate's authorized fire event (the `handle_channel_body_with_clocks` → `handle_sign_after_lock` path takes
     // a relayed full carrier through the ordinary handler).
     // Small on purpose: before its later positive-control settlement this coin only
     // enlarges the coerced escape's fire-time coverage denominator. At 0.05 BTC
@@ -3660,7 +3660,7 @@ const PIN_COST_FLOOR: Duration = Duration::from_millis(50);
 /// the default schedule, which is a single zero, so the base value is the whole
 /// budget a request has.
 const NODE_HANDLER_DEADLINE: Duration = Duration::from_secs(10);
-/// Memory-hard evaluations one spend request costs under the node's store lock:
+/// Memory-hard evaluations one spend request costs outside the node's `sign_state` lock:
 /// both enrolled PIN slots (`pin::verify_pin` evaluates both unconditionally) plus
 /// the `arm_carrier_id` derivation, whose work factor is the elementwise MAX of the
 /// two slots (`vault-node/src/pin.rs`, `CarrierKdf::new`).
