@@ -100,9 +100,9 @@ These are what a reviewer should try hardest to break. Each is enforced in code,
 
 | Surface | Exposure | Notes for a reviewer |
 |---|---|---|
-| `POST /sign` | The main gate | Coord-auth → freshness/nonce → PIN (two Argon2id evaluations, constant-time compare) → chain preflight → user signature → class/allowlist → Hot budget → register. The preflight really does precede validation: its fail-closed exit is step 4b (`lib.rs`) and user-signature verification is step 5, a shape bead btc-policy-f91 established and btc-policy-9zs kept. The nonce is consumed atomically under the sign lock; the two Argon2id PIN evaluations, the carrier derivation and the slow chain I/O are all deliberately *outside* it (bead btc-policy-9zs), so neither memory-hard work nor a slow RPC lengthens the section a waiting Lockdown-at-T contends for — but see R11: the acquisition delay itself still has no finite bound. |
+| `POST /sign` | The main gate | Coord-auth → freshness/nonce+shared Carrier capacity → PIN (two Argon2id evaluations, constant-time compare) → chain preflight → user signature → class/allowlist → Hot budget → register. Every accepted channel-mode Spend nonce records immutable `D`; its replay/fan-out tombstone remains until both wall expiry and `D` end even if Carrier state retires earlier. A node without channel mode has no Carrier/`HotClock` and retains wall-only Spend nonce lifetime. At the existing ceiling a newcomer consumes/relays/derives/evicts nothing. The preflight really does precede validation: its fail-closed exit is step 4b (`lib.rs`) and user-signature verification is step 5, a shape bead btc-policy-f91 established and btc-policy-9zs kept. An admitted nonce is consumed atomically under the sign lock; the two Argon2id PIN evaluations, the carrier derivation and the slow chain I/O are all deliberately *outside* it (bead btc-policy-9zs), so neither memory-hard work nor a slow RPC lengthens the section a waiting Lockdown-at-T contends for — but see R11: the acquisition delay itself still has no finite bound. |
 | `POST /channel` | Peer transport | Manifest-pinned endpoints and endorsed channel keys; per-peer rate quota; size bound is manifest-uniform. |
-| `GET /events` | Watchtower alerts + one channel diagnostic | Carries on-chain watchtower alerts (`RECOVERY_PATH_SPEND`, `UNRECOGNIZED_SPEND`) plus `CHANNEL_FRESHNESS_REJECT`, which names a peer whose clock is off. It carries nothing about pending or armed state. A reviewer should confirm the freshness diagnostic is genuinely pin-independent, since it is the one `/events` entry not derived from the chain. |
+| `GET /events` | Watchtower alerts + one channel diagnostic | Carries on-chain watchtower alerts (`RECOVERY_PATH_SPEND`, `UNRECOGNIZED_SPEND`) plus `CHANNEL_FRESHNESS_REJECT`, which names a peer whose clock is off. It carries nothing about pending or armed state. Publication is keyed by `(peer, ingress freshness high-water)`: a lower concurrent observation is dropped; an equal high-water updates a retained entry at the same sequence without resurrecting an evicted entry; only a strictly higher high-water can append and contend for queue capacity. Therefore a latched-high-water outage publishes at most once per peer; if that entry is later cap-evicted, equal-high-water retries do not republish it during the same outage. Preserving unrelated on-chain watchtower evidence wins over diagnostic persistence. A reviewer should confirm the diagnostic is genuinely pin-independent, since it is the one `/events` entry not derived from the chain. |
 | `GET /healthz` | Liveness | Three atomic loads; must stay free of duress-dependent content. |
 | `GET /pending` | Accepted hot-candidate ids | Sorted opaque commitment ids only. No arm state, transaction, amount, destination, signature material, or explicit timing field. The complete body must stay byte-identical across normal/duress and armed/idle twins. One short `sign_state` snapshot is allowed; concurrent snapshots are shed before entering the blocking pool. The SILENCE row above is asserted here on the response **bytes**. This is the one read surface that waits on `sign_state`, and it is **not** structurally isolated from arm-dependent work: the fire pass's release/combine loop holds `sign_state` too (it must — the release gate is fail-closed under that guard). What makes the channel pin-uniform is scheduling, not isolation: dynamic-`T` puts `T` at or before the earliest pending hot Hold expiry minus `epsilon_secs`, so **pre-`T` the due set is empty on an armed node and an idle twin alike** and the guarded section does no arm-dependent work on either; the arm-dependent duration difference is confined to the post-`T` window, by which point Lockdown is already public. A separate, weaker residual remains and is not co-residency: because the route is unauthenticated and waits on this lock, any network observer can poll it and infer *that* a `/sign` was being processed — including one that was REFUSED and therefore never appears in the projection. That is a spend-activity timing channel, not a duress oracle. |
 | Chain backend RPC | Per-node bitcoind | Requires `-txindex=1`. Node fails closed if unreadable. |
@@ -237,51 +237,86 @@ concurrency semaphore bounds *simultaneous* jobs, not *successive* ones, so a co
 defeats it on an unfair mutex. Bead btc-policy-9zs moved all three memory-hard passes (~600 ms) out
 of the contended section, which shortens each individual hold and does nothing more to bound lock
 acquisition. The CONSEQUENCES are bounded by the signer/partial coupling + release-gate (ADR-0012
-invariant vii) plus expiry-bounded arming: a merely DELAYED node is still frozen, still releases no
-hot partial, and its carriers still expire — so the outcome is denial, not theft. A reviewer should
+invariant vii): a merely DELAYED node is still frozen and still releases no hot partial — so the outcome
+is denial, not theft. Signed expiry bounds new holder/arm decisions, while a Carrier's monotonic deadline
+only bounds pre-terminal state retention and retry recovery. A reviewer should
 read "unconditional Lockdown at T" everywhere it appears as a statement about the decision, never
 about its latency.
 
-The same unbounded concurrency has one further cost the bead added, stated here rather than left in
-a code comment. A peer receipt for a nonce whose handler has not yet RULED — during the out-of-lock
-PIN window, then chain preflight and registration until staging — gets `RATE_LIMITED` with a fixed
-1 s retry; answering `ACCEPTED` would silently lose a holder receipt. Those spans end when that
-handler exits, including on panic. Separately, a completed STAGED memo for the same authenticated
-generation gets the same 1 Hz retry if the receiver's raw clock sample says it is expired: it can
-become confirmable after correction, so its ceiling is clock correction or the sender's signed
-deadline rather than any handler's lifetime. Read that as an UPPER bound on the pressure, not as a
-recovery claim: on today's code a sustained excursion is cut far shorter, by two receiver-side
-mechanisms that both LOSE the receipt rather than deliver it. The node's own 1 Hz fire sweep prunes
-at the same raw wall clock (`fire_tick` -> `prune_store` -> `prune_intents`, which shelters only
-`owner_ruling` state), so a ruled staged intent and its memo are gone within about one tick and the
-next retry reads `Vacant` and stops on a terminal `ACCEPTED`; and an excursion past the 300 s
-envelope past-tolerance refuses the receipt `STALE_TIMESTAMP`, which the sender's `retry_loop`
-treats as permanent. That loss is the residual btc-policy-q6v did NOT close, tracked as bead
-btc-policy-sxt. A completed NON-STAGING refusal is final and gets one
-terminal `ACCEPTED`, even under that forward sample. Both retry shapes remain subject to the
-existing per-peer envelope quota. Both Argon2 consumers share one node-wide work
-slot, so that window stretches with the number of concurrent `/sign` handlers, and the retries a
-flood induces therefore grow roughly with the SQUARE of that number. What binds that traffic first
-is NOT `max_concurrent_channel_requests` but the PER-PEER ENVELOPE QUOTA: `check_and_consume`
-charges `per_peer_quota_per_min` (default 600 per 60s) BEFORE it dispatches on `msg_type`, so about
-ten concurrently unruled nonces at 1 Hz exhaust one peer's whole budget, and that peer's next
-envelope — an honest `partial` included — is answered RATE_LIMITED with `oldest + 60 - now` rather
-than the fixed 1s. Partial delivery is idempotent and the channel nonce is deliberately reusable
-after a quota refusal, so this DELAYS a combine input by up to a window rather than losing it. Each retry is a pre-Argon2 replay
-refusal costing microseconds — but state where it is paid: a relayed Spend runs the full `/sign`
-ingress before the memo lookup, so reaching that `NONCE_REPLAYED` means TAKING `sign_state`. Those
-`C² × peers` retries are therefore `C² × peers` further *successive* acquisitions of the very lock
-this residual is about, and pre-9zs the receipt took one `ACCEPTED` and stopped. It is still not a
-new capability — a hostile coordinator can already mint unbounded `/sign` requests directly, and
-all these retries come from HONEST senders and stop at handler exit, clock correction, or `commitment_expiry` — so it is additional
-contention under R11's existing unbounded-acquisition residual, bounded only by the same missing
-`/sign` admission control (bead btc-policy-1y2), not independently.
+The same unbounded concurrency has one further cost, stated here rather than left in a code comment.
+A peer receipt for a nonce whose handler has not yet ruled — during the out-of-lock PIN window,
+chain preflight, and registration before staging — gets fixed one-second `RATE_LIMITED`; answering
+`ACCEPTED` would silently lose holder evidence. That span ends when the owner exits, including on
+panic. Once staged, the retry horizon is no longer a later raw/effective clock reading: coordinator
+nonce acceptance computes `D = accepted_monotonic + (signed_expiry - accepted_effective_wall)`
+from the production-fixed, test-pinnable `channel::HotClock` and retains it on the accepted Spend
+nonce tombstone until it lapses. There is no later pin-release transaction.
+Signed expiry `E` remains new-holder authority: every at/past-`E` attempt to add a holder is refused
+and cannot count, commit, or arm; a fresh duplicate/completed confirmation is an idempotent no-op.
+`D` governs retention only. Post-acceptance wall excursions cannot delete, replace,
+or extend the Carrier while `mono_now < D`. A completed non-staging refusal is terminal once its
+owner exits; it does not retry for the whole signed lifetime merely because its horizon remains live.
 
-Moving that work also lets multiple `/sign` handlers queue directly on the shared Argon2 slot.
-While any one of them owns it, `/channel`'s conflicting-signature receipt path deliberately sheds
-instead of queueing, so a burst can widen the interval in which those honest receipts receive
-`RATE_LIMITED`. They remain retryable and expiry-bounded; this is added censorship pressure under
-the same admission-control residual, not a correctness or PIN-observability exception.
+Outer `/channel` freshness has one deliberately narrow exception to its normal terminal
+`STALE_TIMESTAMP`: after peer authentication and quota charging, an exact resident Spend receipt
+may be bounded-zeroizing-decoded and coordinator-signature-verified solely to decide whether it is
+still actionable. A brief `sign_state → store` decision closes the acceptance-to-Carrier-claim gap;
+alternate-signature KDF work occurs outside both locks and is revalidated after reacquisition.
+The decision returns fixed 30-second `RATE_LIMITED` only for
+an active/ruling or staged, uncommitted Carrier with matching nonce+expiry, a live monotonic horizon,
+and a sender not already counted. Every stale case still records the same freshness diagnostic and
+consumes no envelope nonce; terminal/nonmatching/malformed/unknown/other-message cases remain
+`STALE_TIMESTAMP`. Diagnostic publication follows the `(peer, ingress freshness high-water)` rule:
+lower observations drop, equal observations update a retained sequence in place without resurrection,
+and only a higher high-water appends. The exception performs no ordinary `/sign`, PIN,
+nonce/capacity allocation, holder, gate, commit, arm, candidate, eviction, lifetime, or outbox work.
+After those guards it may use q6v's single nonblocking Carrier-KDF attempt to resolve one previously
+unseen valid coordinator signature; the exact verified tag remains KDF-free. Receiver wall correction does not lower
+the channel freshness high-water: the sender can recover only if elapsed real time brings fresh
+envelopes back inside the 300-second past window before its signed deadline and `D`. A larger
+excursion can blackhole authenticated channel traffic for unbounded real time. `E`, `D`, capacity,
+the Hot budget, and Recovery bound retained state and loss consequences, not outage duration; the
+broader repair is tracked as `btc-policy-r1g`.
+A wall clock already wrong at Carrier acceptance remains the separate time-authority residual.
+
+Strict-DER/low-S coordinator signatures are not unique. Exact verified tags take a KDF-free fast
+path; another valid signature gets at most one nonblocking Carrier-KDF attempt per authenticated
+sender and resident generation. Busy leaves the sender claim unused and retries; equality records
+only the safe signature tag; mismatch spends that allowance and a third unfamiliar signature is
+terminal. Exact expiry, live horizon, uncommitted state and sender-not-held are checked before work,
+and alternate resolution allocates no capacity or lifetime. No fast digest or retained body may
+turn later process-memory capture into cheap PIN guessing.
+
+Both retry shapes remain subject to the existing per-peer envelope quota. `check_and_consume`
+charges `per_peer_quota_per_min` (default 600 per 60s) before the receipt exception. Short
+owner-in-flight/KDF-busy retries remain one second, but a long-lived clock refusal is fixed at
+30 seconds, limiting one Carrier to roughly two attempts/minute. Partial delivery remains idempotent
+and the quota-refused channel nonce reusable, but the rolling quota has no fairness or partial
+priority: enough simultaneous Carriers can still consume newly freed entries until their owners or
+signed/monotonic bounds end, so no one-window delivery bound is claimed. Fresh
+relayed Spend retries still enter ordinary `/sign` before memo lookup and therefore still take
+`sign_state`; with `C` concurrent owners their retry pressure can grow roughly `C² × peers`, adding
+successive acquisitions of the same unfair lock. The authenticated outer-Stale receipt-only
+exception takes `sign_state` only for brief identity/eligibility decisions, never for KDF work, and
+does not cure the fresh-path pressure. This remains
+contention under R11 and btc-policy-1y2, not a new capability: the hostile coordinator can already
+mint successive authenticated `/sign` requests directly.
+
+Resident Carrier state shares the existing `MAX_COORD_NONCES` admission ceiling: every accepted
+channel-mode Spend nonce records `D`; non-channel Spend remains wall-only. An active or confirmation-pending Carrier owns a matching memo, while an
+early/completed Carrier retirement may leave a nonce-only tombstone. Exact retries and alternate
+signatures add no slot, and replay/capacity predicates keep a Spend nonce resident while either
+signed wall expiry or `D` lives, so a different body cannot overlap it. At capacity a newcomer
+consumes/relays/derives/evicts nothing. This is a state bound, not general
+`/sign` task admission or mutex fairness; a hostile coordinator can continue submitting successors
+as ordinary nonce pruning frees slots. Carrier intent+memo retire atomically under the store lock on
+a non-staged terminal owner exit, the fully completed pin-uniform holder decision, the fixed
+monotonic horizon after owner release, or reboot. The store-locked prune pass may execute horizon
+retirement wherever it is driven—from the fire tick, `/sign`, or `/refresh`—using `HotClock`
+monotonic time; the caller's raw/effective wall value has no Carrier-retirement authority. No
+cross-lock pin release exists. The NonceLog replay/fan-out tombstone keeps immutable `D` and is
+removed only when ordinary pruning observes both signed wall expiry and `D` ended.
+Candidate/fire-window expiry remains independent.
 
 ## 8. What a reviewer should attack first
 
