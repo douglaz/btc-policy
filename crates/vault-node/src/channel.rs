@@ -5151,6 +5151,12 @@ impl ChannelState {
 
     // -- ingress -----------------------------------------------------------
 
+    /// Publish one freshness-reject diagnostic for `sender`. `now` is the ingress
+    /// guard's MONOTONIC freshness high-water — the value `check_and_consume`
+    /// decided staleness against and returned in `Stale` — so it both dates the
+    /// skew and KEYS publication ([`AlertQueue::record_freshness`]): repeated
+    /// rejects under one latched high-water coalesce into the retained entry
+    /// instead of re-appending and evicting unrelated watchtower evidence.
     fn record_freshness_reject(&self, sender: u16, ts: u64, now: u64) {
         let count = {
             let mut m = self
@@ -5166,12 +5172,15 @@ impl ChannelState {
         self.alerts
             .lock()
             .expect("alerts lock poisoned")
-            .record_freshness(FreshnessEvent {
-                kind: FreshnessKind::ChannelFreshnessReject,
-                peer_node_id: sender,
-                reject_count: count,
-                skew_secs,
-            });
+            .record_freshness(
+                FreshnessEvent {
+                    kind: FreshnessKind::ChannelFreshnessReject,
+                    peer_node_id: sender,
+                    reject_count: count,
+                    skew_secs,
+                },
+                now,
+            );
     }
 
     /// Process one raw channel body. `now_input` is unix seconds (the server
@@ -8969,6 +8978,61 @@ mod startup_and_schema {
                 "peer 0 reject count"
             );
         }
+    }
+
+    #[test]
+    fn repeated_rejects_under_one_ingress_high_water_publish_one_diagnostic() {
+        use crate::watchtower::FreshnessEvent;
+        let fx = Fixture::new(2, 3);
+        let send = fx.channel_state(0);
+        let node = crate::test_support::load_node(&fx.config(1, 0, "")).expect("config");
+        let recv = node.channel.as_ref().expect("channel");
+        let psbt = fx.spend_psbt(&fx.hot_spk, 7);
+        let payload = fx.partial_payload(&psbt, "c", 0, 0).to_bytes();
+        let stale = |now: u64| {
+            let env = send
+                .build_envelope("partial", 1, &payload, NOW - 400)
+                .expect("env");
+            assert_eq!(
+                recv.ingest_reply(&serde_json::to_vec(&env).expect("json"), now),
+                ChannelReply::Rejected(RejectReason::StaleTimestamp)
+            );
+        };
+
+        // Three rejects under ONE latched ingress high-water: one entry at one
+        // sequence, its running count updated in place.
+        stale(NOW);
+        let cursor = node.events(0).1;
+        stale(NOW);
+        stale(NOW);
+        let (events, after) = node.events(0);
+        assert_eq!(after, cursor, "no new sequence under a latched high-water");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::ChannelFreshness(FreshnessEvent {
+                    peer_node_id: 0,
+                    reject_count: 3,
+                    ..
+                })]
+            ),
+            "got {events:?}"
+        );
+
+        // The guard's high-water advancing is what lets the diagnostic re-enter.
+        stale(NOW + 10);
+        let (events, moved) = node.events(0);
+        assert_eq!(moved, cursor + 1, "a higher high-water appends once");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::ChannelFreshness(FreshnessEvent {
+                    reject_count: 4,
+                    ..
+                })]
+            ),
+            "got {events:?}"
+        );
     }
 
     #[test]
