@@ -397,10 +397,7 @@ impl NonceEntry {
 
 impl NonceLog {
     /// The rollback-guarded lower-bound clock shared by every piece of state whose
-    /// lifetime is coupled to coordinator nonce freshness. Carrier intents must use
-    /// this same value: pruning or confirming them against raw wall time after the
-    /// nonce log has advanced would let a clock rollback revive logically-expired
-    /// confirmation state.
+    /// lifetime is coupled to nonce freshness; Carrier residency instead uses its accepted `D`.
     pub(crate) fn effective_now(&self, now_input: u64) -> u64 {
         self.high_water.max(now_input)
     }
