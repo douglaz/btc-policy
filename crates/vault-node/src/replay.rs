@@ -119,7 +119,16 @@ impl SignState {
         ));
         let mut rows: Vec<String> = entries
             .iter()
-            .map(|(nonce, expiry)| format!("coord_nonce nonce={nonce} expiry={expiry}"))
+            .map(|(nonce, entry)| {
+                // UNMASKED: `carrier_deadline` is fixed from the channel's monotonic
+                // clock, coordinator-signed E, and node-derived effective W, so it is
+                // pin-independent by construction for a request pair.
+                let NonceEntry {
+                    expiry,
+                    carrier_deadline,
+                } = entry;
+                format!("coord_nonce nonce={nonce} expiry={expiry} deadline={carrier_deadline:?}")
+            })
             .collect();
         rows.sort();
         lines.extend(rows);
@@ -338,6 +347,10 @@ pub(crate) enum NonceDecision {
 /// rollback protection cannot widen the required `now + max_age` acceptance
 /// horizon.
 ///
+/// A channel-mode Spend adds its acceptance-fixed Carrier deadline `D` (see
+/// [`NonceEntry`]). `D = M + (E − W)` is at most one commitment age of process uptime,
+/// and the entry cap still bounds the count.
+///
 /// `high_water` advances ONLY through expiries pruned by a request accepted by the
 /// complete freshness gate. Both halves of that rule matter:
 ///
@@ -351,11 +364,35 @@ pub(crate) enum NonceDecision {
 ///   close. So the two move together, or not at all.
 #[derive(Default)]
 pub(crate) struct NonceLog {
-    /// `nonce -> expiry` (unix seconds); the prune horizon, exactly as the other
-    /// two logs use it.
-    entries: HashMap<String, u64>,
+    /// `nonce -> entry`; the wall expiry is the prune horizon, exactly as the other
+    /// two logs use it, plus the monotonic half a channel-mode Spend adds.
+    entries: HashMap<String, NonceEntry>,
     /// Highest expiry of a coordinator nonce removed from `entries`.
     high_water: u64,
+}
+
+/// One coordinator nonce and the clocks that retain it.
+struct NonceEntry {
+    /// The coordinator-signed expiry (unix seconds).
+    expiry: u64,
+    /// A channel-mode Spend's `D` in `HotClock` seconds; `None` for absent-channel
+    /// Spend and Refresh. Inserted whole at acceptance, never recomputed or extended.
+    carrier_deadline: Option<u64>,
+}
+
+impl NonceEntry {
+    /// Resident while wall expiry OR Carrier deadline lives, so a different body cannot
+    /// replace a live Carrier. A channel Refresh supplies `mono_now` to judge existing
+    /// Spends but remains wall-only itself. Without a sample a deadline-bearing entry is
+    /// live, fail-closed; that arm is defensive because `Node::channel` is construction-fixed.
+    fn is_live(&self, effective_now: u64, mono_now: Option<u64>) -> bool {
+        self.expiry > effective_now
+            || match (self.carrier_deadline, mono_now) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(deadline), Some(mono)) => mono < deadline,
+            }
+    }
 }
 
 impl NonceLog {
@@ -368,15 +405,27 @@ impl NonceLog {
         self.high_water.max(now_input)
     }
 
+    /// The accepted channel-mode Spend deadline for `nonce`. Read back under the SAME
+    /// `sign_state` hold, so it is the atomic transition's value, not a re-derivation.
+    pub(crate) fn carrier_deadline(&self, nonce: &str) -> Option<u64> {
+        self.entries.get(nonce)?.carrier_deadline
+    }
+
     /// Apply the complete post-auth freshness decision atomically. The caller
     /// invokes this only after `coord_sig` verifies, so forged traffic cannot
     /// advance the high-water mark or consume capacity.
+    ///
+    /// `mono_now` evaluates existing deadlines; `record_carrier_deadline` allocates
+    /// `D = M + (E − W)` from this decision's effective `W` only for channel-mode Spend.
+    /// Absent-channel Spend and every Refresh record wall-only entries.
     pub(crate) fn check_and_record(
         &mut self,
         nonce: &str,
         expiry: u64,
         now_input: u64,
         max_age: u64,
+        mono_now: Option<u64>,
+        record_carrier_deadline: bool,
     ) -> NonceDecision {
         // Never let the freshness lower bound read further back than an accepted
         // request has already established; a rollback cannot revive a pruned nonce.
@@ -400,33 +449,48 @@ impl NonceLog {
         if self
             .entries
             .get(nonce)
-            .is_some_and(|seen_expiry| *seen_expiry > effective_now)
+            .is_some_and(|entry| entry.is_live(effective_now, mono_now))
         {
             return NonceDecision::Replayed;
         }
         let live_entries = self
             .entries
             .values()
-            .filter(|seen_expiry| **seen_expiry > effective_now)
+            .filter(|entry| entry.is_live(effective_now, mono_now))
             .count();
         if live_entries >= MAX_COORD_NONCES {
             return NonceDecision::AtCapacity;
         }
+        // Derive from this decision's `effective_now` before mutation. The remainder
+        // cannot underflow; an unrepresentable sum fails CLOSED with the log untouched,
+        // rather than saturating and pinning the key forever.
+        let carrier_deadline = match mono_now.filter(|_| record_carrier_deadline) {
+            None => None,
+            Some(mono) => match mono.checked_add(expiry - effective_now) {
+                Some(deadline) => Some(deadline),
+                None => return NonceDecision::OutsideWindow { now: effective_now },
+            },
+        };
 
-        // Accepted: prune under effective time and advance the mark through every
-        // expiry actually forgotten (see the type docstring). Copying
-        // `effective_now` would latch a transiently bogus raw clock even when no
-        // nonce with that expiry was removed.
+        // Accepted: prune under BOTH clocks and advance through expiries actually
+        // forgotten. Copying `effective_now`, or an expiry retained by its monotonic
+        // half, would ratchet a mark for state that was never removed.
         let mut pruned_through = self.high_water;
-        self.entries.retain(|_, seen_expiry| {
-            let keep = *seen_expiry > effective_now;
+        self.entries.retain(|_, entry| {
+            let keep = entry.is_live(effective_now, mono_now);
             if !keep {
-                pruned_through = pruned_through.max(*seen_expiry);
+                pruned_through = pruned_through.max(entry.expiry);
             }
             keep
         });
         self.high_water = pruned_through;
-        self.entries.insert(nonce.to_owned(), expiry);
+        self.entries.insert(
+            nonce.to_owned(),
+            NonceEntry {
+                expiry,
+                carrier_deadline,
+            },
+        );
         NonceDecision::Accepted
     }
 }
@@ -487,17 +551,17 @@ mod tests {
     fn nonce_log_records_rejects_replays_and_expires() {
         let mut log = NonceLog::default();
         assert_eq!(
-            log.check_and_record("n1", 1_000, 500, 1_000),
+            log.check_and_record("n1", 1_000, 500, 1_000, None, false),
             NonceDecision::Accepted
         );
         assert_eq!(
-            log.check_and_record("n1", 1_000, 600, 1_000),
+            log.check_and_record("n1", 1_000, 600, 1_000, None, false),
             NonceDecision::Replayed
         );
         // At expiry the old entry prunes. Reusing the string under a new signed
         // request with a later expiry is fresh; expiry is exclusive.
         assert_eq!(
-            log.check_and_record("n1", 2_000, 1_000, 1_000),
+            log.check_and_record("n1", 2_000, 1_000, 1_000, None, false),
             NonceDecision::Accepted
         );
         assert_eq!(log.entries.len(), 1);
@@ -507,18 +571,18 @@ mod tests {
     fn nonce_log_time_never_regresses_after_pruning() {
         let mut log = NonceLog::default();
         assert_eq!(
-            log.check_and_record("old", 1_000, 500, 1_000),
+            log.check_and_record("old", 1_000, 500, 1_000, None, false),
             NonceDecision::Accepted
         );
         // Authenticated time reaches the old request's expiry and prunes it.
         assert_eq!(
-            log.check_and_record("new", 2_000, 1_000, 1_000),
+            log.check_and_record("new", 2_000, 1_000, 1_000, None, false),
             NonceDecision::Accepted
         );
         // A backwards wall-clock step cannot reopen the old signed request even
         // though its nonce is no longer retained.
         assert_eq!(
-            log.check_and_record("old", 1_000, 600, 1_000),
+            log.check_and_record("old", 1_000, 600, 1_000, None, false),
             NonceDecision::OutsideWindow { now: 1_000 }
         );
     }
@@ -527,14 +591,14 @@ mod tests {
     fn a_rejected_request_never_ratchets_time_forward() {
         let mut log = NonceLog::default();
         assert_eq!(
-            log.check_and_record("n1", 1_500, 1_000, 1_000),
+            log.check_and_record("n1", 1_500, 1_000, 1_000, None, false),
             NonceDecision::Accepted
         );
 
         // The host clock steps far forward (NTP correction, VM restore). Requests
         // timed against the TRUE clock now read as expired and are refused...
         assert_eq!(
-            log.check_and_record("n2", 1_600, 9_000_000, 1_000),
+            log.check_and_record("n2", 1_600, 9_000_000, 1_000, None, false),
             NonceDecision::OutsideWindow { now: 9_000_000 }
         );
         // ...but refusing them must not record the bogus time. Once the clock is
@@ -542,18 +606,18 @@ mod tests {
         // honestly-timed request until wall time caught up, and docs/adr/0007
         // forbids restarting out of it.
         assert_eq!(
-            log.check_and_record("n2", 1_600, 1_100, 1_000),
+            log.check_and_record("n2", 1_600, 1_100, 1_000, None, false),
             NonceDecision::Accepted
         );
 
         // Advancing far enough to expire n1 prunes it and records exactly the
         // forgotten expiry, so a backwards step cannot reopen that request.
         assert_eq!(
-            log.check_and_record("advance", 2_000, 1_500, 1_000),
+            log.check_and_record("advance", 2_000, 1_500, 1_000, None, false),
             NonceDecision::Accepted
         );
         assert_eq!(
-            log.check_and_record("n3", 1_450, 500, 1_000),
+            log.check_and_record("n3", 1_450, 500, 1_000, None, false),
             NonceDecision::OutsideWindow { now: 1_500 }
         );
     }
@@ -562,14 +626,14 @@ mod tests {
     fn an_accepted_request_during_a_forward_clock_step_does_not_latch_raw_time() {
         let mut log = NonceLog::default();
         assert_eq!(
-            log.check_and_record("old", 1_500, 1_000, 1_000),
+            log.check_and_record("old", 1_500, 1_000, 1_000, None, false),
             NonceDecision::Accepted
         );
 
         // The node and coordinator briefly share the same bogus future clock, so
         // the request is valid against both sides of the window and is accepted.
         assert_eq!(
-            log.check_and_record("excursion", 9_000_500, 9_000_000, 1_000),
+            log.check_and_record("excursion", 9_000_500, 9_000_000, 1_000, None, false),
             NonceDecision::Accepted
         );
         // Only the old nonce's forgotten expiry is needed for rollback safety;
@@ -578,7 +642,7 @@ mod tests {
 
         // Once the clock corrects, an honestly timed request remains admissible.
         assert_eq!(
-            log.check_and_record("fresh", 1_600, 1_100, 1_000),
+            log.check_and_record("fresh", 1_600, 1_100, 1_000, None, false),
             NonceDecision::Accepted
         );
     }
@@ -587,11 +651,11 @@ mod tests {
     fn a_replay_during_a_forward_clock_step_does_not_ratchet_time() {
         let mut log = NonceLog::default();
         assert_eq!(
-            log.check_and_record("old", 1_200, 500, 1_000),
+            log.check_and_record("old", 1_200, 500, 1_000, None, false),
             NonceDecision::Accepted
         );
         assert_eq!(
-            log.check_and_record("seen", 2_000, 1_000, 1_000),
+            log.check_and_record("seen", 2_000, 1_000, 1_000, None, false),
             NonceDecision::Accepted
         );
         assert_eq!(log.entries.len(), 2);
@@ -600,7 +664,7 @@ mod tests {
         // a replay, and refusing it must neither latch the transient clock reading
         // nor prune an entry that is still live once the clock corrects.
         assert_eq!(
-            log.check_and_record("seen", 2_000, 1_500, 1_000),
+            log.check_and_record("seen", 2_000, 1_500, 1_000, None, false),
             NonceDecision::Replayed
         );
         assert_eq!(log.high_water, 0);
@@ -609,11 +673,11 @@ mod tests {
         // Once the clock corrects, the old nonce is still a replay and an
         // honestly-timed fresh request remains admissible.
         assert_eq!(
-            log.check_and_record("old", 1_200, 1_100, 1_000),
+            log.check_and_record("old", 1_200, 1_100, 1_000, None, false),
             NonceDecision::Replayed
         );
         assert_eq!(
-            log.check_and_record("fresh", 1_400, 1_100, 1_000),
+            log.check_and_record("fresh", 1_400, 1_100, 1_000, None, false),
             NonceDecision::Accepted
         );
     }
@@ -622,18 +686,18 @@ mod tests {
     fn future_expiry_cap_uses_the_raw_node_clock_after_rollback() {
         let mut log = NonceLog::default();
         assert_eq!(
-            log.check_and_record("old", 1_000, 500, 1_000),
+            log.check_and_record("old", 1_000, 500, 1_000, None, false),
             NonceDecision::Accepted
         );
         assert_eq!(
-            log.check_and_record("first", 1_500, 1_000, 1_000),
+            log.check_and_record("first", 1_500, 1_000, 1_000, None, false),
             NonceDecision::Accepted
         );
 
         // After a backwards clock step the high-water remains the stale lower
         // bound, but it must not widen the upper bound beyond raw now + max_age.
         assert_eq!(
-            log.check_and_record("too-far", 1_700, 600, 1_000),
+            log.check_and_record("too-far", 1_700, 600, 1_000, None, false),
             NonceDecision::OutsideWindow { now: 600 }
         );
         assert_eq!(log.high_water, 1_000);
@@ -643,31 +707,200 @@ mod tests {
     fn nonce_log_bounds_key_size_and_entry_count() {
         let mut log = NonceLog::default();
         assert_eq!(
-            log.check_and_record("", 2_000, 1_000, 1_000),
+            log.check_and_record("", 2_000, 1_000, 1_000, None, false),
             NonceDecision::InvalidLength
         );
         assert_eq!(
-            log.check_and_record(&"x".repeat(MAX_COORD_NONCE_BYTES), 2_000, 1_000, 1_000),
+            log.check_and_record(
+                &"x".repeat(MAX_COORD_NONCE_BYTES),
+                2_000,
+                1_000,
+                1_000,
+                None,
+                false
+            ),
             NonceDecision::Accepted
         );
         assert_eq!(
-            log.check_and_record(&"x".repeat(MAX_COORD_NONCE_BYTES + 1), 2_000, 1_000, 1_000),
+            log.check_and_record(
+                &"x".repeat(MAX_COORD_NONCE_BYTES + 1),
+                2_000,
+                1_000,
+                1_000,
+                None,
+                false
+            ),
             NonceDecision::InvalidLength
         );
         for i in 1..MAX_COORD_NONCES {
             assert_eq!(
-                log.check_and_record(&format!("n{i}"), 2_000, 1_000, 1_000),
+                log.check_and_record(&format!("n{i}"), 2_000, 1_000, 1_000, None, false),
                 NonceDecision::Accepted
             );
         }
         // Even an in-window request observed during a forward clock step must not
         // ratchet the mark when capacity makes the request a refusal.
         assert_eq!(
-            log.check_and_record("one-too-many", 2_000, 1_500, 1_000),
+            log.check_and_record("one-too-many", 2_000, 1_500, 1_000, None, false),
             NonceDecision::AtCapacity
         );
         assert_eq!(log.high_water, 0);
         assert_eq!(log.entries.len(), MAX_COORD_NONCES);
+    }
+
+    /// `D = M + (E − W)`, and `W` is the decision's own `effective_now`. Deriving it
+    /// from the RAW clock instead would hand a backwards clock step a longer deadline
+    /// than the request was admitted under — the request is measured against the
+    /// rollback-guarded bound, so its carrier must be too.
+    #[test]
+    fn a_carrier_deadline_is_fixed_from_effective_not_raw_wall_time() {
+        const MONO: u64 = 42;
+        let mut log = NonceLog::default();
+        assert_eq!(
+            log.check_and_record("old", 1_000, 500, 1_000, None, false),
+            NonceDecision::Accepted
+        );
+        assert_eq!(
+            log.check_and_record("advance", 2_000, 1_000, 1_000, None, false),
+            NonceDecision::Accepted
+        );
+        assert_eq!(log.high_water, 1_000);
+
+        // Raw wall time has rolled back to 600; the effective bound is still 1_000.
+        assert_eq!(
+            log.check_and_record("spend", 1_500, 600, 1_000, Some(MONO), true),
+            NonceDecision::Accepted
+        );
+        assert_eq!(
+            log.carrier_deadline("spend"),
+            Some(MONO + 500),
+            "the remainder is measured from the rollback-guarded bound (1_500 − 1_000), \
+             not from the rolled-back raw clock (1_500 − 600)"
+        );
+        assert_eq!(
+            log.check_and_record("later", 2_000, 1_600, 1_000, Some(MONO + 499), true),
+            NonceDecision::Accepted
+        );
+        assert_eq!(log.high_water, 1_000);
+        assert!(log.entries.contains_key("spend"));
+    }
+
+    /// The full liveness matrix for one channel-mode entry: wall-live/monotonic-dead,
+    /// wall-dead/monotonic-live, and the `< D` / `== D` / `> D` boundary. The key is
+    /// occupied while EITHER clock holds it and is released — replaced in place, never
+    /// duplicated — the moment both have ended.
+    #[test]
+    fn a_channel_mode_nonce_is_occupied_until_both_clocks_end_it() {
+        const MONO: u64 = 7;
+        const DEADLINE: u64 = MONO + 500;
+        let mut log = NonceLog::default();
+        assert_eq!(
+            log.check_and_record("n", 1_000, 500, 1_000, Some(MONO), true),
+            NonceDecision::Accepted
+        );
+
+        // Wall-live, monotonic long dead: the wall half alone still holds the key.
+        assert_eq!(
+            log.check_and_record("n", 1_200, 900, 1_000, Some(DEADLINE + 1), true),
+            NonceDecision::Replayed
+        );
+        // Wall-dead, monotonic live (`< D`): the monotonic half alone still holds it.
+        assert_eq!(
+            log.check_and_record("n", 1_600, 1_000, 1_000, Some(DEADLINE - 1), true),
+            NonceDecision::Replayed
+        );
+        // The same entry with NO sample at all: `is_live`'s defensive arm, unreachable while
+        // `Node::channel` is fixed at construction, must still refuse to free the key.
+        assert!(log.entries["n"].is_live(1_000, None));
+        assert_eq!(
+            log.high_water, 0,
+            "neither refusal forgot or ratcheted anything"
+        );
+
+        // Exactly `D`: the first second both clocks call it dead. The entry is REPLACED
+        // by the new body, and the mark ratchets through the expiry actually removed.
+        assert_eq!(
+            log.check_and_record("n", 1_600, 1_000, 1_000, Some(DEADLINE), true),
+            NonceDecision::Accepted
+        );
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries["n"].expiry, 1_600);
+        assert_eq!(log.high_water, 1_000);
+
+        // `> D` is the same verdict as `== D`; the boundary is closed on one side only.
+        assert_eq!(
+            log.check_and_record("n", 2_400, 1_800, 2_000, Some(DEADLINE + 600 + 50), true),
+            NonceDecision::Accepted
+        );
+        assert_eq!(log.entries["n"].expiry, 2_400);
+    }
+
+    /// Capacity counts monotonic liveness too, and the refusal stays non-mutating: a
+    /// log full of wall-expired entries whose deadlines are still live refuses the next
+    /// request without consuming its nonce, pruning anything, or ratcheting the mark.
+    /// (The channel-side half — that such a refusal derives no carrier and relays
+    /// nothing — is `an_at_capacity_channel_request_skips_carrier_derivation`; the
+    /// refusal path it exercises is this one.)
+    #[test]
+    fn capacity_counts_monotonically_live_entries_and_refuses_without_mutating() {
+        const MONO: u64 = 10;
+        const DEADLINE: u64 = MONO + 500;
+        let mut log = NonceLog::default();
+        for i in 0..MAX_COORD_NONCES {
+            assert_eq!(
+                log.check_and_record(&format!("n{i}"), 1_000, 500, 1_000, Some(MONO), true),
+                NonceDecision::Accepted
+            );
+        }
+        assert_eq!(
+            log.check_and_record(
+                "one-too-many",
+                2_000,
+                1_100,
+                1_000,
+                Some(DEADLINE - 1),
+                true
+            ),
+            NonceDecision::AtCapacity
+        );
+        assert_eq!(log.entries.len(), MAX_COORD_NONCES);
+        assert_eq!(log.high_water, 0);
+        assert_eq!(log.carrier_deadline("one-too-many"), None);
+
+        // Once the deadlines pass, the same request is admitted and every forgotten
+        // expiry lands on the mark.
+        assert_eq!(
+            log.check_and_record("one-too-many", 2_000, 1_100, 1_000, Some(DEADLINE), true),
+            NonceDecision::Accepted
+        );
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.high_water, 1_000);
+    }
+
+    /// An unrepresentable deadline is a refusal, not a saturated deadline that would
+    /// pin the key forever, and it happens BEFORE anything mutates: the entry that this
+    /// request would have pruned is still there afterwards.
+    #[test]
+    fn an_unrepresentable_carrier_deadline_refuses_without_mutating() {
+        let mut log = NonceLog::default();
+        assert_eq!(
+            log.check_and_record("old", 600, 500, 1_000, None, false),
+            NonceDecision::Accepted
+        );
+        assert_eq!(
+            log.check_and_record("overflow", 1_600, 700, 1_000, Some(u64::MAX), true),
+            NonceDecision::OutsideWindow { now: 700 }
+        );
+        assert!(log.entries.contains_key("old"));
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.high_water, 0);
+
+        // The same request under a representable monotonic reading is admitted.
+        assert_eq!(
+            log.check_and_record("overflow", 1_600, 700, 1_000, Some(u64::MAX - 900), true),
+            NonceDecision::Accepted
+        );
+        assert_eq!(log.carrier_deadline("overflow"), Some(u64::MAX));
     }
 
     #[test]

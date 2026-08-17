@@ -1380,7 +1380,8 @@ enum MemoOutcome {
 /// keyed by nonce alone. [`replay::NonceLog::check_and_record`] tests EXPIRY BEFORE
 /// REPLAY (`replay.rs`), so once a request's own expiry has passed, a differently-signed
 /// body carrying a fresh expiry under the SAME nonce is Accepted and enters its own
-/// out-of-lock window while the first handler is still running.
+/// out-of-lock window while the first handler is still running. On a CHANNEL node the
+/// entry's monotonic Carrier deadline must have ended too, or the newer body is Replayed.
 ///
 /// The token is `(nonce, signature_tag, expiry)`: the nonce is the map key, and both
 /// remaining fields live here. A handler may only remove or upgrade a memo whose
@@ -1408,10 +1409,9 @@ pub(crate) enum MemoUpgrade {
     /// nonce, since `check_and_record` tests expiry before replay). The stale handler
     /// neither reinserted nor deleted the memo.
     Superseded,
-    /// ABSENT: a later accepted nonce pruned the claim mid-window after advancing the
-    /// nonce log's rollback high-water through this generation's expiry. The memo was
-    /// re-installed directly as `Derived` under this request's generation; the caller's
-    /// COMMIT-HOLD effective-clock check then stages and refuses the expired generation.
+    /// ABSENT: a later accepted nonce pruned the claim mid-window. Re-install it as
+    /// `Derived`; only a forgotten nonce advanced high-water enough to force COMMIT-HOLD's
+    /// expiry refusal. btc-policy-0hv closes the retained-deadline residual.
     Reinstalled,
 }
 
@@ -2487,8 +2487,10 @@ impl PartialStore {
     }
 
     /// Prune after `NonceLog::check_and_record` accepted a new request under the same
-    /// effective `now`. That acceptance atomically forgot every expired nonce and
-    /// advanced its rollback high-water through the removed expiries, so an old handler
+    /// effective `now`. That acceptance FORGOT every expired nonce except one still inside
+    /// a channel-mode Carrier deadline (btc-policy-o5g), which it RETAINED without moving
+    /// the mark — while this prune still evicts that entry's intent and memo on wall time,
+    /// the residual btc-policy-0hv closes. Only a FORGOTTEN nonce's own old handler
     /// cannot later revive after a clock correction. This is therefore the one write
     /// site allowed to evict expired state whose owner has not yet ruled — the
     /// `owner_ruling` / `InFlight` exception above deliberately does NOT apply here,
@@ -2906,8 +2908,8 @@ pub struct ChannelState {
     limits: ChannelLimits,
     /// Shared with the node so freshness-reject events surface through `/events`.
     alerts: Arc<Mutex<AlertQueue>>,
-    /// The Hot budget's own clock (ADR-0014 §4). See [`HotClock`] for why this one
-    /// piece of node state must NOT read wall time.
+    /// Shared monotonic clock for the Hot budget and Carrier nonce deadlines.
+    /// See [`HotClock`] for why these duration terms must not read wall time.
     hot_clock: HotClock,
     #[cfg(test)]
     schedule_work: ScheduleWorkCounters,
@@ -2918,15 +2920,13 @@ pub struct ChannelState {
     confirm_commit_midpoint: std::sync::OnceLock<Arc<std::sync::Barrier>>,
 }
 
-/// The clock the **Hot budget**'s rolling window ages against: MONOTONIC elapsed
-/// time since this channel was built, deliberately NOT the wall clock.
+/// The clock the Hot budget and Carrier deadlines' duration terms age against:
+/// MONOTONIC elapsed time since channel construction, never wall time.
 ///
-/// A reservation is the only node state here whose lifetime is a pure local
-/// DURATION. Every other deadline in this file — a commitment's expiry, a fire
-/// window's, a coordinator nonce's freshness — is compared against an
-/// ABSOLUTE instant the coordinator signed, so those must read wall time to mean
-/// anything. The velocity window is compared against nothing external: it only ever
-/// asks "how long ago did this node accept that spend?".
+/// Hot reservations and channel-mode Spend Carrier deadlines include a pure local
+/// duration. Other deadlines—and a Carrier nonce's wall-expiry half—use signed
+/// absolute instants. The velocity window asks elapsed time since acceptance; `D`
+/// records the signed lifetime remaining at the atomic nonce acceptance transition.
 ///
 /// This clock is therefore only HALF of a reservation's lifetime, not all of it.
 /// The candidate a reservation meters dies at one of those absolute wall instants,
@@ -3730,7 +3730,7 @@ impl ChannelState {
             // close. Do not "simplify" it into the mismatched branch.
             //
             // Only a later ACCEPTED ingress may prune an owned claim: that operation
-            // advances the nonce log's rollback high-water through this expiry, so the
+            // advances the mark through the expiry of every nonce it FORGOT, so THAT nonce's
             // caller necessarily reaches its COMMIT-HOLD expiry refusal even if the raw
             // wall clock then steps backward. Passive receipt reads retain `InFlight`
             // and answer RATE_LIMITED; they must never create a Vacant memo that a
@@ -4522,6 +4522,12 @@ impl ChannelState {
         let now = self.hot_clock.now();
         let store = self.store.lock().expect("store lock poisoned");
         store.hot_budget.window_sum(now, wall_now)
+    }
+
+    /// Read monotonic `M` for coordinator-nonce acceptance: `/sign` may fix a Carrier
+    /// deadline, while `/refresh` only evaluates existing ones. Production cannot pin it.
+    pub(crate) fn hot_clock_now(&self) -> u64 {
+        self.hot_clock.now()
     }
 
     /// Pin the Hot budget's monotonic clock to `secs`. Test-only, and the ONLY way
@@ -11296,6 +11302,12 @@ mod duress {
     use vault_proto::{SignRequest, SignResponse};
 
     const NOW: u64 = 1_752_000_000;
+    /// The pinned [`HotClock`] second for every test here that reads the MONOTONIC
+    /// clock, deliberately nowhere near `NOW`: `D = M + (E − W)`, so pinning monotonic
+    /// time to the wall second would let an implementation that fixed `D` from wall time
+    /// produce the identical value and pass. It is also what the clock really returns —
+    /// seconds of process uptime, not a unix timestamp.
+    const MONO_NOW: u64 = 4_200;
     const HOLD: u64 = 3_600;
     /// duress_delay_secs for most tests — well inside the Hold, so `T` lands at the
     /// hostage window `now + DELAY`, not at the Hold-expiry − ε clamp.
@@ -12837,12 +12849,14 @@ mod duress {
     /// row is pin-independent by construction for a [`pin_pair`], unlike the channel
     /// store's pin-derived carrier ids.
     ///
-    /// It also needs no clock pin, unlike [`counted_duress_node`]'s `HotClock`: every
-    /// timestamp it projects — replay and pending expiries, the nonce log's expiries and
-    /// high-water mark, refresh times, the attempt ring — is derived from the `now`
-    /// ARGUMENT the test passes to `handle_sign` or from the request's own expiry, never
-    /// from a wall-clock read. Re-check that when adding a row; a wall clock smuggled
-    /// into this record is the defect that would make it the thing it replaced.
+    /// It needs [`counted_duress_node`]'s `HotClock` pin, and for ONE row only: a
+    /// channel-mode Spend nonce's Carrier deadline `D = M + (E − W)`, whose `M` is a
+    /// MONOTONIC reading counted from that node's construction, so two independently
+    /// built nodes would report different `D`s from scheduling alone — the determinism
+    /// `store_shape`'s `reserved_at` row already demands. Every OTHER timestamp — replay
+    /// and pending expiries, the nonce log's expiries and high-water, refresh times, the
+    /// attempt ring — comes from the `now` ARGUMENT or the request's own expiry, and no
+    /// row may read a WALL clock: the defect that would make this the thing it replaced.
     #[derive(PartialEq, Eq)]
     struct SignStateShape(Vec<String>);
 
@@ -12973,7 +12987,7 @@ mod duress {
         node.channel
             .as_ref()
             .expect("ingress-work tests require channel mode")
-            .pin_hot_clock(NOW);
+            .pin_hot_clock(MONO_NOW);
         (node, calls)
     }
 
@@ -13524,6 +13538,50 @@ mod duress {
             "a locked-out node must perform the identical ingress operations, in the identical \
              order, and the identical memory-hard work, under both pins — the fail-closed arm \
              path a refused duress request still runs included"
+        );
+    }
+
+    /// The accepted channel-mode Carrier deadline `D` is part of the `/sign` handler
+    /// state, so it is part of what the two pin classes must agree on — and it is
+    /// projected UNMASKED, unlike the store's pin-derived carrier ids, because it is
+    /// pin-independent by construction: `M` and effective `W` are node-derived, `E` is
+    /// coordinator-signed, and none of them is reached by the PIN.
+    ///
+    /// The row is asserted CONCRETELY before the equality, and that is the load-bearing
+    /// half: an implementation that never recorded a deadline, or that masked the row
+    /// away, would make the two projections agree for free. And since `MONO_NOW` differs
+    /// from `NOW`, fixing `D` from wall time (`D == EXPIRY`) fails here too.
+    #[test]
+    fn normal_and_duress_sign_state_shapes_carry_the_same_carrier_deadline() {
+        const NONCE: &str = "shape-deadline";
+        const DEADLINE: u64 = MONO_NOW + (EXPIRY - NOW);
+
+        let fx = Fixture::new(3, 5);
+        let (node_n, calls_n) = counted_duress_node(&fx);
+        let (node_d, calls_d) = counted_duress_node(&fx);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let (normal, duress) = pin_pair(&fx, fx.spend_request(&spend, EXPIRY, NONCE), NONCE);
+        let normal_pass = ingress_pass(&node_n, &calls_n, &normal, NOW);
+        let duress_pass = ingress_pass(&node_d, &calls_d, &duress, NOW);
+        assert_the_pins_really_differed(&normal_pass, &duress_pass, "carrier deadline");
+        assert_the_pass_is_worth_comparing(&normal_pass.work, "carrier deadline");
+
+        assert_ne!(
+            DEADLINE, EXPIRY,
+            "the fixture must separate monotonic from wall time, or this case cannot tell \
+             a monotonic deadline from a wall one"
+        );
+        let row = format!("coord_nonce nonce={NONCE} expiry={EXPIRY} deadline=Some({DEADLINE})");
+        assert!(
+            normal_pass.work.sign_state.0.contains(&row),
+            "the accepted channel-mode Spend must retain D = M + (E − W) on its nonce entry, \
+             projected unmasked: {:?}",
+            normal_pass.work.sign_state
+        );
+        assert_eq!(
+            normal_pass.work.sign_state, duress_pass.work.sign_state,
+            "the Carrier deadline is fixed from clocks and coordinator-signed values, so both \
+             pin classes must record the identical /sign-state projection"
         );
     }
 
@@ -14578,8 +14636,8 @@ mod duress {
     }
 
     /// THE GENERATION GATE, all three cases. Two handler generations can share one
-    /// nonce key — `check_and_record` tests EXPIRY BEFORE REPLAY, so past expiry a
-    /// differently-signed body with a fresh expiry is accepted onto the same key while
+    /// nonce key — `check_and_record` tests EXPIRY BEFORE REPLAY, so past expiry (and a
+    /// channel node's Carrier deadline) a differently-signed body takes that key while
     /// the first handler is still in its out-of-lock window. A later accepted ingress
     /// also prunes expired claims after advancing the nonce log's rollback high-water,
     /// so a claim can be absent when its owner reaches the COMMIT HOLD.
@@ -14994,7 +15052,7 @@ mod duress {
     /// through `record_arm_intent` directly.
     ///
     /// Two handler generations legitimately share one nonce key: `check_and_record`
-    /// tests EXPIRY BEFORE REPLAY, so once the first handler's expiry has passed, a
+    /// tests EXPIRY BEFORE REPLAY, so once BOTH expiry and Carrier deadline pass, a
     /// differently-signed body carrying a fresh expiry is accepted onto the same key
     /// while the first is still inside its out-of-lock PIN window. What the stale
     /// handler must then do is specified in four parts, and all four are asserted here:
@@ -15053,6 +15111,13 @@ mod duress {
             (0, 1),
             "the stale handler must hold a claim and no intent yet"
         );
+
+        // Advance the pinned monotonic clock by the same interval wall time moved, which
+        // is what a coherent host clock does. The stale generation's nonce entry holds
+        // its key until its Carrier deadline `MONO_NOW + (STALE_EXPIRY − NOW)` has passed
+        // too, so leaving the pin frozen would make the newer body a REPLAY instead of
+        // the supersession this case exists to test.
+        channel.pin_hot_clock(MONO_NOW + (FRESH_NOW - NOW));
 
         // The newer generation runs to completion on the free lock. It is the ONE
         // rendezvous the barrier serves, so this second `/sign` does not park.
@@ -17033,6 +17098,8 @@ mod duress {
                         EXPIRY,
                         NOW,
                         node.max_commitment_age_secs,
+                        None,
+                        false,
                     ),
                     crate::replay::NonceDecision::Accepted
                 );
@@ -18301,6 +18368,13 @@ mod duress {
     fn a_clock_rollback_cannot_revive_a_logically_expired_carrier() {
         let fx = Fixture::new(3, 5);
         let node = duress_node(&fx, HOLD, "duress_delay_secs = 600");
+        // The carrier's own nonce entry now also holds a monotonic Carrier deadline, so
+        // "logically expired" means BOTH clocks have passed it. Pin the monotonic one so
+        // the accepted deadline is a known constant rather than this process's uptime.
+        node.channel
+            .as_ref()
+            .expect("channel")
+            .pin_hot_clock(MONO_NOW);
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
         let request = duress_request(&fx, &spend, &default_escape(&fx), "rollback-carrier");
         assert!(matches!(
@@ -18320,6 +18394,10 @@ mod duress {
                     EXPIRY + 100,
                     EXPIRY + 1,
                     node.max_commitment_age_secs,
+                    // Monotonic time has reached the carrier's deadline too, so this
+                    // acceptance really does forget its nonce and ratchet the mark.
+                    Some(MONO_NOW + (EXPIRY - NOW)),
+                    true,
                 ),
                 crate::replay::NonceDecision::Accepted
             );
@@ -18342,6 +18420,120 @@ mod duress {
                 .armed_snapshot()
                 .is_none(),
             "rollback-guarded expiry must win over the raw wall-clock rollback"
+        );
+    }
+
+    /// A channel-mode Spend's coordinator nonce is held by BOTH clocks: its
+    /// coordinator-signed wall expiry `E` and the monotonic Carrier deadline
+    /// `D = M + (E − W)` fixed at the acceptance transition. Until both have passed,
+    /// the nonce key stays occupied and a differently-signed body cannot take it.
+    ///
+    /// The wall half alone is not enough because the Carrier state keyed off this
+    /// acceptance ages on the MONOTONIC clock: a forward wall excursion (NTP step, VM
+    /// restore) or a host suspend separates the two, and re-admitting the key while the
+    /// deadline it fixed is still live is what would let a second body replace a
+    /// still-live carrier's nonce entry. The third step is the other side of that rule,
+    /// and why this is not "retain forever": at exactly `D` — not a second later — both
+    /// clocks call the entry dead, the key is released, and the replacement is admitted.
+    #[test]
+    fn a_wall_expired_channel_spend_nonce_stays_replayed_until_its_monotonic_deadline() {
+        const NONCE: &str = "deadline-reuse";
+        const FIRST_EXPIRY: u64 = NOW + 7_200;
+        /// One second past the first body's wall expiry: the nonce log prunes on
+        /// `expiry > now`, so this is the first second the old key would be free.
+        const AFTER: u64 = FIRST_EXPIRY + 1;
+        const DEADLINE: u64 = MONO_NOW + (FIRST_EXPIRY - NOW);
+
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        channel.pin_hot_clock(MONO_NOW);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        assert!(matches!(
+            crate::handle_sign(&node, &fx.spend_request(&spend, FIRST_EXPIRY, NONCE), NOW)
+                .expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        // The accepted deadline is retained under the same sign-state hold at the seam
+        // btc-policy-0hv will hand to the claim; this proves its value without a second clock.
+        assert_eq!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .coord_nonces
+                .carrier_deadline(NONCE),
+            Some(DEADLINE)
+        );
+
+        // Wall time steps past `E` while the monotonic clock has NOT reached `D`.
+        // A differently-signed body carrying a fresh expiry on the same nonce key is
+        // exactly the replacement the deadline exists to refuse.
+        let replacement = fx.spend_request(&spend, AFTER + 7_200, NONCE);
+        match crate::handle_sign(&node, &replacement, AFTER).expect("decodable") {
+            SignResponse::Refusal(r) => assert_eq!(
+                r.code,
+                vault_proto::RefusalCode::NonceReplayed,
+                "a wall-expired but monotonically live nonce entry is still occupied"
+            ),
+            other => panic!("the nonce key must stay occupied until BOTH clocks end it: {other:?}"),
+        }
+
+        // Monotonic time reaches `D` exactly. Both clocks now call the entry dead, it
+        // is removed, and the same body is admitted onto the freed key.
+        channel.pin_hot_clock(DEADLINE);
+        assert!(
+            matches!(
+                crate::handle_sign(&node, &replacement, AFTER).expect("decodable"),
+                SignResponse::Accepted(_)
+            ),
+            "at exactly D the monotonic half has ended, so the key is reusable"
+        );
+    }
+
+    /// A channel-mode Refresh can reclaim wall-expired Spend nonce entries whose
+    /// monotonic deadlines have also ended, without allocating a deadline for itself.
+    /// Otherwise 4,096 dead Carrier tombstones permanently deny every Refresh even
+    /// though an ordinary Spend can reclaim the same shared capacity.
+    #[test]
+    fn a_channel_mode_refresh_reclaims_dead_spends_but_records_no_deadline() {
+        const NONCE: &str = "refresh-deadline";
+        const DEADLINE: u64 = MONO_NOW + (EXPIRY - NOW);
+
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, "");
+        let channel = node.channel.as_ref().expect("channel");
+        channel.pin_hot_clock(MONO_NOW);
+        {
+            let mut state = node.sign_state.lock().expect("sign_state");
+            for i in 0..crate::replay::MAX_COORD_NONCES {
+                assert_eq!(
+                    state.coord_nonces.check_and_record(
+                        &format!("spent-{i}"),
+                        EXPIRY,
+                        NOW,
+                        node.max_commitment_age_secs,
+                        Some(MONO_NOW),
+                        true,
+                    ),
+                    crate::replay::NonceDecision::Accepted
+                );
+            }
+        }
+        channel.pin_hot_clock(DEADLINE);
+        let (_refresh, request) = fx.refresh_request(EXPIRY + 1_000, 1_000, NONCE);
+        assert!(matches!(
+            crate::handle_refresh(&node, &request, EXPIRY).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let rows = node.sign_state.lock().expect("sign_state").shape();
+        assert!(
+            rows.contains(&format!("coord_nonces count=1 high_water={EXPIRY}"))
+                && rows.contains(&format!(
+                    "coord_nonce nonce={NONCE} expiry={} deadline=None",
+                    EXPIRY + 1_000
+                )),
+            "the Refresh must reclaim dead Spend entries but remain wall-only itself: {rows:?}"
         );
     }
 
@@ -20860,6 +21052,8 @@ mod hot_budget {
                     EXPIRY + 100,
                     NOW,
                     node.max_commitment_age_secs,
+                    None,
+                    false,
                 ),
                 crate::replay::NonceDecision::Accepted
             );
@@ -20869,6 +21063,8 @@ mod hot_budget {
                     EXPIRY + 7_200,
                     EXPIRY + 100,
                     node.max_commitment_age_secs,
+                    None,
+                    false,
                 ),
                 crate::replay::NonceDecision::Accepted
             );

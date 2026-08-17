@@ -5009,14 +5009,18 @@ fn handle_sign_after_lock(
     //    rollback-guarded clock (`max(high_water, now)`, [`NonceLog`]), so a clock
     //    rollback cannot revive a pruned nonce. Its future upper bound still uses
     //    raw `now`, preserving V0-2's exact `now + max_commitment_age_secs` cap.
-    let effective_now = match verify_coord_auth(
+    // A channel Spend fixes `D` here for 0hv's ordered claim, without a clock re-read;
+    // absent-channel Spend and Refresh remain wall-only.
+    let mono_now = node.channel.as_ref().map(|channel| channel.hot_clock_now());
+    let (effective_now, _carrier_deadline) = match verify_coord_auth(
         node,
         request.coord_request(),
         &request.coord_sig,
         raw_now,
         &mut state.coord_nonces,
+        mono_now,
     ) {
-        Ok(effective_now) => effective_now,
+        Ok(accepted) => accepted,
         Err(rejected) => {
             #[cfg(test)]
             ingress_trace::record(IngressOp::SignStateUnlock);
@@ -5145,10 +5149,9 @@ fn handle_sign_after_lock(
     // §0 counts receipts to reach `t`, so lost receipts mean a node never arms. See
     // [`channel::MemoOutcome::InFlight`].
     //
-    // The generation token is `(nonce, signature_tag, expiry)`. It is needed because two
-    // handler generations can legitimately share one nonce key: `check_and_record` tests
-    // EXPIRY BEFORE REPLAY, so past expiry a differently-signed body with a fresh expiry
-    // is accepted onto the same key while this handler still runs.
+    // The generation token is `(nonce, signature_tag, expiry)`. Two handlers can share a
+    // nonce key only after its existing entry dies: wall expiry has passed and, in channel
+    // mode, its Carrier deadline has ended; a fresh differently-signed body can then take it.
     let generation = channel::MemoGeneration {
         signature_tag: arm_signature_tag(&request.coord_sig),
         expiry: request.expiry,
@@ -6092,14 +6095,18 @@ fn handle_refresh_after_lock(
     }
     let raw_now = clock();
 
+    // A Refresh records no Carrier deadline, but on a channel node the shared nonce log
+    // needs the HotClock sample to reclaim existing Spend entries whose D has ended.
+    let mono_now = node.channel.as_ref().map(|channel| channel.hot_clock_now());
     let _ingress_now = match verify_coord_auth(
         node,
         request.coord_request(),
         &request.coord_sig,
         raw_now,
         &mut state.coord_nonces,
+        mono_now,
     ) {
-        Ok(effective_now) => effective_now,
+        Ok((effective_now, _)) => effective_now,
         Err(rejected) => return Ok(rejected),
     };
     ensure_request_propagatable(node, &vault_proto::TaggedRequest::Refresh(request.clone()))?;
@@ -6820,13 +6827,17 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
 /// separately would let this gate check freshness on values other than the ones
 /// `coord_sig` authenticated. `coord_sig` is a parameter because it is the one
 /// field that is NOT part of its own preimage.
+///
+/// `mono_now` evaluates existing Spend deadlines; only channel-mode Spend records `D`.
+/// Sampling and returning it under the same `sign_state` hold binds it to this transition.
 fn verify_coord_auth(
     node: &Node,
     request: CoordRequest<'_>,
     coord_sig: &str,
     now: u64,
     nonces: &mut NonceLog,
-) -> Result<u64, SignResponse> {
+    mono_now: Option<u64>,
+) -> Result<(u64, Option<u64>), SignResponse> {
     verify_coord_signature(node, request, coord_sig)?;
     // Sender authenticated. Validate the expiry window, reject replay, enforce
     // capacity, and consume the nonce in one operation under the sign-state lock.
@@ -6834,13 +6845,20 @@ fn verify_coord_auth(
     // removed happen ONLY when the complete freshness gate accepts the request.
     // Window, replay, and capacity refusals leave both untouched, while the mark
     // prevents a backwards clock step from reopening a pruned nonce ([`NonceLog`]).
+    let record_carrier_deadline =
+        matches!(request, CoordRequest::Spend { .. }) && mono_now.is_some();
     match nonces.check_and_record(
         request.nonce(),
         request.expiry(),
         now,
         node.max_commitment_age_secs,
+        mono_now,
+        record_carrier_deadline,
     ) {
-        NonceDecision::Accepted => Ok(nonces.effective_now(now)),
+        NonceDecision::Accepted => Ok((
+            nonces.effective_now(now),
+            nonces.carrier_deadline(request.nonce()),
+        )),
         NonceDecision::InvalidLength => Err(refusal(
             RefusalCode::CoordAuthInvalid,
             "coord_nonce",
@@ -9682,6 +9700,39 @@ mod config_bounds_tests {
         assert!(
             err.to_string().contains("max_attemps"),
             "unexpected config error: {err}"
+        );
+    }
+}
+
+/// The channel-mode Carrier deadline `D` exists only where a Carrier can. A node with
+/// no `[channel]` has no peers to receive from, no arm intent, no memo — and no
+/// [`channel::HotClock`], since that clock is a piece of channel state. Its Spend
+/// nonces must therefore stay exactly wall-only, which is also what makes the absent
+/// clock a non-question rather than a fallback to invent.
+#[cfg(test)]
+mod carrier_deadline_tests {
+    use super::test_support::node_and_valid_request;
+    use vault_proto::SignResponse;
+
+    #[test]
+    fn an_absent_channel_spend_nonce_records_no_carrier_deadline() {
+        let (node, request) = node_and_valid_request();
+        assert!(
+            node.channel.is_none(),
+            "this case is about the node that has no HotClock to read"
+        );
+        let now = request.expiry - 100;
+        assert!(matches!(
+            super::handle_sign(&node, &request, now).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let rows = node.sign_state.lock().expect("sign_state").shape();
+        assert!(
+            rows.contains(&format!(
+                "coord_nonce nonce={} expiry={} deadline=None",
+                request.nonce, request.expiry
+            )),
+            "an absent-channel Spend nonce is wall-only: {rows:?}"
         );
     }
 }
