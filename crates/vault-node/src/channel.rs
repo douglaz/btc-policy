@@ -1269,15 +1269,11 @@ struct ArmIntent {
     /// WHY IT CANNOT BE `!ready_to_propagate` ALONE. Refusals below the arm hook that are
     /// FEDERATION-UNIFORM deliberately never stage (see `Node::handle_sign_now`'s policy
     /// exits): this node decided not to be a holder, and contributing no self receipt is
-    /// what stops a locally drifted node from arming alone. Those intents keep
-    /// `ready_to_propagate == false` until their own expiry — up to
-    /// `max_commitment_age_secs` — so treating that as "still deciding" would answer a
-    /// peer `RATE_LIMITED` once a second for the whole horizon (`retry_loop` retries
-    /// until `commitment_expiry`), against a decision that will never change. Bounding
-    /// the retry by the RULING window instead keeps it bounded by the handler's own
-    /// lifetime, and a receipt arriving after a non-staging refusal gets the one
-    /// `ACCEPTED` it got before this state existed: the node HAS ruled, and the answer
-    /// "there is no carrier here for you to confirm" is true and final.
+    /// what stops a locally drifted node from arming alone. Treating
+    /// `!ready_to_propagate` as "still deciding" after such an exit would answer a peer
+    /// `RATE_LIMITED` against a decision that will never change. The terminal guard
+    /// instead retires the non-staged intent and memo together; while the handler still
+    /// rules, receipts retry for only the interval in which the answer can change.
     owner_ruling: bool,
     /// This node's OWN internal pin verdict for this carrier. Written under both pins
     /// in the same-shaped record; only this bit differs, and it is what decides
@@ -1301,11 +1297,12 @@ struct ArmIntent {
     /// example a duress pin received while this node is locked out) — the SAFETY track
     /// still arms, the SWEEP simply has nothing to fire.
     escape_commitment_id: String,
-    /// This carrier's own expiry — the eviction horizon. Bounded exactly like the
-    /// coordinator nonce log that gates entry creation: an intent exists only for a
-    /// coord-authenticated, fresh-nonce request, and the node caps every accepted
-    /// expiry at `now + max_commitment_age_secs`.
+    /// This carrier's signed wall expiry `E`: receipt-attempt authority and generation
+    /// identity, never Carrier retirement authority.
     expiry: u64,
+    /// Immutable process-monotonic retirement deadline fixed when the coordinator
+    /// nonce was accepted. Wall-clock reads never alter or replace it.
+    deadline: u64,
     /// Set once this exact request reaches `t`, under BOTH verdicts. A normal verdict
     /// performs the same-shaped confirmation work once and remains a no-op; a duress
     /// verdict commits the arm. Repeated receipts past `t` are idempotent.
@@ -1314,9 +1311,10 @@ struct ArmIntent {
 
 struct CarrierMemo {
     outcome: MemoOutcome,
-    /// This memo's own eviction horizon (the request expiry), using the same strict
-    /// `expiry > now` rule as the coordinator nonce log.
+    /// The signed expiry remains receipt-attempt authority and generation identity.
     expiry: u64,
+    /// The same immutable retirement deadline carried by the matching intent.
+    deadline: u64,
 }
 
 impl CarrierMemo {
@@ -1326,6 +1324,7 @@ impl CarrierMemo {
     /// against, and the generation gate exists to keep a stale handler from touching it.
     fn matches_generation(&self, generation: &MemoGeneration) -> bool {
         self.expiry == generation.expiry
+            && self.deadline == generation.deadline
             && matches!(
                 &self.outcome,
                 MemoOutcome::InFlight { signature_tag } if *signature_tag == generation.signature_tag
@@ -1380,18 +1379,21 @@ enum MemoOutcome {
 /// keyed by nonce alone. [`replay::NonceLog::check_and_record`] tests EXPIRY BEFORE
 /// REPLAY (`replay.rs`), so once a request's own expiry has passed, a differently-signed
 /// body carrying a fresh expiry under the SAME nonce is Accepted and enters its own
-/// out-of-lock window while the first handler is still running.
+/// out-of-lock window while the first handler is still running. On a CHANNEL node the
+/// entry's monotonic Carrier deadline must have ended too, or the newer body is Replayed.
 ///
-/// The token is `(nonce, signature_tag, expiry)`: the nonce is the map key, and both
-/// remaining fields live here. A handler may only remove or upgrade a memo whose
-/// generation matches its own.
+/// The token is `(nonce, signature_tag, expiry, deadline)`: the nonce is the map key,
+/// and the remaining fields live here. A handler may only remove or upgrade a memo
+/// whose generation matches its own.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MemoGeneration {
     /// Domain-separated digest of this request's verified coordinator signature — the
     /// same tag [`MemoOutcome::Derived`] memoizes.
     pub(crate) signature_tag: [u8; 32],
-    /// This request's own expiry, which is also the memo's eviction horizon.
+    /// This request's signed wall expiry `E`, retained as generation identity.
     pub(crate) expiry: u64,
+    /// Acceptance-fixed Carrier retirement deadline `D`.
+    pub(crate) deadline: u64,
 }
 
 /// What [`ChannelState::record_arm_intent`] did with the nonce memo. The ARM INTENT is
@@ -1408,10 +1410,9 @@ pub(crate) enum MemoUpgrade {
     /// nonce, since `check_and_record` tests expiry before replay). The stale handler
     /// neither reinserted nor deleted the memo.
     Superseded,
-    /// ABSENT: a later accepted nonce pruned the claim mid-window after advancing the
-    /// nonce log's rollback high-water through this generation's expiry. The memo was
-    /// re-installed directly as `Derived` under this request's generation; the caller's
-    /// COMMIT-HOLD effective-clock check then stages and refuses the expired generation.
+    /// ABSENT: defensively restore a missing exact-generation claim as `Derived`.
+    /// The retirement rules preserve a live owner's claim, but keeping this recovery
+    /// avoids a hollow staged carrier if an already-absent state is encountered.
     Reinstalled,
 }
 
@@ -1453,10 +1454,9 @@ pub(crate) enum CarrierMemoLookup {
     ///
     /// It is NOT `!ready_to_propagate` on its own. A handler that RULED and refused
     /// without staging — every federation-uniform policy refusal below the arm hook does
-    /// exactly that, deliberately — leaves an intent that will never be staged and never
-    /// be pruned before its own expiry. Retrying against that is retrying against a final
-    /// answer, once a second until `commitment_expiry`, which is why the ruling bit and
-    /// not the staging bit is what makes this state end.
+    /// exactly that, deliberately — retires its intent and memo on terminal exit.
+    /// Retrying against that is retrying against a final answer, which is why the ruling
+    /// bit and not the staging bit is what makes this state end.
     AwaitingPropagation,
     /// This exact signature is memoized; reuse its carrier with no derivation.
     Exact(String),
@@ -2432,51 +2432,21 @@ impl PartialStore {
         invalidated
     }
 
-    /// Keep completed confirmation state and its replay memo on the same strict
-    /// freshness boundary as the coordinator nonce log (`expiry > now`). Expiry is the
-    /// only bound applied here; there is no count cap in this function. Ingress calls
-    /// this independently of the fire driver, so a stalled backend/fire pass cannot make
-    /// completed intent memory grow without bound. The corresponding count invariant is
-    /// only checked, never enforced, at [`ChannelState::record_arm_intent`]'s
-    /// `debug_assert!`.
-    ///
-    /// STATE WHOSE OWNER HAS NOT YET RULED IS DIFFERENT, and this is the one exception:
-    /// a passive receipt's clock read, or another handler's COMMIT-HOLD read, must not
-    /// delete it. The nonce log deliberately does not ratchet on a request rejected
-    /// during a transient forward clock excursion, so this prune can run past an expiry
-    /// the authoritative freshness state has NOT reached. If such a read deleted a live
-    /// claim, the receipt that triggered it would be answered `ACCEPTED` against a vacant
-    /// memo while the owner went on to install its carrier and sign after the clock
-    /// corrected — the silent false positive [`MemoOutcome::InFlight`] exists to close —
-    /// and the owner's own intent would be gone, leaving a registered candidate whose
-    /// holder gate can never open. The exception therefore covers BOTH halves of an
-    /// unruled request: an `InFlight` claim, and a `Derived` memo plus the
-    /// [`ArmIntent`] whose `owner_ruling` handler is still running.
-    ///
-    /// Both maps stay bounded by the nonce log: an entry exists only for an accepted
-    /// nonce, unruled entries are additionally bounded by the concurrent handlers holding
-    /// them (each releases on every exit, including a panic), and
-    /// [`Self::prune_intents_after_nonce_accept`] evicts expired ones unconditionally
-    /// once a later accepted nonce has advanced the authoritative freshness state.
-    fn prune_intents(&mut self, now: u64) {
+    /// Retire state whose acceptance-fixed monotonic deadline has lapsed and whose
+    /// handler no longer rules it. The caller holds the store lock, so an intent and
+    /// the nonce memo naming it disappear atomically. `InFlight` itself proves a live
+    /// owner; its Drop guard is its terminal cleanup authority.
+    fn prune_carriers(&mut self, mono_now: u64) {
         self.intents
-            .retain(|_, intent| intent.expiry > now || intent.owner_ruling);
-        // Memos carry their own horizon rather than following their intent: a memo
-        // outlives nothing longer than the nonce whose replay it short-circuits, and
-        // pinning it to its intent instead would keep it alive across the eviction
-        // `confirm_carrier` performs when a receipt lands past expiry. The unruled owner
-        // is the one deliberate departure from that, and it reads the intents RETAINED
-        // just above, so the two halves of one unruled request survive or expire
-        // together.
+            .retain(|_, intent| intent.deadline > mono_now || intent.owner_ruling);
         let intents = &self.intents;
         self.carriers_by_nonce
-            .retain(|_, memo| memo.expiry > now || Self::owner_still_ruling(intents, memo));
+            .retain(|_, memo| memo.deadline > mono_now || Self::owner_still_ruling(intents, memo));
     }
 
     /// Whether `memo`'s authoritative `/sign` handler is still deciding this nonce: it
     /// has claimed it and not yet derived a carrier (`InFlight`), or it has derived one
-    /// and not yet exited. `Derived` with no live intent is a ruled request whose intent
-    /// already aged out, which is exactly the ordinary expiry case.
+    /// and not yet exited.
     fn owner_still_ruling(intents: &HashMap<String, ArmIntent>, memo: &CarrierMemo) -> bool {
         match &memo.outcome {
             MemoOutcome::InFlight { .. } => true,
@@ -2486,16 +2456,13 @@ impl PartialStore {
         }
     }
 
-    /// Prune after `NonceLog::check_and_record` accepted a new request under the same
-    /// effective `now`. That acceptance atomically forgot every expired nonce and
-    /// advanced its rollback high-water through the removed expiries, so an old handler
-    /// cannot later revive after a clock correction. This is therefore the one write
-    /// site allowed to evict expired state whose owner has not yet ruled — the
-    /// `owner_ruling` / `InFlight` exception above deliberately does NOT apply here,
-    /// which is what keeps [`MemoUpgrade::Reinstalled`] reachable and both maps bounded.
-    fn prune_intents_after_nonce_accept(&mut self, now: u64) {
-        self.intents.retain(|_, intent| intent.expiry > now);
-        self.carriers_by_nonce.retain(|_, memo| memo.expiry > now);
+    /// Remove `carrier` and exactly the Derived nonce memo that names it. A newer
+    /// generation's memo on the same nonce is deliberately untouched.
+    fn retire_carrier(&mut self, carrier: &str) {
+        self.intents.remove(carrier);
+        self.carriers_by_nonce.retain(|_, memo| {
+            !matches!(&memo.outcome, MemoOutcome::Derived { carrier: c, .. } if c == carrier)
+        });
     }
 
     /// Whether `candidate`'s partial-release/finalize slot is live. Every SpendRequest
@@ -2569,14 +2536,6 @@ impl PartialStore {
     /// EXEMPT while its `T`-based window is open. The normal no-op delayed slot and
     /// its pair receive the same exemption so candidate capacity cannot reveal the PIN.
     fn prune(&mut self, now: u64) {
-        // §0 confirmation state ages out on its carrier's own expiry, the same
-        // horizon the coordinator nonce log uses. An intent exists only for a
-        // coord-authenticated fresh-nonce request whose expiry the node already capped
-        // at `now + max_commitment_age_secs`, so this map is bounded by exactly what
-        // bounds that log. Pin-independent: both verdicts write and evict identically.
-        // A COMMITTED intent is dropped too — the arm it produced lives in the `armed`
-        // overlay, which is terminal and never re-derived from here.
-        self.prune_intents(now);
         // Snapshot the selected slot and its pair eagerly before the mutable retain.
         // Normal and duress histories both pay the same lookup/allocation work; the
         // internal sweep bit only selects whether the already-built exemption is live.
@@ -2906,8 +2865,8 @@ pub struct ChannelState {
     limits: ChannelLimits,
     /// Shared with the node so freshness-reject events surface through `/events`.
     alerts: Arc<Mutex<AlertQueue>>,
-    /// The Hot budget's own clock (ADR-0014 §4). See [`HotClock`] for why this one
-    /// piece of node state must NOT read wall time.
+    /// Shared monotonic clock for the Hot budget and Carrier nonce deadlines.
+    /// See [`HotClock`] for why these duration terms must not read wall time.
     hot_clock: HotClock,
     #[cfg(test)]
     schedule_work: ScheduleWorkCounters,
@@ -2918,15 +2877,13 @@ pub struct ChannelState {
     confirm_commit_midpoint: std::sync::OnceLock<Arc<std::sync::Barrier>>,
 }
 
-/// The clock the **Hot budget**'s rolling window ages against: MONOTONIC elapsed
-/// time since this channel was built, deliberately NOT the wall clock.
+/// The clock the Hot budget and Carrier deadlines' duration terms age against:
+/// MONOTONIC elapsed time since channel construction, never wall time.
 ///
-/// A reservation is the only node state here whose lifetime is a pure local
-/// DURATION. Every other deadline in this file — a commitment's expiry, a fire
-/// window's, a coordinator nonce's freshness — is compared against an
-/// ABSOLUTE instant the coordinator signed, so those must read wall time to mean
-/// anything. The velocity window is compared against nothing external: it only ever
-/// asks "how long ago did this node accept that spend?".
+/// Hot reservations and channel-mode Spend Carrier deadlines include a pure local
+/// duration. Other deadlines—and a Carrier nonce's wall-expiry half—use signed
+/// absolute instants. The velocity window asks elapsed time since acceptance; `D`
+/// records the signed lifetime remaining at the atomic nonce acceptance transition.
 ///
 /// This clock is therefore only HALF of a reservation's lifetime, not all of it.
 /// The candidate a reservation meters dies at one of those absolute wall instants,
@@ -3574,11 +3531,12 @@ impl ChannelState {
     /// **TWO CLOCK VALUES, and the mapping is not the implementer's choice.**
     /// `first_seen` is the INGRESS-HOLD effective time — the instant this node consumed
     /// the coordinator nonce — and is what `T` is measured from. `now` is the
-    /// COMMIT-HOLD effective time and drives pruning and the overlay's current-time
-    /// input. Using the commit-hold value for `first_seen` too would let a lock or
+    /// COMMIT-HOLD effective time and drives the overlay's current-time input and the
+    /// caller's attempt checks; it never retires Carrier state. Using the commit-hold
+    /// value for `first_seen` too would let a lock or
     /// `work_lock` delay move `T` LATER, silently stretching the hostage window past
     /// what the user was promised (see [`ArmIntent::first_seen`]); using the ingress
-    /// value for pruning would violate the nonce-log effective-clock coupling
+    /// value for the overlay would violate the nonce-log effective-clock coupling
     /// ([`replay::NonceLog::effective_now`]). The overlay therefore receives BOTH.
     ///
     /// Returns which of [`MemoUpgrade`]'s three cases the nonce memo took. The INTENT is
@@ -3618,47 +3576,14 @@ impl ChannelState {
         self.schedule_work
             .safety_overlay_writes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Bound/prune independently of the periodic fire driver. Coordinator auth
-        // admitted this nonce under the same MAX_COORD_NONCES/live-expiry bound, so
-        // finding the intent table full after this prune would indicate an internal
-        // accounting bug rather than attacker-controlled capacity.
-        //
-        // Passive COMMIT-HOLD pruning deliberately retains in-flight claims. A later
-        // ACCEPTED ingress may already have pruned this one after advancing the nonce
-        // log's rollback high-water; that is the `MemoUpgrade::Reinstalled` case below,
-        // not an error.
-        store.prune_intents(now);
-        // NOT a hard `assert!`. This runs while holding `store` and while the caller
-        // holds `sign_state`, so a panic here poisons BOTH and every later
-        // `.expect("... lock poisoned")` aborts — bricking a node that, under
-        // reboot-death (ADR-0007), can never restart. Turning an internal accounting
-        // invariant into a remote kill switch is strictly worse than the over-count it
-        // would be guarding against — the prune just above keeps the map a working set
-        // rather than a leak, even where the count is not a strict subset of the log.
-        // `debug_assert!` keeps a GROWTH check under test; what it can honestly assert
-        // is spelled out at the ceiling below, and it is NOT that intents stay within
-        // the nonce log's cap.
-        //
-        // The BOUND is what this asserts, and it is deliberately not restated as a 1:1
-        // intent/nonce correspondence any more: an intent can now be BORN EXPIRED (the
-        // out-of-lock window outlived this request's expiry, so the prune just above
-        // removed nothing on its behalf; `confirm_carrier` evicts it on the first receipt
-        // AFTER its owner stops ruling, NOT the next one — a born-expired intent's owner
-        // is ruling by construction here, and that site now refuses without destroying
-        // while `owner_ruling` holds), and a MISMATCHED generation records its own
-        // separately-keyed intent
-        // for a nonce another generation's memo owns. THAT second entry is what stops the
-        // count being a strict subset of the nonce log: one nonce can carry the stale
-        // generation's intent and the fresh one's at once, and chained supersessions can
-        // add further ones. The overshoot is bounded only by how many handlers sit in
-        // that state, which nothing bounds until btc-policy-1y2 puts admission control on
-        // `/sign` — so there is no honest constant equal to the real ceiling. What
-        // follows is therefore a SMOKE ALARM for genuine unbounded growth, not a
-        // statement of the invariant: at the log's own cap it would fire on a legitimate
-        // superseded intent and, in a debug build, panic into a poisoned-lock Lockdown.
-        // Do NOT tighten it back to `MAX_COORD_NONCES`, and do NOT "restore" the
-        // correspondence by comparing `intents.len() + carriers_by_nonce.len()`, which
-        // double-counts every Derived request.
+        // COMMIT-HOLD's wall sample drives the overlay above and attempt refusal only.
+        // Carrier retirement is separately driven by the acceptance-fixed monotonic D.
+        // NOT a hard `assert!`: this runs under both `store` and the caller's
+        // `sign_state`, where a panic would poison both locks. Exact D and terminal
+        // cleanup bound sequential residency, but concurrent superseded handlers can
+        // temporarily create more intents than nonce entries. The debug ceiling is a
+        // smoke alarm, not a 1:1 invariant; do not tighten it to `MAX_COORD_NONCES` or
+        // double-count every Derived request by summing both maps.
         debug_assert!(
             store.intents.contains_key(carrier)
                 || store.intents.len() < MAX_COORD_NONCES.saturating_mul(4),
@@ -3676,6 +3601,7 @@ impl ChannelState {
                 spend_commitment_id: String::new(),
                 escape_commitment_id: String::new(),
                 expiry: generation.expiry,
+                deadline: generation.deadline,
                 committed: false,
             });
         // Monotonic: a carrier's verdict is decided once, by the first processing of
@@ -3706,6 +3632,7 @@ impl ChannelState {
                 resolved_senders: HashMap::new(),
             },
             expiry: generation.expiry,
+            deadline: generation.deadline,
         };
         match store.carriers_by_nonce.get(nonce) {
             // MATCHED — this handler's own claim is still here. Upgrade it.
@@ -3723,18 +3650,11 @@ impl ChannelState {
             // other expiry exit, because refusing without staging would drop a duress
             // signal the coordinator already authenticated.
             Some(_) => MemoUpgrade::Superseded,
-            // ABSENT — pruned mid-window. RE-INSTALL directly as Derived under this
-            // request's generation and continue. This is FORCED, not a preference: the
-            // alternative, reading absence as staleness and refusing, SILENTLY SWALLOWS
-            // A DURESS SIGNAL, which is the failure class this whole reorder exists to
-            // close. Do not "simplify" it into the mismatched branch.
-            //
-            // Only a later ACCEPTED ingress may prune an owned claim: that operation
-            // advances the nonce log's rollback high-water through this expiry, so the
-            // caller necessarily reaches its COMMIT-HOLD expiry refusal even if the raw
-            // wall clock then steps backward. Passive receipt reads retain `InFlight`
-            // and answer RATE_LIMITED; they must never create a Vacant memo that a
-            // still-authoritative handler can revive after clock correction.
+            // ABSENT — defensively RE-INSTALL directly as Derived under this request's
+            // generation. Active-owner and wall-clock paths cannot remove this claim;
+            // preserving the recovery branch prevents an already-missing memo from
+            // producing a hollow carrier. Do not fold it into Superseded: absence does
+            // not prove that another generation owns the nonce.
             None => {
                 store.carriers_by_nonce.insert(nonce.to_string(), derived);
                 MemoUpgrade::Reinstalled
@@ -3751,18 +3671,21 @@ impl ChannelState {
     /// under `generation`.
     ///
     /// Called from the INGRESS HOLD, immediately after the nonce is consumed, so no
-    /// window exists in which the nonce is spent but nothing names the claim. `now` is
-    /// the ingress-hold effective time, and the caller has just accepted this nonce under
-    /// that same time. That accepted transition is what authorizes pruning expired
-    /// in-flight owners: the nonce log has already advanced its rollback high-water
-    /// through every nonce it forgot.
-    pub(crate) fn claim_nonce_in_flight(&self, nonce: &str, generation: MemoGeneration, now: u64) {
+    /// window exists in which the nonce is spent but nothing names the claim.
+    /// `mono_now` is the exact HotClock sample used by that accepted transition; it may
+    /// retire older ruled state at D, while the accepted wall sample has no such power.
+    pub(crate) fn claim_nonce_in_flight(
+        &self,
+        nonce: &str,
+        generation: MemoGeneration,
+        mono_now: u64,
+    ) {
         let mut store = self.store.lock().expect("store lock poisoned");
         #[cfg(test)]
         self.schedule_work
             .safety_locks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        store.prune_intents_after_nonce_accept(now);
+        store.prune_carriers(mono_now);
         store.carriers_by_nonce.insert(
             nonce.to_string(),
             CarrierMemo {
@@ -3770,6 +3693,7 @@ impl ChannelState {
                     signature_tag: generation.signature_tag,
                 },
                 expiry: generation.expiry,
+                deadline: generation.deadline,
             },
         );
     }
@@ -3812,18 +3736,23 @@ impl ChannelState {
     /// returns and a panic boundary, and the alternative — "finalize the intent on every
     /// exit that did not stage" — is an action that can be missed on a branch. A missed
     /// one leaves every peer receipt for that carrier answered `RATE_LIMITED` once a
-    /// second until the request expires, which is a self-inflicted denial of the very
+    /// second until process death, which is a self-inflicted denial of the very
     /// `/channel` capacity honest partials and receipts need.
     ///
-    /// It deliberately does NOT touch `ready_to_propagate`: whether this node is a holder
-    /// was decided by whether the handler staged the carrier, and this call only records
-    /// that the decision — either way — has now been made. Poison-tolerant for the reason
-    /// [`Self::release_nonce_claim`] documents: a `Drop` that panicked while unwinding
-    /// would abort the process and leave the node dead but UNLATCHED.
+    /// A staged carrier remains resident unless D has elapsed. A non-staged terminal
+    /// exit, including unwind, retires its intent and matching memo atomically because
+    /// this node has definitively declined holder ownership. Poison-tolerant for the
+    /// reason [`Self::release_nonce_claim`] documents: a `Drop` that panicked while
+    /// unwinding would abort the process and leave the node dead but UNLATCHED.
     pub(crate) fn end_carrier_ruling(&self, carrier: &str) {
+        let mono_now = self.hot_clock.now();
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(intent) = store.intents.get_mut(carrier) {
+        let retire = store.intents.get_mut(carrier).is_some_and(|intent| {
             intent.owner_ruling = false;
+            !intent.ready_to_propagate || intent.deadline <= mono_now
+        });
+        if retire {
+            store.retire_carrier(carrier);
         }
     }
 
@@ -3917,6 +3846,7 @@ impl ChannelState {
                         generation: MemoGeneration {
                             signature_tag: *remembered,
                             expiry: memo.expiry,
+                            deadline: memo.deadline,
                         },
                     }
                 }
@@ -3986,9 +3916,11 @@ impl ChannelState {
                         resolved_senders,
                     },
                 expiry,
+                deadline,
             }) if carrier == memoized_carrier
                 && *remembered == generation.signature_tag
                 && *expiry == generation.expiry
+                && *deadline == generation.deadline
                 && resolved_senders.get(&sender) == Some(&generation.signature_tag) =>
             {
                 resolved_senders.insert(sender, signature_tag);
@@ -4193,36 +4125,10 @@ impl ChannelState {
         let Some(intent) = store.intents.get_mut(carrier) else {
             return CarrierConfirmation::NONE;
         };
-        // Expiry is enforced HERE, atomically with the count, not only by the
-        // periodic prune. Both sites use the same strict `expiry > now` rule as
-        // coordinator freshness, but a late receipt that arrives between expiry and
-        // the next prune tick
-        // would otherwise commit an arm on one node while a node that had already
-        // pruned ignored the identical receipt — making "who armed" a function of
-        // poll phase rather than of the carrier, which is the one thing §0 exists to
-        // rule out. Refusing uniformly keeps a lapsed carrier a clean censorship
-        // (nobody arms) instead of a scheduling-dependent split. Pin-independent:
-        // both verdicts evict on the same clock comparison.
+        // Signed expiry is enforced HERE, atomically with the count. It is attempt
+        // authority only: a late receipt counts no holder and commits nothing, while
+        // the intent+memo remain available for an honest retry until their monotonic D.
         if intent.expiry <= now {
-            // REFUSE always; DESTROY only when no handler is still ruling. `now` here HAS
-            // been through `NonceLog::effective_now` (`Node::confirm_carrier`), but that
-            // is a rollback LOWER bound — `high_water.max(now)` — so it corrects a
-            // backward step and passes a FORWARD excursion through untouched. The
-            // residual is therefore forward-only, and a transient forward step still
-            // reaches this branch for a carrier that is not really expired. Deleting a still-ruling owner's
-            // intent there is the same silent failed-arm `prune_intents`' exception
-            // exists to prevent — and it is worse here, because the wrong-pin/lockout
-            // exit leaves an intent `ready_to_propagate` across its whole backoff, which
-            // is exactly the fail-closed intent a locked-out node needs in order to arm
-            // on confirmation at all. Refusing without destroying keeps both properties:
-            // an expired carrier still never collects a holder, and the owner's state
-            // survives the clock correcting. The owner's own exit prunes it normally.
-            if !intent.owner_ruling {
-                store.intents.remove(carrier);
-                store.carriers_by_nonce.retain(|_, remembered| {
-                    !matches!(&remembered.outcome, MemoOutcome::Derived { carrier: c, .. } if c == carrier)
-                });
-            }
             return CarrierConfirmation::NONE;
         }
         if !intent.ready_to_propagate {
@@ -4318,10 +4224,15 @@ impl ChannelState {
             .selector_allocations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self::refresh_escape_window(&mut store, &selected);
-        CarrierConfirmation {
+        let confirmation = CarrierConfirmation {
             committed: true,
             armed: commit_arm,
-        }
+        };
+        // `committed = true` above is only an internal midpoint. Retire after the full
+        // pin-uniform holder-decision transaction has opened both gates and refreshed
+        // both selector inputs, all under this same store lock.
+        store.retire_carrier(carrier);
+        confirmation
     }
 
     /// Fixed-work deadline poll for the always-running SAFETY timer. Both states take
@@ -4381,6 +4292,7 @@ impl ChannelState {
                     spend_commitment_id,
                     escape_commitment_id: String::new(),
                     expiry: u64::MAX,
+                    deadline: u64::MAX,
                     committed: false,
                 });
             intent.duress = true;
@@ -4449,10 +4361,10 @@ impl ChannelState {
         release.recv().expect("await the store release");
     }
 
-    /// Prune expired candidates — driven from the same `/sign` sweep the replay
-    /// log runs on (§5); the `/channel` lookup also evicts expired candidates so an
-    /// idle node still rejects them.
+    /// Prune wall-expired candidates and, independently, Carriers whose monotonic D
+    /// has lapsed after owner release. The caller's `now` never reaches Carrier state.
     pub(crate) fn prune_store(&self, now: u64) {
+        let mono_now = self.hot_clock.now();
         let mut store = self.store.lock().expect("store lock poisoned");
         #[cfg(test)]
         {
@@ -4462,6 +4374,7 @@ impl ChannelState {
                 .prune_candidate_visits
                 .fetch_add(store.candidates.len(), Relaxed);
         }
+        store.prune_carriers(mono_now);
         store.prune(now);
     }
 
@@ -4522,6 +4435,12 @@ impl ChannelState {
         let now = self.hot_clock.now();
         let store = self.store.lock().expect("store lock poisoned");
         store.hot_budget.window_sum(now, wall_now)
+    }
+
+    /// Read monotonic `M` for coordinator-nonce acceptance: `/sign` may fix a Carrier
+    /// deadline, while `/refresh` only evaluates existing ones. Production cannot pin it.
+    pub(crate) fn hot_clock_now(&self) -> u64 {
+        self.hot_clock.now()
     }
 
     /// Pin the Hot budget's monotonic clock to `secs`. Test-only, and the ONLY way
@@ -11296,6 +11215,12 @@ mod duress {
     use vault_proto::{SignRequest, SignResponse};
 
     const NOW: u64 = 1_752_000_000;
+    /// The pinned [`HotClock`] second for every test here that reads the MONOTONIC
+    /// clock, deliberately nowhere near `NOW`: `D = M + (E − W)`, so pinning monotonic
+    /// time to the wall second would let an implementation that fixed `D` from wall time
+    /// produce the identical value and pass. It is also what the clock really returns —
+    /// seconds of process uptime, not a unix timestamp.
+    const MONO_NOW: u64 = 4_200;
     const HOLD: u64 = 3_600;
     /// duress_delay_secs for most tests — well inside the Hold, so `T` lands at the
     /// hostage window `now + DELAY`, not at the Hold-expiry − ε clamp.
@@ -11700,6 +11625,11 @@ mod duress {
             normal_channel.armed_snapshot().is_none(),
             "a normal carrier must never activate the SAFETY freeze"
         );
+        assert_eq!(
+            normal_channel.intent_counts(),
+            (0, 0),
+            "the completed normal decision retires Carrier state"
+        );
 
         // A DURESS carrier: the SAME holder-decision commit also freezes, atomically.
         let duress_node_ = Arc::new(duress_node(
@@ -11765,6 +11695,11 @@ mod duress {
         assert!(
             duress_channel.armed_snapshot().is_some(),
             "the duress carrier's holder-decision commit must also arm"
+        );
+        assert_eq!(
+            duress_channel.intent_counts(),
+            (0, 0),
+            "retirement follows the full duress decision transaction"
         );
         // The coupling made observable: the quorum-reached hot spend is FROZEN, so its
         // partial never releases — not at its Hold-expiry, not at expiry.
@@ -12736,6 +12671,7 @@ mod duress {
                     spend_commitment_id,
                     escape_commitment_id,
                     expiry,
+                    deadline,
                     committed,
                 } = intent;
                 let mut sorted_holders: Vec<u16> = holders.iter().copied().collect();
@@ -12743,13 +12679,14 @@ mod duress {
                 format!(
                     "intent holders={sorted_holders:?} ready_to_propagate={} owner_ruling={} \
                      first_seen={} spend_commitment_id={} escape_commitment_id={} expiry={} \
-                     committed={}",
+                     deadline={} committed={}",
                     ready_to_propagate,
                     owner_ruling,
                     first_seen,
                     spend_commitment_id,
                     escape_commitment_id,
                     expiry,
+                    deadline,
                     committed,
                 )
             })
@@ -12763,7 +12700,11 @@ mod duress {
         memos.sort_by(|a, b| a.0.cmp(b.0));
         lines.push(format!("nonce_memos count={}", memos.len()));
         for (nonce, memo) in memos {
-            let CarrierMemo { outcome, expiry } = memo;
+            let CarrierMemo {
+                outcome,
+                expiry,
+                deadline,
+            } = memo;
             // BOTH variants mask `signature_tag`, for the one reason `Derived`'s is
             // masked: the coordinator signature covers the PIN, so projecting the tag
             // would make this SILENCE projection itself a pin oracle.
@@ -12781,7 +12722,9 @@ mod duress {
                     format!("outcome=Derived resolved_senders={senders:?}")
                 }
             };
-            lines.push(format!("memo nonce={nonce} {row} expiry={expiry}"));
+            lines.push(format!(
+                "memo nonce={nonce} {row} expiry={expiry} deadline={deadline}"
+            ));
         }
         let HotBudgetLedger {
             budget,
@@ -12837,12 +12780,14 @@ mod duress {
     /// row is pin-independent by construction for a [`pin_pair`], unlike the channel
     /// store's pin-derived carrier ids.
     ///
-    /// It also needs no clock pin, unlike [`counted_duress_node`]'s `HotClock`: every
-    /// timestamp it projects — replay and pending expiries, the nonce log's expiries and
-    /// high-water mark, refresh times, the attempt ring — is derived from the `now`
-    /// ARGUMENT the test passes to `handle_sign` or from the request's own expiry, never
-    /// from a wall-clock read. Re-check that when adding a row; a wall clock smuggled
-    /// into this record is the defect that would make it the thing it replaced.
+    /// It needs [`counted_duress_node`]'s `HotClock` pin, and for ONE row only: a
+    /// channel-mode Spend nonce's Carrier deadline `D = M + (E − W)`, whose `M` is a
+    /// MONOTONIC reading counted from that node's construction, so two independently
+    /// built nodes would report different `D`s from scheduling alone — the determinism
+    /// `store_shape`'s `reserved_at` row already demands. Every OTHER timestamp — replay
+    /// and pending expiries, the nonce log's expiries and high-water, refresh times, the
+    /// attempt ring — comes from the `now` ARGUMENT or the request's own expiry, and no
+    /// row may read a WALL clock: the defect that would make this the thing it replaced.
     #[derive(PartialEq, Eq)]
     struct SignStateShape(Vec<String>);
 
@@ -12973,7 +12918,7 @@ mod duress {
         node.channel
             .as_ref()
             .expect("ingress-work tests require channel mode")
-            .pin_hot_clock(NOW);
+            .pin_hot_clock(MONO_NOW);
         (node, calls)
     }
 
@@ -13527,6 +13472,50 @@ mod duress {
         );
     }
 
+    /// The accepted channel-mode Carrier deadline `D` is part of the `/sign` handler
+    /// state, so it is part of what the two pin classes must agree on — and it is
+    /// projected UNMASKED, unlike the store's pin-derived carrier ids, because it is
+    /// pin-independent by construction: `M` and effective `W` are node-derived, `E` is
+    /// coordinator-signed, and none of them is reached by the PIN.
+    ///
+    /// The row is asserted CONCRETELY before the equality, and that is the load-bearing
+    /// half: an implementation that never recorded a deadline, or that masked the row
+    /// away, would make the two projections agree for free. And since `MONO_NOW` differs
+    /// from `NOW`, fixing `D` from wall time (`D == EXPIRY`) fails here too.
+    #[test]
+    fn normal_and_duress_sign_state_shapes_carry_the_same_carrier_deadline() {
+        const NONCE: &str = "shape-deadline";
+        const DEADLINE: u64 = MONO_NOW + (EXPIRY - NOW);
+
+        let fx = Fixture::new(3, 5);
+        let (node_n, calls_n) = counted_duress_node(&fx);
+        let (node_d, calls_d) = counted_duress_node(&fx);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let (normal, duress) = pin_pair(&fx, fx.spend_request(&spend, EXPIRY, NONCE), NONCE);
+        let normal_pass = ingress_pass(&node_n, &calls_n, &normal, NOW);
+        let duress_pass = ingress_pass(&node_d, &calls_d, &duress, NOW);
+        assert_the_pins_really_differed(&normal_pass, &duress_pass, "carrier deadline");
+        assert_the_pass_is_worth_comparing(&normal_pass.work, "carrier deadline");
+
+        assert_ne!(
+            DEADLINE, EXPIRY,
+            "the fixture must separate monotonic from wall time, or this case cannot tell \
+             a monotonic deadline from a wall one"
+        );
+        let row = format!("coord_nonce nonce={NONCE} expiry={EXPIRY} deadline=Some({DEADLINE})");
+        assert!(
+            normal_pass.work.sign_state.0.contains(&row),
+            "the accepted channel-mode Spend must retain D = M + (E − W) on its nonce entry, \
+             projected unmasked: {:?}",
+            normal_pass.work.sign_state
+        );
+        assert_eq!(
+            normal_pass.work.sign_state, duress_pass.work.sign_state,
+            "the Carrier deadline is fixed from clocks and coordinator-signed values, so both \
+             pin classes must record the identical /sign-state projection"
+        );
+    }
+
     /// The positive control for every equality above: the record has to be able to
     /// come out DIFFERENT, or `assert_eq!` on it is decoration. Two genuinely
     /// different ingress shapes — a hot spend that installs a Hold and meters the Hot
@@ -14075,8 +14064,8 @@ mod duress {
         assert_eq!(
             shape_rows(channel, "memo "),
             vec![format!(
-                "memo nonce={} outcome=InFlight expiry={}",
-                request.nonce, next.expiry
+                "memo nonce={} outcome=InFlight expiry={} deadline={}",
+                request.nonce, next.expiry, next.deadline
             )],
             "replacement must discard every prior generation's recognition"
         );
@@ -14098,6 +14087,10 @@ mod duress {
     }
     fn memoized_duress(fx: &Fixture, nonce: &str) -> (crate::Node, SignRequest) {
         let node = duress_node(fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        node.channel
+            .as_ref()
+            .expect("channel")
+            .pin_hot_clock(MONO_NOW);
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
         let request = duress_request(fx, &spend, &default_escape(fx), nonce);
         assert!(matches!(
@@ -14187,8 +14180,8 @@ mod duress {
             );
         }
     }
-    /// q6v left `confirm_carrier`'s bare `intent.expiry <= now` eviction for sxt; its
-    /// clock has been through `NonceLog::effective_now`, which is only a rollback LOWER
+    /// `confirm_carrier` now treats `intent.expiry <= now` as refusal-only; its clock has
+    /// been through `NonceLog::effective_now`, which is only a rollback LOWER
     /// bound, so a FORWARD excursion still passes through untouched. Refusing is correct
     /// and must not change —
     /// an expired carrier may never collect a holder — but DESTROYING a still-ruling
@@ -14214,6 +14207,7 @@ mod duress {
         let generation = MemoGeneration {
             signature_tag: [0x33; 32],
             expiry: EXPIRY,
+            deadline: EXPIRY,
         };
 
         // An owner inside its COMMIT HOLD that has staged but not yet exited.
@@ -14235,14 +14229,20 @@ mod duress {
              answered ACCEPTED, and stop retrying — the node never reaches t"
         );
 
-        // Once the owner has ruled, the ordinary eviction must still fire — otherwise
-        // this exception would leak an intent per expired carrier forever.
+        // Once the owner has ruled, wall expiry still has no retirement authority.
         channel.end_carrier_ruling(CARRIER);
         assert!(!node.confirm_carrier(SENDER, CARRIER, EXPIRY).armed);
         assert_eq!(
             channel.intent_counts(),
+            (1, 1),
+            "confirmation at E refuses without destroying the ruled Carrier"
+        );
+        channel.pin_hot_clock(EXPIRY);
+        channel.prune_store(NOW);
+        assert_eq!(
+            channel.intent_counts(),
             (0, 0),
-            "with no owner ruling, the expiry eviction is unchanged"
+            "D retires after owner release"
         );
     }
     /// The negative control for the case above: the compared record must be ABLE to come
@@ -14300,11 +14300,8 @@ mod duress {
     ///    retry for the sliver between staging and handler exit; or
     ///  - it RULES AND REFUSES WITHOUT STAGING, which every federation-uniform policy
     ///    refusal below the arm hook does deliberately — this node decided not to be a
-    ///    holder. `ready_to_propagate` then stays false until the intent's own expiry, so
-    ///    reading that bit alone as "still deciding" would answer a peer `RATE_LIMITED`
-    ///    once a second until `commitment_expiry` (up to `max_commitment_age_secs`)
-    ///    against an answer that will never change — self-inflicted denial of the
-    ///    `/channel` capacity honest partials and receipts need.
+    ///    holder, so terminal cleanup retires both Carrier records. Reading the staging
+    ///    bit alone as "still deciding" would retry against a final answer.
     #[test]
     fn the_awaiting_propagation_window_ends_with_its_handler_not_with_its_intent() {
         const SENDER: u16 = 1;
@@ -14320,6 +14317,7 @@ mod duress {
         let generation = MemoGeneration {
             signature_tag: [0x51; 32],
             expiry: EXPIRY,
+            deadline: EXPIRY,
         };
         let lookup = |nonce: &str| memo_lookup(channel, nonce, generation, SENDER, NOW);
 
@@ -14357,6 +14355,7 @@ mod duress {
         let refused = MemoGeneration {
             signature_tag: [0x52; 32],
             expiry: EXPIRY,
+            deadline: EXPIRY,
         };
         channel.claim_nonce_in_flight("refused", refused, NOW);
         channel.record_arm_intent(
@@ -14376,10 +14375,9 @@ mod duress {
         assert!(
             matches!(
                 memo_lookup(channel, "refused", refused, SENDER, NOW),
-                CarrierMemoLookup::Exact(carrier) if carrier == "carrier-refused"
+                CarrierMemoLookup::Vacant
             ),
-            "once the handler has ruled, an unstaged intent must stop asking for retries: \
-             the node HAS answered, and `confirm_carrier` refuses it as the non-holder it is"
+            "once the handler has ruled, an unstaged intent and memo retire together"
         );
         assert!(
             !channel
@@ -14394,9 +14392,8 @@ mod duress {
     /// `transaction_class` — a federation-uniform refusal, so it deliberately never
     /// stages the carrier and this node never becomes a holder for it.
     ///
-    /// Before the ruling bit existed, the intent that refusal leaves behind
-    /// (`ready_to_propagate == false` until its own expiry) was indistinguishable from a
-    /// handler still working, so a peer relaying the same request was answered
+    /// Before terminal non-staged retirement, the false staging bit was
+    /// indistinguishable from a handler still working, so a peer relaying the same request was answered
     /// `RATE_LIMITED{1}` and `retry_loop` re-sent it once a second until
     /// `commitment_expiry`. Each of those retries costs the receiver a `sign_state`
     /// acquisition and a coordinator-signature verify, and they compete for the same
@@ -14411,7 +14408,11 @@ mod duress {
         let self_spend = fx.spend_psbt(&fx.vault_spk, 7);
         let request = fx.spend_request(&self_spend, EXPIRY, "ruled-not-staged");
 
-        match crate::handle_sign(&node, &request, NOW).expect("decodable") {
+        let (response, ops) = crate::ingress_trace::capture(|| {
+            crate::handle_sign(&node, &request, NOW).expect("decodable")
+        });
+        assert!(ops.contains(&crate::ingress_trace::IngressOp::ArmIntentWrite));
+        match response {
             SignResponse::Refusal(r) => assert_eq!(
                 r.check, "transaction_class",
                 "this test needs the non-staging half of the refusal split"
@@ -14419,21 +14420,9 @@ mod duress {
             other => panic!("expected a class refusal, got {other:?}"),
         }
         assert_eq!(
-            shape_rows(channel, "intent "),
-            vec![format!(
-                "intent holders=[] ready_to_propagate=false owner_ruling=false first_seen={NOW} \
-                 spend_commitment_id= escape_commitment_id= expiry={EXPIRY} committed=false"
-            )],
-            "the arm hook recorded the intent, the refusal did not stage it, and the handler \
-             ended its ruling on the way out"
-        );
-        // Without this the test could pass vacuously: a VACANT memo also answers
-        // ACCEPTED, and it is `Derived` + unstaged that used to answer RATE_LIMITED.
-        assert_eq!(
-            shape_rows(channel, "memo "),
-            vec![format!(
-                "memo nonce=ruled-not-staged outcome=Derived resolved_senders=[] expiry={EXPIRY}"
-            )]
+            channel.intent_counts(),
+            (0, 0),
+            "the arm hook recorded both halves, then the non-staging terminal exit retired them"
         );
 
         // The peer's relay of the very same request: its own ingress refuses as a nonce
@@ -14450,7 +14439,7 @@ mod duress {
             "a node that has RULED must answer once; RATE_LIMITED here is a retry against a \
              decision that cannot change, repeated until the commitment expires"
         );
-        assert_eq!(channel.intent_counts(), (1, 1), "lookup is non-destructive");
+        assert_eq!(channel.intent_counts(), (0, 0), "relay adds nothing");
     }
 
     /// The unruled exception covers BOTH halves of a request, not just the `InFlight`
@@ -14460,9 +14449,9 @@ mod duress {
     /// false positive — and leave the owner's own registration with no intent to stage
     /// into, so its candidate's holder gate could never open.
     ///
-    /// The bound is the other half of the same rule: the exception is passive-only. Once
-    /// a later nonce is ACCEPTED — which advances the log's rollback high-water past the
-    /// expiries it forgets — the eviction is unconditional again.
+    /// The bound is the closed retirement set: terminal non-staging or completed holder
+    /// decisions retire early, while a ruled Carrier retires at `D` after owner release.
+    /// Accepted ingress may drive that monotonic pass but has no wall-time authority.
     #[test]
     fn a_forward_clock_prune_cannot_delete_an_unruled_intent_or_its_memo() {
         let fx = Fixture::new(3, 5);
@@ -14476,6 +14465,7 @@ mod duress {
         let generation = MemoGeneration {
             signature_tag: [0x61; 32],
             expiry: EXPIRY,
+            deadline: EXPIRY,
         };
 
         channel.claim_nonce_in_flight("unruled", generation, NOW);
@@ -14540,11 +14530,12 @@ mod duress {
              committed terminal={committed_is_terminal}"
         );
 
-        // THE BOUND: an ACCEPTED nonce evicts expired state even while its owner rules,
-        // so unruled entries cannot accumulate past the nonce log's own horizon.
+        // THE BOUND: accepted ingress may run D retirement, but the active owner keeps
+        // both halves resident until its terminal guard runs.
         let second = MemoGeneration {
             signature_tag: [0x62; 32],
             expiry: EXPIRY,
+            deadline: EXPIRY,
         };
         channel.claim_nonce_in_flight("still-unruled", second, NOW);
         channel.record_arm_intent(
@@ -14558,31 +14549,31 @@ mod duress {
         );
         assert_eq!(
             channel.intent_counts(),
-            (2, 2),
-            "this claim's own accept-path prune runs at NOW, which is before either \
-             generation's expiry, so both pairs are legitimately resident"
+            (1, 1),
+            "the earlier carrier completed its holder decision and retired; this owner remains"
         );
         channel.claim_nonce_in_flight(
             "fresher",
             MemoGeneration {
                 signature_tag: [0x63; 32],
                 expiry: EXPIRY + 100,
+                deadline: EXPIRY + 100,
             },
             EXPIRY + 1,
         );
         assert_eq!(
             channel.intent_counts(),
-            (0, 1),
-            "the nonce-accepting prune is unconditional: only the fresh claim remains"
+            (1, 2),
+            "monotonic D has lapsed, but the older owner still rules and cannot be deleted"
         );
     }
 
     /// THE GENERATION GATE, all three cases. Two handler generations can share one
-    /// nonce key — `check_and_record` tests EXPIRY BEFORE REPLAY, so past expiry a
-    /// differently-signed body with a fresh expiry is accepted onto the same key while
-    /// the first handler is still in its out-of-lock window. A later accepted ingress
-    /// also prunes expired claims after advancing the nonce log's rollback high-water,
-    /// so a claim can be absent when its owner reaches the COMMIT HOLD.
+    /// nonce key — `check_and_record` tests EXPIRY BEFORE REPLAY, so past expiry (and a
+    /// channel node's Carrier deadline) a differently-signed body takes that key while
+    /// the first handler is still in its out-of-lock window. Active-owner and wall-clock
+    /// paths now preserve its claim; the ABSENT case below remains a defensive recovery
+    /// for an already-missing exact-generation claim.
     ///
     /// The three cases are NOT the same, which is why they are asserted separately.
     /// What they share is that the ARM INTENT is recorded in every one: it is keyed by
@@ -14602,10 +14593,12 @@ mod duress {
         let mine = MemoGeneration {
             signature_tag: [0x11; 32],
             expiry: EXPIRY,
+            deadline: EXPIRY,
         };
         let newer = MemoGeneration {
             signature_tag: [0x22; 32],
             expiry: EXPIRY + 1,
+            deadline: EXPIRY + 1,
         };
         let memo_rows = |channel: &ChannelState| -> Vec<String> {
             store_shape(channel)
@@ -14620,7 +14613,7 @@ mod duress {
         assert_eq!(
             memo_rows(channel),
             vec![format!(
-                "memo nonce=shared outcome=InFlight expiry={EXPIRY}"
+                "memo nonce=shared outcome=InFlight expiry={EXPIRY} deadline={EXPIRY}"
             )]
         );
         assert_eq!(
@@ -14630,7 +14623,8 @@ mod duress {
         assert_eq!(
             memo_rows(channel),
             vec![format!(
-                "memo nonce=shared outcome=Derived resolved_senders=[] expiry={EXPIRY}"
+                "memo nonce=shared outcome=Derived resolved_senders=[] expiry={EXPIRY} \
+                 deadline={EXPIRY}"
             )]
         );
         assert_eq!(channel.intent_counts(), (1, 1));
@@ -14646,7 +14640,8 @@ mod duress {
         assert_eq!(
             memo_rows(channel),
             vec![format!(
-                "memo nonce=shared outcome=InFlight expiry={}",
+                "memo nonce=shared outcome=InFlight expiry={} deadline={}",
+                EXPIRY + 1,
                 EXPIRY + 1
             )],
             "the stale handler must leave the newer generation's claim exactly as it found it"
@@ -14657,17 +14652,16 @@ mod duress {
             "the stale handler still records its own separately-keyed intent"
         );
 
-        // ABSENT — the claim was pruned mid-window. RECORD THE INTENT ANYWAY and
-        // re-install the memo directly as Derived. The alternative — reading absence as
-        // staleness and refusing — silently swallows a duress signal, which is the
-        // failure class the whole reorder exists to close.
+        // ABSENT — preserve the defensive recovery: record the intent and re-install
+        // the memo directly as Derived rather than creating a hollow carrier.
         assert_eq!(
             channel.record_arm_intent(true, "carrier-pruned", "unclaimed", mine, NOW, NOW, timing),
             MemoUpgrade::Reinstalled
         );
         assert!(
             memo_rows(channel).contains(&format!(
-                "memo nonce=unclaimed outcome=Derived resolved_senders=[] expiry={EXPIRY}"
+                "memo nonce=unclaimed outcome=Derived resolved_senders=[] expiry={EXPIRY} \
+                 deadline={EXPIRY}"
             )),
             "an absent claim must be re-installed as Derived, not refused: {:?}",
             memo_rows(channel)
@@ -14695,10 +14689,12 @@ mod duress {
         let mine = MemoGeneration {
             signature_tag: [0x11; 32],
             expiry: EXPIRY,
+            deadline: EXPIRY,
         };
         let newer = MemoGeneration {
             signature_tag: [0x22; 32],
             expiry: EXPIRY + 1,
+            deadline: EXPIRY + 1,
         };
 
         // Its own live claim: removed.
@@ -14733,8 +14729,8 @@ mod duress {
     ///
     /// BOTH halves of the guard take that lock — the memo claim and the carrier ruling —
     /// so both are exercised here. A panicking handler that left `owner_ruling` set would
-    /// leave every peer receipt for that carrier answered RATE_LIMITED until the request
-    /// expired, which is the failure the ruling bit is a GUARD rather than a per-branch
+    /// leave every peer receipt for that carrier answered RATE_LIMITED until process
+    /// death, which is the failure the ruling bit is a GUARD rather than a per-branch
     /// action to prevent.
     #[test]
     fn an_in_flight_guard_cleans_a_poisoned_store_while_unwinding() {
@@ -14749,6 +14745,7 @@ mod duress {
         let generation = MemoGeneration {
             signature_tag: [0x31; 32],
             expiry: EXPIRY,
+            deadline: EXPIRY,
         };
         channel.claim_nonce_in_flight("poisoned-drop", generation, NOW);
         // A second, separately-keyed request whose intent this same handler is ruling on.
@@ -14789,22 +14786,15 @@ mod duress {
             !store.carriers_by_nonce.contains_key("poisoned-drop"),
             "the poison-tolerant Drop must still remove its matched InFlight claim"
         );
-        assert!(
-            !store
-                .intents
-                .get("carrier-poisoned")
-                .expect("the ruled intent survives the panic")
-                .owner_ruling,
-            "a panicking handler must still end its ruling, or peer receipts for that \
-             carrier retry until the request expires"
-        );
+        assert!(!store.intents.contains_key("carrier-poisoned"));
+        assert!(!store.carriers_by_nonce.contains_key("ruled-nonce"));
     }
 
     /// The COMMIT HOLD's Lockdown exit is the one refusal that deliberately does not
     /// stage — and it must not strand its nonce claim either. A claim left behind would
-    /// answer every peer receipt for that nonce RATE_LIMITED throughout the sender's
-    /// retry horizon (then remain until a later accepted ingress pruned it), turning a
-    /// terminal transition into federation-wide censorship of one carrier.
+    /// answer every peer receipt for that nonce RATE_LIMITED until process death, because
+    /// an `InFlight` claim itself protects its owner from deadline pruning. The guard's
+    /// terminal cleanup therefore prevents federation-wide censorship of one carrier.
     #[test]
     fn a_lockdown_during_the_pin_window_strands_no_claim() {
         let fx = Fixture::new(3, 5);
@@ -14888,6 +14878,7 @@ mod duress {
         MemoGeneration {
             signature_tag,
             expiry,
+            deadline: expiry,
         }
     }
 
@@ -14925,6 +14916,7 @@ mod duress {
             let fx = Fixture::new(3, 5);
             let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
             let channel = node.channel.as_ref().expect("channel");
+            channel.pin_hot_clock(MONO_NOW);
             let spend = fx.spend_psbt(&fx.hot_spk, 7);
             let request = duress_request(&fx, &spend, &default_escape(&fx), "slow-pin-window");
 
@@ -14952,7 +14944,8 @@ mod duress {
                 memos,
                 vec![format!(
                     "memo nonce=slow-pin-window outcome=Derived resolved_senders=[] \
-                     expiry={EXPIRY}"
+                     expiry={EXPIRY} deadline={}",
+                    MONO_NOW + EXPIRY - NOW
                 )],
                 "{case}: the guard must have relinquished the memo it upgraded"
             );
@@ -14994,7 +14987,7 @@ mod duress {
     /// through `record_arm_intent` directly.
     ///
     /// Two handler generations legitimately share one nonce key: `check_and_record`
-    /// tests EXPIRY BEFORE REPLAY, so once the first handler's expiry has passed, a
+    /// tests EXPIRY BEFORE REPLAY, so once BOTH expiry and Carrier deadline pass, a
     /// differently-signed body carrying a fresh expiry is accepted onto the same key
     /// while the first is still inside its out-of-lock PIN window. What the stale
     /// handler must then do is specified in four parts, and all four are asserted here:
@@ -15054,6 +15047,13 @@ mod duress {
             "the stale handler must hold a claim and no intent yet"
         );
 
+        // Advance the pinned monotonic clock by the same interval wall time moved, which
+        // is what a coherent host clock does. The stale generation's nonce entry holds
+        // its key until its Carrier deadline `MONO_NOW + (STALE_EXPIRY − NOW)` has passed
+        // too, so leaving the pin frozen would make the newer body a REPLAY instead of
+        // the supersession this case exists to test.
+        channel.pin_hot_clock(MONO_NOW + (FRESH_NOW - NOW));
+
         // The newer generation runs to completion on the free lock. It is the ONE
         // rendezvous the barrier serves, so this second `/sign` does not park.
         let fresh_response = crate::handle_sign(&node, &fresh, FRESH_NOW).expect("decodable");
@@ -15066,7 +15066,9 @@ mod duress {
         assert_eq!(
             after_fresh,
             vec![format!(
-                "memo nonce={NONCE} outcome=Derived resolved_senders=[] expiry={FRESH_EXPIRY}"
+                "memo nonce={NONCE} outcome=Derived resolved_senders=[] expiry={FRESH_EXPIRY} \
+                 deadline={}",
+                MONO_NOW + (FRESH_EXPIRY - NOW)
             )],
             "the newer generation owns the key before the stale handler resumes"
         );
@@ -15090,16 +15092,15 @@ mod duress {
         let intents = shape_rows(channel, "intent ");
         assert_eq!(
             intents.len(),
-            2,
-            "the stale handler still records its own carrier-keyed intent: {intents:?}"
+            1,
+            "the stale handler records its intent, stages, then retires it when its \
+             already-lapsed D meets owner release: {intents:?}"
         );
         assert!(
             intents
                 .iter()
                 .all(|row| row.contains("holders=[0] ready_to_propagate=true")),
-            "both carriers are staged — the superseded one refuses like any other expiry \
-             exit, and refusing without staging would drop an authenticated duress signal: \
-             {intents:?}"
+            "the newer generation remains staged and untouched: {intents:?}"
         );
         assert_eq!(
             node.duress_arm_count(),
@@ -15113,6 +15114,400 @@ mod duress {
             "only the newer generation charged the budget; the superseded handler must \
              not charge it again"
         );
+    }
+
+    fn has_memo(channel: &ChannelState, nonce: &str) -> bool {
+        shape_rows(channel, "memo ")
+            .iter()
+            .any(|row| row.starts_with(&format!("memo nonce={nonce} ")))
+    }
+
+    /// The three production `prune_store` drivers share one wall argument, but that
+    /// argument owns candidate/fire-window aging only. A wall jump past E cannot erase
+    /// the Carrier while the acceptance-fixed monotonic horizon is still live.
+    #[tokio::test]
+    async fn carrier_retirement_wall_prune_drivers_preserve_the_carrier_and_candidates_still_age() {
+        const LATE: u64 = EXPIRY + 1;
+        const DEADLINE: u64 = MONO_NOW + (EXPIRY - NOW);
+
+        // The 1 Hz fire driver executes the real prune before any backend work.
+        let fx = Fixture::new(3, 5);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let (node, _) = memoized_duress(&fx, "retire-fire");
+        let node = Arc::new(node);
+        assert_eq!(node.channel.as_ref().expect("channel").store_len(), 2);
+        assert_eq!(
+            crate::fire_tick(Arc::clone(&node), Arc::new(backend_for(&spend)), LATE).await,
+            0
+        );
+        let channel = node.channel.as_ref().expect("channel");
+        assert!(has_memo(channel, "retire-fire"));
+        assert_eq!(
+            channel.store_len(),
+            0,
+            "candidate wall expiry remains unchanged while Carrier retirement splits away"
+        );
+        channel.pin_hot_clock(DEADLINE);
+        let _ = crate::fire_tick(Arc::clone(&node), Arc::new(backend_for(&spend)), LATE).await;
+        assert!(!has_memo(channel, "retire-fire"));
+
+        // Insert the old Carrier only after the new /sign's accepted-nonce claim, so its
+        // registration-phase prune_store call must perform exact-D retirement.
+        let fx = Fixture::new(3, 5);
+        let (node, _) = counted_duress_node(&fx);
+        let node = Arc::new(node);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        node.pin_window_a_midpoint(Arc::clone(&barrier));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = fx.spend_request(&spend, EXPIRY, "retire-sign-new");
+        let worker_node = Arc::clone(&node);
+        let worker = std::thread::spawn(move || {
+            crate::handle_sign(&worker_node, &request, NOW).expect("decodable")
+        });
+        barrier.wait();
+        let channel = node.channel.as_ref().expect("channel");
+        let generation = MemoGeneration {
+            signature_tag: [0xD1; 32],
+            expiry: EXPIRY,
+            deadline: MONO_NOW + 1,
+        };
+        channel.record_arm_intent(
+            false,
+            "retire-sign-old",
+            "retire-sign-old",
+            generation,
+            NOW,
+            NOW,
+            DuressTiming {
+                duress_delay_secs: DELAY,
+                epsilon_secs: EPS,
+                combine_slack_secs: SLACK,
+            },
+        );
+        channel.mark_carrier_propagated("retire-sign-old");
+        channel.end_carrier_ruling("retire-sign-old");
+        channel.pin_hot_clock(MONO_NOW + 1);
+        barrier.wait();
+        assert!(matches!(
+            worker.join().expect("/sign driver"),
+            SignResponse::Accepted(_)
+        ));
+        assert!(!has_memo(channel, "retire-sign-old"));
+
+        // /refresh has no Carrier of its own, but it still drives the same prune.
+        let fx = Fixture::new(3, 5);
+        let (node, _) = memoized_duress(&fx, "retire-refresh-old");
+        let (_, refresh) = fx.refresh_request(LATE + 7_200, 1_000, "retire-refresh-new");
+        let _ = crate::handle_refresh(&node, &refresh, LATE).expect("decodable");
+        assert!(has_memo(
+            node.channel.as_ref().expect("channel"),
+            "retire-refresh-old"
+        ));
+        node.channel
+            .as_ref()
+            .expect("channel")
+            .pin_hot_clock(DEADLINE);
+        let (_, refresh) = fx.refresh_request(LATE + 7_201, 1_000, "retire-refresh-at-d");
+        let _ = crate::handle_refresh(&node, &refresh, LATE).expect("decodable");
+        assert!(!has_memo(
+            node.channel.as_ref().expect("channel"),
+            "retire-refresh-old"
+        ));
+    }
+
+    /// Accepted-nonce collection is a separate seam from `prune_store`: park the new
+    /// owner immediately after its claim, before COMMIT-HOLD can run, and prove its
+    /// forward wall sample did not collect a wall-dead/monotonic-live Carrier.
+    #[test]
+    fn carrier_retirement_real_nonce_acceptance_has_no_wall_retirement_authority() {
+        const LATE: u64 = EXPIRY + 1;
+        let fx = Fixture::new(3, 5);
+        let (node, _) = memoized_duress(&fx, "retire-accept-old");
+        let node = Arc::new(node);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        node.pin_window_a_midpoint(Arc::clone(&barrier));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = fx.spend_request(&spend, LATE + 7_200, "retire-accept-new");
+        let worker_node = Arc::clone(&node);
+        let worker = std::thread::spawn(move || {
+            crate::handle_sign(&worker_node, &request, LATE).expect("decodable")
+        });
+
+        barrier.wait();
+        assert!(
+            has_memo(node.channel.as_ref().expect("channel"), "retire-accept-old"),
+            "the accepted transition may collect only against monotonic D, never its wall W"
+        );
+        barrier.wait();
+        let _ = worker.join().expect("new owner");
+    }
+
+    /// COMMIT-HOLD receives an effective wall value for attempt checks and overlay
+    /// scheduling. Park in WINDOW B to inspect the store before the later /sign prune:
+    /// that value cannot retire an unrelated Carrier either.
+    #[test]
+    fn carrier_retirement_commit_hold_wall_sample_cannot_collect_an_older_carrier() {
+        let fx = Fixture::new(3, 5);
+        let (mut node, _) = memoized_duress(&fx, "retire-commit-old");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let proceed = Arc::new(std::sync::Barrier::new(2));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let mut backend = backend_for(&spend);
+        backend.prevout_fetch_entered = Some(Arc::clone(&entered));
+        backend.prevout_fetch_continue = Some(Arc::clone(&proceed));
+        node.set_chain_backend(Arc::new(backend));
+        let request = fx.spend_request(&spend, EXPIRY + 7_200, "retire-commit-new");
+        let node = Arc::new(node);
+        let worker_node = Arc::clone(&node);
+        let worker = std::thread::spawn(move || {
+            crate::handle_sign_after_lock(
+                &worker_node,
+                &request,
+                stepping_clock([EXPIRY - 1, EXPIRY + 1]),
+            )
+            .expect("decodable")
+        });
+
+        entered.wait();
+        assert!(
+            has_memo(node.channel.as_ref().expect("channel"), "retire-commit-old"),
+            "COMMIT-HOLD wall time is attempt authority, not Carrier-retirement authority"
+        );
+        proceed.wait();
+        let _ = worker.join().expect("window B owner");
+    }
+
+    /// Lookup samples before E, then final confirmation samples at E. The attempt is a
+    /// terminal no-op until 7ip changes its response class, but it must preserve the
+    /// exact state and must not count a holder, open a gate, commit, or arm.
+    #[test]
+    fn carrier_retirement_two_sample_confirmation_refusal_preserves_state() {
+        let fx = Fixture::new(3, 5);
+        let (node, request) = memoized_duress(&fx, "retire-confirm");
+        let channel = node.channel.as_ref().expect("channel");
+        let before = shape_rows(channel, "intent ");
+        let payload = request_payload(&vault_proto::TaggedRequest::Spend(request));
+        let envelope = fx
+            .channel_state(1)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, NOW)
+            .expect("envelope");
+        let body = serde_json::to_vec(&envelope).expect("json");
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let reply = crate::handle_channel_body_with_clocks(
+            &node,
+            &body,
+            NOW,
+            || NOW,
+            || {
+                let read = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                [NOW, EXPIRY][read.min(1)]
+            },
+        );
+        assert_eq!(reply, ChannelReply::Accepted);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(shape_rows(channel, "intent "), before);
+        assert_eq!(channel.intent_counts(), (1, 1));
+        assert!(shape_rows(channel, "intent ")[0].contains("holders=[0]"));
+        assert!(channel.armed_snapshot().is_none());
+    }
+
+    /// D is inclusive retirement authority: state lives just before it, retires at it,
+    /// and stays gone after it. The wall remains before E throughout, proving this is
+    /// not candidate expiry; the accepted nonce tombstone outlives the Carrier.
+    #[test]
+    fn carrier_retirement_exact_deadline_boundaries_and_ruling_owner() {
+        const DEADLINE: u64 = MONO_NOW + (EXPIRY - NOW);
+        for (mono_now, retained) in [
+            (DEADLINE - 1, true),
+            (DEADLINE, false),
+            (DEADLINE + 1, false),
+        ] {
+            let fx = Fixture::new(3, 5);
+            let (node, _) = memoized_duress(&fx, "retire-boundary");
+            let channel = node.channel.as_ref().expect("channel");
+            channel.pin_hot_clock(mono_now);
+            channel.prune_store(NOW);
+            assert_eq!(
+                channel.intent_counts() == (1, 1),
+                retained,
+                "mono={mono_now}"
+            );
+            assert_eq!(
+                channel.store_len(),
+                2,
+                "candidate wall semantics must not move"
+            );
+            assert!(
+                node.sign_state
+                    .lock()
+                    .expect("sign_state")
+                    .shape()
+                    .iter()
+                    .any(|row| row.contains("nonce=retire-boundary")
+                        && row.contains(&format!("deadline=Some({DEADLINE})"))),
+                "Carrier retirement must not release or rewrite the nonce tombstone"
+            );
+        }
+
+        // An owner parked in WINDOW A survives D. Once it finishes and releases its
+        // ruling, the already-lapsed D removes the staged intent and memo atomically.
+        let fx = Fixture::new(3, 5);
+        let (node, _calls) = counted_duress_node(&fx);
+        let node = Arc::new(node);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        node.pin_window_a_midpoint(Arc::clone(&barrier));
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "retire-ruling");
+        let worker_node = Arc::clone(&node);
+        let worker = std::thread::spawn(move || {
+            crate::handle_sign(&worker_node, &request, NOW).expect("decodable")
+        });
+        barrier.wait();
+        let channel = node.channel.as_ref().expect("channel");
+        channel.pin_hot_clock(DEADLINE);
+        channel.prune_store(NOW);
+        assert_eq!(
+            channel.intent_counts(),
+            (0, 1),
+            "an InFlight owner survives D"
+        );
+        barrier.wait();
+        assert!(matches!(
+            worker.join().expect("owner"),
+            SignResponse::Accepted(_)
+        ));
+        assert_eq!(
+            channel.intent_counts(),
+            (0, 0),
+            "owner release at an already-lapsed D retires both Carrier halves"
+        );
+
+        // The same owner rule protects a Derived carrier, not only its Window-A claim.
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let generation = MemoGeneration {
+            signature_tag: [0xD0; 32],
+            expiry: EXPIRY,
+            deadline: DEADLINE,
+        };
+        channel.claim_nonce_in_flight("derived-owner", generation, MONO_NOW);
+        channel.record_arm_intent(
+            true,
+            "derived-owner",
+            "derived-owner",
+            generation,
+            NOW,
+            NOW,
+            DuressTiming {
+                duress_delay_secs: DELAY,
+                epsilon_secs: EPS,
+                combine_slack_secs: SLACK,
+            },
+        );
+        channel.mark_carrier_propagated("derived-owner");
+        channel.pin_hot_clock(DEADLINE);
+        channel.prune_store(NOW);
+        assert_eq!(
+            channel.intent_counts(),
+            (1, 1),
+            "a Derived owner survives D"
+        );
+        channel.end_carrier_ruling("derived-owner");
+        assert_eq!(channel.intent_counts(), (0, 0));
+    }
+
+    /// Terminal non-staging exits and completed holder decisions are early retirement
+    /// authorities. In both cases the nonce tombstone remains, and normal/duress
+    /// decisions complete candidate release/freeze work before their state disappears.
+    #[test]
+    fn carrier_retirement_terminal_exits_and_both_holder_decisions_leave_nonce_only() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        node.channel
+            .as_ref()
+            .expect("channel")
+            .pin_hot_clock(MONO_NOW);
+        let self_spend = fx.spend_psbt(&fx.vault_spk, 7);
+        let request = fx.spend_request(&self_spend, EXPIRY, "retire-non-staged");
+        let (response, ops) = crate::ingress_trace::capture(|| {
+            crate::handle_sign(&node, &request, NOW).expect("decodable")
+        });
+        assert!(ops.contains(&crate::ingress_trace::IngressOp::ArmIntentWrite));
+        assert!(matches!(
+            response,
+            SignResponse::Refusal(r) if r.check == "transaction_class"
+        ));
+        assert_eq!(
+            node.channel.as_ref().expect("channel").intent_counts(),
+            (0, 0)
+        );
+        assert!(node
+            .sign_state
+            .lock()
+            .expect("sign_state")
+            .shape()
+            .iter()
+            .any(|row| row.contains("nonce=retire-non-staged") && row.contains("deadline=Some(")));
+
+        for (nonce, pin, should_arm) in [
+            ("retire-normal", "1234", false),
+            ("retire-duress", "9999", true),
+        ] {
+            let fx = Fixture::new(3, 5);
+            let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+            node.channel
+                .as_ref()
+                .expect("channel")
+                .pin_hot_clock(MONO_NOW);
+            let spend = fx.spend_psbt(&fx.hot_spk, 7);
+            let mut request = fx.spend_request(&spend, EXPIRY, nonce);
+            request.pin = pin.to_string().into();
+            fx.coord_sign(&mut request, nonce);
+            assert!(matches!(
+                crate::handle_sign(&node, &request, NOW).expect("decodable"),
+                SignResponse::Accepted(_)
+            ));
+            assert_eq!(confirm_peers(&node, &request, 2, NOW), should_arm);
+            let channel = node.channel.as_ref().expect("channel");
+            assert_eq!(channel.intent_counts(), (0, 0), "{nonce}");
+            assert!(channel.slot_is_active(&crate::commitment_id_for(&node, &spend, EXPIRY)));
+            assert_eq!(channel.armed_snapshot().is_some(), should_arm);
+            assert!(node
+                .sign_state
+                .lock()
+                .expect("sign_state")
+                .shape()
+                .iter()
+                .any(|row| row.contains(&format!("nonce={nonce}"))));
+        }
+    }
+
+    /// Sequential terminal and horizon removals keep both maps flat. This is the
+    /// steady-state bound after accepted-nonce wall collection is removed.
+    #[test]
+    fn carrier_retirement_sequential_store_bound_is_constant() {
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        let timing = DuressTiming {
+            duress_delay_secs: DELAY,
+            epsilon_secs: EPS,
+            combine_slack_secs: SLACK,
+        };
+        for i in 0..64u64 {
+            let expiry = EXPIRY + i;
+            let generation = generation([i as u8; 32], expiry);
+            let nonce = format!("bounded-{i}");
+            let carrier = format!("carrier-bounded-{i}");
+            channel.claim_nonce_in_flight(&nonce, generation, NOW);
+            channel.record_arm_intent(false, &carrier, &nonce, generation, NOW, NOW, timing);
+            channel.mark_carrier_propagated(&carrier);
+            channel.end_carrier_ruling(&carrier);
+            channel.pin_hot_clock(expiry);
+            channel.prune_store(NOW);
+            assert_eq!(channel.intent_counts(), (0, 0), "round {i}");
+        }
     }
 
     // -- Partial-release authorization --------------------------------------
@@ -17033,6 +17428,8 @@ mod duress {
                         EXPIRY,
                         NOW,
                         node.max_commitment_age_secs,
+                        None,
+                        false,
                     ),
                     crate::replay::NonceDecision::Accepted
                 );
@@ -18185,12 +18582,10 @@ mod duress {
         );
     }
 
-    /// Expiry is enforced inside the confirmation commit, not only by the periodic
-    /// prune. Otherwise a receipt landing between a carrier's expiry and the next
-    /// prune tick arms whichever node had not pruned yet, while a node that had
-    /// ignores the identical receipt — making "who armed" a function of poll phase
-    /// rather than of the carrier. Both sites use the coordinator freshness rule
-    /// `expiry > now`, so the boundary second is already stale.
+    /// Expiry is enforced inside the confirmation commit as holder-attempt authority.
+    /// Otherwise a receipt landing at/past `E` could count or arm even though periodic
+    /// pruning now governs Carrier residency only by monotonic `D`. The coordinator
+    /// freshness rule is `expiry > now`, so the boundary second is already stale.
     #[test]
     fn a_lapsed_carrier_cannot_arm_on_a_late_receipt() {
         let fx = Fixture::new(3, 5);
@@ -18301,6 +18696,13 @@ mod duress {
     fn a_clock_rollback_cannot_revive_a_logically_expired_carrier() {
         let fx = Fixture::new(3, 5);
         let node = duress_node(&fx, HOLD, "duress_delay_secs = 600");
+        // The carrier's own nonce entry now also holds a monotonic Carrier deadline, so
+        // "logically expired" means BOTH clocks have passed it. Pin the monotonic one so
+        // the accepted deadline is a known constant rather than this process's uptime.
+        node.channel
+            .as_ref()
+            .expect("channel")
+            .pin_hot_clock(MONO_NOW);
         let spend = fx.spend_psbt(&fx.hot_spk, 7);
         let request = duress_request(&fx, &spend, &default_escape(&fx), "rollback-carrier");
         assert!(matches!(
@@ -18320,6 +18722,10 @@ mod duress {
                     EXPIRY + 100,
                     EXPIRY + 1,
                     node.max_commitment_age_secs,
+                    // Monotonic time has reached the carrier's deadline too, so this
+                    // acceptance really does forget its nonce and ratchet the mark.
+                    Some(MONO_NOW + (EXPIRY - NOW)),
+                    true,
                 ),
                 crate::replay::NonceDecision::Accepted
             );
@@ -18345,10 +18751,123 @@ mod duress {
         );
     }
 
-    /// Intent pruning runs on ingress itself, not only from the backend-dependent
-    /// fire driver. A hung chain RPC therefore cannot turn fresh authenticated
-    /// traffic into unbounded RAM growth; the table and replay memo stay at the same
-    /// hard cap as the coordinator nonce log and expired generations are reclaimed.
+    /// A channel-mode Spend's coordinator nonce is held by BOTH clocks: its
+    /// coordinator-signed wall expiry `E` and the monotonic Carrier deadline
+    /// `D = M + (E − W)` fixed at the acceptance transition. Until both have passed,
+    /// the nonce key stays occupied and a differently-signed body cannot take it.
+    ///
+    /// The wall half alone is not enough because the Carrier state keyed off this
+    /// acceptance ages on the MONOTONIC clock: a forward wall excursion (NTP step, VM
+    /// restore) or a host suspend separates the two, and re-admitting the key while the
+    /// deadline it fixed is still live is what would let a second body replace a
+    /// still-live carrier's nonce entry. The third step is the other side of that rule,
+    /// and why this is not "retain forever": at exactly `D` — not a second later — both
+    /// clocks call the entry dead, the key is released, and the replacement is admitted.
+    #[test]
+    fn a_wall_expired_channel_spend_nonce_stays_replayed_until_its_monotonic_deadline() {
+        const NONCE: &str = "deadline-reuse";
+        const FIRST_EXPIRY: u64 = NOW + 7_200;
+        /// One second past the first body's wall expiry: the nonce log prunes on
+        /// `expiry > now`, so this is the first second the old key would be free.
+        const AFTER: u64 = FIRST_EXPIRY + 1;
+        const DEADLINE: u64 = MONO_NOW + (FIRST_EXPIRY - NOW);
+
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
+        let channel = node.channel.as_ref().expect("channel");
+        channel.pin_hot_clock(MONO_NOW);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        assert!(matches!(
+            crate::handle_sign(&node, &fx.spend_request(&spend, FIRST_EXPIRY, NONCE), NOW)
+                .expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+
+        // The accepted deadline reaches the claim from this same sign-state hold; this
+        // proves its value without a second clock sample.
+        assert_eq!(
+            node.sign_state
+                .lock()
+                .expect("sign_state")
+                .coord_nonces
+                .carrier_deadline(NONCE),
+            Some(DEADLINE)
+        );
+
+        // Wall time steps past `E` while the monotonic clock has NOT reached `D`.
+        // A differently-signed body carrying a fresh expiry on the same nonce key is
+        // exactly the replacement the deadline exists to refuse.
+        let replacement = fx.spend_request(&spend, AFTER + 7_200, NONCE);
+        match crate::handle_sign(&node, &replacement, AFTER).expect("decodable") {
+            SignResponse::Refusal(r) => assert_eq!(
+                r.code,
+                vault_proto::RefusalCode::NonceReplayed,
+                "a wall-expired but monotonically live nonce entry is still occupied"
+            ),
+            other => panic!("the nonce key must stay occupied until BOTH clocks end it: {other:?}"),
+        }
+
+        // Monotonic time reaches `D` exactly. Both clocks now call the entry dead, it
+        // is removed, and the same body is admitted onto the freed key.
+        channel.pin_hot_clock(DEADLINE);
+        assert!(
+            matches!(
+                crate::handle_sign(&node, &replacement, AFTER).expect("decodable"),
+                SignResponse::Accepted(_)
+            ),
+            "at exactly D the monotonic half has ended, so the key is reusable"
+        );
+    }
+
+    /// A channel-mode Refresh can reclaim wall-expired Spend nonce entries whose
+    /// monotonic deadlines have also ended, without allocating a deadline for itself.
+    /// Otherwise 4,096 dead Carrier tombstones permanently deny every Refresh even
+    /// though an ordinary Spend can reclaim the same shared capacity.
+    #[test]
+    fn a_channel_mode_refresh_reclaims_dead_spends_but_records_no_deadline() {
+        const NONCE: &str = "refresh-deadline";
+        const DEADLINE: u64 = MONO_NOW + (EXPIRY - NOW);
+
+        let fx = Fixture::new(3, 5);
+        let node = duress_node(&fx, HOLD, "");
+        let channel = node.channel.as_ref().expect("channel");
+        channel.pin_hot_clock(MONO_NOW);
+        {
+            let mut state = node.sign_state.lock().expect("sign_state");
+            for i in 0..crate::replay::MAX_COORD_NONCES {
+                assert_eq!(
+                    state.coord_nonces.check_and_record(
+                        &format!("spent-{i}"),
+                        EXPIRY,
+                        NOW,
+                        node.max_commitment_age_secs,
+                        Some(MONO_NOW),
+                        true,
+                    ),
+                    crate::replay::NonceDecision::Accepted
+                );
+            }
+        }
+        channel.pin_hot_clock(DEADLINE);
+        let (_refresh, request) = fx.refresh_request(EXPIRY + 1_000, 1_000, NONCE);
+        assert!(matches!(
+            crate::handle_refresh(&node, &request, EXPIRY).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let rows = node.sign_state.lock().expect("sign_state").shape();
+        assert!(
+            rows.contains(&format!("coord_nonces count=1 high_water={EXPIRY}"))
+                && rows.contains(&format!(
+                    "coord_nonce nonce={NONCE} expiry={} deadline=None",
+                    EXPIRY + 1_000
+                )),
+            "the Refresh must reclaim dead Spend entries but remain wall-only itself: {rows:?}"
+        );
+    }
+
+    /// Monotonic Carrier retirement runs on ingress as well as the fire driver. A hung
+    /// chain RPC cannot turn sequential authenticated traffic into unbounded RAM growth:
+    /// at D the old generation is reclaimed before its successor remains.
     #[test]
     fn arm_intents_remain_bounded_when_the_fire_driver_does_not_run() {
         let fx = Fixture::new(3, 5);
@@ -18367,21 +18886,23 @@ mod duress {
                 MemoGeneration {
                     signature_tag: [i as u8; 32],
                     expiry: NOW + 1,
+                    deadline: NOW + 1,
                 },
                 NOW,
                 NOW,
                 timing,
             );
-            // Every real handler ends its ruling on the way out, and only a RULED intent
-            // is collectable by the passive prune this test is about. See
-            // `a_forward_clock_prune_cannot_delete_an_unruled_intent_or_its_memo` for the
-            // complementary bound on the unruled ones.
+            channel.mark_carrier_propagated(&format!("carrier-{i}"));
             channel.end_carrier_ruling(&format!("carrier-{i}"));
         }
         assert_eq!(
             channel.intent_counts(),
             (MAX_COORD_NONCES, MAX_COORD_NONCES)
         );
+
+        channel.pin_hot_clock(NOW + 1);
+        channel.prune_store(NOW);
+        assert_eq!(channel.intent_counts(), (0, 0));
 
         channel.record_arm_intent(
             false,
@@ -18390,6 +18911,7 @@ mod duress {
             MemoGeneration {
                 signature_tag: [0xA5; 32],
                 expiry: NOW + 100,
+                deadline: NOW + 100,
             },
             NOW + 2,
             NOW + 2,
@@ -18398,7 +18920,7 @@ mod duress {
         assert_eq!(
             channel.intent_counts(),
             (1, 1),
-            "a new ingress prunes the expired intent generation without a fire tick"
+            "monotonic pruning reclaims the full old generation before the successor"
         );
     }
 
@@ -20860,6 +21382,8 @@ mod hot_budget {
                     EXPIRY + 100,
                     NOW,
                     node.max_commitment_age_secs,
+                    None,
+                    false,
                 ),
                 crate::replay::NonceDecision::Accepted
             );
@@ -20869,6 +21393,8 @@ mod hot_budget {
                     EXPIRY + 7_200,
                     EXPIRY + 100,
                     node.max_commitment_age_secs,
+                    None,
+                    false,
                 ),
                 crate::replay::NonceDecision::Accepted
             );

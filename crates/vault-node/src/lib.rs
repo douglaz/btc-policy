@@ -2228,7 +2228,7 @@ impl Node {
         verdict: pin::PinVerdict,
         carrier: &str,
         nonce: &str,
-        generation: channel::MemoGeneration,
+        generation: Option<channel::MemoGeneration>,
         first_seen: u64,
         now: u64,
     ) -> Option<channel::MemoUpgrade> {
@@ -2238,6 +2238,7 @@ impl Node {
         let delta = u64::conditional_select(&0, &1, is_duress);
         self.duress_arm.fetch_add(delta, Ordering::Relaxed);
         let channel = self.channel.as_ref()?;
+        let generation = generation.expect("channel arm hook carries Carrier generation");
         #[cfg(test)]
         ingress_trace::record(IngressOp::ArmIntentWrite);
         Some(channel.record_arm_intent(
@@ -2260,12 +2261,12 @@ impl Node {
         &self,
         nonce: &str,
         generation: channel::MemoGeneration,
-        now: u64,
+        mono_now: u64,
     ) -> Option<InFlightMemoGuard<'_>> {
         let channel = self.channel.as_ref()?;
         #[cfg(test)]
         ingress_trace::record(IngressOp::NonceClaim);
-        channel.claim_nonce_in_flight(nonce, generation, now);
+        channel.claim_nonce_in_flight(nonce, generation, mono_now);
         Some(InFlightMemoGuard {
             channel,
             nonce: nonce.to_string(),
@@ -2462,9 +2463,9 @@ impl Drop for SpendPreflightGuard<'_> {
 /// A guard rather than a paired removal for the same reason
 /// [`SpendPreflightGuard`] is one: the window it spans contains a Lockdown re-check,
 /// two memory-hard evaluations, and a panic boundary, and a claim left behind would
-/// answer every peer receipt for that nonce `RATE_LIMITED` throughout the sender's retry
-/// horizon (then remain until a later accepted ingress pruned it) — turning a crash into
-/// federation-wide censorship of one carrier.
+/// answer every peer receipt for that nonce `RATE_LIMITED` until process death: an
+/// `InFlight` claim itself protects its owner from deadline pruning. Removing it on every
+/// terminal exit therefore prevents federation-wide censorship of one carrier.
 ///
 /// **The predicate, not the action.** `Drop` removes ONLY a generation-matched
 /// `InFlight` entry and NEVER a `Derived` one, and every successful `Derived`
@@ -5009,14 +5010,18 @@ fn handle_sign_after_lock(
     //    rollback-guarded clock (`max(high_water, now)`, [`NonceLog`]), so a clock
     //    rollback cannot revive a pruned nonce. Its future upper bound still uses
     //    raw `now`, preserving V0-2's exact `now + max_commitment_age_secs` cap.
-    let effective_now = match verify_coord_auth(
+    // A channel Spend fixes `D` here for the ordered Carrier claim, without a clock re-read;
+    // absent-channel Spend and Refresh remain wall-only.
+    let mono_now = node.channel.as_ref().map(|channel| channel.hot_clock_now());
+    let (effective_now, carrier_deadline) = match verify_coord_auth(
         node,
         request.coord_request(),
         &request.coord_sig,
         raw_now,
         &mut state.coord_nonces,
+        mono_now,
     ) {
-        Ok(effective_now) => effective_now,
+        Ok(accepted) => accepted,
         Err(rejected) => {
             #[cfg(test)]
             ingress_trace::record(IngressOp::SignStateUnlock);
@@ -5145,15 +5150,20 @@ fn handle_sign_after_lock(
     // §0 counts receipts to reach `t`, so lost receipts mean a node never arms. See
     // [`channel::MemoOutcome::InFlight`].
     //
-    // The generation token is `(nonce, signature_tag, expiry)`. It is needed because two
-    // handler generations can legitimately share one nonce key: `check_and_record` tests
-    // EXPIRY BEFORE REPLAY, so past expiry a differently-signed body with a fresh expiry
-    // is accepted onto the same key while this handler still runs.
-    let generation = channel::MemoGeneration {
+    // Carry the exact D accepted above into both Carrier halves. `mono_now` is the same
+    // sample used to compute it; neither handoff reads a clock again.
+    let generation = node.channel.as_ref().map(|_| channel::MemoGeneration {
         signature_tag: arm_signature_tag(&request.coord_sig),
         expiry: request.expiry,
-    };
-    let mut nonce_claim = node.claim_nonce_in_flight(&request.nonce, generation, now);
+        deadline: carrier_deadline.expect("channel Spend acceptance fixes Carrier D"),
+    });
+    let mut nonce_claim = generation.and_then(|generation| {
+        node.claim_nonce_in_flight(
+            &request.nonce,
+            generation,
+            mono_now.expect("channel Spend acceptance samples HotClock"),
+        )
+    });
     #[cfg(test)]
     ingress_trace::record(IngressOp::SignStateUnlock);
     drop(state);
@@ -5252,8 +5262,8 @@ fn handle_sign_after_lock(
     // case, because it is keyed by carrier (a digest of this exact body) and a staged
     // carrier without an intent is the hollow configuration `confirm_carrier` can never
     // resolve. TWO CLOCKS: `now` (INGRESS HOLD) is the immutable `first_seen` that `T`
-    // is measured from, `commit_now` drives pruning and the overlay's current-time
-    // input.
+    // is measured from; `commit_now` drives the overlay and attempt checks, never
+    // Carrier retirement.
     let upgrade = node.fire_arm_hook(
         verdict,
         &carrier,
@@ -5332,9 +5342,9 @@ fn handle_sign_after_lock(
         stage_spend_carrier(node, propagated_request, &carrier);
         return Ok(refused);
     }
-    // 4. The attempt budget, charged on the COMMIT-HOLD clock — the same value the
-    //    pruning and overlay above used, so a lockout horizon cannot be computed from
-    //    one clock and enforced against another.
+    // 4. The attempt budget is charged on the COMMIT-HOLD clock, matching the overlay
+    //    and effective-clock attempt checks above. The lockout horizon is therefore
+    //    computed and enforced against one clock.
     let charge = state
         .pin_budget
         .charge(verdict, commit_now, &node.pin_budget_config);
@@ -6092,14 +6102,18 @@ fn handle_refresh_after_lock(
     }
     let raw_now = clock();
 
+    // A Refresh records no Carrier deadline, but on a channel node the shared nonce log
+    // needs the HotClock sample to reclaim existing Spend entries whose D has ended.
+    let mono_now = node.channel.as_ref().map(|channel| channel.hot_clock_now());
     let _ingress_now = match verify_coord_auth(
         node,
         request.coord_request(),
         &request.coord_sig,
         raw_now,
         &mut state.coord_nonces,
+        mono_now,
     ) {
-        Ok(effective_now) => effective_now,
+        Ok((effective_now, _)) => effective_now,
         Err(rejected) => return Ok(rejected),
     };
     ensure_request_propagatable(node, &vault_proto::TaggedRequest::Refresh(request.clone()))?;
@@ -6820,13 +6834,17 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
 /// separately would let this gate check freshness on values other than the ones
 /// `coord_sig` authenticated. `coord_sig` is a parameter because it is the one
 /// field that is NOT part of its own preimage.
+///
+/// `mono_now` evaluates existing Spend deadlines; only channel-mode Spend records `D`.
+/// Sampling and returning it under the same `sign_state` hold binds it to this transition.
 fn verify_coord_auth(
     node: &Node,
     request: CoordRequest<'_>,
     coord_sig: &str,
     now: u64,
     nonces: &mut NonceLog,
-) -> Result<u64, SignResponse> {
+    mono_now: Option<u64>,
+) -> Result<(u64, Option<u64>), SignResponse> {
     verify_coord_signature(node, request, coord_sig)?;
     // Sender authenticated. Validate the expiry window, reject replay, enforce
     // capacity, and consume the nonce in one operation under the sign-state lock.
@@ -6834,13 +6852,20 @@ fn verify_coord_auth(
     // removed happen ONLY when the complete freshness gate accepts the request.
     // Window, replay, and capacity refusals leave both untouched, while the mark
     // prevents a backwards clock step from reopening a pruned nonce ([`NonceLog`]).
+    let record_carrier_deadline =
+        matches!(request, CoordRequest::Spend { .. }) && mono_now.is_some();
     match nonces.check_and_record(
         request.nonce(),
         request.expiry(),
         now,
         node.max_commitment_age_secs,
+        mono_now,
+        record_carrier_deadline,
     ) {
-        NonceDecision::Accepted => Ok(nonces.effective_now(now)),
+        NonceDecision::Accepted => Ok((
+            nonces.effective_now(now),
+            nonces.carrier_deadline(request.nonce()),
+        )),
         NonceDecision::InvalidLength => Err(refusal(
             RefusalCode::CoordAuthInvalid,
             "coord_nonce",
@@ -9682,6 +9707,39 @@ mod config_bounds_tests {
         assert!(
             err.to_string().contains("max_attemps"),
             "unexpected config error: {err}"
+        );
+    }
+}
+
+/// The channel-mode Carrier deadline `D` exists only where a Carrier can. A node with
+/// no `[channel]` has no peers to receive from, no arm intent, no memo — and no
+/// [`channel::HotClock`], since that clock is a piece of channel state. Its Spend
+/// nonces must therefore stay exactly wall-only, which is also what makes the absent
+/// clock a non-question rather than a fallback to invent.
+#[cfg(test)]
+mod carrier_deadline_tests {
+    use super::test_support::node_and_valid_request;
+    use vault_proto::SignResponse;
+
+    #[test]
+    fn an_absent_channel_spend_nonce_records_no_carrier_deadline() {
+        let (node, request) = node_and_valid_request();
+        assert!(
+            node.channel.is_none(),
+            "this case is about the node that has no HotClock to read"
+        );
+        let now = request.expiry - 100;
+        assert!(matches!(
+            super::handle_sign(&node, &request, now).expect("decodable"),
+            SignResponse::Accepted(_)
+        ));
+        let rows = node.sign_state.lock().expect("sign_state").shape();
+        assert!(
+            rows.contains(&format!(
+                "coord_nonce nonce={} expiry={} deadline=None",
+                request.nonce, request.expiry
+            )),
+            "an absent-channel Spend nonce is wall-only: {rows:?}"
         );
     }
 }
