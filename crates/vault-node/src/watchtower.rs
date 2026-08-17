@@ -597,6 +597,16 @@ pub fn spawn_driver(
     });
 }
 
+/// One peer's published freshness diagnostic — the publication key and what it
+/// carried. See [`AlertQueue::record_freshness`], which owns both rules.
+struct PublishedFreshness {
+    /// The ingress freshness high-water the publication was keyed by.
+    ingress_high_water: u64,
+    /// The highest `reject_count` accepted by publication state. It may exceed
+    /// the last surfaced count after an equal-high-water, no-resurrection update.
+    reject_count: u64,
+}
+
 /// Bounded, in-memory alert queue with a monotonic cursor (ADR-0002). Each alert
 /// gets a strictly increasing sequence number; `since` returns everything past a
 /// cursor with no loss and no duplication. Bounded so a noisy chain cannot grow
@@ -611,12 +621,14 @@ pub struct AlertQueue {
     /// Events already queued (dedupe key), so repeated ticks are idempotent — a
     /// watchtower polls the chain, so it re-sees old spends.
     seen: HashSet<String>,
-    /// Highest freshness `reject_count` ever PUBLISHED per peer. A freshness entry
-    /// can be cap-evicted from `entries` between two concurrent handlers'
-    /// publications, so the retained-entry count alone cannot keep `reject_count`
-    /// monotonic; this queue-independent high-water can. Bounded by manifest
-    /// membership `n` (one key per peer), never pruned — it IS the durable record.
-    freshness_high_water: HashMap<u16, u64>,
+    /// What has already been PUBLISHED per peer. A freshness entry can be
+    /// cap-evicted from `entries` between two concurrent handlers' publications, so
+    /// the retained entry alone can neither key publication nor keep `reject_count`
+    /// monotonic; this queue-independent record can. Bounded by manifest membership
+    /// `n` (one key per peer), never pruned — it IS the durable record. ABSENCE
+    /// means nothing has been published for that peer: high-water 0 is a real clock
+    /// value, so it cannot double as that sentinel.
+    published_freshness: HashMap<u16, PublishedFreshness>,
     cap: usize,
 }
 
@@ -626,7 +638,7 @@ impl AlertQueue {
             entries: VecDeque::new(),
             next_seq: 1,
             seen: HashSet::new(),
-            freshness_high_water: HashMap::new(),
+            published_freshness: HashMap::new(),
             cap,
         }
     }
@@ -643,36 +655,76 @@ impl AlertQueue {
         true
     }
 
-    /// Record a channel freshness-rejection event (V0-8a). Dedupe key
-    /// `freshness:<peer>` with **replace** semantics: at most one freshness entry
-    /// per peer, refreshed to the newest sequence on each rejection so its running
-    /// `reject_count` stays monotonic and a cursor-polling client re-sees it —
-    /// while a skew-spamming peer can never grow the queue beyond `n` freshness
-    /// entries (so it cannot evict watchtower alerts unboundedly).
-    pub fn record_freshness(&mut self, event: FreshnessEvent) {
-        // Concurrent channel handlers allocate per-peer counts, then take this
-        // queue's lock separately, so a later count can be published first. Gate on
-        // the per-peer published high-water — NOT the retained queue entry — so an
-        // older publication is dropped even when its newer sibling was already
-        // cap-evicted from `entries` (which would otherwise leave the position
-        // lookup empty and let `/events` regress). Counts are strictly increasing
-        // per peer (channel.rs saturating_add from 0, first publish ≥ 1), so `<=`
-        // is exact and the 0 initial means "nothing published yet".
-        let hw = self
-            .freshness_high_water
-            .entry(event.peer_node_id)
-            .or_insert(0);
-        if event.reject_count <= *hw {
-            return;
-        }
-        *hw = event.reject_count;
+    /// Record a channel freshness-rejection event (V0-8a), keyed by `(peer,
+    /// ingress_high_water)` — the ingress guard's MONOTONIC freshness high-water
+    /// (`IngressGuards::check_and_consume`), not the receipt wall clock. It keys
+    /// publication only; the `/events` schema is unchanged.
+    ///
+    /// Concurrent channel handlers read that high-water and allocate their per-peer
+    /// count under different locks, then take this queue's lock separately, so
+    /// either can arrive reordered. Per key, on the queue-independent record above
+    /// rather than on the retained entry:
+    ///
+    ///  - a LOWER high-water is an older concurrent observation: dropped.
+    ///  - an EQUAL high-water updates count/skew in the RETAINED entry at its
+    ///    existing sequence. It never calls `append`, so it evicts nothing — and an
+    ///    entry already cap-evicted is NOT resurrected.
+    ///  - only a STRICTLY HIGHER high-water appends (reinserting after eviction, at
+    ///    a new sequence a cursor-polling client re-sees). It is the one path that
+    ///    contends for queue capacity, and it keeps at most one entry per peer.
+    ///
+    /// The deliberate consequence: one latched-high-water outage — a forward clock
+    /// excursion latches `high_water`, so every honest peer reads stale until real
+    /// time catches up — publishes AT MOST ONCE per peer, and once that entry is
+    /// cap-evicted the same outage's retries do not republish it. Protecting
+    /// unrelated on-chain evidence beats diagnostic persistence: refreshing to the
+    /// newest sequence instead cost one more `RECOVERY_PATH_SPEND` /
+    /// `UNRECOGNIZED_SPEND` alert its slot on every retry from a full queue.
+    ///
+    /// `reject_count` stays monotonic per peer under every ordering — it is only
+    /// ever published at the per-peer maximum.
+    pub fn record_freshness(&mut self, event: FreshnessEvent, ingress_high_water: u64) {
         let key = format!("freshness:{}", event.peer_node_id);
+        let publish_count = match self.published_freshness.get_mut(&event.peer_node_id) {
+            Some(published) if ingress_high_water < published.ingress_high_water => return,
+            Some(published) if ingress_high_water == published.ingress_high_water => {
+                if event.reject_count <= published.reject_count {
+                    return;
+                }
+                published.reject_count = event.reject_count;
+                if let Some((_, _, retained)) = self.entries.iter_mut().find(|(_, k, _)| *k == key)
+                {
+                    *retained = Event::ChannelFreshness(event);
+                }
+                return;
+            }
+            Some(published) => {
+                published.ingress_high_water = ingress_high_water;
+                published.reject_count = published.reject_count.max(event.reject_count);
+                published.reject_count
+            }
+            None => {
+                self.published_freshness.insert(
+                    event.peer_node_id,
+                    PublishedFreshness {
+                        ingress_high_water,
+                        reject_count: event.reject_count,
+                    },
+                );
+                event.reject_count
+            }
+        };
         if let Some(pos) = self.entries.iter().position(|(_, k, _)| *k == key) {
             self.entries.remove(pos);
         }
-        self.seen.remove(&key);
         self.seen.insert(key.clone());
-        self.append(key, Event::ChannelFreshness(event));
+        self.append(
+            key,
+            Event::ChannelFreshness(FreshnessEvent {
+                reject_count: publish_count,
+                ..event
+            }),
+        );
     }
 
     /// Assign the next sequence, enqueue, and cap-evict the oldest.
@@ -923,18 +975,152 @@ mod tests {
         assert_eq!(retained[0].watchtower().spend_txid, txid(1).to_string());
     }
 
-    #[test]
-    fn an_out_of_order_freshness_publication_never_regresses_the_count() {
-        let mut queue = AlertQueue::new(DEFAULT_ALERT_CAP);
-        let event = |reject_count| FreshnessEvent {
+    // -- freshness diagnostics (btc-policy-qzo) ------------------------------
+
+    fn freshness(reject_count: u64, skew_secs: i64) -> FreshnessEvent {
+        FreshnessEvent {
             kind: FreshnessKind::ChannelFreshnessReject,
             peer_node_id: 7,
             reject_count,
-            skew_secs: -400,
-        };
-        queue.record_freshness(event(2));
+            skew_secs,
+        }
+    }
+
+    /// Peer 7's retained diagnostic as `(sequence, reject_count, skew_secs)`, or
+    /// `None` when the queue holds none — the entry, not the published record.
+    fn retained(queue: &AlertQueue) -> Option<(u64, u64, i64)> {
+        queue
+            .entries
+            .iter()
+            .find_map(|(seq, key, event)| match event {
+                Event::ChannelFreshness(f) if key == "freshness:7" => {
+                    Some((*seq, f.reject_count, f.skew_secs))
+                }
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn freshness_publication_keys_on_the_peer_and_the_ingress_high_water() {
+        let mut queue = AlertQueue::new(DEFAULT_ALERT_CAP);
+        // Concurrent handlers read the ingress high-water and allocate their count
+        // under different locks, so publication arrives reordered in both. Each row
+        // is `(high-water, count, skew)` applied in order, then the retained
+        // `(sequence, count, skew)` and the cursor it must leave.
+        let table = [
+            ("first publication appends", 100, 1, -400, (1, 1, -400), 1),
+            ("equal updates in place", 100, 3, -402, (1, 3, -402), 1),
+            ("equal, older count drops", 100, 2, -401, (1, 3, -402), 1),
+            ("lower high-water drops", 99, 9, -9, (1, 3, -402), 1),
+            ("higher high-water appends", 101, 4, -500, (2, 4, -500), 2),
+            ("equal again, older count", 101, 2, -1, (2, 4, -500), 2),
+            ("higher keeps max count", 102, 3, -600, (3, 4, -600), 3),
+        ];
+        for (name, high_water, count, skew, want, want_cursor) in table {
+            queue.record_freshness(freshness(count, skew), high_water);
+            assert_eq!(retained(&queue), Some(want), "{name}");
+            assert_eq!(queue.cursor(), want_cursor, "{name}");
+        }
+        assert_eq!(
+            queue.entries.len(),
+            1,
+            "one retained freshness entry per peer, whatever the ordering"
+        );
+    }
+
+    #[test]
+    fn an_evicted_freshness_entry_revives_only_at_a_higher_ingress_high_water() {
+        // The eviction race under one latched high-water: the diagnostic is
+        // published, cap-evicted by unrelated evidence, and the outage keeps
+        // producing rejects. Re-appending each one would cost another alert its
+        // slot, so an equal high-water never resurrects it.
+        let mut queue = AlertQueue::new(1);
+        queue.record_freshness(freshness(2, -400), 100);
+        // A single watchtower alert (cap == 1) evicts the freshness entry.
+        assert!(queue.push(alert(1)));
+        assert_eq!(retained(&queue), None, "the diagnostic was cap-evicted");
+
+        // Neither an older concurrent publication nor a NEWER count at the same
+        // latched high-water re-enters.
+        queue.record_freshness(freshness(1, -399), 100);
+        queue.record_freshness(freshness(3, -401), 100);
+        assert_eq!(retained(&queue), None, "no equal-high-water resurrection");
+        assert_eq!(
+            queue.since(0).0.len(),
+            1,
+            "the watchtower alert keeps the only slot"
+        );
+
+        // Forward progress: a strictly higher high-water reinserts, carrying the
+        // monotonic count (3 was allocated during the outage, never published).
+        queue.record_freshness(freshness(3, -402), 101);
+        assert_eq!(retained(&queue), Some((3, 3, -402)));
+    }
+
+    #[test]
+    fn a_latched_high_water_peer_stops_displacing_watchtower_evidence() {
+        // A full queue, a peer whose every reject carries ONE latched ingress
+        // high-water, and unrelated on-chain alerts arriving between them. The old
+        // refresh-to-newest behavior kept the diagnostic squatting one slot after
+        // every reject; once evicted, this outage must stop occupying a slot.
+        let mut queue = AlertQueue::new(4);
+        for n in 1..=3 {
+            assert!(queue.push(alert(n)));
+        }
+        for (n, count) in (4..=9u8).zip(1..) {
+            queue.record_freshness(freshness(count, -400), 100);
+            assert!(queue.push(alert(n)));
+        }
+        let retained_alerts: Vec<String> = queue
+            .since(0)
+            .0
+            .iter()
+            .filter_map(|event| match event {
+                Event::Watchtower(a) => Some(a.spend_txid.clone()),
+                Event::ChannelFreshness(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            retained_alerts,
+            (6..=9u8).map(|n| txid(n).to_string()).collect::<Vec<_>>(),
+            "an evicted latched-high-water diagnostic must stop occupying a slot"
+        );
+    }
+
+    #[test]
+    fn an_equal_high_water_update_publishes_once_to_a_cursor_client() {
+        let mut queue = AlertQueue::new(DEFAULT_ALERT_CAP);
+        queue.record_freshness(freshness(1, -400), 100);
+        let cursor = queue.since(0).1;
+
+        // The in-place update is visible to a full pull but does NOT re-deliver to
+        // a client already past that sequence: one latched-high-water outage
+        // publishes at most once per peer.
+        queue.record_freshness(freshness(2, -401), 100);
+        assert_eq!(retained(&queue), Some((1, 2, -401)));
+        let (nothing, after) = queue.since(cursor);
+        assert!(nothing.is_empty(), "no new sequence at an equal high-water");
+        assert_eq!(after, cursor, "the cursor does not move");
+
+        // A strictly higher high-water reinserts, so the client sees the peer again.
+        queue.record_freshness(freshness(3, -500), 101);
+        let (again, moved) = queue.since(cursor);
+        assert_eq!(moved, cursor + 1);
+        assert!(matches!(
+            again.as_slice(),
+            [Event::ChannelFreshness(FreshnessEvent {
+                reject_count: 3,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn an_out_of_order_freshness_publication_never_regresses_the_count() {
+        let mut queue = AlertQueue::new(DEFAULT_ALERT_CAP);
+        queue.record_freshness(freshness(2, -400), 100);
         let cursor = queue.cursor();
-        queue.record_freshness(event(1));
+        queue.record_freshness(freshness(1, -400), 100);
 
         let (events, after) = queue.since(0);
         assert_eq!(after, cursor, "an obsolete publication is not appended");
@@ -945,46 +1131,6 @@ mod tests {
                 ..
             })]
         ));
-    }
-
-    #[test]
-    fn an_evicted_freshness_entry_still_blocks_an_older_publication() {
-        // The eviction race: a newer count is published, cap-evicted, THEN an older
-        // count arrives. Without a queue-independent high-water the position lookup
-        // finds nothing and appends the stale count, regressing `/events`.
-        let mut queue = AlertQueue::new(1);
-        let event = |reject_count| FreshnessEvent {
-            kind: FreshnessKind::ChannelFreshnessReject,
-            peer_node_id: 7,
-            reject_count,
-            skew_secs: -400,
-        };
-        queue.record_freshness(event(2));
-        // A single watchtower alert (cap == 1) evicts the freshness entry.
-        assert!(queue.push(alert(1)));
-        assert!(
-            !queue.entries.iter().any(|(_, k, _)| k == "freshness:7"),
-            "the count-2 freshness entry was cap-evicted"
-        );
-
-        // The out-of-order older publication must NOT re-enter after eviction.
-        queue.record_freshness(event(1));
-        assert!(
-            !queue.entries.iter().any(|(_, k, _)| k == "freshness:7"),
-            "a stale count-1 publication is dropped by the high-water, not re-appended"
-        );
-
-        // Forward progress still works: a genuinely newer count re-enters.
-        queue.record_freshness(event(3));
-        let published = queue.since(0).0.into_iter().find_map(|e| match e {
-            Event::ChannelFreshness(f) if f.peer_node_id == 7 => Some(f.reject_count),
-            _ => None,
-        });
-        assert_eq!(
-            published,
-            Some(3),
-            "a higher count than the high-water is published again"
-        );
     }
 
     // -- the daemon driver (V0-6b) ------------------------------------------
