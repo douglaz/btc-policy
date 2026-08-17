@@ -2,7 +2,7 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** SELECT · **Bead:** btc-policy-sxt · **Branch:** —
+**Phase:** SPEC · **Bead:** btc-policy-sxt · **Branch:** beads/sxt-clock-authority
 **Pending:** —
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 (the stale-flake assertion plus three of the four legs of CI's `check` matrix; `regtest-backend`
@@ -30,14 +30,35 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-From fresh main after q6v's closure lands, claim `sxt` and enter SPEC for the remaining
-clock-authority theft residual: the 1 Hz fire sweep, post-acceptance clock re-reads, and the
-two-sample confirmation straddle.
+Finish `sxt` SPEC review. Channel-mode Spend acceptance fixes one immutable process-monotonic
+Carrier horizon from the signed lifetime remaining (non-channel stays wall-only); post-accept
+wall/effective samples can refuse but never retire or extend
+state. Exact authenticated, quota-admitted actionable receipts receive fixed 30-second retry at all three
+Carrier clock-refusal sites and through the narrow outer-Stale receipt path; terminal/nonmatching
+stale input stays `STALE_TIMESTAMP`, and every stale case records the same high-water-keyed diagnostic. Receiver
+correction still waits for elapsed time to re-enter the latched 300-second window before the sender
+and monotonic bounds. One resident Carrier owns one nonce in the existing coordinator capacity; no
+overlapping body, second cap, schema, lease, or general `/sign` admission. q6v's verified-tag/one-KDF
+alternate-signature bound remains, with exact-expiry and terminal-state guards. Carrier intent+memo
+retirement is store-only on non-staged terminal owner exit, the fully
+completed holder decision, the fixed horizon after owner release, or reboot; immutable `D` stays on
+the nonce replay/fan-out tombstone until it lapses, and pruning removes that entry only after wall
+expiry also ends. Candidate expiry remains separate. The production-fixed, test-pinnable `HotClock`
+supplies the monotonic instant; every store prune driver may execute deadline retirement without
+wall-clock authority. The outer-Stale final check briefly serializes `sign_state → store`, keeps KDF
+outside both locks, and freshness diagnostics coalesce by peer plus ingress high-water.
 
 ## Next
-Re-derive a bounded rb-lite budget for `sxt` before implementation. `mby` remains the widest
-product unblocker but must first be distilled; do not hand its ~30k-character accumulated record
-directly to an implementation run.
+Obtain one final Opus/Codex READY pass on the corrected integrated spec, then land the spec/evidence
+baseline before Rust. Implement only through bounded rb-lite children, sequentially in one ownership
+lane: `qzo` diagnostics (**400 gross Rust = ~110 prod + 290 test**), `o5g` nonce deadline
+(**650 = ~230 + 420**), `0hv` store retirement (**950 = ~280 + 670**), `7ip` ordinary receipt retry
+(**550 = ~130 + 420**), and `30c` outer-Stale (**700 = ~150 + 550**). `5io` and `ok4` are their
+integration owners. Total hard cap: **3,250 gross Rust lines, ~900 production + 2,350 tests**; tests
+are 2.61× production from measured repository/q6v density, and every line is counted. `sxt` closes
+only after all children and custody-critical gates.
+`mby` remains the widest product unblocker but must first be distilled; do not hand its
+~30k-character accumulated record directly to an implementation run.
 
 `gbw`'s open blockers, computed from the dependency graph 2026-08-10, not counted by hand:
 `mby`, `oy3`, `rt0`, `sqn`, `wdu`. `6nq`, `9yf`, `c9r` and `nia` are closed. The closed edges stay
@@ -61,6 +82,10 @@ existed is worth more than a tidy list.
 - `btc-policy-sxt` (P1) — forward-clock sweeps and confirmation resampling can still destroy
   ruled carrier state outside q6v's passive lookup. This is a separate eviction-authority defect,
   not a reason to widen q6v into a clock subsystem.
+- `btc-policy-r1g` (P2) — `/channel` freshness high-water survives raw clock correction and can
+  blackhole every peer message until real time catches the 300-second window, with no protocol bound
+  on that duration. It depends on `sxt`;
+  do not widen `sxt` into global freshness authority.
 
 ## Open questions for the human
 - none
