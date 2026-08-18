@@ -2,13 +2,23 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** SPEC · **Bead:** btc-policy-sxt · **Branch:** beads/sxt-clock-authority
+**Phase:** CLOSE · **Bead:** btc-policy-7ip · **Branch:** beads/close-7ip-carrier-retry
 **Pending:** —
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 (the stale-flake assertion plus three of the four legs of CI's `check` matrix; `regtest-backend`
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-qzo` (P1) — repeated channel-freshness diagnostics coalesce by peer plus
+  ingress high-water without evicting unrelated watchtower evidence. Merged #12 (`40c3269`);
+  closure merged #13 (`3171f47`).
+- `btc-policy-5io` (`o5g` + `0hv`, P1) — channel-mode Spend acceptance fixes immutable
+  Carrier deadline `D`; nonce liveness uses wall-live OR monotonic-live; Carrier state retires
+  only through store monotonic/terminal authority. The unsafe intermediate never landed:
+  both children merged atomically in #14 (`6f1ef82`), with closure in #15 (`8c80d82`).
+- `btc-policy-7ip` (P1) — ordinary fresh Carrier receipts enforce `E`/`D` actionability,
+  preserve state on recoverable wall-clock refusal, and retry at 30 seconds while short
+  owner/KDF windows remain one second. Merged #16 (`8b05c56`); this branch records closure.
 - `btc-policy-q6v` (P1) — passive carrier-receipt lookup is non-destructive under forward
   clock excursions, retained retries are generation/sender scoped, and conflicting signatures
   resolve through the bounded memory-hard carrier path without retaining a fast PIN verifier.
@@ -30,33 +40,19 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Finish `sxt` SPEC review. Channel-mode Spend acceptance fixes one immutable process-monotonic
-Carrier horizon from the signed lifetime remaining (non-channel stays wall-only); post-accept
-wall/effective samples can refuse but never retire or extend
-state. Exact authenticated, quota-admitted actionable receipts receive fixed 30-second retry at all three
-Carrier clock-refusal sites and through the narrow outer-Stale receipt path; terminal/nonmatching
-stale input stays `STALE_TIMESTAMP`, and every stale case records the same high-water-keyed diagnostic. Receiver
-correction still waits, under the current premise `coord_nonces.high_water < E`, for elapsed time to re-enter the latched 300-second window before `E` and `D`;
-`btc-policy-coord-highwater-carrier-recovery-i3p` tracks the coordinator-nonce coupling. One resident Carrier owns one nonce in the existing coordinator capacity; no
-overlapping body, second cap, schema, lease, or general `/sign` admission. q6v's verified-tag/one-KDF
-alternate-signature bound remains, with exact-expiry and terminal-state guards. Carrier intent+memo
-retirement is store-only on non-staged terminal owner exit, the fully
-completed holder decision, the fixed horizon after owner release, or reboot; immutable `D` stays on
-the nonce replay/fan-out tombstone until it lapses, and pruning removes that entry only after wall
-expiry also ends. Candidate expiry remains separate. The production-fixed, test-pinnable `HotClock`
-supplies the monotonic instant; every store prune driver may execute deadline retirement without
-wall-clock authority. The outer-Stale final check briefly serializes `sign_state → store`, keeps KDF
-outside both locks, and freshness diagnostics coalesce by peer plus ingress high-water.
+Close `7ip` on merged PR #16 and preserve its exact evidence: 539/550 gross Rust lines with
+tests included, 17 final-byte mutation controls, current-head regtest coverage, and both launch
+gates. The remaining ordinary-receipt recovery premise is explicit:
+`coord_nonces.high_water < E`; `btc-policy-coord-highwater-carrier-recovery-i3p` owns that
+separate coupling rather than widening `7ip`.
 
 ## Next
-Obtain one final Opus/Codex READY pass on the corrected integrated spec, then land the spec/evidence
-baseline before Rust. Implement only through bounded rb-lite children, sequentially in one ownership
-lane: `qzo` diagnostics (**400 gross Rust = ~110 prod + 290 test**), `o5g` nonce deadline
-(**650 = ~230 + 420**), `0hv` store retirement (**950 = ~280 + 670**), `7ip` ordinary receipt retry
-(**550 = ~130 + 420**), and `30c` outer-Stale (**700 = ~150 + 550**). `5io` and `ok4` are their
-integration owners. Total hard cap: **3,250 gross Rust lines, ~900 production + 2,350 tests**; tests
-are 2.61× production from measured repository/q6v density, and every line is counted. `sxt` closes
-only after all children and custody-critical gates.
+Implement the final bounded `sxt` code child, `btc-policy-30c`: authenticated,
+quota-admitted outer-Stale Carrier discrimination and acceptance-to-claim serialization.
+Its hard rb-lite cap remains **700 gross Rust = ~150 production + 550 tests**. Then close
+integration owner `ok4`, run the completed `sxt` custody-critical gates, and close `sxt`.
+The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
+`coord-highwater-carrier-recovery-i3p`.
 `mby` remains the widest product unblocker but must first be distilled; do not hand its
 ~30k-character accumulated record directly to an implementation run.
 
