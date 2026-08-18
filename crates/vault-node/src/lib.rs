@@ -4602,6 +4602,11 @@ fn handle_channel_body_with_clocks(
                                 retry_after_secs: 1,
                             };
                         }
+                        channel::CarrierMemoLookup::ClockRefused => {
+                            return ChannelReply::RateLimited {
+                                retry_after_secs: channel::CARRIER_CLOCK_RETRY_SECS,
+                            };
+                        }
                         // A DIFFERENT valid signature over the SAME body is not a
                         // different carrier: canonical request bytes exclude
                         // `coord_sig`. Derive the body identity once for this sender;
@@ -4665,6 +4670,11 @@ fn handle_channel_body_with_clocks(
                                                 retry_after_secs: 1,
                                             };
                                         }
+                                        channel::CarrierMemoLookup::ClockRefused => {
+                                            return ChannelReply::RateLimited {
+                                                retry_after_secs: channel::CARRIER_CLOCK_RETRY_SECS,
+                                            };
+                                        }
                                         _ => None,
                                     }
                                 }
@@ -4687,6 +4697,11 @@ fn handle_channel_body_with_clocks(
                     // observability; erring late only ever refuses (censorship), never
                     // arms.
                     let confirmation = node.confirm_carrier(sender, &carrier, confirmation_clock());
+                    if confirmation.clock_refused {
+                        return ChannelReply::RateLimited {
+                            retry_after_secs: channel::CARRIER_CLOCK_RETRY_SECS,
+                        };
+                    }
                     // Pin-uniform live-harness evidence. `/channel` intentionally maps
                     // every decodable policy outcome to ACCEPTED, so that reply cannot
                     // establish that the carrier memo resolved or its holder decision

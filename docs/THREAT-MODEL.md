@@ -238,8 +238,8 @@ defeats it on an unfair mutex. Bead btc-policy-9zs moved all three memory-hard p
 of the contended section, which shortens each individual hold and does nothing more to bound lock
 acquisition. The CONSEQUENCES are bounded by the signer/partial coupling + release-gate (ADR-0012
 invariant vii): a merely DELAYED node is still frozen and still releases no hot partial — so the outcome
-is denial, not theft. Signed expiry bounds new holder/arm decisions, while a Carrier's monotonic deadline
-only bounds pre-terminal state retention and retry recovery. A reviewer should
+is denial, not theft. Signed expiry `E` is the signed/federation-facing attempt-authority bound,
+while `D` ends node-local logical residency/actionability. A reviewer should
 read "unconditional Lockdown at T" everywhere it appears as a statement about the decision, never
 about its latency.
 
@@ -251,11 +251,9 @@ panic. Once staged, the retry horizon is no longer a later raw/effective clock r
 nonce acceptance computes `D = accepted_monotonic + (signed_expiry - accepted_effective_wall)`
 from the production-fixed, test-pinnable `channel::HotClock` and retains it on the accepted Spend
 nonce tombstone until it lapses. There is no later pin-release transaction.
-Signed expiry `E` remains new-holder authority: every at/past-`E` attempt to add a holder is refused
-and cannot count, commit, or arm; a fresh duplicate/completed confirmation is an idempotent no-op.
-`D` governs retention only. Post-acceptance wall excursions cannot delete, replace,
-or extend the Carrier while `mono_now < D`. A completed non-staging refusal is terminal once its
-owner exits; it does not retry for the whole signed lifetime merely because its horizon remains live.
+Physical intent/memo records may remain at or after `D` while an owner is ruling, but confer no holder authority. A new holder requires attempt `< E` and `mono_now < D`.
+Wall refusal retries only while `mono_now < D`; at/past `D` the outcome is terminal, opaque, and non-mutating. A fresh duplicate/completed confirmation is an idempotent no-op.
+Post-acceptance wall excursions cannot delete, replace, or extend the Carrier while `mono_now < D`. A completed non-staging refusal is terminal once its owner exits; it does not retry merely because physical records remain.
 
 Outer `/channel` freshness has one deliberately narrow exception to its normal terminal
 `STALE_TIMESTAMP`: after peer authentication and quota charging, an exact resident Spend receipt
@@ -272,11 +270,12 @@ and only a higher high-water appends. The exception performs no ordinary `/sign`
 nonce/capacity allocation, holder, gate, commit, arm, candidate, eviction, lifetime, or outbox work.
 After those guards it may use q6v's single nonblocking Carrier-KDF attempt to resolve one previously
 unseen valid coordinator signature; the exact verified tag remains KDF-free. Receiver wall correction does not lower
-the channel freshness high-water: the sender can recover only if elapsed real time brings fresh
-envelopes back inside the 300-second past window before its signed deadline and `D`. A larger
-excursion can blackhole authenticated channel traffic for unbounded real time. `E`, `D`, capacity,
-the Hot budget, and Recovery bound retained state and loss consequences, not outage duration; the
-broader repair is tracked as `btc-policy-r1g`.
+the channel freshness high-water: under the current premise `coord_nonces.high_water < E`, the
+sender can recover only if elapsed real time brings fresh envelopes back inside the 300-second past
+window before `E` and `D`. Retries end at `E`/`D`; a larger excursion can blackhole authenticated
+channel traffic for unbounded real time. `E`, `D`, capacity, the Hot budget, and Recovery bound
+retained state and loss consequences, not outage duration. The broader channel repair is
+`btc-policy-r1g`; coordinator-nonce coupling is `btc-policy-coord-highwater-carrier-recovery-i3p`.
 A wall clock already wrong at Carrier acceptance remains the separate time-authority residual.
 
 Strict-DER/low-S coordinator signatures are not unique. Exact verified tags take a KDF-free fast
