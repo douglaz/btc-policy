@@ -36,8 +36,8 @@ wall/effective samples can refuse but never retire or extend
 state. Exact authenticated, quota-admitted actionable receipts receive fixed 30-second retry at all three
 Carrier clock-refusal sites and through the narrow outer-Stale receipt path; terminal/nonmatching
 stale input stays `STALE_TIMESTAMP`, and every stale case records the same high-water-keyed diagnostic. Receiver
-correction still waits for elapsed time to re-enter the latched 300-second window before the sender
-and monotonic bounds. One resident Carrier owns one nonce in the existing coordinator capacity; no
+correction still waits, under the current premise `coord_nonces.high_water < E`, for elapsed time to re-enter the latched 300-second window before `E` and `D`;
+`btc-policy-coord-highwater-carrier-recovery-i3p` tracks the coordinator-nonce coupling. One resident Carrier owns one nonce in the existing coordinator capacity; no
 overlapping body, second cap, schema, lease, or general `/sign` admission. q6v's verified-tag/one-KDF
 alternate-signature bound remains, with exact-expiry and terminal-state guards. Carrier intent+memo
 retirement is store-only on non-staged terminal owner exit, the fully
@@ -84,8 +84,8 @@ existed is worth more than a tidy list.
   not a reason to widen q6v into a clock subsystem.
 - `btc-policy-r1g` (P2) — `/channel` freshness high-water survives raw clock correction and can
   blackhole every peer message until real time catches the 300-second window, with no protocol bound
-  on that duration. It depends on `sxt`;
-  do not widen `sxt` into global freshness authority.
+  on that duration. It depends on `sxt`; `btc-policy-coord-highwater-carrier-recovery-i3p` (P2) tracks
+  the separate coordinator-nonce high-water coupling; do not widen `sxt` into either authority.
 
 ## Open questions for the human
 - none
