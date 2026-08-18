@@ -227,12 +227,15 @@ fn fixture_config(hold_secs: u64, max_commitment_age_secs: u64, allow_escape: bo
          hot_window_secs = {max_commitment_age_secs}\n\
          max_commitment_age_secs = {max_commitment_age_secs}\n\
          policy_version = {POLICY_VERSION}\n\
+         protocol_version = {}\n\
+         escape_bump_max_fee_pct = 0\n\
          pin_normal_hash = \"{}\"\n\
          pin_duress_hash = \"{}\"\n\
          coordinator_auth_pubkey = \"{}\"\n",
         node_kdf().salt_hex(),
         node_kdf().ops(),
         node_kdf().mem_kib(),
+        vault_node::channel::PROTOCOL_VERSION,
         vault_node::argon2id_normal_phc(NORMAL_PIN),
         vault_node::argon2id_duress_phc(DURESS_PIN),
         coord_key().1,

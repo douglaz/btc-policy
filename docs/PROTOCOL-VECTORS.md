@@ -84,6 +84,7 @@ escape_descriptor             var
 max_derivation_index          u32
 escape_feerate_floor          u64        <- fire-time selector input
 escape_coverage_pct           u8         <- fire-time selector input
+escape_bump_max_fee_pct       u8         <- sealed ladder ceiling (ADR-0016 §3a)
 nodes                         u32 count, then per node:
                                 node_id          u16
                                 signing_pubkey   fixed 33
@@ -91,15 +92,15 @@ nodes                         u32 count, then per node:
                                 endpoints        u32 count, then each as var (UTF-8)
 ```
 
-**Vector** — `wallet_id = 0x22*32`, `protocol_version = 0`, coordinator pubkey `03 8a3b…`,
+**Vector** — `wallet_id = 0x22*32`, `protocol_version = 1`, coordinator pubkey `03 8a3b…`,
 `max_msg_bytes = 1048576`, hot budget `(0x11111111, 0x22222222, 0x33333333)`, allowlist
 `["wpkh(hot)"]`, escape `"wpkh(escape)"`, `max_derivation_index = 5`,
-`escape_feerate_floor = 1`, `escape_coverage_pct = 95 (0x5f)`, two nodes on
-`127.0.0.1:9000` / `127.0.0.1:9001`:
+`escape_feerate_floor = 1`, `escape_coverage_pct = 95 (0x5f)`,
+`escape_bump_max_fee_pct = 0 (0x00)`, two nodes on `127.0.0.1:9000` / `127.0.0.1:9001`:
 
 ```
 preimage:
-222222222222222222222222222222222222222222222222222222222222222200000000
+222222222222222222222222222222222222222222222222222222222222222201000000
 038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c236
 0000100000000000
 1111111100000000
@@ -110,6 +111,7 @@ preimage:
 905000000
 0100000000000000
 5f
+00
 02000000
 0000 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
      024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766
@@ -118,15 +120,19 @@ preimage:
      03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b
      01000000 0e000000 3132372e302e302e313a39303031
 
-digest: f71ea65bac9966e61997d6d041499fb05facd426b15c13ac3cfb795f95385307
+digest: e1eacefbc4501240e2c01e61e9ca916b9245b2732a32690893ca0f17eb1aeb3b
 ```
 
 (The preimage is one contiguous byte string; it is broken across lines above only to show the
 field boundaries. The canonical single-line form is `FROZEN_MANIFEST_PREIMAGE_HEX`.)
 
-Note `0100000000000000` (floor = 1) and `5f` (coverage = 95) sitting between
-`max_derivation_index` and the node count: those two fields are hash-bound precisely so a node
-provisioned with a different fire-time selector cannot boot into this federation.
+Note `0100000000000000` (floor = 1), `5f` (coverage = 95) and `00`
+(`escape_bump_max_fee_pct` = 0) sitting between `max_derivation_index` and the node count. The
+first two are hash-bound precisely so a node provisioned with a different fire-time selector
+cannot boot into this federation. The third is hash-bound for the reason ADR-0016 §3a gives:
+"sealed" means in the PREIMAGE, and a ceiling present only in `manifest.json` would be a value
+the ceremony writes and no node is bound to. Nodes never enforce it (§4a) — they only prove it
+uniform. Appending that one byte is why `protocol_version` is `1` here and was `0` before.
 
 ## Vector 3 — Channel endorsement
 
@@ -142,11 +148,14 @@ preimage:
 3333333333333333333333333333333333333333333333333333333333333333
 0100
 03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b
-00000000
+01000000
 01000000 0e000000 3132372e302e302e313a39303031
 
-digest: 51faa376da7236f11c41b5ceeda907bdf4bc67ab58de9a11fb5cf8f828f73acd
+digest: be2aa05e39b0c5858c00f288bc1ca4d7aae22c674c1df19826aac3d12944d18f
 ```
+
+`protocol_version` is inside these bytes, so an endorsement collected at revision 0 does not
+verify at revision 1 — the signature binds the schema revision, not just the membership.
 
 ## Vector 4 — Channel envelope
 
@@ -158,13 +167,13 @@ detectable.
 fields : msg_type(var) ‖ protocol_version(u32) ‖ wallet_id(32) ‖ manifest_hash(32)
          ‖ from_node(u16) ‖ to_node(u16) ‖ payload(var) ‖ nonce(16) ‖ timestamp(u64)
 
-inputs : msg_type="partial", protocol_version=0, wallet_id=0x22*32,
+inputs : msg_type="partial", protocol_version=1, wallet_id=0x22*32,
          manifest_hash=0x33*32, from=1, to=2, payload=b"cGFydGlhbA==",
          nonce=0x44*16, timestamp=1752000000
 
 preimage:
 07000000 7061727469616c
-00000000
+01000000
 2222222222222222222222222222222222222222222222222222222222222222
 3333333333333333333333333333333333333333333333333333333333333333
 0100 0200
@@ -172,7 +181,7 @@ preimage:
 10000000 44444444444444444444444444444444
 00666d6800000000
 
-digest: fb179a1687044a0eb2169ceaee3368df72982e633355b887bfc80580cb9b951a
+digest: ef653cb88931e6240d923505944beafe9b9a7057d3c32cfe3fd17a78cd065237
 ```
 
 ## Vector 5 — User sig hash and Vector 6 — Coordinator request
@@ -200,9 +209,13 @@ alone. If it cannot, one of the two is wrong — and the vectors, not the prose,
 
 ## Caveats
 
-- These vectors pin the **v0** wire format. `protocol_version` is inside the manifest preimage,
-  so a version bump is a new manifest and therefore a new vault (see
-  `docs/UPGRADE-AND-ROTATION-POLICY.md`).
+- These vectors pin **manifest schema revision 1** — the value `protocol_version` carries, and
+  NOT the routable/authenticated transport v1, which is separate work. The domain tags stay
+  `/v0`: they separate domains, not revisions, and retagging them would invalidate every digest
+  for no gain. `protocol_version` is inside the manifest preimage, so a revision bump is a new
+  manifest and therefore a new vault (see `docs/UPGRADE-AND-ROTATION-POLICY.md`). Revision 0's
+  vectors are not reproduced here; sealed hosts take no upgrade-in-place (ADR-0005), so a
+  revision-0 vault keeps computing revision-0 bytes with the binary it was sealed with.
 - The vectors cover hash **preimages and digests**, not signature encodings. Signatures are
   DER-encoded ECDSA over secp256k1 with the usual Bitcoin conventions.
 - Vectors 5 and 6 are referenced rather than reproduced here; a reviewer wanting full

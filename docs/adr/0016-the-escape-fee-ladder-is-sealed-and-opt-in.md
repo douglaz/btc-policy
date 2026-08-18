@@ -121,7 +121,7 @@ One tie-break, stated in one place: the vector wins, because it is executable ag
 ADR-0013 §4's prose copy has been wrong three times. ADR-0013 §4 and this ADR both defer to it. It instructs reimplementers to work "from THIS list
 + order, NOT a naive serialization". That list previously omitted `escape_feerate_floor` and
 `escape_coverage_pct`, which the code hashes between `max_derivation_index` and the node count
-(`channel.rs:499-501`) and which `docs/UPGRADE-AND-ROTATION-POLICY.md` already listed as preimage
+(`channel.rs:506-509`) and which `docs/UPGRADE-AND-ROTATION-POLICY.md` already listed as preimage
 members. §4's list now includes both fields in that order, and defers to PROTOCOL-VECTORS.md as above.
 `escape_bump_max_fee_pct` is an unsigned `u8`, encoded at fixed width as the single byte written by
 `Enc::u8`. Its exact canonical position is immediately after `escape_coverage_pct` and immediately

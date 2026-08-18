@@ -51,7 +51,7 @@ use bitcoin::secp256k1::ecdsa::Signature;
 use bitcoin::secp256k1::{All, Message, Secp256k1, SecretKey};
 use bitcoin::{PublicKey, Txid};
 use serde_json::{json, Value};
-use vault_node::channel::{ceremony, PROTOCOL_VERSION_V0};
+use vault_node::channel::{ceremony, PROTOCOL_VERSION};
 use vault_proto::{push_var, tagged_hash, TaggedRequest};
 
 use crate::fed::{unix_now, Actor};
@@ -81,7 +81,7 @@ use crate::http::{self, Error};
 ///    in an observed partial, so drift fails the binding check in
 ///    `validate_observed_partial` loudly rather than silently.
 ///
-/// `PROTOCOL_VERSION_V0` is deliberately NOT mirrored: `vault_node::channel` exports
+/// `PROTOCOL_VERSION` is deliberately NOT mirrored: `vault_node::channel` exports
 /// it, so importing it removes a value from this list entirely.
 const CHANNEL_KEY_TAG: &str = "btc-policy/channel-key/v0";
 const ENVELOPE_TAG: &str = "btc-policy/channel-envelope/v0";
@@ -339,7 +339,7 @@ impl CompromisedNode {
         let timestamp = unix_now()?;
         let preimage = envelope_preimage(
             msg_type,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &self.wallet_id,
             &self.manifest_hash,
             self.node_id,
@@ -354,7 +354,7 @@ impl CompromisedNode {
         );
         let envelope = serde_json::json!({
             "msg_type": msg_type,
-            "protocol_version": PROTOCOL_VERSION_V0,
+            "protocol_version": PROTOCOL_VERSION,
             "wallet_id": self.wallet_id.to_lower_hex_string(),
             "manifest_hash": self.manifest_hash.to_lower_hex_string(),
             "sender_node_id": self.node_id,
@@ -704,7 +704,7 @@ impl Wiretap {
             .and_then(Value::as_str)
             .ok_or("channel envelope has no channel_sig")?;
 
-        if protocol_version != PROTOCOL_VERSION_V0 {
+        if protocol_version != PROTOCOL_VERSION {
             return Err("channel envelope has the wrong protocol version".into());
         }
         if wallet_id != self.wallet_id {

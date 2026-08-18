@@ -1196,7 +1196,7 @@ impl Vault {
     /// its use in `demo`, which today compose unconditionally against a hardcoded
     /// ceiling — but this harness must not. (ADR-0016 DECIDES to gate that on a sealed
     /// per-vault `escape_bump_max_fee_pct`, default off; the field lands with
-    /// btc-policy-mby and the wiring with btc-policy-sqn. Not built yet.) Two reasons, and both are about
+    /// btc-policy-mby and IS now sealed; the wiring lands with btc-policy-sqn and is NOT built yet.) Two reasons, both about
     /// keeping the 16 adversarial scenarios meaningful:
     ///
     ///  - a ladder rewrites the escape's `nSequence` to signal BIP125 replacement,

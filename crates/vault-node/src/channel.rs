@@ -70,7 +70,7 @@
 //! | digest (tag)                                    | preimage fields, in order (LE; `var`=u32-len+bytes; `eps`=u32-count then each `var`) |
 //! |-------------------------------------------------|-------------------------------------------------------------------------------------|
 //! | channel-key  `btc-policy/channel-key/v0`        | `node_seckey[32]` (then `‖ counter:u8` on retry)                                    |
-//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), `max_msg_bytes:u64`, Hot-budget triple, canonical hot allowlist, escape descriptor, `max_derivation_index:u32`, `escape_feerate_floor:u64`, `escape_coverage_pct:u8`, node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
+//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), `max_msg_bytes:u64`, Hot-budget triple, canonical hot allowlist, escape descriptor, `max_derivation_index:u32`, `escape_feerate_floor:u64`, `escape_coverage_pct:u8`, `escape_bump_max_fee_pct:u8`, node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
 //! | endorsement  `btc-policy/channel-endorsement/v0`| `wallet_id[32]`, `manifest_hash[32]`, `node_id:u16`, `channel_pubkey[33]`, `protocol_version:u32`, `endpoints:eps` |
 //! | envelope     `btc-policy/channel-envelope/v0`   | `msg_type:var`, `protocol_version:u32`, `wallet_id[32]`, `manifest_hash[32]`, `sender_node_id:u16`, `recipient_node_id:u16`, `payload_b64_bytes:var`, `nonce:var`, `timestamp:u64` |
 //! | user-sig     `btc-policy/user-sig-hash/v0`      | per input in order: `user_der_sig:var`, `sighash_type:u8`                            |
@@ -110,10 +110,11 @@ use crate::replay::{MAX_COORD_NONCES, MAX_COORD_NONCE_BYTES};
 use crate::watchtower::{AlertQueue, FreshnessEvent, FreshnessKind};
 use crate::{Error, HotBudget};
 
-/// The pinned wire/protocol version for v0 (ADR-0013 §4 `BaseManifest`). The
-/// minimal in-memory manifest sets it here and the envelope check compares
-/// against it — a named const, never a magic literal. V0-9 carries it forward.
-pub const PROTOCOL_VERSION_V0: u32 = 0;
+/// Manifest schema revision 1, not routable/authenticated transport v1. It moved
+/// with the appended ceiling byte (ADR-0016 §3a); `/v0` domain tags remain unchanged.
+/// Startup preflights the raw config's declared version against this one runtime
+/// source before [`crate::ConfigFile`] deserialization and retains no second copy.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Domain-separation tags (fixed consts — every digest names its tag so
 /// independent derivations agree; codex audit 2026-07-16).
@@ -463,6 +464,9 @@ struct ManifestNode {
 /// the escape classification inputs (`escape_descriptor`, `max_derivation_index`) and
 /// before the node list, so the documented prefix through `max_derivation_index`
 /// keeps its byte offsets.
+///
+/// ADR-0016 §3a seals `escape_bump_max_fee_pct` here, after coverage and before the
+/// node count; `docs/PROTOCOL-VECTORS.md` pins the byte and the revision-1 bump.
 #[allow(clippy::too_many_arguments)]
 fn base_manifest_bytes(
     wallet_id: &[u8; 32],
@@ -476,6 +480,7 @@ fn base_manifest_bytes(
     max_derivation_index: u32,
     escape_feerate_floor: u64,
     escape_coverage_pct: u8,
+    escape_bump_max_fee_pct: u8,
 ) -> Vec<u8> {
     let mut e = Enc::new();
     e.fixed(wallet_id);
@@ -500,6 +505,8 @@ fn base_manifest_bytes(
     // The two federation-uniform fire-time selector inputs (see the doc above).
     e.u64(escape_feerate_floor);
     e.u8(escape_coverage_pct);
+    // The sealed escape-ladder ceiling (ADR-0016 §2/§3a), fixed-width `u8`.
+    e.u8(escape_bump_max_fee_pct);
     e.u32(nodes.len() as u32);
     for n in nodes {
         e.u16(n.node_id);
@@ -523,6 +530,7 @@ fn compute_manifest_hash(
     max_derivation_index: u32,
     escape_feerate_floor: u64,
     escape_coverage_pct: u8,
+    escape_bump_max_fee_pct: u8,
 ) -> [u8; 32] {
     tagged_hash(
         MANIFEST_TAG,
@@ -538,6 +546,7 @@ fn compute_manifest_hash(
             max_derivation_index,
             escape_feerate_floor,
             escape_coverage_pct,
+            escape_bump_max_fee_pct,
         ),
     )
 }
@@ -764,7 +773,7 @@ fn reject(reason: RejectReason) -> Ingested {
 pub mod ceremony {
     use super::{
         channel_pubkey_of, compute_manifest_hash, derive_channel_seckey, endorsement_digest,
-        HotBudget, ManifestNode, PROTOCOL_VERSION_V0,
+        HotBudget, ManifestNode, PROTOCOL_VERSION,
     };
     use bitcoin::hex::DisplayHex;
     use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
@@ -846,6 +855,7 @@ pub mod ceremony {
         max_derivation_index: u32,
         escape_feerate_floor: u64,
         escape_coverage_pct: u8,
+        escape_bump_max_fee_pct: u8,
     ) -> Result<[u8; 32], Error> {
         let canonical_hot = hot_allowlist
             .iter()
@@ -859,7 +869,7 @@ pub mod ceremony {
         let manifest = manifest_nodes(nodes, channel_pubkeys);
         Ok(compute_manifest_hash(
             wallet_id,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             coordinator_auth_pubkey,
             &manifest,
             max_msg_bytes,
@@ -869,6 +879,7 @@ pub mod ceremony {
             max_derivation_index,
             escape_feerate_floor,
             escape_coverage_pct,
+            escape_bump_max_fee_pct,
         ))
     }
 
@@ -890,7 +901,7 @@ pub mod ceremony {
             manifest_hash,
             node_id,
             &channel_pubkey(node_seckey),
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             endpoints,
         );
         Secp256k1::new()
@@ -923,7 +934,7 @@ pub mod ceremony {
             manifest_hash,
             node_id,
             channel_pubkey,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             endpoints,
         );
         Secp256k1::verification_only()
@@ -3016,6 +3027,10 @@ impl ChannelState {
         // rung set (coverage) and splitting the sweep. See `base_manifest_bytes`.
         escape_feerate_floor: u64,
         escape_coverage_pct: u8,
+        // The sealed escape-ladder ceiling (ADR-0016 §2/§3a): a ceiling no node's
+        // preimage carries binds nothing. Nodes never ENFORCE it (§4a) — the ceremony
+        // and the signer do — so it is hashed here and read nowhere else.
+        escape_bump_max_fee_pct: u8,
         alerts: Arc<Mutex<AlertQueue>>,
     ) -> Result<ChannelState, Error> {
         // Tokio's constructor panics above this implementation limit. Treat a
@@ -3145,7 +3160,7 @@ impl ChannelState {
         // "it fits every peer's cap".
         let manifest_hash = compute_manifest_hash(
             &wallet_id,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &coordinator_auth,
             &nodes,
             cfg.max_msg_bytes as u64,
@@ -3155,11 +3170,12 @@ impl ChannelState {
             max_derivation_index,
             escape_feerate_floor,
             escape_coverage_pct,
+            escape_bump_max_fee_pct,
         );
         let expected = from_hex_32(&cfg.expected_manifest_hash)
             .map_err(|_| Error::from("[channel] expected_manifest_hash is not 32-byte hex"))?;
         if expected != manifest_hash {
-            return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes, Hot budget, Hot-budget classification input, or escape_feerate_floor/escape_coverage_pct disagreeing with the federation-uniform manifest values is one cause)".into());
+            return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes, Hot budget, Hot-budget classification input, or escape_feerate_floor/escape_coverage_pct/escape_bump_max_fee_pct disagreeing with the federation-uniform manifest values is one cause)".into());
         }
 
         // Verify every node's channel-key endorsement against its signing key
@@ -3172,7 +3188,7 @@ impl ChannelState {
                 &manifest_hash,
                 node.node_id,
                 &node.channel_pubkey,
-                PROTOCOL_VERSION_V0,
+                PROTOCOL_VERSION,
                 &node.endpoints,
             );
             let entry = cfg
@@ -5320,7 +5336,7 @@ impl ChannelState {
         };
 
         // 1. protocol_version pinned to the manifest.
-        if env.protocol_version != PROTOCOL_VERSION_V0 {
+        if env.protocol_version != PROTOCOL_VERSION {
             return reject(RejectReason::BadProtocolVersion);
         }
         // 2. explicit local-vault equality (independent of endorsement validity).
@@ -5522,7 +5538,7 @@ impl ChannelState {
         let payload_b64 = STANDARD.encode(payload);
         let preimage = envelope_preimage(
             msg_type,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &self.wallet_id,
             &self.manifest_hash,
             self.node_id,
@@ -5536,7 +5552,7 @@ impl ChannelState {
             .sign_ecdsa(&Message::from_digest(digest), &self.channel_seckey);
         Ok(Envelope {
             msg_type: msg_type.to_string(),
-            protocol_version: PROTOCOL_VERSION_V0,
+            protocol_version: PROTOCOL_VERSION,
             wallet_id: to_hex(&self.wallet_id),
             manifest_hash: to_hex(&self.manifest_hash),
             sender_node_id: self.node_id,
@@ -5646,7 +5662,7 @@ pub(crate) fn request_fits_channel_body(request: &TaggedRequest, max_msg_bytes: 
 
     let envelope = Envelope {
         msg_type: MSG_TYPE_REQUEST.to_string(),
-        protocol_version: PROTOCOL_VERSION_V0,
+        protocol_version: PROTOCOL_VERSION,
         wallet_id: "0".repeat(HEX_32_BYTES),
         manifest_hash: "0".repeat(HEX_32_BYTES),
         sender_node_id: u16::MAX,
@@ -6077,6 +6093,7 @@ pub(crate) mod fixture {
         /// that still match its manifest — the same discipline as `max_msg_bytes`.
         pub(crate) escape_feerate_floor: u64,
         pub(crate) escape_coverage_pct: u8,
+        pub(crate) escape_bump_max_fee_pct: u8,
     }
 
     impl Fixture {
@@ -6167,7 +6184,7 @@ pub(crate) mod fixture {
             }
             let manifest_hash = compute_manifest_hash(
                 &wallet_id,
-                PROTOCOL_VERSION_V0,
+                PROTOCOL_VERSION,
                 &coord_pk,
                 &nodes,
                 DEFAULT_MAX_MSG_BYTES,
@@ -6177,6 +6194,7 @@ pub(crate) mod fixture {
                 5,
                 crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+                crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
             );
 
             let mut entries = Vec::new();
@@ -6188,7 +6206,7 @@ pub(crate) mod fixture {
                     &manifest_hash,
                     node_id as u16,
                     &cpk,
-                    PROTOCOL_VERSION_V0,
+                    PROTOCOL_VERSION,
                     &nodes[node_id].endpoints,
                 );
                 let sig = Secp256k1::signing_only().sign_ecdsa(&Message::from_digest(digest), &fsk);
@@ -6223,6 +6241,7 @@ pub(crate) mod fixture {
                 hot_budget: TEST_HOT_BUDGET,
                 escape_feerate_floor: crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 escape_coverage_pct: crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+                escape_bump_max_fee_pct: crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
             }
         }
 
@@ -6273,7 +6292,7 @@ pub(crate) mod fixture {
                 .collect();
             self.manifest_hash = compute_manifest_hash(
                 &self.wallet_id,
-                PROTOCOL_VERSION_V0,
+                PROTOCOL_VERSION,
                 &self.coord_pk,
                 &nodes,
                 self.max_msg_bytes,
@@ -6283,6 +6302,7 @@ pub(crate) mod fixture {
                 5,
                 self.escape_feerate_floor,
                 self.escape_coverage_pct,
+                self.escape_bump_max_fee_pct,
             );
             for entry in &mut self.entries {
                 let digest = endorsement_digest(
@@ -6290,7 +6310,7 @@ pub(crate) mod fixture {
                     &self.manifest_hash,
                     entry.node_id,
                     &entry.channel_pk,
-                    PROTOCOL_VERSION_V0,
+                    PROTOCOL_VERSION,
                     &entry.endpoints,
                 );
                 let sig = Secp256k1::signing_only()
@@ -6389,7 +6409,7 @@ pub(crate) mod fixture {
             // re-sealed to a non-default floor/coverage would compute a different
             // `manifest_hash` and fail startup — the same discipline as the cap above.
             format!(
-                "listen_port = {}\n{}descriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nhot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\nmax_commitment_age_secs = 172800\npolicy_version = 1\nescape_feerate_floor = {}\nescape_coverage_pct = {}\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
+                "listen_port = {}\n{}descriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nhot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\nmax_commitment_age_secs = 172800\npolicy_version = 1\nprotocol_version = {}\nescape_feerate_floor = {}\nescape_coverage_pct = {}\nescape_bump_max_fee_pct = {}\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
                 self.ports[self_id as usize],
                 crate::test_support::node_key_toml(&e.kdf),
                 self.descriptor,
@@ -6399,8 +6419,10 @@ pub(crate) mod fixture {
                 self.hot_budget.max_per_tx_sat,
                 self.hot_budget.max_per_window_sat,
                 self.hot_budget.window_secs,
+                PROTOCOL_VERSION,
                 self.escape_feerate_floor,
                 self.escape_coverage_pct,
+                self.escape_bump_max_fee_pct,
                 crate::argon2id_normal_phc("1234"),
                 crate::argon2id_duress_phc("9999"),
                 self.coord_pk,
@@ -6760,9 +6782,9 @@ mod golden {
     /// Regenerated when ADR-0014 added the Hot budget and its classification
     /// descriptors to the preimage; the V0-9 prefix through `max_msg_bytes` is
     /// byte-identical, which is what the offset assertions below check.
-    const FROZEN_MANIFEST_PREIMAGE_HEX: &str = "222222222222222222222222222222222222222222222222222222222222222200000000038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c2360000100000000000111111110000000022222222000000003333333300000000010000000900000077706b6828686f74290c00000077706b6828657363617065290500000001000000000000005f020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031";
+    const FROZEN_MANIFEST_PREIMAGE_HEX: &str = "222222222222222222222222222222222222222222222222222222222222222201000000038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c2360000100000000000111111110000000022222222000000003333333300000000010000000900000077706b6828686f74290c00000077706b6828657363617065290500000001000000000000005f00020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031";
     const FROZEN_MANIFEST_HASH_HEX: &str =
-        "f71ea65bac9966e61997d6d041499fb05facd426b15c13ac3cfb795f95385307";
+        "e1eacefbc4501240e2c01e61e9ca916b9245b2732a32690893ca0f17eb1aeb3b";
 
     #[test]
     fn manifest_vector_is_frozen() {
@@ -6786,7 +6808,8 @@ mod golden {
         // max_msg_bytes:u64, hot_max_per_tx:u64, hot_max_per_window:u64,
         // hot_window_secs:u64, canonical hot descriptors, escape descriptor,
         // max_derivation_index:u32, escape_feerate_floor:u64,
-        // escape_coverage_pct:u8, node-count:u32, then each node by id. The
+        // escape_coverage_pct:u8, escape_bump_max_fee_pct:u8, node-count:u32,
+        // then each node by id. The
         // coordinator key is unconditional
         // — every vault is sealed to exactly one coordinator — so it always occupies offsets 36..69, the federation-uniform
         // `max_msg_bytes` (V0-4b §0) follows it at 69..77, and the ADR-0014 Hot
@@ -6804,7 +6827,7 @@ mod golden {
         let escape_descriptor = "wpkh(escape)";
         let bytes = base_manifest_bytes(
             &wallet_id,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &coord,
             &nodes,
             DEFAULT_MAX_MSG_BYTES,
@@ -6814,6 +6837,7 @@ mod golden {
             5,
             crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+            crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
         );
         assert_eq!(to_hex(&bytes), FROZEN_MANIFEST_PREIMAGE_HEX);
         assert_eq!(
@@ -6864,7 +6888,7 @@ mod golden {
         let escape_descriptor = "wpkh(escape)";
         let with_a = compute_manifest_hash(
             &wallet_id,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &pk(0xC0),
             &nodes,
             DEFAULT_MAX_MSG_BYTES,
@@ -6874,10 +6898,11 @@ mod golden {
             5,
             crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+            crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
         );
         let with_b = compute_manifest_hash(
             &wallet_id,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &pk(0xC1),
             &nodes,
             DEFAULT_MAX_MSG_BYTES,
@@ -6887,6 +6912,7 @@ mod golden {
             5,
             crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+            crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
         );
         assert_ne!(
             with_a, with_b,
@@ -6913,7 +6939,7 @@ mod golden {
         let hash_of = |budget| {
             compute_manifest_hash(
                 &wallet_id,
-                PROTOCOL_VERSION_V0,
+                PROTOCOL_VERSION,
                 &pk(0xC0),
                 &nodes,
                 DEFAULT_MAX_MSG_BYTES,
@@ -6923,6 +6949,7 @@ mod golden {
                 5,
                 crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+                crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
             )
         };
         let sealed = hash_of(TEST_HOT_BUDGET);
@@ -6978,7 +7005,7 @@ mod golden {
         let hash_of = |floor: u64, coverage: u8| {
             compute_manifest_hash(
                 &wallet_id,
-                PROTOCOL_VERSION_V0,
+                PROTOCOL_VERSION,
                 &pk(0xC0),
                 &nodes,
                 DEFAULT_MAX_MSG_BYTES,
@@ -6988,6 +7015,7 @@ mod golden {
                 5,
                 floor,
                 coverage,
+                crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
             )
         };
         let sealed = hash_of(
@@ -7024,7 +7052,7 @@ mod golden {
         let hash_of = |hot_allowlist: &[String], escape_descriptor: &str, max_derivation_index| {
             compute_manifest_hash(
                 &wallet_id,
-                PROTOCOL_VERSION_V0,
+                PROTOCOL_VERSION,
                 &pk(0xC0),
                 &nodes,
                 DEFAULT_MAX_MSG_BYTES,
@@ -7034,6 +7062,7 @@ mod golden {
                 max_derivation_index,
                 crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+                crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
             )
         };
         let hot = vec!["wpkh(hot)".to_string()];
@@ -7115,6 +7144,7 @@ mod golden {
                 5,
                 crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+                crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
             )
             .expect("valid ceremony descriptors")
         };
@@ -7133,13 +7163,13 @@ mod golden {
             &[0x33u8; 32],
             1,
             &pk(4),
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &["127.0.0.1:9001".to_string()],
         );
-        assert_eq!(to_hex(&pre), "22222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333010003462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b00000000010000000e0000003132372e302e302e313a39303031");
+        assert_eq!(to_hex(&pre), "22222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333010003462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b01000000010000000e0000003132372e302e302e313a39303031");
         assert_eq!(
             to_hex(&tagged_hash(ENDORSEMENT_TAG, &pre)),
-            "51faa376da7236f11c41b5ceeda907bdf4bc67ab58de9a11fb5cf8f828f73acd"
+            "be2aa05e39b0c5858c00f288bc1ca4d7aae22c674c1df19826aac3d12944d18f"
         );
     }
 
@@ -7147,7 +7177,7 @@ mod golden {
     fn envelope_vector_is_frozen() {
         let pre = envelope_preimage(
             "partial",
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &[0x22u8; 32],
             &[0x33u8; 32],
             1,
@@ -7156,10 +7186,10 @@ mod golden {
             &[0x44u8; 16],
             1_752_000_000,
         );
-        assert_eq!(to_hex(&pre), "070000007061727469616c0000000022222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333010002000c0000006347467964476c6862413d3d100000004444444444444444444444444444444400666d6800000000");
+        assert_eq!(to_hex(&pre), "070000007061727469616c0100000022222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333010002000c0000006347467964476c6862413d3d100000004444444444444444444444444444444400666d6800000000");
         assert_eq!(
             to_hex(&tagged_hash(ENVELOPE_TAG, &pre)),
-            "fb179a1687044a0eb2169ceaee3368df72982e633355b887bfc80580cb9b951a"
+            "ef653cb88931e6240d923505944beafe9b9a7057d3c32cfe3fd17a78cd065237"
         );
     }
 
@@ -7232,6 +7262,118 @@ mod identity {
             err.contains("[channel] mode requires a [chain_backend]"),
             "the fatal must name the missing backend, not some other defect: {err}"
         );
+    }
+
+    /// The five version-precedence cases (ADR-0016 §3a, bead
+    /// btc-policy-mby-manifest-v1-zero-ceiling-88w). Every input is the config
+    /// `a_valid_channel_config_builds` accepts with ONE edit, so nothing here can pass
+    /// because some other part of the config went bad.
+    ///
+    /// The first three fix an ORDER, not merely a message: a config written for an
+    /// older manifest revision differs in its fields AND in the anchor those fields
+    /// reproduce, so without the preflight the operator is told about a missing field
+    /// or a hash mismatch — both read as corruption — when what they did was point a
+    /// current binary at an old manifest. The last two are its other side: the preflight
+    /// owns the VERSION alone, so omitting a current field still gets that field's error,
+    /// and a DIFFERENT CEILING gets the sealed-anchor error — the only test binding the
+    /// ceiling's VALUE rather than its presence, which a literal-`0` preimage would pass.
+    #[test]
+    fn the_startup_version_preflight_outranks_every_current_schema_error() {
+        let fx = Fixture::new(2, 3);
+        let valid = fx.config(0, 0, "");
+        let declared = format!("protocol_version = {PROTOCOL_VERSION}\n");
+        let ceiling = "escape_bump_max_fee_pct = 0\n";
+        assert!(
+            valid.contains(&declared) && valid.contains(ceiling),
+            "the fixture no longer emits the two lines these cases edit"
+        );
+
+        let old = valid.replace(&declared, "protocol_version = 0\n");
+        let absent = valid.replace(&declared, "");
+        // v0 AND a deliberately wrong anchor: the version must still win.
+        let old_and_wrong_anchor = old.replace(
+            &to_hex(&fx.manifest_hash),
+            &"0".repeat(2 * fx.manifest_hash.len()),
+        );
+        assert_ne!(
+            old_and_wrong_anchor, old,
+            "the sealed anchor this case corrupts is no longer in the config"
+        );
+        for (label, cfg, expected) in [
+            (
+                "an older declared revision",
+                old,
+                "unsupported manifest protocol_version 0",
+            ),
+            (
+                "no declared revision at all",
+                absent,
+                "unsupported manifest protocol_version (absent)",
+            ),
+            (
+                "an older revision beside a wrong sealed anchor",
+                old_and_wrong_anchor,
+                "unsupported manifest protocol_version 0",
+            ),
+            (
+                "the current revision missing a current field",
+                valid.replace(ceiling, ""),
+                "escape_bump_max_fee_pct",
+            ),
+            (
+                "the current revision at a different sealed ceiling",
+                valid.replace(ceiling, "escape_bump_max_fee_pct = 3\n"),
+                "does not equal the sealed expected_manifest_hash",
+            ),
+        ] {
+            let err = crate::test_support::load_node(&cfg)
+                .err()
+                .unwrap_or_else(|| panic!("{label} must fail startup"))
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "{label}: expected an error naming {expected:?}, got: {err}"
+            );
+        }
+    }
+
+    /// `protocol_version` is INSIDE the endorsement preimage, so an endorsement
+    /// collected during a revision-0 ceremony is not a valid endorsement at revision
+    /// 1 — the signature binds the revision. That is what stops a cross-version
+    /// artifact set from being assembled into a vault whose nodes would each compute
+    /// a different anchor.
+    #[test]
+    fn an_endorsement_from_the_previous_revision_does_not_verify_at_this_one() {
+        let fx = Fixture::new(2, 3);
+        let entry = &fx.entries[0];
+        let at_v0 = Secp256k1::signing_only().sign_ecdsa(
+            &Message::from_digest(endorsement_digest(
+                &fx.wallet_id,
+                &fx.manifest_hash,
+                entry.node_id,
+                &entry.channel_pk,
+                0,
+                &entry.endpoints,
+            )),
+            &entry.fed_sk,
+        );
+        let verify = |endorsement_hex: &str| {
+            ceremony::verify_endorsement(
+                &entry.fed_pk,
+                &entry.channel_pk,
+                &fx.wallet_id,
+                &fx.manifest_hash,
+                entry.node_id,
+                &entry.endpoints,
+                endorsement_hex,
+            )
+        };
+        assert!(
+            verify(&to_hex(&at_v0.serialize_der())).is_err(),
+            "a revision-0 endorsement must not verify against this revision"
+        );
+        // Control: the fixture's own endorsement, made at the current revision, does.
+        verify(&entry.endorsement_hex).expect("the current-revision endorsement verifies");
     }
 
     #[test]
@@ -7367,7 +7509,7 @@ mod identity {
             &wrong_hash,
             0,
             &e.channel_pk,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &e.endpoints,
         );
         let bad = Secp256k1::signing_only().sign_ecdsa(&Message::from_digest(digest), &e.fed_sk);
@@ -7393,7 +7535,7 @@ mod identity {
             &fx.manifest_hash,
             0,
             &e.channel_pk,
-            PROTOCOL_VERSION_V0,
+            PROTOCOL_VERSION,
             &e.endpoints,
         );
         let bad = Secp256k1::signing_only().sign_ecdsa(&Message::from_digest(digest), &stranger_sk);
@@ -7712,7 +7854,9 @@ mod ingress {
     fn a_bad_protocol_version_is_rejected() {
         let fx = Fixture::new(2, 3);
         let (send, recv) = (fx.channel_state(0), fx.channel_state(1));
-        let bytes = envelope_bytes(&fx, &send, 1, "c", NOW, |e| e.protocol_version = 1);
+        let bytes = envelope_bytes(&fx, &send, 1, "c", NOW, |e| {
+            e.protocol_version = PROTOCOL_VERSION + 1
+        });
         assert_eq!(
             recv.ingest_reply(&bytes, NOW),
             ChannelReply::Rejected(RejectReason::BadProtocolVersion)
@@ -8270,7 +8414,7 @@ mod partial {
                 "msg_type",
                 envelope_preimage(
                     "combine",
-                    0,
+                    PROTOCOL_VERSION,
                     &wallet_id,
                     &manifest_hash,
                     0,
@@ -8284,7 +8428,7 @@ mod partial {
                 "protocol_version",
                 envelope_preimage(
                     "partial",
-                    1,
+                    PROTOCOL_VERSION + 1,
                     &wallet_id,
                     &manifest_hash,
                     0,
@@ -8298,7 +8442,7 @@ mod partial {
                 "wallet_id",
                 envelope_preimage(
                     "partial",
-                    0,
+                    PROTOCOL_VERSION,
                     &[0x00; 32],
                     &manifest_hash,
                     0,
@@ -8312,7 +8456,7 @@ mod partial {
                 "manifest_hash",
                 envelope_preimage(
                     "partial",
-                    0,
+                    PROTOCOL_VERSION,
                     &wallet_id,
                     &[0x00; 32],
                     0,
@@ -8326,7 +8470,7 @@ mod partial {
                 "sender_node_id",
                 envelope_preimage(
                     "partial",
-                    0,
+                    PROTOCOL_VERSION,
                     &wallet_id,
                     &manifest_hash,
                     1,
@@ -8340,7 +8484,7 @@ mod partial {
                 "recipient_node_id",
                 envelope_preimage(
                     "partial",
-                    0,
+                    PROTOCOL_VERSION,
                     &wallet_id,
                     &manifest_hash,
                     0,
@@ -8354,7 +8498,7 @@ mod partial {
                 "payload_b64",
                 envelope_preimage(
                     "partial",
-                    0,
+                    PROTOCOL_VERSION,
                     &wallet_id,
                     &manifest_hash,
                     0,
@@ -8368,7 +8512,7 @@ mod partial {
                 "nonce",
                 envelope_preimage(
                     "partial",
-                    0,
+                    PROTOCOL_VERSION,
                     &wallet_id,
                     &manifest_hash,
                     0,
@@ -8382,7 +8526,7 @@ mod partial {
                 "timestamp",
                 envelope_preimage(
                     "partial",
-                    0,
+                    PROTOCOL_VERSION,
                     &wallet_id,
                     &manifest_hash,
                     0,
@@ -8404,7 +8548,7 @@ mod partial {
         // Control: the un-mutated preimage DOES verify (signer == verifier).
         let base = envelope_preimage(
             "partial",
-            0,
+            PROTOCOL_VERSION,
             &wallet_id,
             &manifest_hash,
             0,

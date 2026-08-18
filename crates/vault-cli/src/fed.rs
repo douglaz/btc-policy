@@ -751,6 +751,8 @@ impl NodeParams {
             // The harness never varies coverage, so seal + emit the shared default;
             // a heterogeneity test would add the field to `NodeParams` and set it here.
             escape_coverage_pct: vault_node::DEFAULT_ESCAPE_COVERAGE_PCT,
+            // ADR-0016 §2's ladderless posture: the only value the ceremony accepts.
+            escape_bump_max_fee_pct: vault_node::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
             hot_max_per_tx: self.hot_budget.max_per_tx_sat,
             hot_max_per_window: self.hot_budget.max_per_window_sat,
             hot_window_secs: self.hot_budget.window_secs,
