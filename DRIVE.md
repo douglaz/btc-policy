@@ -2,13 +2,24 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** IMPL · **Bead:** btc-policy-30c · **Branch:** beads/30c-outer-stale-receipt
-**Pending:** —
+**Phase:** PLAN · **Bead:** btc-policy-mby · **Branch:** —
+**Pending:** distill and split before any rb-lite implementation run
+**Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
+recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
+bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
+a `br ready` ranking.
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 (the stale-flake assertion plus three of the four legs of CI's `check` matrix; `regtest-backend`
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-sxt` (`q6v` + `qzo` + `o5g` + `0hv` + `7ip` + `30c` + `ok4`, P1) —
+  bare wall-clock reads cannot retire live Carrier confirmation state; accepted `D` supplies
+  monotonic authority; under the current `coord_nonces.high_water < E` premise, recoverable exact
+  receipts retry through both ordinary and outer-Stale paths without lowering freshness
+  high-water. Final child #18 merged as `31303f1`. `br show btc-policy-30c` owns the red-first,
+  13-mutation and command/exit evidence; `br show btc-policy-ok4` and `br show btc-policy-sxt`
+  own the integrated closure and known-limit qualification. They are linked, not recopied here.
 - `btc-policy-qzo` (P1) — repeated channel-freshness diagnostics coalesce by peer plus
   ingress high-water without evicting unrelated watchtower evidence. Merged #12 (`40c3269`);
   closure merged #13 (`3171f47`).
@@ -40,21 +51,18 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Implement `btc-policy-30c`, the final bounded `sxt` code child: recognize only exact,
-authenticated, quota-admitted outer-Stale Carrier receipts; serialize the final
-acceptance-to-claim decision; keep memory-hard work outside locks; and preserve terminal
-`STALE_TIMESTAMP` for every nonmatching or ended case. Global freshness high-water remains
-unchanged.
+Distill `btc-policy-mby` before implementation. Its accumulated record spans the sealed-manifest
+substrate, signer seam, protocol/preimage versioning, ceremony, fee handling, operator commands,
+documentation and E2E evidence; handing that bundle directly to rb-lite would violate the
+one-self-contained-task rule. Re-derive the dependency order and hard budgets with every test line
+included, then create bounded code children.
 
 ## Next
-Close `btc-policy-30c` after review, then close integration owner `ok4`, run the completed
-`sxt` custody-critical gates, and close `sxt`. The child remains bounded at **700 gross Rust
-= ~150 production + 550 tests**; ignored regtest and the launch gate remain integrated-PR
-obligations rather than claims of this branch run.
+Review the split with Codex and Opus, then implement and land one child at a time through rb-lite.
 The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
-`coord-highwater-carrier-recovery-i3p`.
-`mby` remains the widest product unblocker but must first be distilled; do not hand its
-~30k-character accumulated record directly to an implementation run.
+`coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's
+invariant-panic unwind and test-synchronization observations are P3 follow-ups, not reopened
+Carrier clock-authority work.
 
 `gbw`'s open blockers, computed from the dependency graph 2026-08-10, not counted by hand:
 `mby`, `oy3`, `rt0`, `sqn`, `wdu`. `6nq`, `9yf`, `c9r` and `nia` are closed. The closed edges stay
@@ -62,6 +70,12 @@ in the graph deliberately — `br ready` counts only open blockers, and the reco
 existed is worth more than a tidy list.
 
 ## Filed during this drive, not fixed here
+- `btc-policy-carrier-claim-unwind-hardening-i2o` (P3) — give both ordinary and outer-Stale
+  alternate-signature claims one exact generation/sender/tag unwind owner if the presently
+  invariant-only KDF panic boundary ever unwinds.
+- `btc-policy-outer-stale-test-sync-ykp` (P3) — replace the two scheduler-yield polls with
+  deterministic test milestones; the mutation is pinned, but the current negative assertion can
+  pass before its worker reaches the guarded region.
 - `btc-policy-u98` (P1, raised from P2) — `attack all` is blind to a mixed hot+escape spend because no scenario
   builds one. Cheap: `build_spend_n` already takes a general output slice. Its done-definition
   requires re-injecting the fault to prove the new scenario CAN go red.
@@ -75,9 +89,6 @@ existed is worth more than a tidy list.
 - `btc-policy-o97` (P3) — a DESIGN.md audit, rescoped from a site list to a sweep after three
   review passes each found sites the previous enumeration had missed (2 → 5 → 8).
 - `btc-policy-8sq` — CLOSED as a duplicate of the pre-existing `tf0`.
-- `btc-policy-sxt` (P1) — forward-clock sweeps and confirmation resampling can still destroy
-  ruled carrier state outside q6v's passive lookup. This is a separate eviction-authority defect,
-  not a reason to widen q6v into a clock subsystem.
 - `btc-policy-r1g` (P2) — `/channel` freshness high-water survives raw clock correction and can
   blackhole every peer message until real time catches the 300-second window, with no protocol bound
   on that duration. It depends on `sxt`; `btc-policy-coord-highwater-carrier-recovery-i3p` (P2) tracks
