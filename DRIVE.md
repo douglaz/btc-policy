@@ -4,9 +4,10 @@
 Beads outside that frontier are NOT in scope for this drive.
 **Phase:** PLAN · **Bead:** btc-policy-mby · **Branch:** —
 **Pending:** distill and split before any rb-lite implementation run
-**Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because the
-Codex/Opus bead review identified it as the widest product unblocker, after the bounded custody fix
-chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not a `br ready` ranking.
+**Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
+recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
+bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
+a `br ready` ranking.
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 (the stale-flake assertion plus three of the four legs of CI's `check` matrix; `regtest-backend`
 is the fourth — see AGENTS.md for why each part is load-bearing)
