@@ -1553,7 +1553,6 @@ struct Artifact {
 }
 
 const STAGING_DIR: &str = ".finalize-staging";
-/// The complete, atomically published manifest-schema-revision-1 artifact set.
 const SEALED_DIR: &str = "sealed-v1";
 
 /// Stage the complete rendered set under this process's [`STAGING_DIR`], then make the
@@ -1567,6 +1566,7 @@ fn publish_artifact_set(
     artifacts: &[Artifact],
     stage_failpoint: Option<usize>,
 ) -> Result<(), Error> {
+    use std::os::unix::fs::DirBuilderExt;
     let staging = dir.join(format!("{STAGING_DIR}.{}", std::process::id()));
     let sealed = dir.join(SEALED_DIR);
     if sealed.exists() {
@@ -1583,6 +1583,7 @@ fn publish_artifact_set(
         std::fs::remove_dir_all(&staging)
             .map_err(|e| format!("cannot clear stale staging {}: {e}", staging.display()))?;
     }
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
     for (index, artifact) in artifacts.iter().enumerate() {
         if stage_failpoint == Some(index) {
             return Err(format!(
@@ -1853,11 +1854,7 @@ fn finalize_cmd(args: &Args, stage_failpoint: Option<usize>) -> Result<(), Error
     // into the backup would surface only years later at recovery, when the coins cannot
     // be located. `state.descriptor` passed the wallet_id recompute, `manifest_hash` the
     // manifest recompute, and `coord_pubkey` the secret-derivation check.
-    // `manifest.json` is the same rendered bytes staged above, and the auth secret the
-    // same bytes the derivation check verified — a re-read would back up something other
-    // than what was checked. `independence.txt` is assemble's witnessed evidence, not
-    // reconstructible from state, so it is the one artifact read back in. The secret is
-    // staged owner-only, never `fs::copy`d, which would create the copy at the umask.
+    // Reuse verified bytes; `fs::copy` remakes secrets at the umask. Re-read independence.txt.
     let sealed = dir.join(SEALED_DIR);
     let backup = sealed.join("backup");
     let independence = std::fs::read_to_string(dir.join("independence.txt"))
@@ -3315,6 +3312,7 @@ mod tests {
     /// where a write-as-you-go finalize would already have published one host's config.
     #[test]
     fn an_interrupted_finalize_seals_nothing_and_an_exact_retry_completes_one_set() {
+        use std::os::unix::fs::PermissionsExt;
         let ceremony = ceremony_through_endorse(3, 2);
         let published = [
             "manifest.json",
@@ -3327,6 +3325,7 @@ mod tests {
         ];
         let staging_name = format!("{STAGING_DIR}.{}", std::process::id());
         let staging = ceremony.dir.join(&staging_name);
+        let mode = |path: &Path| path.metadata().expect("root mode").permissions().mode();
         // Staging is per invocation, so publication must never remove a directory it did not
         // create: clearing an overlapping finalize's set would leave it renaming a partial one.
         let theirs = ceremony.dir.join(STAGING_DIR);
@@ -3355,6 +3354,7 @@ mod tests {
                 staging.join("manifest.json").exists(),
                 "failpoint {failpoint} must fire after the manifest was staged"
             );
+            assert_eq!(mode(&staging) & 0o077, 0, "staging root is not owner-only");
         }
 
         // The exact retry — same command, same directory — completes the set.
@@ -3372,11 +3372,11 @@ mod tests {
             "a completed publication leaves no staging directory behind"
         );
         assert!(theirs.exists(), "overlapping staging was destroyed");
+        assert_eq!(mode(&ceremony.sealed("")) & 0o077, 0, "sealed root mode");
 
         // A completed seal is immutable even when its bytes still match. In particular,
         // a hand copy can preserve bytes while widening secret modes; finalize must not
         // bless that filesystem state as a verified artifact set.
-        use std::os::unix::fs::PermissionsExt;
         let secret = ceremony.sealed("backup/coordinator-auth.secret");
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644))
             .expect("simulate an unsafe hand copy");

@@ -204,6 +204,14 @@ one complete set—never an independently usable node config from a partial publ
 That staging directory is per invocation, so two `finalize` runs that overlap in one
 ceremony directory cannot clear each other's staged set and publish the remnant as a
 complete seal: whichever loses fails, at the existing-set refusal below or at the rename.
+Both that staging directory and the `sealed-v1/` it becomes request owner-only mode at
+creation (`mkdir` mode 0700); the umask can only remove bits, never add group/world access.
+That prevents another local account from
+traversing those inodes or changing entries inside them. It does NOT protect the directory
+entries that name those roots: the ceremony directory that contains them is still created at
+your umask, so an account able to write that parent can replace the staging root mid-ceremony
+or `sealed-v1/` afterwards. Run the ceremony on a host and medium you control; `btc-policy-b8z`
+tracks a parent-namespace remedy.
 Re-running after a process interruption safely creates exactly one complete set, but it
 does NOT delete the interrupted run's staging directory, which holds the same secrets as
 the artifacts below (0600 node configs, the coordinator key). Remove it yourself once the
