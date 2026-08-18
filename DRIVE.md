@@ -2,8 +2,8 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** PLAN · **Bead:** btc-policy-mby · **Branch:** —
-**Pending:** distill and split before any rb-lite implementation run
+**Phase:** SPEC · **Bead:** btc-policy-mby-manifest-v1-zero-ceiling-88w · **Branch:** beads/mby-split
+**Pending:** land the reviewed split, then claim M1 for rb-lite implementation
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -51,25 +51,50 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Distill `btc-policy-mby` before implementation. Its accumulated record spans the sealed-manifest
-substrate, signer seam, protocol/preimage versioning, ceremony, fee handling, operator commands,
-documentation and E2E evidence; handing that bundle directly to rb-lite would violate the
-one-self-contained-task rule. Re-derive the dependency order and hard budgets with every test line
-included, then create bounded code children.
+Implement `btc-policy-mby-manifest-v1-zero-ceiling-88w` (M1) after this split lands: atomically
+append the default-zero escape-ladder ceiling to the sealed manifest preimage, move to
+`protocol_version = 1`, preflight old versions before current-schema/hash errors, render/finalize
+the complete artifact set atomically, disclose the fixed 180-day timelock and uncapped/unknown
+base Escape fee, and reject every nonzero ceiling until `sqn`. M1 may land as code but does not
+authorize a production ceremony; the `mby` umbrella remains the rollout authority.
 
 ## Next
-Review the split with Codex and Opus, then implement and land one child at a time through rb-lite.
-The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
-`coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's
-invariant-panic unwind and test-synchronization observations are P3 follow-ups, not reopened
-Carrier clock-authority work.
+M1's `protocol_version = 1` is a manifest-schema revision, not routable transport v1. After M1,
+land `5ag`'s sealed network field and next manifest protocol bump before M2 parses live artifacts;
+M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or network
+I/O. Then implement M2 operator core, M3 stable Core composer, M4 Spend command, and the parallel
+M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
+rb-lite. M4/M5 reuse one exact request across ordered stage-1 ingress attempts and report success
+only after Core observes node-side threshold combine/broadcast; M6 mutation-tests that non-ingress
+nodes receive and validate it through the request channel. M5 rejects unknown/spent/off-vault
+outpoints and ships the mandatory two-transaction base Escape pair with an empty bump ladder; M1
+rejects every nonzero ceiling until `sqn`. `wdu` follows M1+5ag; `sqn` follows M5 because it decides
+whether that escape-class command's delayed residual carries rungs. Other
+complete-product dependents stay
+blocked on `mby`. `imb` owns confidential authenticated coordinator ingress and routable peer
+transport from stage 2 onward; the operator CLI remains on the coordinator host.
 
-`gbw`'s open blockers, computed from the dependency graph 2026-08-10, not counted by hand:
+The reviewed hard Rust caps are **4,050 gross lines total, additions plus deletions with every test
+line included**: M1 800, M2 900, M3 500, M4 500, M5 850, M6 500. The estimate is approximately
+1,450 production + 2,600 tests, so tests are 64.2% of the Rust budget; non-Rust evidence/docs total
+700. Exact scope and stop conditions live in each child bead. These caps supersede the old
+2,500–4,500 estimate, which never said whether tests or deletions counted.
+
+The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
+`coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's P3
+unwind/test-synchronization follow-ups do not reopen Carrier clock authority.
+
+`gbw`'s direct open blockers, refreshed from `br show btc-policy-gbw --json` on 2026-08-18:
 `mby`, `oy3`, `rt0`, `sqn`, `wdu`. `6nq`, `9yf`, `c9r` and `nia` are closed. The closed edges stay
 in the graph deliberately — `br ready` counts only open blockers, and the record that the gate
 existed is worth more than a tidy list.
 
-## Filed during this drive, not fixed here
+## Filed or adjudicated during this drive, not implemented here
+- `btc-policy-sealed-host-cli-packaging-u4y` (CLOSED/rejected) — it conflated the dedicated
+  coordinator with an ADR-0005 node image. A sealed node has no lawful interactive invocation or
+  secret-input surface, and stage 2+ no longer uses the v0 loopback topology. `4y3` owns the
+  coordinator's reproducible install slot; `4wx` binds the `oy3`-identified operator artifact and
+  proves it against `imb` transport before stage 4. The invalid `s12 -> u4y` edge was removed.
 - `btc-policy-carrier-claim-unwind-hardening-i2o` (P3) — give both ordinary and outer-Stale
   alternate-signature claims one exact generation/sender/tag unwind owner if the presently
   invariant-only KDF panic boundary ever unwinds.
