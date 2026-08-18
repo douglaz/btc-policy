@@ -4463,6 +4463,85 @@ fn handle_channel_body_with_clock(
     handle_channel_body_with_clocks(node, body, received_at, || received_at, confirmation_clock)
 }
 
+fn handle_outer_stale_spend(
+    node: &Node,
+    channel: &channel::ChannelState,
+    sender: u16,
+    request: &vault_proto::TaggedRequest,
+    clock: &impl Fn() -> u64,
+) -> ChannelReply {
+    let stale = || ChannelReply::Rejected(channel::RejectReason::StaleTimestamp);
+    let retry = |retry_after_secs| ChannelReply::RateLimited { retry_after_secs };
+    let reply = |outcome| match outcome {
+        channel::OuterStaleCarrier::Retry(seconds) => retry(seconds),
+        channel::OuterStaleCarrier::Terminal => stale(),
+        channel::OuterStaleCarrier::Derive(..) => retry(1),
+    };
+    let vault_proto::TaggedRequest::Spend(spend) = request else {
+        return stale();
+    };
+    if verify_coord_signature(node, spend.coord_request(), &spend.coord_sig).is_err() {
+        return stale();
+    }
+    if spend.nonce.is_empty()
+        || spend.nonce.len() > MAX_COORD_NONCE_BYTES
+        || ensure_request_propagatable(node, request).is_err()
+    {
+        return stale();
+    }
+
+    let signature_tag = arm_signature_tag(&spend.coord_sig);
+    let decide = |step, claim: bool| {
+        let state = node.sign_state.lock().expect("sign_state lock poisoned");
+        if node.is_locked_down() {
+            return (channel::OuterStaleCarrier::Terminal, None);
+        }
+        let Some(deadline) = state
+            .coord_nonces
+            .outer_stale_carrier_deadline(&spend.nonce, spend.expiry)
+        else {
+            return (channel::OuterStaleCarrier::Terminal, None);
+        };
+        let classify = |step| {
+            channel.outer_stale_carrier(
+                &spend.nonce,
+                signature_tag,
+                (spend.expiry, deadline),
+                sender,
+                clock(),
+                step,
+            )
+        };
+        let outcome = classify(step);
+        if !claim || !matches!(outcome, channel::OuterStaleCarrier::Derive(..)) {
+            return (outcome, None);
+        }
+        // `sign_state` covered first eligibility; reserve only now, then Inspect(true) rechecks it.
+        let Some(reservation) = node.carrier_kdf.try_reserve() else {
+            return (outcome, None);
+        };
+        (
+            classify(channel::OuterStaleStep::Inspect(true)),
+            Some(reservation),
+        )
+    };
+    let (claim, reservation) = decide(channel::OuterStaleStep::Inspect(false), true);
+    let Some(reservation) = reservation else {
+        return reply(claim);
+    };
+    let channel::OuterStaleCarrier::Derive(memoized_carrier, generation) = claim else {
+        return reply(claim);
+    };
+
+    let digest = Zeroizing::new(spend.coord_request().auth_digest(&node.wallet_id));
+    let stretched = reservation.derive(&digest);
+    let derived =
+        vault_proto::tagged_hash(ARM_CARRIER_TAG, stretched.as_slice()).to_lower_hex_string();
+    let finish =
+        channel::OuterStaleStep::Finish(&memoized_carrier, generation, derived == memoized_carrier);
+    reply(decide(finish, false).0)
+}
+
 fn handle_channel_body_with_clocks(
     node: &Node,
     body: &[u8],
@@ -4476,6 +4555,9 @@ fn handle_channel_body_with_clocks(
     };
     match channel.ingest(body, received_at) {
         channel::Ingested::Reply(reply) => reply,
+        channel::Ingested::StaleSpend(sender, request) => {
+            handle_outer_stale_spend(node, channel, sender, request.as_ref(), &confirmation_clock)
+        }
         channel::Ingested::Request { sender, request } => {
             // The node's own gates decide. The peer learns only that we processed
             // it — never our policy verdict, which is ours alone and which a peer
@@ -4616,6 +4698,8 @@ fn handle_channel_body_with_clocks(
                             memoized_carrier,
                             generation,
                         } => {
+                            #[cfg(test)]
+                            channel.carrier_lookup_rendezvous();
                             // A hostile coordinator plus one compromised peer can
                             // manufacture conflicting signatures across thousands of
                             // live nonces. Never let those memory-hard resolutions all
@@ -4637,7 +4721,9 @@ fn handle_channel_body_with_clocks(
                                 sender,
                                 &memoized_carrier,
                             ) {
-                                None
+                                return ChannelReply::RateLimited {
+                                    retry_after_secs: 1,
+                                };
                             } else {
                                 let digest = Zeroizing::new(
                                     spend.coord_request().auth_digest(&node.wallet_id),

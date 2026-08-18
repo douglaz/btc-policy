@@ -408,6 +408,14 @@ impl NonceLog {
         self.entries.get(nonce)?.carrier_deadline
     }
 
+    /// Read-only deadline authority: exact generation plus `high_water < E`; never lowers it.
+    pub(crate) fn outer_stale_carrier_deadline(&self, nonce: &str, expiry: u64) -> Option<u64> {
+        self.entries
+            .get(nonce)
+            .filter(|entry| self.high_water < expiry && entry.expiry == expiry)?
+            .carrier_deadline
+    }
+
     /// Apply the complete post-auth freshness decision atomically. The caller
     /// invokes this only after `coord_sig` verifies, so forged traffic cannot
     /// advance the high-water mark or consume capacity.
@@ -780,6 +788,12 @@ mod tests {
         );
         assert_eq!(log.high_water, 1_000);
         assert!(log.entries.contains_key("spend"));
+        assert_eq!(
+            log.outer_stale_carrier_deadline("spend", 1_500),
+            Some(MONO + 500)
+        );
+        log.high_water = 1_500;
+        assert_eq!(log.outer_stale_carrier_deadline("spend", 1_500), None);
     }
 
     /// The full liveness matrix for one channel-mode entry: wall-live/monotonic-dead,

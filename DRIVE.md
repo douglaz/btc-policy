@@ -47,10 +47,10 @@ acceptance-to-claim decision; keep memory-hard work outside locks; and preserve 
 unchanged.
 
 ## Next
-Implement the final bounded `sxt` code child, `btc-policy-30c`: authenticated,
-quota-admitted outer-Stale Carrier discrimination and acceptance-to-claim serialization.
-Its hard rb-lite cap remains **700 gross Rust = ~150 production + 550 tests**. Then close
-integration owner `ok4`, run the completed `sxt` custody-critical gates, and close `sxt`.
+Close `btc-policy-30c` after review, then close integration owner `ok4`, run the completed
+`sxt` custody-critical gates, and close `sxt`. The child remains bounded at **700 gross Rust
+= ~150 production + 550 tests**; ignored regtest and the launch gate remain integrated-PR
+obligations rather than claims of this branch run.
 The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
 `coord-highwater-carrier-recovery-i3p`.
 `mby` remains the widest product unblocker but must first be distilled; do not hand its
