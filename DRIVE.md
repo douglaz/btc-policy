@@ -68,7 +68,8 @@ rb-lite. M4/M5 reuse one exact request across ordered stage-1 ingress attempts a
 only after Core observes node-side threshold combine/broadcast; M6 mutation-tests that non-ingress
 nodes receive and validate it through the request channel. M5 rejects unknown/spent/off-vault
 outpoints and ships the mandatory two-transaction base Escape pair with an empty bump ladder; M1
-rejects every nonzero ceiling until `sqn`. `wdu` follows M1+5ag; `sqn` follows M4. Other
+rejects every nonzero ceiling until `sqn`. `wdu` follows M1+5ag; `sqn` follows M5 because it decides
+whether that escape-class command's delayed residual carries rungs. Other
 complete-product dependents stay
 blocked on `mby`. `imb` owns confidential authenticated coordinator ingress and routable peer
 transport from stage 2 onward; the operator CLI remains on the coordinator host.
