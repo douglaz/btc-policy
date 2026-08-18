@@ -11,9 +11,10 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
 ## Done
 - `btc-policy-sxt` (`q6v` + `qzo` + `o5g` + `0hv` + `7ip` + `30c`, P1) — bare
   wall-clock reads cannot retire live Carrier confirmation state; accepted `D` supplies monotonic
-  authority; recoverable exact receipts retry through both ordinary and outer-Stale paths without
-  lowering freshness high-water. Final child #18 merged as `31303f1`; its reviewed head passed
-  fmt, Clippy, workspace tests, live-Core regtest and both launch gates.
+  authority; under the current `coord_nonces.high_water < E` premise, recoverable exact receipts
+  retry through both ordinary and outer-Stale paths without lowering freshness high-water. Final
+  child #18 merged as `31303f1`; its reviewed head passed fmt, Clippy, workspace tests,
+  live-Core regtest and both launch gates.
 - `btc-policy-qzo` (P1) — repeated channel-freshness diagnostics coalesce by peer plus
   ingress high-water without evicting unrelated watchtower evidence. Merged #12 (`40c3269`);
   closure merged #13 (`3171f47`).
@@ -83,9 +84,6 @@ existed is worth more than a tidy list.
 - `btc-policy-o97` (P3) — a DESIGN.md audit, rescoped from a site list to a sweep after three
   review passes each found sites the previous enumeration had missed (2 → 5 → 8).
 - `btc-policy-8sq` — CLOSED as a duplicate of the pre-existing `tf0`.
-- `btc-policy-sxt` (P1) — forward-clock sweeps and confirmation resampling can still destroy
-  ruled carrier state outside q6v's passive lookup. This is a separate eviction-authority defect,
-  not a reason to widen q6v into a clock subsystem.
 - `btc-policy-r1g` (P2) — `/channel` freshness high-water survives raw clock correction and can
   blackhole every peer message until real time catches the 300-second window, with no protocol bound
   on that duration. It depends on `sxt`; `btc-policy-coord-highwater-carrier-recovery-i3p` (P2) tracks
