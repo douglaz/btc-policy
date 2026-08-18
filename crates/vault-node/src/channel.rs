@@ -36,7 +36,7 @@
 //!   channel_sig verifies over preimage  no ──▶ REJECTED(BAD_CHANNEL_SIG)
 //!         │      ── sender now authenticated ──
 //!   timestamp ∈ [now-300, now+60] ───── no ──▶ charge peer quota, then
-//!                                                       REJECTED(STALE_TIMESTAMP) + freshness event
+//!                         STALE_TIMESTAMP (or classify stale Spend receipt) + freshness event
 //!         │
 //!   (sender,nonce) unseen ───────────── seen ▶ charge peer quota, then
 //!                                                       REJECTED(REPLAYED_NONCE)
@@ -122,6 +122,7 @@ const MANIFEST_TAG: &str = "btc-policy/manifest/v0";
 const ENDORSEMENT_TAG: &str = "btc-policy/channel-endorsement/v0";
 const ENVELOPE_TAG: &str = "btc-policy/channel-envelope/v0";
 const USER_SIG_HASH_TAG: &str = "btc-policy/user-sig-hash/v0";
+const OUTER_STALE_CLAIM_TAG: &str = "btc-policy/outer-stale-claim/v0";
 
 /// Freshness window (decided 2026-07-16): accept `timestamp ∈ [now-300, now+60]`.
 /// 5 min past tolerance is for v1 Tor latency + retries + skew; 60 s future is
@@ -740,6 +741,7 @@ pub(crate) enum Ingested {
         sender: u16,
         request: Box<TaggedRequest>,
     },
+    StaleSpend(u16, Box<TaggedRequest>),
 }
 
 /// One rejection exit, as an [`Ingested`].
@@ -1493,6 +1495,19 @@ pub(crate) enum CarrierMemoLookup {
     /// Nothing here can be confirmed: the matching intent is committed, the
     /// authenticated sender is already a holder, or this sender spent its one derivation.
     Skip,
+}
+
+// Inspect(false) authorizes before KDF reservation; Inspect(true) claims before out-of-lock work.
+// Its domain-separated claim is mandatory InFlight state and must survive ordinary claim loss.
+// Finish resolves matching work before transient E refusal, making correction KDF-free.
+pub(crate) enum OuterStaleCarrier {
+    Terminal,
+    Retry(u64),
+    Derive(String, MemoGeneration),
+}
+pub(crate) enum OuterStaleStep<'a> {
+    Inspect(bool),
+    Finish(&'a str, MemoGeneration, bool),
 }
 
 /// A read-only view of the [`Armed`] overlay for the fire driver (which drives
@@ -2305,6 +2320,17 @@ pub(crate) struct PartialStore {
 }
 
 impl PartialStore {
+    fn resolve_signature(&mut self, nonce: &str, sender: u16, signature_tag: [u8; 32]) {
+        let memos = &mut self.carriers_by_nonce;
+        let memo = memos.get_mut(nonce).expect("memo checked above");
+        match &mut memo.outcome {
+            MemoOutcome::Derived {
+                resolved_senders, ..
+            } => resolved_senders.insert(sender, signature_tag),
+            MemoOutcome::InFlight { .. } => unreachable!("memo checked as Derived above"),
+        };
+    }
+
     /// Free the Hot-budget reservation of a candidate being REMOVED from the
     /// registry, if neither its partial left this node nor this node broadcast it.
     ///
@@ -2891,6 +2917,8 @@ pub struct ChannelState {
     /// still held, so no reader can observe either half of the coupled commit.
     #[cfg(test)]
     confirm_commit_midpoint: std::sync::OnceLock<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    carrier_lookup_midpoint: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 /// The clock the Hot budget and Carrier deadlines' duration terms age against:
@@ -3242,6 +3270,8 @@ impl ChannelState {
             schedule_work: ScheduleWorkCounters::default(),
             #[cfg(test)]
             confirm_commit_midpoint: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            carrier_lookup_midpoint: Mutex::new(None),
         })
     }
 
@@ -3874,6 +3904,9 @@ impl ChannelState {
                 {
                     return CarrierMemoLookup::Skip;
                 }
+                if resolved == Some(&tagged_hash(OUTER_STALE_CLAIM_TAG, &signature_tag)) {
+                    return CarrierMemoLookup::InFlight;
+                }
                 if resolved.is_some() {
                     CarrierMemoLookup::Skip
                 } else {
@@ -3887,6 +3920,91 @@ impl ChannelState {
                     }
                 }
             }
+        }
+    }
+
+    pub(crate) fn outer_stale_carrier(
+        &self,
+        nonce: &str,
+        signature_tag: [u8; 32],
+        lifetime: (u64, u64),
+        sender: u16,
+        now: u64,
+        step: OuterStaleStep<'_>,
+    ) -> OuterStaleCarrier {
+        let (expiry, deadline) = lifetime;
+        let mono_now = self.hot_clock.now();
+        let mut store = self.store.lock().expect("store lock poisoned");
+        let Some(memo) = store.carriers_by_nonce.get(nonce) else {
+            return OuterStaleCarrier::Terminal;
+        };
+        if deadline <= mono_now || (memo.expiry, memo.deadline) != lifetime {
+            return OuterStaleCarrier::Terminal;
+        }
+        let (carrier, remembered, resolved) = match &memo.outcome {
+            MemoOutcome::InFlight { .. } if expiry > now => return OuterStaleCarrier::Retry(1),
+            MemoOutcome::InFlight { .. } => return OuterStaleCarrier::Terminal,
+            MemoOutcome::Derived {
+                carrier,
+                signature_tag,
+                resolved_senders,
+            } => (
+                carrier.clone(),
+                *signature_tag,
+                resolved_senders.get(&sender).copied(),
+            ),
+        };
+        let claim_tag = tagged_hash(OUTER_STALE_CLAIM_TAG, &signature_tag);
+        let generation = MemoGeneration {
+            signature_tag: remembered,
+            expiry: memo.expiry,
+            deadline: memo.deadline,
+        };
+        let finished = match &step {
+            OuterStaleStep::Finish(memoized_carrier, claimed, matched) => (*memoized_carrier
+                == carrier
+                && *claimed == generation
+                && resolved == Some(claim_tag))
+            .then_some(*matched),
+            OuterStaleStep::Inspect(_) => None,
+        };
+        if let Some(matched) = finished {
+            let tag = if matched { signature_tag } else { remembered };
+            store.resolve_signature(nonce, sender, tag);
+        }
+        if expiry <= now {
+            return OuterStaleCarrier::Terminal;
+        }
+        let Some(intent) = store.intents.get(&carrier) else {
+            return OuterStaleCarrier::Terminal;
+        };
+        if (intent.expiry, intent.deadline) != lifetime
+            || intent.committed
+            || intent.holders.contains(&sender)
+            || !(intent.owner_ruling || intent.ready_to_propagate)
+        {
+            return OuterStaleCarrier::Terminal;
+        }
+        if intent.owner_ruling && !intent.ready_to_propagate {
+            return OuterStaleCarrier::Retry(1);
+        }
+        if remembered == signature_tag || resolved == Some(signature_tag) {
+            return OuterStaleCarrier::Retry(CARRIER_CLOCK_RETRY_SECS);
+        }
+        if resolved == Some(claim_tag) && matches!(&step, OuterStaleStep::Inspect(_)) {
+            return OuterStaleCarrier::Retry(1);
+        }
+        match step {
+            OuterStaleStep::Inspect(claim) if resolved.is_none() => {
+                if claim {
+                    store.resolve_signature(nonce, sender, claim_tag);
+                }
+                OuterStaleCarrier::Derive(carrier, generation)
+            }
+            OuterStaleStep::Finish(..) if finished == Some(true) => {
+                OuterStaleCarrier::Retry(CARRIER_CLOCK_RETRY_SECS)
+            }
+            _ => OuterStaleCarrier::Terminal,
         }
     }
 
@@ -3932,16 +4050,29 @@ impl ChannelState {
                 signature_tag,
                 resolved_senders,
             } if carrier == memoized_carrier => {
-                resolved_senders.insert(sender, *signature_tag).is_none()
+                if resolved_senders.contains_key(&sender) {
+                    return false;
+                }
+                resolved_senders.insert(sender, *signature_tag);
+                true
             }
             MemoOutcome::Derived { .. } => false,
             // An in-flight claim replaced the memo between the lookup and here. There is
             // no carrier to charge the derivation against, so refuse the claim without
             // charging the new generation. Replacement is possible only after the
             // looked-up generation expired, when `confirm_carrier` would refuse it too;
-            // the policy-opaque channel path therefore answers `Accepted`, not retriable
+            // callers conservatively answer claim loss with fixed, retriable
             // `RateLimited`.
             MemoOutcome::InFlight { .. } => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn carrier_lookup_rendezvous(&self) {
+        let barrier = self.carrier_lookup_midpoint.lock().expect("lookup").take();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
         }
     }
 
@@ -5263,11 +5394,14 @@ impl ChannelState {
                 now_input,
                 self.limits.per_peer_quota_per_min,
             );
-        let now = match guard_result {
-            IngressGuardResult::Accepted { now } => now,
+        let (now, outer_stale) = match guard_result {
+            IngressGuardResult::Accepted { now } => (now, false),
             IngressGuardResult::Stale { now } => {
                 self.record_freshness_reject(sender, env.timestamp, now);
-                return reject(RejectReason::StaleTimestamp);
+                if env.msg_type != MSG_TYPE_REQUEST {
+                    return reject(RejectReason::StaleTimestamp);
+                }
+                (now, true)
             }
             IngressGuardResult::Replayed => {
                 return reject(RejectReason::ReplayedNonce);
@@ -5288,7 +5422,19 @@ impl ChannelState {
             .decode_vec(env.payload_b64.as_bytes(), &mut payload)
             .is_err()
         {
-            return reject(RejectReason::MalformedPayload);
+            return reject(if outer_stale {
+                RejectReason::StaleTimestamp
+            } else {
+                RejectReason::MalformedPayload
+            });
+        }
+        if outer_stale {
+            return match serde_json::from_slice::<TaggedRequest>(&payload) {
+                Ok(request @ TaggedRequest::Spend(_)) => {
+                    Ingested::StaleSpend(sender, Box::new(request))
+                }
+                _ => reject(RejectReason::StaleTimestamp),
+            };
         }
         // 9. dispatch. Two msg_types: `partial` (verified + stored here) and
         //    `request` (handed back to the node, which owns every policy gate).
@@ -7434,7 +7580,7 @@ impl ChannelState {
     pub(crate) fn ingest_reply(&self, body: &[u8], now: u64) -> ChannelReply {
         match self.ingest(body, now) {
             Ingested::Reply(reply) => reply,
-            Ingested::Request { .. } => {
+            Ingested::Request { .. } | Ingested::StaleSpend(..) => {
                 panic!("a `request` envelope is decided by the node (handle_channel_body)")
             }
         }
@@ -11267,6 +11413,7 @@ mod duress {
     use super::*;
     use crate::chain::mock::MockBackend;
     use crate::chain::Prevout;
+    use crate::Node;
     use bitcoin::{Amount, OutPoint, Sequence, TxOut};
     use std::sync::Arc;
     use vault_proto::{SignRequest, SignResponse};
@@ -14142,6 +14289,429 @@ mod duress {
         let body = serde_json::to_vec(&envelope).expect("json");
         crate::handle_channel_body_with_clocks(node, &body, EXPIRY + 1, || NOW, confirmation_clock)
     }
+
+    fn outer_stale_body(
+        fx: &Fixture,
+        request: &vault_proto::TaggedRequest,
+        sender: u16,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let payload = request_payload(request);
+        let envelope = fx
+            .channel_state(sender)
+            .build_envelope(MSG_TYPE_REQUEST, 0, &payload, timestamp)
+            .expect("envelope");
+        serde_json::to_vec(&envelope).expect("json")
+    }
+
+    fn deliver_outer_stale(
+        fx: &Fixture,
+        node: &crate::Node,
+        request: &SignRequest,
+        sender: u16,
+        received_at: u64,
+        clock: impl Fn() -> u64,
+    ) -> ChannelReply {
+        let body = outer_stale_body(
+            fx,
+            &vault_proto::TaggedRequest::Spend(request.clone()),
+            sender,
+            NOW,
+        );
+        crate::handle_channel_body_with_clocks(node, &body, received_at, || NOW, clock)
+    }
+
+    fn carrier_retry(retry_after_secs: u64) -> ChannelReply {
+        ChannelReply::RateLimited { retry_after_secs }
+    }
+
+    fn stale_reply() -> ChannelReply {
+        ChannelReply::Rejected(RejectReason::StaleTimestamp)
+    }
+
+    fn stale_now(fx: &Fixture, node: &Node, request: &SignRequest, sender: u16) -> ChannelReply {
+        deliver_outer_stale(fx, node, request, sender, NOW + 301, || NOW)
+    }
+
+    fn eventually(mut predicate: impl FnMut() -> bool) -> bool {
+        (0..10_000).any(|_| {
+            std::thread::yield_now();
+            predicate()
+        })
+    }
+
+    #[test]
+    fn outer_stale_never_strands_kdf_while_waiting_for_sign_state() {
+        let fx = Fixture::new(3, 5);
+        let (node, request) = memoized_duress(&fx, "outer-kdf-order");
+        let mut alternate = request.clone();
+        fx.coord_resign(&mut alternate, 0x30);
+        let request = vault_proto::TaggedRequest::Spend(alternate);
+        let channel = node.channel.as_ref().expect("channel");
+        let rendezvous = std::sync::Barrier::new(2);
+        let state = node.sign_state.lock().expect("sign_state");
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                rendezvous.wait();
+                crate::handle_outer_stale_spend(&node, channel, 1, &request, &|| NOW)
+            });
+            rendezvous.wait();
+            let work_lock = node.carrier_kdf.work_lock();
+            let reserved = eventually(|| work_lock.try_lock().is_err());
+            drop(state);
+            worker.join().expect("stale worker");
+            assert!(!reserved, "sign_state wait reserved Argon2");
+        });
+    }
+
+    #[test]
+    fn outer_stale_body_and_signature_discrimination_is_terminal_and_bounded() {
+        let fx = Fixture::new(3, 5);
+        let (node, original) = memoized_duress(&fx, "outer-stale-table");
+        let retry = carrier_retry(CARRIER_CLOCK_RETRY_SECS);
+        let stale = stale_reply();
+        let start = node.carrier_derivation_count();
+
+        let mut equal = original.clone();
+        fx.coord_resign(&mut equal, 0x31);
+        let before_busy = receipt_state(&node);
+        let work_lock = node.carrier_kdf.work_lock();
+        let busy = work_lock.lock().expect("KDF work lock");
+        assert_eq!(stale_now(&fx, &node, &equal, 1), carrier_retry(1));
+        assert_eq!(receipt_state(&node), before_busy, "busy consumes no claim");
+        assert_eq!(node.carrier_derivation_count(), start);
+        drop(busy);
+
+        let channel = node.channel.as_ref().expect("channel");
+        let signature_tag = crate::arm_signature_tag(&equal.coord_sig);
+        let lifetime = (EXPIRY, MONO_NOW + EXPIRY - NOW);
+        let classify =
+            |step| channel.outer_stale_carrier(&equal.nonce, signature_tag, lifetime, 4, NOW, step);
+        let rendezvous = Arc::new(std::sync::Barrier::new(2));
+        *channel.carrier_lookup_midpoint.lock().expect("lookup") = Some(Arc::clone(&rendezvous));
+        std::thread::scope(|scope| {
+            let ordinary = scope.spawn(|| deliver_receipt_at(&fx, &node, &equal, 4, || NOW));
+            rendezvous.wait();
+            let first = classify(OuterStaleStep::Inspect(false));
+            assert!(matches!(first, OuterStaleCarrier::Derive(..)));
+            let reservation = node.carrier_kdf.try_reserve().expect("outer reservation");
+            let (carrier, generation) = match classify(OuterStaleStep::Inspect(true)) {
+                OuterStaleCarrier::Derive(carrier, generation) => (carrier, generation),
+                _ => panic!("outer claim lost"),
+            };
+            drop(reservation);
+            rendezvous.wait();
+            assert_eq!(ordinary.join().expect("ordinary receipt"), carrier_retry(1));
+            let finish = |step| {
+                channel.outer_stale_carrier(&equal.nonce, signature_tag, lifetime, 4, NOW, step)
+            };
+            let finished = finish(OuterStaleStep::Finish(&carrier, generation, true));
+            assert!(matches!(
+                finished,
+                OuterStaleCarrier::Retry(CARRIER_CLOCK_RETRY_SECS)
+            ));
+        });
+        let retried = deliver_receipt_at(&fx, &node, &equal, 4, || NOW);
+        assert_eq!(retried, ChannelReply::Accepted);
+        assert!(shape_rows(channel, "intent ")[0].contains("holders=[0, 4]"));
+        assert_eq!(stale_now(&fx, &node, &equal, 1), retry);
+        assert_eq!(node.carrier_derivation_count(), start + 1);
+        assert_eq!(stale_now(&fx, &node, &equal, 1), retry);
+        assert_eq!(node.carrier_derivation_count(), start + 1);
+
+        let mut mismatch = original.clone();
+        mismatch.pin = "wrong body".into();
+        fx.coord_resign(&mut mismatch, 0x32);
+        assert_eq!(stale_now(&fx, &node, &mismatch, 2), stale);
+        assert_eq!(node.carrier_derivation_count(), start + 2);
+        assert_eq!(stale_now(&fx, &node, &mismatch, 2), stale);
+        let mut third = original.clone();
+        third.pin = "third body".into();
+        fx.coord_resign(&mut third, 0x33);
+        assert_eq!(stale_now(&fx, &node, &third, 2), stale);
+        assert_eq!(node.carrier_derivation_count(), start + 2);
+        assert_eq!(stale_now(&fx, &node, &original, 2), retry);
+
+        let mut wrong_expiry = original.clone();
+        wrong_expiry.expiry += 1;
+        fx.coord_resign(&mut wrong_expiry, 0x34);
+        let unknown = fx.spend_request(&fx.spend_psbt(&fx.hot_spk, 8), EXPIRY, "unknown");
+        let mut invalid = original.clone();
+        invalid.pin = "1234x".into();
+        let mut oversized = original.clone();
+        oversized
+            .psbt
+            .push_str(&"x".repeat(DEFAULT_MAX_MSG_BYTES as usize));
+        fx.coord_resign(&mut oversized, 0x35);
+        for (case, request) in [
+            ("wrong expiry", wrong_expiry),
+            ("unknown nonce/body", unknown),
+            ("invalid coordinator signature", invalid),
+            ("oversized request", oversized),
+        ] {
+            assert_eq!(stale_now(&fx, &node, &request, 1), stale, "{case}");
+        }
+        assert_eq!(node.carrier_derivation_count(), start + 2);
+
+        let malformed = fx
+            .channel_state(1)
+            .build_envelope(MSG_TYPE_REQUEST, 0, b"{", NOW)
+            .expect("envelope");
+        let (_, refresh) = fx.refresh_request(EXPIRY, 1_000, "stale-refresh");
+        let refresh = outer_stale_body(&fx, &vault_proto::TaggedRequest::Refresh(refresh), 1, NOW);
+        let partial = fx
+            .channel_state(1)
+            .build_envelope(MSG_TYPE_PARTIAL, 0, b"ignored", NOW)
+            .expect("envelope");
+        for body in [
+            serde_json::to_vec(&malformed).expect("json"),
+            refresh,
+            serde_json::to_vec(&partial).expect("json"),
+        ] {
+            assert_eq!(
+                crate::handle_channel_body_with_clocks(&node, &body, NOW + 301, || NOW, || NOW),
+                stale
+            );
+        }
+    }
+
+    #[test]
+    fn outer_stale_lifetimes_holders_and_freshness_catchup_are_exact() {
+        const DEADLINE: u64 = MONO_NOW + (EXPIRY - NOW);
+        let fx = Fixture::new(3, 5);
+        let retry = carrier_retry(CARRIER_CLOCK_RETRY_SECS);
+        let stale = stale_reply();
+
+        let (node, request) = memoized_duress(&fx, "outer-boundaries");
+        let boundary = |now| deliver_outer_stale(&fx, &node, &request, 1, NOW + 301, || now);
+        assert_eq!(boundary(EXPIRY - 1), retry);
+        assert_eq!(boundary(EXPIRY), stale);
+        let channel = node.channel.as_ref().expect("channel");
+        channel.pin_hot_clock(DEADLINE);
+        assert_eq!(stale_now(&fx, &node, &request, 1), stale);
+        let (held, held_request) = memoized_duress(&fx, "outer-held");
+        let held_first = deliver_receipt_at(&fx, &held, &held_request, 1, || NOW);
+        assert_eq!(held_first, ChannelReply::Accepted);
+        assert_eq!(stale_now(&fx, &held, &held_request, 1), stale);
+        let held_second = deliver_receipt_at(&fx, &held, &held_request, 2, || NOW);
+        assert_eq!(held_second, ChannelReply::Accepted);
+        assert_eq!(stale_now(&fx, &held, &held_request, 2), stale);
+        let (locked, locked_request) = memoized_duress(&fx, "outer-lockdown");
+        locked.enter_lockdown();
+        assert_eq!(stale_now(&fx, &locked, &locked_request, 1), stale);
+        let (nonce_node, nonce_request) = memoized_duress(&fx, "outer-nonce-free");
+        let body = outer_stale_body(
+            &fx,
+            &vault_proto::TaggedRequest::Spend(nonce_request),
+            1,
+            NOW + 60,
+        );
+        let ingress = |received_at| {
+            crate::handle_channel_body_with_clocks(&nonce_node, &body, received_at, || NOW, || NOW)
+        };
+        assert_eq!(ingress(NOW - 1), retry);
+        assert_eq!(ingress(NOW), ChannelReply::Accepted);
+        let (catchup, catchup_request) = memoized_duress(&fx, "outer-catchup");
+        let first = deliver_outer_stale(&fx, &catchup, &catchup_request, 1, NOW + 600, || NOW);
+        assert_eq!(first, retry);
+        for (timestamp, expected) in [
+            (NOW + 299, retry.clone()),
+            (NOW + 300, ChannelReply::Accepted),
+        ] {
+            let body = outer_stale_body(
+                &fx,
+                &vault_proto::TaggedRequest::Spend(catchup_request.clone()),
+                1,
+                timestamp,
+            );
+            let delivered = crate::handle_channel_body_with_clocks(
+                &catchup,
+                &body,
+                timestamp,
+                || timestamp,
+                || timestamp,
+            );
+            assert_eq!(delivered, expected);
+        }
+        let (long, long_request) = memoized_duress(&fx, "outer-long-excursion");
+        let excursion =
+            |now| deliver_outer_stale(&fx, &long, &long_request, 1, EXPIRY + 300, || now);
+        assert_eq!(excursion(NOW), retry);
+        assert_eq!(excursion(EXPIRY), stale);
+    }
+
+    #[test]
+    fn outer_stale_keeps_auth_quota_diagnostics_and_pin_work_uniform() {
+        use crate::watchtower::{Event, FreshnessEvent};
+
+        let fx = Fixture::new(3, 5);
+        let (node, request) = memoized_duress(&fx, "outer-accounting");
+        assert_eq!(stale_now(&fx, &node, &request, 1), carrier_retry(30));
+        let channel = node.channel.as_ref().expect("channel");
+        let guards = channel.ingress_guards.lock().expect("ingress guards");
+        let charges = guards.quotas.get(&1).expect("peer quota").charged_at.len();
+        assert_eq!(charges, 1);
+        assert!(guards.seen_nonces.is_empty(), "stale consumes no nonce");
+        drop(guards);
+        assert!(matches!(
+            node.events(0).0.as_slice(),
+            [Event::ChannelFreshness(FreshnessEvent {
+                peer_node_id: 1,
+                reject_count: 1,
+                ..
+            })]
+        ));
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct Projection {
+            reply: (u16, String),
+            state: (StoreShape, SignStateShape),
+            pin_calls: Vec<crate::pin::PinSlot>,
+            carrier_work: usize,
+            outbox_delta: usize,
+        }
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let mut projections = Vec::new();
+        for pin in ["1234", "9999"] {
+            let (node, calls) = counted_duress_node(&fx);
+            let mut request = fx.spend_request(&spend, EXPIRY, "outer-pin-uniform");
+            request.pin = pin.into();
+            fx.coord_sign(&mut request, "outer-pin-uniform");
+            let response = crate::handle_sign(&node, &request, NOW).expect("request");
+            assert!(matches!(response, SignResponse::Accepted(_)));
+            calls.lock().expect("pin calls").clear();
+            let before = receipt_state(&node);
+            let derivations = node.carrier_derivation_count();
+            let outbox = node.outbox.lock().expect("outbox").len();
+            let reply = crate::ingress_trace::capture(|| stale_now(&fx, &node, &request, 1)).0;
+            let after = receipt_state(&node);
+            assert_eq!(before, after, "exact stale classification is read-only");
+            projections.push(Projection {
+                reply: reply.http(),
+                state: after,
+                pin_calls: calls.lock().expect("pin calls").clone(),
+                carrier_work: node.carrier_derivation_count() - derivations,
+                outbox_delta: node.outbox.lock().expect("outbox").len() - outbox,
+            });
+        }
+        assert_eq!(projections[0], projections[1]);
+        assert!(projections[0].pin_calls.is_empty());
+        assert_eq!(projections[0].carrier_work, 0);
+        assert_eq!(projections[0].outbox_delta, 0);
+    }
+
+    #[test]
+    fn outer_stale_waits_for_the_atomic_nonce_to_carrier_transition() {
+        let fx = Fixture::new(3, 5);
+        let config = format!("duress_delay_secs = {DELAY}");
+        let node = Arc::new(duress_node(&fx, HOLD, &config));
+        let channel = node.channel.as_ref().expect("channel");
+        channel.pin_hot_clock(MONO_NOW);
+        let spend = fx.spend_psbt(&fx.hot_spk, 7);
+        let request = duress_request(&fx, &spend, &default_escape(&fx), "outer-transition");
+        let tagged = vault_proto::TaggedRequest::Spend(request.clone());
+        let body = outer_stale_body(&fx, &tagged, 1, NOW);
+        let mut state = node.sign_state.lock().expect("sign_state");
+        let rendezvous = Arc::new(std::sync::Barrier::new(2));
+        let worker_rendezvous = Arc::clone(&rendezvous);
+        let worker_node = Arc::clone(&node);
+        let worker = std::thread::spawn(move || {
+            crate::handle_channel_body_with_clocks(
+                &worker_node,
+                &body,
+                NOW + 301,
+                || NOW,
+                || {
+                    worker_rendezvous.wait();
+                    NOW
+                },
+            )
+        });
+        let diagnosed = || channel.freshness_counts.lock().is_ok_and(|m| !m.is_empty());
+        assert!(eventually(diagnosed) && !worker.is_finished());
+        assert_eq!(
+            state.coord_nonces.check_and_record(
+                &request.nonce,
+                request.expiry,
+                NOW,
+                node.max_commitment_age_secs,
+                Some(MONO_NOW),
+                true,
+            ),
+            crate::replay::NonceDecision::Accepted
+        );
+        let generation = MemoGeneration {
+            signature_tag: crate::arm_signature_tag(&request.coord_sig),
+            expiry: EXPIRY,
+            deadline: MONO_NOW + EXPIRY - NOW,
+        };
+        channel.claim_nonce_in_flight(&request.nonce, generation, MONO_NOW);
+        let store = channel.store.lock().expect("store");
+        drop(state);
+        rendezvous.wait();
+        assert!(matches!(
+            node.sign_state.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        drop(store);
+        assert_eq!(worker.join().expect("stale worker"), carrier_retry(1));
+        let mut alternate = request.clone();
+        fx.coord_resign(&mut alternate, 0x41);
+        let carrier = crate::arm_carrier_id(&node, request.coord_request());
+        let derivations = node.carrier_derivation_count();
+        assert_eq!(
+            deliver_outer_stale(&fx, &node, &alternate, 1, NOW + 301, || EXPIRY),
+            stale_reply()
+        );
+        assert_eq!(node.carrier_derivation_count(), derivations);
+        channel.record_arm_intent(
+            false,
+            &carrier,
+            &request.nonce,
+            generation,
+            NOW,
+            NOW,
+            node.duress_timing(),
+        );
+        for candidate in [&request, &alternate] {
+            assert_eq!(stale_now(&fx, &node, candidate, 1), carrier_retry(1));
+        }
+        assert_eq!(node.carrier_derivation_count(), derivations);
+    }
+
+    #[test]
+    fn outer_stale_resolves_kdf_before_transient_wall_refusal() {
+        let fx = Fixture::new(3, 5);
+        for (nonce, cross_deadline, corrected) in [
+            ("outer-post-kdf-wall", false, carrier_retry(30)),
+            ("outer-post-kdf-mono", true, carrier_retry(1)),
+        ] {
+            let (node, request) = memoized_duress(&fx, nonce);
+            let mut alternate = request.clone();
+            fx.coord_resign(&mut alternate, 0x51);
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let derivations = node.carrier_derivation_count();
+            let channel = node.channel.as_ref().expect("channel");
+            let reply = deliver_outer_stale(&fx, &node, &alternate, 1, NOW + 301, || {
+                if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2 {
+                    if cross_deadline {
+                        channel.pin_hot_clock(MONO_NOW + EXPIRY - NOW);
+                        NOW
+                    } else {
+                        EXPIRY
+                    }
+                } else {
+                    NOW
+                }
+            });
+            assert_eq!(reply, stale_reply());
+            assert_eq!(node.carrier_derivation_count(), derivations + 1);
+            channel.pin_hot_clock(MONO_NOW);
+            assert_eq!(stale_now(&fx, &node, &alternate, 1), corrected);
+            assert_eq!(node.carrier_derivation_count(), derivations + 1);
+        }
+    }
+
     fn memoized_duress(fx: &Fixture, nonce: &str) -> (crate::Node, SignRequest) {
         let node = duress_node(fx, HOLD, &format!("duress_delay_secs = {DELAY}"));
         node.channel
@@ -14194,12 +14764,7 @@ mod duress {
                 .schedule_work_trace();
             let reply = deliver_receipt_at(&fx, &node, &request, 1, || EXPIRY);
             let after = receipt_state(&node);
-            assert_eq!(
-                reply,
-                ChannelReply::RateLimited {
-                    retry_after_secs: 30
-                }
-            );
+            assert_eq!(reply, carrier_retry(30));
             assert_eq!(
                 before, after,
                 "wall refusal must change no receipt-owned state"
