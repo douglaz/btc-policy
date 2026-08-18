@@ -2,7 +2,7 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** CLOSE · **Bead:** btc-policy-7ip · **Branch:** beads/close-7ip-carrier-retry
+**Phase:** IMPL · **Bead:** btc-policy-30c · **Branch:** beads/30c-outer-stale-receipt
 **Pending:** —
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 (the stale-flake assertion plus three of the four legs of CI's `check` matrix; `regtest-backend`
@@ -40,11 +40,11 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Close `7ip` on merged PR #16 and preserve its exact evidence: 539/550 gross Rust lines with
-tests included, 17 final-byte mutation controls, current-head regtest coverage, and both launch
-gates. The remaining ordinary-receipt recovery premise is explicit:
-`coord_nonces.high_water < E`; `btc-policy-coord-highwater-carrier-recovery-i3p` owns that
-separate coupling rather than widening `7ip`.
+Implement `btc-policy-30c`, the final bounded `sxt` code child: recognize only exact,
+authenticated, quota-admitted outer-Stale Carrier receipts; serialize the final
+acceptance-to-claim decision; keep memory-hard work outside locks; and preserve terminal
+`STALE_TIMESTAMP` for every nonmatching or ended case. Global freshness high-water remains
+unchanged.
 
 ## Next
 Implement the final bounded `sxt` code child, `btc-policy-30c`: authenticated,
