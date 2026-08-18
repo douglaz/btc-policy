@@ -4,17 +4,21 @@
 Beads outside that frontier are NOT in scope for this drive.
 **Phase:** PLAN · **Bead:** btc-policy-mby · **Branch:** —
 **Pending:** distill and split before any rb-lite implementation run
+**Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because the
+Codex/Opus bead review identified it as the widest product unblocker, after the bounded custody fix
+chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not a `br ready` ranking.
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 (the stale-flake assertion plus three of the four legs of CI's `check` matrix; `regtest-backend`
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
-- `btc-policy-sxt` (`q6v` + `qzo` + `o5g` + `0hv` + `7ip` + `30c`, P1) — bare
-  wall-clock reads cannot retire live Carrier confirmation state; accepted `D` supplies monotonic
-  authority; under the current `coord_nonces.high_water < E` premise, recoverable exact receipts
-  retry through both ordinary and outer-Stale paths without lowering freshness high-water. Final
-  child #18 merged as `31303f1`; its reviewed head passed fmt, Clippy, workspace tests,
-  live-Core regtest and both launch gates.
+- `btc-policy-sxt` (`q6v` + `qzo` + `o5g` + `0hv` + `7ip` + `30c` + `ok4`, P1) —
+  bare wall-clock reads cannot retire live Carrier confirmation state; accepted `D` supplies
+  monotonic authority; under the current `coord_nonces.high_water < E` premise, recoverable exact
+  receipts retry through both ordinary and outer-Stale paths without lowering freshness
+  high-water. Final child #18 merged as `31303f1`. `br show btc-policy-30c` owns the red-first,
+  13-mutation and command/exit evidence; `br show btc-policy-ok4` and `br show btc-policy-sxt`
+  own the integrated closure and known-limit qualification. They are linked, not recopied here.
 - `btc-policy-qzo` (P1) — repeated channel-freshness diagnostics coalesce by peer plus
   ingress high-water without evicting unrelated watchtower evidence. Merged #12 (`40c3269`);
   closure merged #13 (`3171f47`).
