@@ -59,11 +59,19 @@ base Escape fee, and reject every nonzero ceiling until `sqn`. M1 may land as co
 authorize a production ceremony; the `mby` umbrella remains the rollout authority.
 
 ## Next
-After M1, land `5ag`'s sealed network and next protocol bump before M2 parses live artifacts. Then
-implement M2 operator core, M3 stable Core composer, M4 Spend command, and the parallel M5
-known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
-rb-lite. `wdu` follows M1+5ag; `sqn` follows M4. Other complete-product dependents stay blocked
-on `mby`.
+M1's `protocol_version = 1` is a manifest-schema revision, not routable transport v1. After M1,
+land `5ag`'s sealed network field and next manifest protocol bump before M2 parses live artifacts;
+M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or network
+I/O. Then implement M2 operator core, M3 stable Core composer, M4 Spend command, and the parallel
+M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
+rb-lite. M4/M5 reuse one exact request across ordered stage-1 ingress attempts and report success
+only after Core observes node-side threshold combine/broadcast; M6 mutation-tests that non-ingress
+nodes receive and validate it through the request channel. M5 rejects unknown/spent/off-vault
+outpoints and ships the mandatory two-transaction base Escape pair with an empty bump ladder; M1
+rejects every nonzero ceiling until `sqn`. `wdu` follows M1+5ag; `sqn` follows M4. Other
+complete-product dependents stay
+blocked on `mby`. `imb` owns confidential authenticated coordinator ingress and routable peer
+transport from stage 2 onward; the operator CLI remains on the coordinator host.
 
 The reviewed hard Rust caps are **4,050 gross lines total, additions plus deletions with every test
 line included**: M1 800, M2 900, M3 500, M4 500, M5 850, M6 500. The estimate is approximately
@@ -75,16 +83,17 @@ The broader channel and coordinator high-water repairs remain separately owned b
 `coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's P3
 unwind/test-synchronization follow-ups do not reopen Carrier clock authority.
 
-`gbw`'s open blockers, computed from the dependency graph 2026-08-10, not counted by hand:
+`gbw`'s direct open blockers, refreshed from `br show btc-policy-gbw --json` on 2026-08-18:
 `mby`, `oy3`, `rt0`, `sqn`, `wdu`. `6nq`, `9yf`, `c9r` and `nia` are closed. The closed edges stay
 in the graph deliberately — `br ready` counts only open blockers, and the record that the gate
 existed is worth more than a tidy list.
 
-## Filed during this drive, not fixed here
-- `btc-policy-sealed-host-cli-packaging-u4y` (P3) — stage-1 M6 proves the open-host
-  artifact-to-command seam, not delivery of `btc-vault` onto ADR-0005's later loopback-only sealed
-  image. The reviewed binary must be installed and attested before sealing; stage 4 now depends on
-  that evidence rather than assuming post-seal administration exists.
+## Filed or adjudicated during this drive, not implemented here
+- `btc-policy-sealed-host-cli-packaging-u4y` (CLOSED/rejected) — it conflated the dedicated
+  coordinator with an ADR-0005 node image. A sealed node has no lawful interactive invocation or
+  secret-input surface, and stage 2+ no longer uses the v0 loopback topology. `4y3` owns the
+  coordinator's reproducible install slot; `4wx` binds the `oy3`-identified operator artifact and
+  proves it against `imb` transport before stage 4. The invalid `s12 -> u4y` edge was removed.
 - `btc-policy-carrier-claim-unwind-hardening-i2o` (P3) — give both ordinary and outer-Stale
   alternate-signature claims one exact generation/sender/tag unwind owner if the presently
   invariant-only KDF panic boundary ever unwinds.
