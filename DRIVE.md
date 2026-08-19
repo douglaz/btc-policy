@@ -2,9 +2,9 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** IMPL · **Bead:** btc-policy-mby-manifest-v1-zero-ceiling-88w · **Branch:** beads/mby-m1
-**Pending:** implement only M1 through rb-lite under its test-inclusive hard caps; keep the
-intermediate non-deployable
+**Phase:** CLOSE · **Bead:** btc-policy-mby-manifest-v1-zero-ceiling-88w · **Branch:** beads/mby-m1-close
+**Pending:** land the reviewed M1 closure record, then claim `btc-policy-5ag`; keep the intermediate
+non-deployable
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -14,6 +14,12 @@ a `br ready` ranking.
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-mby-manifest-v1-zero-ceiling-88w` (M1, P1) — manifest schema revision 1
+  appends and seals the zero-only Escape ladder ceiling, preflights old node configs, refuses
+  nonzero ceilings until `sqn`, and publishes one owner-only complete setup artifact set. Merged
+  #21 (`53ae011`) at the exact 800-line Rust cap after Codex+Opus rb-lite review, current-head bot
+  review, live regtest, and both launch gates. The pre-existing ceremony-parent namespace remains
+  explicitly blocked by `b8z` before M6; M1 itself does not authorize a production ceremony.
 - `btc-policy-sxt` (`q6v` + `qzo` + `o5g` + `0hv` + `7ip` + `30c` + `ok4`, P1) —
   bare wall-clock reads cannot retire live Carrier confirmation state; accepted `D` supplies
   monotonic authority; under the current `coord_nonces.high_water < E` premise, recoverable exact
@@ -52,16 +58,14 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Implement `btc-policy-mby-manifest-v1-zero-ceiling-88w` (M1) after this split lands: atomically
-append the default-zero escape-ladder ceiling to the sealed manifest preimage, move to
-`protocol_version = 1`, preflight old versions before current-schema/hash errors, render/finalize
-the complete artifact set atomically, disclose the fixed 180-day timelock and uncapped/unknown
-base Escape fee, and reject every nonzero ceiling until `sqn`. M1 may land as code but does not
-authorize a production ceremony; the `mby` umbrella remains the rollout authority.
+Land M1's closure-only Beads/DRIVE record after implementation PR #21 merged as `53ae011`.
+No implementation byte changes here. The `mby` umbrella remains open, stage 1 remains unreachable,
+and `b8z` must close before M6 consumes the ceremony output end to end.
 
 ## Next
-M1's `protocol_version = 1` is a manifest-schema revision, not routable transport v1. After M1,
-land `5ag`'s sealed network field and next manifest protocol bump before M2 parses live artifacts;
+Implement `btc-policy-5ag` through rb-lite: add the sealed network field and the next manifest
+protocol bump before M2 parses live artifacts. M1's `protocol_version = 1` is a manifest-schema
+revision, not routable transport v1; `5ag` must not reuse it after changing the canonical preimage.
 M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or network
 I/O. Then implement M2 operator core, M3 stable Core composer, M4 Spend command, and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
