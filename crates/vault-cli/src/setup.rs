@@ -143,6 +143,7 @@ pub(crate) struct KeyBundle {
 // "what the manifest was sealed over" and "what the configs say" cannot drift.
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PolicyParams {
     pub(crate) max_derivation_index: u32,
     pub(crate) hold_secs: u64,
@@ -158,6 +159,10 @@ pub(crate) struct PolicyParams {
     /// the ceremony hashes it and `node_config_toml` emits it, so every node's
     /// configured value is provably the one sealed, or that node fails startup.
     pub(crate) escape_coverage_pct: u8,
+    /// Sealed whole-fee ceiling for replacement rungs (ADR-0016 §2).
+    /// Defaults to `0`; [`check_escape_bump_ceiling`] currently accepts nothing else.
+    #[serde(default)]
+    pub(crate) escape_bump_max_fee_pct: u8,
     pub(crate) hot_max_per_tx: u64,
     pub(crate) hot_max_per_window: u64,
     pub(crate) hot_window_secs: u64,
@@ -231,8 +236,10 @@ pub(crate) fn node_config_toml(config: &NodeConfig) -> String {
          hot_window_secs = {}\n\
          max_commitment_age_secs = {}\n\
          policy_version = {}\n\
+         protocol_version = {}\n\
          escape_feerate_floor = {}\n\
          escape_coverage_pct = {}\n\
+         escape_bump_max_fee_pct = {}\n\
          pin_normal_hash = \"{}\"\n\
          pin_duress_hash = \"{}\"\n\
          coordinator_auth_pubkey = \"{}\"\n",
@@ -254,8 +261,10 @@ pub(crate) fn node_config_toml(config: &NodeConfig) -> String {
         p.hot_window_secs,
         p.max_commitment_age_secs,
         p.policy_version,
+        vault_node::channel::PROTOCOL_VERSION,
         p.escape_feerate_floor,
         p.escape_coverage_pct,
+        p.escape_bump_max_fee_pct,
         config.pin_normal_hash,
         config.pin_duress_hash,
         config.coordinator_auth_pubkey,
@@ -646,6 +655,67 @@ pub(crate) struct Assembled {
     pub(crate) max_msg_bytes: u64,
 }
 
+/// Refuse ceilings above the ingress cap, coverage headroom, or ADR-0016's decided
+/// 5x margin, then reject every remaining nonzero value until `btc-policy-sqn`.
+/// This order keeps all four diagnoses reachable because the 5x rule is stronger
+/// than coverage. `u32` prevents `pct * 5` and `100 - coverage` from wrapping.
+fn check_escape_bump_ceiling(policy: &PolicyParams) -> Result<(), Error> {
+    let ceiling = u32::from(policy.escape_bump_max_fee_pct);
+    let headroom = 100u32.saturating_sub(u32::from(policy.escape_coverage_pct));
+    if u64::from(ceiling) > policy_core::MAX_FEE_PERCENT {
+        return Err(format!(
+            "escape_bump_max_fee_pct = {ceiling} exceeds the {}% ingress fee cap every rung \
+             passes through `verify_escape` (ADR-0016 §3)",
+            policy_core::MAX_FEE_PERCENT
+        )
+        .into());
+    }
+    if ceiling > headroom {
+        return Err(format!(
+            "escape_bump_max_fee_pct = {ceiling} exceeds the fire-time coverage headroom of \
+             {headroom}% left by escape_coverage_pct = {} (ADR-0016 §3)",
+            policy.escape_coverage_pct
+        )
+        .into());
+    }
+    if ceiling * 5 > headroom {
+        return Err(format!(
+            "escape_bump_max_fee_pct = {ceiling} leaves less than ADR-0016's decided 5x margin \
+             under the {headroom}% coverage headroom (escape_coverage_pct = {})",
+            policy.escape_coverage_pct
+        )
+        .into());
+    }
+    if ceiling != 0 {
+        return Err(format!(
+            "escape_bump_max_fee_pct = {ceiling} is a cap-valid ceiling but an UNSUPPORTED \
+             LADDER CONFIGURATION until btc-policy-sqn ships the rung composer; seal 0 or wait \
+             for sqn (ADR-0016 §4)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Disclose the rung-only ceiling, unknown base fee, and fixed timelock together.
+/// ADR-0016 §4 requires this until `btc-policy-wdu` makes the timelock selectable.
+fn ladder_disclosure(policy: &PolicyParams) -> String {
+    format!(
+        "\n!! escape_bump_max_fee_pct = {} and recovery timelock = {} days (FIXED — not a \
+         setting\n\x20  in this release). Decide them together: the timelock is how long the \
+         funds are\n\x20  immobile if the sweep misses, and it is also the refresh deadline.\n\
+         \x20  The ceiling governs REPLACEMENT RUNGS ONLY. It never caps the base Escape, which\n\
+         \x20  is always retained and always pays its own nonzero fee. That concrete base fee\n\
+         \x20  CANNOT EXIST at seal time — it depends on inputs, output shape and a feerate\n\
+         \x20  source chosen later — so it is displayed per spend, never here.\n\
+         \x20  At {}, no rung is offered: a SpendRequest presents exactly two transactions\n\
+         \x20  (a RefreshRequest is a self-spend and presents one — it has no Escape).",
+        policy.escape_bump_max_fee_pct,
+        policy_core::RECOVERY_TIMELOCK_UNITS as u64 * 512 / 86_400,
+        policy.escape_bump_max_fee_pct,
+    )
+}
+
 /// Assemble the vault from PUBLIC bundles alone.
 ///
 /// `node_bundles` order does not matter: `node_id` is the key's position in the
@@ -808,6 +878,8 @@ pub(crate) fn assemble(
         }
     }
 
+    check_escape_bump_ceiling(policy)?;
+
     let manifest_hash = ceremony::manifest_hash(
         &wallet_id,
         &coordinator_auth_pubkey,
@@ -820,6 +892,7 @@ pub(crate) fn assemble(
         policy.max_derivation_index,
         policy.escape_feerate_floor,
         policy.escape_coverage_pct,
+        policy.escape_bump_max_fee_pct,
     )?;
 
     let nodes = ceremony_nodes
@@ -914,7 +987,7 @@ pub(crate) fn run(args: &[&str]) -> ExitCode {
         ["node-endorse", rest @ ..] => node_endorse(&Args::parse(rest)),
         ["keygen", rest @ ..] => keygen(&Args::parse(rest)),
         ["assemble", rest @ ..] => assemble_cmd(&Args::parse(rest)),
-        ["finalize", rest @ ..] => finalize_cmd(&Args::parse(rest)),
+        ["finalize", rest @ ..] => finalize_cmd(&Args::parse(rest), None),
         _ => Err(Error::from(USAGE)),
     };
     match result {
@@ -1455,6 +1528,7 @@ fn assemble_cmd(args: &Args) -> Result<(), Error> {
         \x20  the past and the escape fires immediately — with no silent window at all.",
         input.policy.duress_delay_secs,
     );
+    println!("{}", ladder_disclosure(&input.policy));
     println!("\nROUND TWO — on each node host, run:");
     for node in &state.nodes {
         println!(
@@ -1472,7 +1546,68 @@ fn assemble_cmd(args: &Args) -> Result<(), Error> {
     Ok(())
 }
 
-fn finalize_cmd(args: &Args) -> Result<(), Error> {
+struct Artifact {
+    rel: String,
+    contents: String,
+    secret: bool,
+}
+
+const STAGING_DIR: &str = ".finalize-staging";
+const SEALED_DIR: &str = "sealed-v1";
+
+/// Stage the complete rendered set under this process's [`STAGING_DIR`], then make the
+/// manifest, every independently usable node config, and the backup visible through ONE
+/// same-filesystem directory rename to [`SEALED_DIR`] (ADR-0016 §4). Interruption
+/// exposes no finalized partial set; an existing set is never accepted, merged, or
+/// overwritten. `stage_failpoint` is the test seam for those interruptions: `Some(i)`
+/// aborts immediately before artifact `i` is staged. Production passes `None`.
+fn publish_artifact_set(
+    dir: &Path,
+    artifacts: &[Artifact],
+    stage_failpoint: Option<usize>,
+) -> Result<(), Error> {
+    use std::os::unix::fs::DirBuilderExt;
+    let staging = dir.join(format!("{STAGING_DIR}.{}", std::process::id()));
+    let sealed = dir.join(SEALED_DIR);
+    if sealed.exists() {
+        return Err(format!(
+            "{} already exists; finalize never accepts, merges, or overwrites a sealed artifact \
+             set: inspect it and remove it explicitly before retrying",
+            sealed.display()
+        )
+        .into());
+    }
+    // Staging is per invocation: a shared one lets an overlapping finalize clear this run's
+    // staged set. A leftover at OUR path is an interrupted run's — never adopt any part of it.
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|e| format!("cannot clear stale staging {}: {e}", staging.display()))?;
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    for (index, artifact) in artifacts.iter().enumerate() {
+        if stage_failpoint == Some(index) {
+            return Err(format!(
+                "finalize interrupted before staging artifact {index} ({})",
+                artifact.rel
+            )
+            .into());
+        }
+        let staged = staging.join(&artifact.rel);
+        if let Some(parent) = staged.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if artifact.secret {
+            write_secret_file(&staged, artifact.contents.as_bytes())?;
+        } else {
+            std::fs::write(&staged, &artifact.contents)?;
+        }
+    }
+    std::fs::rename(&staging, &sealed)
+        .map_err(|e| format!("cannot atomically publish {}: {e}", sealed.display()))?;
+    Ok(())
+}
+
+fn finalize_cmd(args: &Args, stage_failpoint: Option<usize>) -> Result<(), Error> {
     let dir = PathBuf::from(args.get("dir")?);
     let state: CeremonyState =
         serde_json::from_str(&std::fs::read_to_string(dir.join("ceremony-state.json"))?)?;
@@ -1528,6 +1663,11 @@ fn finalize_cmd(args: &Args) -> Result<(), Error> {
         .into());
     }
 
+    // Nothing downstream bounds the ceiling — nodes hash it and never enforce it —
+    // so `assemble`'s gate is the only one, and a state edited here then re-endorsed
+    // at the hash the refusal below prints would seal a ladder no release can honour.
+    check_escape_bump_ceiling(&state.policy)?;
+
     // The wallet_id recompute above covers the descriptor; the manifest hash commits
     // to everything ELSE the sealed anchor binds — the policy caps (`max_msg_bytes`,
     // the hot-budget), the endpoints, and the channel keys. Endorsements are signed
@@ -1564,6 +1704,7 @@ fn finalize_cmd(args: &Args) -> Result<(), Error> {
         state.policy.max_derivation_index,
         state.policy.escape_feerate_floor,
         state.policy.escape_coverage_pct,
+        state.policy.escape_bump_max_fee_pct,
     )?
     .to_lower_hex_string();
     if recomputed_manifest_hash != state.manifest_hash {
@@ -1623,7 +1764,7 @@ fn finalize_cmd(args: &Args) -> Result<(), Error> {
         "coordinator_auth_pubkey": state.coordinator_auth_pubkey,
         // The runtime BaseManifest's `protocol_version` is a u32 (ADR-0013 §4), the
         // same value hashed into `manifest_hash`; emit the number, not the "v0" label.
-        "protocol_version": vault_node::channel::PROTOCOL_VERSION_V0,
+        "protocol_version": vault_node::channel::PROTOCOL_VERSION,
         // `t`/`n`/`recovery_timelock` are consensus facts read back from the descriptor
         // (not the hash preimage), and `policy_version` is the one field that is neither
         // hash-bound nor descriptor-derivable — so recording it here is what lets the
@@ -1646,6 +1787,9 @@ fn finalize_cmd(args: &Args) -> Result<(), Error> {
         // preimage fields, in preimage order.
         "escape_feerate_floor": state.policy.escape_feerate_floor,
         "escape_coverage_pct": state.policy.escape_coverage_pct,
+        // The sealed ladder ceiling, hash-bound since ADR-0016 §3a and therefore
+        // recorded here for the same reason as the two fields above.
+        "escape_bump_max_fee_pct": state.policy.escape_bump_max_fee_pct,
         "nodes": state.nodes.iter().map(|node| serde_json::json!({
             "node_id": node.node_id,
             "signing_pubkey": node.signing_pubkey,
@@ -1655,12 +1799,22 @@ fn finalize_cmd(args: &Args) -> Result<(), Error> {
         })).collect::<Vec<_>>(),
     });
     let manifest_json = format!("{}\n", serde_json::to_string_pretty(&manifest)?);
-    std::fs::write(dir.join("manifest.json"), &manifest_json)?;
 
     let allowlist = vec![
         state.hot_descriptor.clone(),
         state.escape_descriptor.clone(),
     ];
+    // Render the WHOLE set before publishing (ADR-0016 §4): the ceiling and timelock
+    // are jointly chosen in an immutable manifest, so a partial set is irreparable.
+    // Nothing below touches the ceremony directory until `publish_artifact_set`.
+    let artifact = |rel: &str, contents: String, secret: bool| Artifact {
+        rel: rel.to_string(),
+        contents,
+        secret,
+    };
+    let public = |rel: &str, contents| artifact(rel, contents, false);
+    let secret = |rel: &str, contents| artifact(rel, contents, true);
+    let mut artifacts = vec![public("manifest.json", manifest_json.clone())];
     for node in &state.nodes {
         let kdf = KdfParams::from_hex_salt(
             &node.node_key_salt,
@@ -1688,61 +1842,50 @@ fn finalize_cmd(args: &Args) -> Result<(), Error> {
         });
         // Each `node-<id>.toml` carries both PIN digests and the chain-backend RPC
         // credential, so it is written owner-only rather than at the process umask.
-        write_secret_file(
-            &dir.join(format!("node-{}.toml", node.node_id)),
-            config.as_bytes(),
-        )?;
+        artifacts.push(secret(&format!("node-{}.toml", node.node_id), config));
     }
 
     // Backups (ADR-0013 §4/§7). A copy in a sibling directory is not itself
     // off-site storage — the README says so — but it is the artifact set an
     // operator moves, in one piece, to the media they trust.
-    let backup = dir.join("backup");
-    std::fs::create_dir_all(&backup)?;
     // Regenerate the state-derivable text files from the JUST-VERIFIED state rather
     // than blind-copying the working-dir siblings: finalize's whole rule is to catch an
     // edited artifact before sealing, and a corrupted `descriptor.txt` copied unchecked
     // into the backup would surface only years later at recovery, when the coins cannot
     // be located. `state.descriptor` passed the wallet_id recompute, `manifest_hash` the
     // manifest recompute, and `coord_pubkey` the secret-derivation check.
-    std::fs::write(
-        backup.join("descriptor.txt"),
-        format!("{}\n", state.descriptor),
-    )?;
-    std::fs::write(
-        backup.join("wallet-id.txt"),
-        format!("{}\n", state.wallet_id),
-    )?;
-    std::fs::write(
-        backup.join("manifest-hash.txt"),
-        format!("{}\n", state.manifest_hash),
-    )?;
-    std::fs::write(
-        backup.join("coordinator-auth.pubkey"),
-        format!("{coord_pubkey}\n"),
-    )?;
-    // `manifest.json` was just written fresh from verified state above; `independence.txt`
-    // is assemble's witnessed evidence (not reconstructible from state), so copy those two.
-    for name in ["manifest.json", "independence.txt"] {
-        std::fs::copy(dir.join(name), backup.join(name))
-            .map_err(|e| format!("cannot back up {name}: {e}"))?;
-    }
-    // The auth key is copied with its restrictive mode re-applied rather than by
-    // `fs::copy`, which would carry the source mode but leave the copy's creation
-    // momentarily at the process umask.
-    let auth_secret = std::fs::read(dir.join("coordinator-auth.secret"))?;
-    write_secret_file(&backup.join("coordinator-auth.secret"), &auth_secret)?;
-    std::fs::write(backup.join("README.txt"), BACKUP_README)?;
+    // Reuse verified bytes; `fs::copy` remakes secrets at the umask. Re-read independence.txt.
+    let sealed = dir.join(SEALED_DIR);
+    let backup = sealed.join("backup");
+    let independence = std::fs::read_to_string(dir.join("independence.txt"))
+        .map_err(|e| format!("cannot back up independence.txt: {e}"))?;
+    artifacts.extend([
+        public("backup/descriptor.txt", format!("{}\n", state.descriptor)),
+        public("backup/wallet-id.txt", format!("{}\n", state.wallet_id)),
+        public(
+            "backup/manifest-hash.txt",
+            format!("{}\n", state.manifest_hash),
+        ),
+        public(
+            "backup/coordinator-auth.pubkey",
+            format!("{coord_pubkey}\n"),
+        ),
+        public("backup/manifest.json", manifest_json),
+        public("backup/independence.txt", independence),
+        secret("backup/coordinator-auth.secret", coord_secret_raw),
+        public("backup/README.txt", BACKUP_README.to_string()),
+    ]);
+    publish_artifact_set(&dir, &artifacts, stage_failpoint)?;
 
     println!("sealed vault:");
     println!("  descriptor    : {}", state.descriptor);
     println!("  manifest_hash : {}", state.manifest_hash);
-    println!("  manifest      : {}", dir.join("manifest.json").display());
-    println!("  node configs  : {}/node-<node_id>.toml", dir.display());
+    println!("  manifest      : {}/manifest.json", sealed.display());
+    println!("  node configs  : {}/node-<node_id>.toml", sealed.display());
     println!("  backups       : {}", backup.display());
     println!(
         "\nEach node config names its derivation, NOT its key: start a node with\n  \
-         vault-node --config node-<id>.toml   and give it that node's preimage on stdin.\n\
+         vault-node --config {SEALED_DIR}/node-<id>.toml   and give it that node's preimage on stdin.\n\
          A node starts ONCE in its life, before its host is sealed (ADR-0005/0007)."
     );
     println!(
@@ -1964,6 +2107,7 @@ mod tests {
             policy_version: 1,
             escape_feerate_floor: 1,
             escape_coverage_pct: vault_node::DEFAULT_ESCAPE_COVERAGE_PCT,
+            escape_bump_max_fee_pct: vault_node::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
             hot_max_per_tx: 1_000_000,
             hot_max_per_window: 1_000_000,
             hot_window_secs: 172_800,
@@ -2053,6 +2197,118 @@ mod tests {
             assert_eq!(node.node_id, index as u16);
             assert_eq!(node.signing_pubkey.to_string(), expected[index]);
         }
+    }
+
+    /// ADR-0016 §3's four refusals, each reachable and each named distinctly. The
+    /// ORDER is what makes that true: the 5x margin is strictly stronger than the
+    /// coverage bound, so a coverage-only violation could never be diagnosed if the
+    /// margin were checked first, and an over-cap value would be blamed on coverage if
+    /// the ingress cap were checked last. The last row is not a bound at all: a value
+    /// the caps ADMIT, refused because nothing composes its rungs until btc-policy-sqn.
+    #[test]
+    fn the_ceremony_refuses_every_ladder_ceiling_the_vault_cannot_honour() {
+        for (ceiling, coverage, expected) in [
+            (11, 95, "ingress fee cap"),
+            (6, 95, "exceeds the fire-time coverage headroom"),
+            (2, 95, "5x margin"),
+            (1, 95, "UNSUPPORTED LADDER CONFIGURATION"),
+            // Coverage above 100 IS reachable — nothing in this ceremony bounds it, only
+            // the node does (lib.rs `1..=100`) — so the subtraction must not underflow.
+            (1, 200, "exceeds the fire-time coverage headroom"),
+            // A ceiling at the ingress cap with all the headroom in the world still
+            // reaches the sqn gate — and `ceiling * 5` must not wrap on the way.
+            (10, 0, "UNSUPPORTED LADDER CONFIGURATION"),
+        ] {
+            let policy = PolicyParams {
+                escape_bump_max_fee_pct: ceiling,
+                escape_coverage_pct: coverage,
+                ..policy()
+            };
+            let err = check_escape_bump_ceiling(&policy)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("ceiling {ceiling} at coverage {coverage} must be refused")
+                })
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "ceiling {ceiling} at coverage {coverage}: expected {expected:?}, got: {err}"
+            );
+        }
+        // The supported posture seals: zero, ladderless, two transactions per spend.
+        check_escape_bump_ceiling(&policy()).expect("the default zero ceiling seals");
+    }
+
+    #[test]
+    fn a_misspelled_ladder_ceiling_is_not_silently_defaulted() {
+        let misspelled = serde_json::to_string(&policy())
+            .expect("serialize policy")
+            .replace("\"escape_bump_max_fee_pct\"", "\"escape_bump_max_fee_pc\"");
+        assert!(
+            serde_json::from_str::<PolicyParams>(&misspelled).is_err(),
+            "an unknown ceiling field must not silently select the zero default"
+        );
+    }
+
+    /// The gate is WIRED, not merely present: a cap-valid nonzero ceiling must not
+    /// survive the seal path the CLI and the regtest harness share. Without this, a
+    /// `check_escape_bump_ceiling` that no caller invokes would test green.
+    #[test]
+    fn assemble_refuses_a_nonzero_ceiling_before_it_seals_anything() {
+        let devices = devices(3);
+        let bundles: Vec<NodeBundle> = devices.iter().map(|(_, b)| b.clone()).collect();
+        let recovery: Vec<PublicKey> = (0x30u8..=0x32).map(|i| keypair(i).1).collect();
+        let seal = |escape_bump_max_fee_pct| {
+            assemble(
+                &bundles,
+                2,
+                keypair(1).1,
+                &recovery,
+                keypair(0xC0).1,
+                &wallet(0xE0).to_string(),
+                &[wallet(0xA0).to_string()],
+                &PolicyParams {
+                    escape_bump_max_fee_pct,
+                    ..policy()
+                },
+            )
+        };
+        let err = seal(1)
+            .expect_err("a nonzero ceiling must not reach a sealed manifest")
+            .to_string();
+        assert!(
+            err.contains("UNSUPPORTED LADDER CONFIGURATION"),
+            "unexpected error: {err}"
+        );
+        seal(0).expect("the default zero ceiling assembles");
+    }
+
+    /// ADR-0016 §4's ceremony-time disclosure, at the only ceiling this release
+    /// accepts. None of its three facts is derivable from the number itself: the
+    /// ceiling's scope (rungs, never the base Escape), the base fee's non-existence at
+    /// seal time, and the fixed timelock beside it, so the two are still chosen
+    /// together before `btc-policy-wdu` makes the second one selectable.
+    #[test]
+    fn the_ceremony_discloses_the_rung_only_scope_the_unknown_base_fee_and_the_timelock() {
+        let disclosure = ladder_disclosure(&policy());
+        for expected in [
+            "escape_bump_max_fee_pct = 0",
+            "recovery timelock = 180 days (FIXED",
+            "REPLACEMENT RUNGS ONLY",
+            "never caps the base Escape",
+            "CANNOT EXIST at seal time",
+            "exactly two transactions",
+        ] {
+            assert!(
+                disclosure.contains(expected),
+                "the ceremony disclosure must state {expected:?}: {disclosure}"
+            );
+        }
+        // The "180" above is the descriptor's real timelock, not a copied number.
+        assert_eq!(
+            policy_core::RECOVERY_TIMELOCK_UNITS as u64 * 512 / 86_400,
+            180
+        );
     }
 
     /// Round two, end to end: a device re-derives from its own preimage, endorses,
@@ -2883,6 +3139,10 @@ mod tests {
     }
 
     impl Ceremony {
+        fn sealed(&self, rel: impl AsRef<Path>) -> PathBuf {
+            self.dir.join(SEALED_DIR).join(rel)
+        }
+
         fn state(&self) -> CeremonyState {
             serde_json::from_str(
                 &std::fs::read_to_string(self.dir.join("ceremony-state.json")).expect("state"),
@@ -2905,10 +3165,16 @@ mod tests {
         }
 
         fn finalize(&self) -> Result<(), Error> {
-            finalize_cmd(&Args::parse(&[
-                "--dir",
-                self.dir.to_str().expect("utf-8 dir"),
-            ]))
+            self.finalize_stopping_at(None)
+        }
+
+        /// `finalize` with the staging failpoint armed: `Some(i)` aborts immediately
+        /// before artifact `i` is staged.
+        fn finalize_stopping_at(&self, stage_failpoint: Option<usize>) -> Result<(), Error> {
+            finalize_cmd(
+                &Args::parse(&["--dir", self.dir.to_str().expect("utf-8 dir")]),
+                stage_failpoint,
+            )
         }
     }
 
@@ -3038,6 +3304,114 @@ mod tests {
         ceremony
     }
 
+    /// ADR-0016 §4: a ceremony interrupted mid-write leaves NOTHING sealed and is
+    /// safely retriable — the manifest is immutable, so half a jointly chosen artifact
+    /// set is not a thing a later edit can repair. Two interruption points, because
+    /// they fail differently: artifact 1 is the instant AFTER the manifest itself is
+    /// staged (the first thing rendered), and artifact 2 is BETWEEN two node configs,
+    /// where a write-as-you-go finalize would already have published one host's config.
+    #[test]
+    fn an_interrupted_finalize_seals_nothing_and_an_exact_retry_completes_one_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let ceremony = ceremony_through_endorse(3, 2);
+        let published = [
+            "manifest.json",
+            "node-0.toml",
+            "node-1.toml",
+            "node-2.toml",
+            "backup/manifest.json",
+            "backup/coordinator-auth.secret",
+            "backup/README.txt",
+        ];
+        let staging_name = format!("{STAGING_DIR}.{}", std::process::id());
+        let staging = ceremony.dir.join(&staging_name);
+        let mode = |path: &Path| path.metadata().expect("root mode").permissions().mode();
+        // Staging is per invocation, so publication must never remove a directory it did not
+        // create: clearing an overlapping finalize's set would leave it renaming a partial one.
+        let theirs = ceremony.dir.join(STAGING_DIR);
+        std::fs::create_dir(&theirs).expect("another invocation's staging directory");
+        for failpoint in [1, 2] {
+            let err = ceremony
+                .finalize_stopping_at(Some(failpoint))
+                .expect_err("the armed failpoint must abort finalize")
+                .to_string();
+            assert!(
+                err.contains("interrupted before staging artifact"),
+                "unexpected error: {err}"
+            );
+            for rel in published {
+                // The ceremony ROOT as well as the sealed set: a write-in-place finalize
+                // exposes the root path and never creates the sealed directory at all.
+                assert!(
+                    !ceremony.sealed(rel).exists() && !ceremony.dir.join(rel).exists(),
+                    "failpoint {failpoint} published {rel}: an interrupted ceremony must seal \
+                     nothing"
+                );
+            }
+            // ...and it fired AFTER real bytes were written, or the case above would
+            // prove nothing about a partial write.
+            assert!(
+                staging.join("manifest.json").exists(),
+                "failpoint {failpoint} must fire after the manifest was staged"
+            );
+            assert_eq!(mode(&staging) & 0o077, 0, "staging root is not owner-only");
+        }
+
+        // The exact retry — same command, same directory — completes the set.
+        ceremony
+            .finalize()
+            .expect("the exact retry seals the vault");
+        for rel in published {
+            assert!(
+                ceremony.sealed(rel).exists(),
+                "{rel} missing after the retry"
+            );
+        }
+        assert!(
+            !staging.exists(),
+            "a completed publication leaves no staging directory behind"
+        );
+        assert!(theirs.exists(), "overlapping staging was destroyed");
+        assert_eq!(mode(&ceremony.sealed("")) & 0o077, 0, "sealed root mode");
+
+        // A completed seal is immutable even when its bytes still match. In particular,
+        // a hand copy can preserve bytes while widening secret modes; finalize must not
+        // bless that filesystem state as a verified artifact set.
+        let secret = ceremony.sealed("backup/coordinator-auth.secret");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644))
+            .expect("simulate an unsafe hand copy");
+        let err = ceremony
+            .finalize()
+            .expect_err("finalize never accepts an existing sealed set")
+            .to_string();
+        assert!(err.contains("already exists"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_root_level_publish_obstruction_cannot_expose_a_partial_artifact_set() {
+        let temp = crate::fed::TempDir::new("atomic-publication").expect("tempdir");
+        let dir = &temp.path;
+        std::fs::create_dir(dir.join("manifest.json")).expect("obstruct any root-level write");
+        let artifacts = [
+            Artifact {
+                rel: "manifest.json".into(),
+                contents: "manifest".into(),
+                secret: false,
+            },
+            Artifact {
+                rel: "node-0.toml".into(),
+                contents: "config".into(),
+                secret: true,
+            },
+        ];
+        publish_artifact_set(dir, &artifacts, None).expect("publish one complete directory");
+        assert!(
+            !dir.join("node-0.toml").exists(),
+            "publication must not expose an independently usable node config"
+        );
+        assert!(dir.join(SEALED_DIR).join("node-0.toml").exists());
+    }
+
     /// The headline round trip: assemble → endorse → finalize seals a COMPLETE typed
     /// manifest, owner-only node configs whose bind port comes from the endorsed
     /// endpoint, and a backup regenerated from the verified state.
@@ -3052,12 +3426,12 @@ mod tests {
         //    including the ones the hash preimage does NOT carry (t/n/recovery_timelock/
         //    policy_version) and the ones it does.
         let manifest: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(ceremony.dir.join("manifest.json")).expect("manifest.json"),
+            &std::fs::read_to_string(ceremony.sealed("manifest.json")).expect("manifest.json"),
         )
         .expect("parse manifest");
         assert_eq!(
             manifest["protocol_version"],
-            serde_json::json!(vault_node::channel::PROTOCOL_VERSION_V0),
+            serde_json::json!(vault_node::channel::PROTOCOL_VERSION),
             "protocol_version is the hashed u32, not a \"v0\" label"
         );
         assert_eq!(manifest["t"], serde_json::json!(3));
@@ -3101,6 +3475,10 @@ mod tests {
             (
                 "escape_coverage_pct",
                 serde_json::json!(policy().escape_coverage_pct),
+            ),
+            (
+                "escape_bump_max_fee_pct",
+                serde_json::json!(policy().escape_bump_max_fee_pct),
             ),
             (
                 "coordinator_auth_pubkey",
@@ -3148,7 +3526,7 @@ mod tests {
         //    chain-backend credential) and binds the port from its ENDORSED endpoint.
         for node in &state.nodes {
             use std::os::unix::fs::PermissionsExt;
-            let path = ceremony.dir.join(format!("node-{}.toml", node.node_id));
+            let path = ceremony.sealed(format!("node-{}.toml", node.node_id));
             let mode = std::fs::metadata(&path)
                 .expect("config metadata")
                 .permissions()
@@ -3177,7 +3555,7 @@ mod tests {
         //    separate property and needs a corrupted sibling to prove — see
         //    `the_backup_is_regenerated_from_verified_state_not_copied_from_siblings`.
         for name in ["descriptor.txt", "wallet-id.txt", "manifest-hash.txt"] {
-            let path = ceremony.dir.join("backup").join(name);
+            let path = ceremony.sealed("backup").join(name);
             assert!(path.exists(), "backup/{name} must be written");
         }
     }
@@ -3209,8 +3587,8 @@ mod tests {
             ("wallet-id.txt", &state.wallet_id),
             ("manifest-hash.txt", &state.manifest_hash),
         ] {
-            let backed_up = std::fs::read_to_string(ceremony.dir.join("backup").join(name))
-                .expect("backup file");
+            let backed_up =
+                std::fs::read_to_string(ceremony.sealed("backup").join(name)).expect("backup file");
             assert_eq!(
                 backed_up.trim(),
                 expected,
@@ -3240,7 +3618,7 @@ mod tests {
         let state = ceremony.state();
         let node = &state.nodes[0];
         let config =
-            std::fs::read_to_string(ceremony.dir.join(format!("node-{}.toml", node.node_id)))
+            std::fs::read_to_string(ceremony.sealed(format!("node-{}.toml", node.node_id)))
                 .expect("config");
         let endorsed_port =
             loopback_port(&node.endpoints, node.node_id).expect("endorsed endpoint");
@@ -3308,6 +3686,18 @@ mod tests {
                 "manifest_hash",
             ),
             (
+                // Nothing downstream bounds the ceiling, and this gate runs BEFORE the
+                // hash recompute, so it also refuses the re-endorsed consistent state
+                // an operator reaches by pasting the recomputed hash back in.
+                "a nonzero ladder ceiling edited in after assembly",
+                Box::new(|ceremony: &Ceremony| {
+                    ceremony.edit_state(|state| {
+                        state["policy"]["escape_bump_max_fee_pct"] = serde_json::json!(1);
+                    });
+                }),
+                "UNSUPPORTED LADDER CONFIGURATION",
+            ),
+            (
                 "the wrong coordinator secret beside the state",
                 Box::new(|ceremony: &Ceremony| {
                     // A valid key, just not the one the manifest pins — the stale/
@@ -3336,11 +3726,11 @@ mod tests {
             // Nothing sealed: the operator re-runs `assemble` against a clean state
             // rather than shipping half-written artifacts to the hosts.
             assert!(
-                !ceremony.dir.join("manifest.json").exists(),
+                !ceremony.sealed("manifest.json").exists(),
                 "{label}: finalize must refuse BEFORE writing the manifest"
             );
             assert!(
-                !ceremony.dir.join("node-0.toml").exists(),
+                !ceremony.sealed("node-0.toml").exists(),
                 "{label}: finalize must refuse BEFORE writing any node config"
             );
         }
@@ -3399,7 +3789,7 @@ mod tests {
             "an endorsement from another device's key must not finalize"
         );
         assert!(
-            !ceremony.dir.join("manifest.json").exists(),
+            !ceremony.sealed("manifest.json").exists(),
             "a forged endorsement must be caught before sealing"
         );
     }

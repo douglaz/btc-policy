@@ -2,8 +2,9 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** SPEC · **Bead:** btc-policy-mby-manifest-v1-zero-ceiling-88w · **Branch:** beads/mby-split
-**Pending:** land the reviewed split, then claim M1 for rb-lite implementation
+**Phase:** IMPL · **Bead:** btc-policy-mby-manifest-v1-zero-ceiling-88w · **Branch:** beads/mby-m1
+**Pending:** implement only M1 through rb-lite under its test-inclusive hard caps; keep the
+intermediate non-deployable
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not

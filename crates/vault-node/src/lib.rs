@@ -677,6 +677,12 @@ pub struct ConfigFile {
     /// sweep does not fire → recovery. Never an arm gate (ADR-0012).
     #[serde(default = "default_escape_feerate_floor")]
     pub escape_feerate_floor: u64,
+    /// Mandatory manifest schema revision, preflighted before this schema so an old
+    /// config gets a version error; validated, then not stored (ADR-0016 §3a).
+    pub protocol_version: u32,
+    /// Mandatory sealed rung-fee ceiling. No default: omission must not silently
+    /// reproduce zero. It is hash-bound but never enforced node-side (ADR-0016 §4a).
+    pub escape_bump_max_fee_pct: u8,
     /// The baked-at-setup policy identifier, bound into every commitment
     /// (policy is immutable, so this never changes).
     pub policy_version: u32,
@@ -792,6 +798,10 @@ pub const DEFAULT_ESCAPE_COVERAGE_PCT: u8 = 95;
 /// be a static, cross-node-deterministic sweep-admissibility check. `pub const` for
 /// the same manifest-preimage reason as [`DEFAULT_ESCAPE_COVERAGE_PCT`].
 pub const DEFAULT_ESCAPE_FEERATE_FLOOR: u64 = 1;
+
+/// ADR-0016 §2's sealed default: `0`, the ladderless two-transaction posture.
+/// It is deliberately not a [`ConfigFile`] fallback.
+pub const DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT: u8 = 0;
 
 /// ADR-0013 §6's default escape coverage threshold (95%).
 fn default_escape_coverage_pct() -> u8 {
@@ -1308,6 +1318,30 @@ impl Node {
     /// keep true. Production reaches this through [`Node::load`], which reads the
     /// preimage from stdin.
     pub fn from_toml_str(raw: &str, preimage: &nodekey::Preimage) -> Result<Node, Error> {
+        // VERSION PREFLIGHT (ADR-0016 §3a): read only the declared revision before
+        // current-schema fields or the anchor, so old/absent wins over their errors.
+        // A current revision still reaches every current-field diagnostic.
+        #[derive(Deserialize)]
+        struct DeclaredVersion {
+            protocol_version: Option<u32>,
+        }
+        let declared: DeclaredVersion =
+            toml::from_str(raw).map_err(|e| format!("bad config: {e}"))?;
+        if declared.protocol_version != Some(channel::PROTOCOL_VERSION) {
+            return Err(format!(
+                "unsupported manifest protocol_version {}: this binary speaks manifest schema \
+                 revision {} only, so any other declared revision — absent, older or newer — \
+                 names a DIFFERENT preimage layout (ADR-0016 §3a) whose sealed anchor cannot \
+                 be reproduced here. Sealed hosts take no upgrade-in-place (ADR-0005): the \
+                 remedy is a ceremony at this revision, never an edit of this file.",
+                match declared.protocol_version {
+                    Some(version) => version.to_string(),
+                    None => "(absent)".to_string(),
+                },
+                channel::PROTOCOL_VERSION,
+            )
+            .into());
+        }
         let config: ConfigFile = toml::from_str(raw).map_err(|e| format!("bad config: {e}"))?;
         let secp = Secp256k1::new();
         // Derive the federation signing key in RAM. Nothing this reads from the
@@ -1842,6 +1876,9 @@ impl Node {
                     // floor/coverage differs from the federation's fails startup.
                     config.escape_feerate_floor,
                     config.escape_coverage_pct,
+                    // The sealed ladder ceiling (ADR-0016 §3a): hashed here, so a node
+                    // whose ceiling differs from the sealed one fails startup.
+                    config.escape_bump_max_fee_pct,
                     Arc::clone(&alerts),
                 )
             })
@@ -9222,6 +9259,7 @@ pub(crate) mod test_support {
              hot_max_per_tx = {}\nhot_max_per_window = {}\n\
              hot_window_secs = {}\n\
              max_commitment_age_secs = {max_commitment_age_secs}\npolicy_version = 1\n\
+             protocol_version = {protocol_version}\nescape_bump_max_fee_pct = 0\n\
              pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
              coordinator_auth_pubkey = \"{}\"\n{extra}",
             node_key_toml(&node_kdf),
@@ -9234,6 +9272,7 @@ pub(crate) mod test_support {
             argon2id_normal_phc("1234"),
             argon2id_duress_phc("9999"),
             coord_key().1,
+            protocol_version = channel::PROTOCOL_VERSION,
         )
     }
 
@@ -9398,6 +9437,7 @@ pub(crate) mod test_support {
              max_derivation_index = 5\nhold_secs = 0\n\
              hot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\n\
              max_commitment_age_secs = 172800\npolicy_version = 1\n\
+             protocol_version = {protocol_version}\nescape_bump_max_fee_pct = 0\n\
              pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
              coordinator_auth_pubkey = \"{}\"\n{budget_toml}",
             node_key_toml(&node_kdf),
@@ -9407,6 +9447,7 @@ pub(crate) mod test_support {
             argon2id_normal_phc("1234"),
             argon2id_duress_phc("9999"),
             coord_key().1,
+            protocol_version = channel::PROTOCOL_VERSION,
         );
         let node = load_node(&config).expect("valid config");
         let escape_spk = escape
