@@ -2,9 +2,9 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** CLOSE · **Bead:** btc-policy-mby-manifest-v1-zero-ceiling-88w · **Branch:** beads/mby-m1-close
-**Pending:** land the reviewed M1 closure record, then claim `btc-policy-5ag`; keep the intermediate
-non-deployable
+**Phase:** SHAPE · **Bead:** btc-policy-5ag · **Branch:** beads/5ag-network
+**Pending:** review the network-parameter design and derive a test-inclusive hard budget before
+starting rb-lite; keep the intermediate non-deployable
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -58,14 +58,17 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Land M1's closure-only Beads/DRIVE record after implementation PR #21 merged as `53ae011`.
-No implementation byte changes here. The `mby` umbrella remains open, stage 1 remains unreachable,
-and `b8z` must close before M6 consumes the ceremony output end to end.
+Shape `btc-policy-5ag` before implementation. Codex and Opus xhigh must independently inspect the
+current ceremony, sealed manifest/config, startup chain checks, every driver, frozen vectors, and
+address evidence; then reconcile the smallest correct design, exact red-first proof, and hard gross
+Rust/non-Rust budget with every test line included. The `mby` umbrella remains open, stage 1 remains
+unreachable, and `b8z` must close before M6 consumes the ceremony output end to end.
 
 ## Next
-Implement `btc-policy-5ag` through rb-lite: add the sealed network field and the next manifest
-protocol bump before M2 parses live artifacts. M1's `protocol_version = 1` is a manifest-schema
-revision, not routable transport v1; `5ag` must not reuse it after changing the canonical preimage.
+After the reviewed 5ag design and budget are recorded, implement it through one rb-lite run: add the
+sealed network field and the next manifest protocol bump before M2 parses live artifacts. M1's
+`protocol_version = 1` is a manifest-schema revision, not routable transport v1; `5ag` must not
+reuse it after changing the canonical preimage.
 M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or network
 I/O. Then implement M2 operator core, M3 stable Core composer, M4 Spend command, and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
