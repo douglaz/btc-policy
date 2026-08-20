@@ -106,11 +106,13 @@ in the graph deliberately — `br ready` counts only open blockers, and the reco
 existed is worth more than a tidy list.
 
 ## Filed or adjudicated during this drive, not implemented here
-- `btc-policy-cyberkrill-independent-claims-zgl` (P3) — the 5ag review withdrew cyberkrill as
+- `btc-policy-cyberkrill-independent-claims-zgl` (P2) — the 5ag review withdrew cyberkrill as
   an independent address encoder and moved `00i` to A's flake-pinned Core oracle, but the rollout
   pre-funding checklist and `wdu` still use cyberkrill for whole-descriptor/timelock read-back.
   Audit independent implementation versus merely separate binary/caller before changing either
-  live check; do not delete the pre-funding verification.
+  live check; do not delete the pre-funding verification. A is now a direct prerequisite of `00i`,
+  and this audit directly blocks `wdu`, so neither corrected verification can be scheduled ahead of
+  its evidence.
 - `btc-policy-sealed-host-cli-packaging-u4y` (CLOSED/rejected) — it conflated the dedicated
   coordinator with an ADR-0005 node image. A sealed node has no lawful interactive invocation or
   secret-input surface, and stage 2+ no longer uses the v0 loopback topology. `4y3` owns the
