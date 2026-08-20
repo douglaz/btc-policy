@@ -2,9 +2,10 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** SHAPE · **Bead:** btc-policy-5ag · **Branch:** beads/5ag-network
-**Pending:** review the network-parameter design and derive a test-inclusive hard budget before
-starting rb-lite; keep the intermediate non-deployable
+**Phase:** GRAPH · **Bead:** btc-policy-5ag · **Branch:** beads/5ag-network
+**Pending:** land the reviewed two-child network graph, then implement child
+`btc-policy-sealed-network-v2-mn6` through rb-lite on its own branch; keep both intermediates
+non-deployable
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -58,17 +59,24 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Shape `btc-policy-5ag` before implementation. Codex and Opus xhigh must independently inspect the
-current ceremony, sealed manifest/config, startup chain checks, every driver, frozen vectors, and
-address evidence; then reconcile the smallest correct design, exact red-first proof, and hard gross
-Rust/non-Rust budget with every test line included. The `mby` umbrella remains open, stage 1 remains
-unreachable, and `b8z` must close before M6 consumes the ceremony output end to end.
+Record the reviewed `btc-policy-5ag` split. `btc-policy-sealed-network-v2-mn6` (A) owns the sealed
+network byte, revision 2, backend/default-public-signet identity, seven real driver sites, the
+three-network Core oracle, and neutral `sealed/` path at **1,150 gross Rust / 230 non-Rust**.
+`btc-policy-descriptor-network-kind-x00` (B) depends on A and owns required Escape keygen network
+plus one shared `policy-core` Main/Test XPub validator at assemble, finalize, and node load at
+**520 gross Rust / 95 non-Rust**. Every Rust cap includes every production, test, helper and fixture
+line; tests are estimated at 63% of A and 70% of B. The tracking parent has no implementation
+budget. The `mby` umbrella remains open, stage 1 remains unreachable, and `b8z` must close before M6
+consumes the ceremony output end to end.
 
 ## Next
-After the reviewed 5ag design and budget are recorded, implement it through one rb-lite run: add the
-sealed network field and the next manifest protocol bump before M2 parses live artifacts. M1's
-`protocol_version = 1` is a manifest-schema revision, not routable transport v1; `5ag` must not
-reuse it after changing the canonical preimage.
+After this graph-only PR merges, branch from current `main`, claim
+`btc-policy-sealed-network-v2-mn6`, and implement A through one rb-lite run/branch/PR. M1's
+`protocol_version = 1` is a manifest-schema revision, not routable transport v1; A must not reuse it
+after changing the canonical preimage. A lands explicitly non-deployable. Only after A merges,
+claim `btc-policy-descriptor-network-kind-x00` and implement B through its own rb-lite
+run/branch/PR; B changes no preimage layout and performs no second version bump. Then close the
+tracking parent in a reviewed record.
 M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or network
 I/O. Then implement M2 operator core, M3 stable Core composer, M4 Spend command, and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
@@ -98,6 +106,11 @@ in the graph deliberately — `br ready` counts only open blockers, and the reco
 existed is worth more than a tidy list.
 
 ## Filed or adjudicated during this drive, not implemented here
+- `btc-policy-cyberkrill-independent-claims-zgl` (P3) — the 5ag review withdrew cyberkrill as
+  an independent address encoder and moved `00i` to A's flake-pinned Core oracle, but the rollout
+  pre-funding checklist and `wdu` still use cyberkrill for whole-descriptor/timelock read-back.
+  Audit independent implementation versus merely separate binary/caller before changing either
+  live check; do not delete the pre-funding verification.
 - `btc-policy-sealed-host-cli-packaging-u4y` (CLOSED/rejected) — it conflated the dedicated
   coordinator with an ADR-0005 node image. A sealed node has no lawful interactive invocation or
   secret-input surface, and stage 2+ no longer uses the v0 loopback topology. `4y3` owns the
