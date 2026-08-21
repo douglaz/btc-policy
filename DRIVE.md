@@ -2,9 +2,9 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** BUILD · **Bead:** btc-policy-sealed-network-v2-mn6 · **Branch:** beads/sealed-network-v2-mn6
-**Pending:** implement child A through one rb-lite run within its 1,150/230 hard caps, prove every
-load-bearing property red/mutation-first, and keep the intermediate non-deployable
+**Phase:** RECORD · **Bead:** btc-policy-sealed-network-v2-mn6 · **Branch:** beads/sealed-network-v2-mn6-close
+**Pending:** land child A's closure-only record, then claim child B on a fresh branch; A's intermediate
+manifest remains explicitly non-deployable until B closes the descriptor-kind relation
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -14,6 +14,14 @@ a `br ready` ranking.
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-sealed-network-v2-mn6` (5ag child A, P1) — manifest revision 2 seals
+  Bitcoin/default-public-Signet/Regtest as explicit codes 1/2/3; old revisions fail before current
+  schema/hash/I/O; startup binds to the existing Core chain response and exact public-Signet
+  challenge before IBD; the seven ceremony-backed address sites follow the sealed network; three
+  fixed digests and offline Core address oracles pin the mapping; live artifacts use neutral
+  `sealed/`. Merged #24 (`b7a92b5`) at the exact 1,150-line Rust cap after Codex+Opus review,
+  independent adjudication, live regtest, and both launch gates. A is deliberately non-deployable:
+  `btc-policy-descriptor-network-kind-x00` remains mandatory.
 - `btc-policy-mby-manifest-v1-zero-ceiling-88w` (M1, P1) — manifest schema revision 1
   appends and seals the zero-only Escape ladder ceiling, preflights old node configs, refuses
   nonzero ceilings until `sqn`, and publishes one owner-only complete setup artifact set. Merged
@@ -58,21 +66,17 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Implement `btc-policy-sealed-network-v2-mn6` (A) through rb-lite. It owns the sealed network byte,
-revision 2, backend/default-public-signet identity, seven real driver sites, the three-network Core
-oracle, and neutral `sealed/` path at **1,150 gross Rust / 230 non-Rust**. Every Rust line in
-production, tests, helpers and fixtures counts; tests are estimated at 63%. At 950 Rust with either
-the full chain/challenge table or all three protocol vectors unwritten, stop and reshape rather than
-compress proof. A remains explicitly non-deployable. The `mby` umbrella and stage 1 stay unreachable.
+Record the reviewed closure of `btc-policy-sealed-network-v2-mn6` (A). PR #24 merged as
+`b7a92b5` after current-head Codex review, exact local and CI gates, both live-Core jobs, and both
+launch gates. Its final budget is **1,150/1,150 gross Rust** (tests included) and **187/230
+non-Rust**. This closure records evidence only; it does not authorize deployment or fold B into A.
 
 ## Next
-After rb-lite exits clean, independently verify A's red/mutation evidence, exact gross counts, local
-gate, live Core leg and launch gate; then run Codex+Opus hardening and land one reviewed PR. M1's
-`protocol_version = 1` is a manifest-schema revision, not routable transport v1; A must not reuse it
-after changing the canonical preimage. Only after A merges, claim
-`btc-policy-descriptor-network-kind-x00` and implement B through its own rb-lite run/branch/PR; B
-changes no preimage layout and performs no second version bump. Then close the tracking parent in a
-reviewed record.
+After this closure lands, claim `btc-policy-descriptor-network-kind-x00` on a fresh branch and
+implement B through its own rb-lite run/branch/PR at **520 gross Rust / 95 non-Rust**. B owns one
+shared policy-core descriptor visitor, independent assemble/finalize/node-load checks, and required
+network-aware Escape keygen; it changes no preimage layout and performs no second version bump.
+Then close the tracking parent in a reviewed record.
 M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or network
 I/O. Then implement M2 operator core, M3 stable Core composer, M4 Spend command, and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
