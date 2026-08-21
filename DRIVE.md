@@ -68,8 +68,9 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
 ## Now
 Record the reviewed closure of `btc-policy-sealed-network-v2-mn6` (A). PR #24 merged as
 `b7a92b5` after current-head Codex review, exact local and CI gates, both live-Core jobs, and both
-launch gates. Its final budget is **1,150/1,150 gross Rust** (tests included) and **187/230
-non-Rust**. This closure records evidence only; it does not authorize deployment or fold B into A.
+launch gates. Its exact `312d983..ce1025d` budget is **1,150/1,150 gross Rust** (tests included)
+and **187/230 total non-Rust**: 181 code/docs plus six Beads-bookkeeping lines. This closure records
+evidence only; it does not authorize deployment or fold B into A.
 
 ## Next
 After this closure lands, claim `btc-policy-descriptor-network-kind-x00` on a fresh branch and
