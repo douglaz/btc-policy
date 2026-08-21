@@ -69,7 +69,8 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
 Implement `btc-policy-descriptor-network-kind-x00` (B) through rb-lite at **520 gross Rust / 95
 non-Rust**, every production/test/helper/fixture line included. It owns one shared policy-core
 descriptor visitor, independent assemble/finalize/node-load enforcement, required network-aware
-Escape keygen, and within-revision migration documentation. At 430 Rust with the finalize
+Escape keygen, and revision-2 A-era-mismatch re-ceremony documentation in `SETUP-CEREMONY.md`
+and `UPGRADE-AND-ROTATION-POLICY.md`. At 430 Rust with the finalize
 edit/recompute/re-endorse proof or hash-consistent node proof unwritten, stop; omit B7 corroboration
 before cutting B1-B6. The combined A+B state remains non-deployable until the tracking parent closes.
 

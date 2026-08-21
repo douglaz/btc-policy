@@ -107,7 +107,7 @@ the enrolled PIN digests, the chain backend, and the policy numbers:
   "user_bundle": "user.json",
   "recovery_bundles": ["rec-a.json", "rec-b.json", "rec-c.json"],
   "escape_bundle": "escape.json",
-  "hot_descriptor": "wpkh([<fp>]<xpub>/*)",
+  "hot_descriptor": "wpkh([<fp>]<tpub>/*)",
   "policy": {
     "max_derivation_index": 1000,
     "hold_secs": 86400,
@@ -316,7 +316,7 @@ neither this change nor `btc-policy-sealed-network-v2-mn6` before it grants it.
   deployment exports the wallet from the device instead — which is the recommended path
   regardless (see step 2). The prefix is a serialization hint, not a derivation input:
   the same seed derives the same keys and the same scripts either way. When you
-  hand-write the bundle, the escape descriptor's xpub MUST NOT be the account key you
+  hand-write the bundle, the escape descriptor's extended key MUST NOT be the account key you
   also use as the user key (or any node/recovery/coordinator key): non-hardened BIP32
   derivation over a public chain code means whoever holds that key's private half can
   derive every escape address, silently turning duress into theft (ADR-0012 §10).
