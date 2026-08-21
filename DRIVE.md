@@ -2,9 +2,9 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** RECORD · **Bead:** btc-policy-sealed-network-v2-mn6 · **Branch:** beads/sealed-network-v2-mn6-close
-**Pending:** land child A's closure-only record, then claim child B on a fresh branch; A's intermediate
-manifest remains explicitly non-deployable until B closes the descriptor-kind relation
+**Phase:** BUILD · **Bead:** btc-policy-descriptor-network-kind-x00 · **Branch:** beads/descriptor-network-kind-x00
+**Pending:** implement child B through one rb-lite run within its 520/95 hard caps, prove all three
+artifact-consumption boundaries independently, and keep the combined A+B state non-deployable
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -66,18 +66,18 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Record the reviewed closure of `btc-policy-sealed-network-v2-mn6` (A). PR #24 merged as
-`b7a92b5` after current-head Codex review, exact local and CI gates, both live-Core jobs, and both
-launch gates. Its exact `312d983..ce1025d` budget is **1,150/1,150 gross Rust** (tests included)
-and **187/230 total non-Rust**: 181 code/docs plus six Beads-bookkeeping lines. This closure records
-evidence only; it does not authorize deployment or fold B into A.
+Implement `btc-policy-descriptor-network-kind-x00` (B) through rb-lite at **520 gross Rust / 95
+non-Rust**, every production/test/helper/fixture line included. It owns one shared policy-core
+descriptor visitor, independent assemble/finalize/node-load enforcement, required network-aware
+Escape keygen, and within-revision migration documentation. At 430 Rust with the finalize
+edit/recompute/re-endorse proof or hash-consistent node proof unwritten, stop; omit B7 corroboration
+before cutting B1-B6. The combined A+B state remains non-deployable until the tracking parent closes.
 
 ## Next
-After this closure lands, claim `btc-policy-descriptor-network-kind-x00` on a fresh branch and
-implement B through its own rb-lite run/branch/PR at **520 gross Rust / 95 non-Rust**. B owns one
-shared policy-core descriptor visitor, independent assemble/finalize/node-load checks, and required
-network-aware Escape keygen; it changes no preimage layout and performs no second version bump.
-Then close the tracking parent in a reviewed record.
+After rb-lite exits clean, independently verify B's red/mutation evidence, exact counts, local gate,
+live Core and launch obligations; run current-head Codex+Opus hardening and land one reviewed PR.
+Then close B and the tracking parent in reviewed records. B changes no preimage layout, performs no
+second version bump, and does not authorize production by itself.
 M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or network
 I/O. Then implement M2 operator core, M3 stable Core composer, M4 Spend command, and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
