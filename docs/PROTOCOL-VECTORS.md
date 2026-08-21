@@ -102,7 +102,7 @@ nodes                         u32 count, then per node:
 `escape_bump_max_fee_pct = 0 (0x00)`, `network = bitcoin (0x01)`,
 two nodes on `127.0.0.1:9000` / `127.0.0.1:9001`:
 
-```
+```text
 preimage:
 222222222222222222222222222222222222222222222222222222222222222202000000
 038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c236

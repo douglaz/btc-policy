@@ -252,7 +252,7 @@ operator's paper), the escape wallet secret, and the recovery keys.
 
 ## 6. Start each node, then seal
 
-```
+```console
 vault-node --config sealed/node-<id>.toml     # then type that node's preimage
 ```
 
