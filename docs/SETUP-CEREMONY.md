@@ -24,7 +24,7 @@ Specs: [ADR-0013 §4/§5](adr/0013-concrete-protocol-schemas.md) (manifest, conf
 | Step | Machine | Command |
 |---|---|---|
 | 1 | each node host | `btc-vault setup node-keygen` |
-| 2 | escape device (holds no other vault role) | `btc-vault setup keygen --role escape` |
+| 2 | escape device (holds no other vault role) | `btc-vault setup keygen --role escape --network <chain>` |
 | 2 | user / recovery devices | `btc-vault setup keygen --role user\|recovery` |
 | 3 | coordinator | `btc-vault setup assemble` |
 | 4 | each node host | `btc-vault setup node-endorse` |
@@ -81,7 +81,8 @@ free knob. The regtest harness derives at the floor with `--allow-weak-kdf` for 
 ## 2. On the independent devices — the other keys
 
 ```
-btc-vault setup keygen --role escape   --out escape.json      # its OWN device
+btc-vault setup keygen --role escape   --out escape.json \
+                       --network <bitcoin|signet|regtest>   # its OWN device
 btc-vault setup keygen --role user     --out user.json
 btc-vault setup keygen --role recovery --out recovery-a.json  # ×3, distributed
 ```
@@ -106,7 +107,7 @@ the enrolled PIN digests, the chain backend, and the policy numbers:
   "user_bundle": "user.json",
   "recovery_bundles": ["rec-a.json", "rec-b.json", "rec-c.json"],
   "escape_bundle": "escape.json",
-  "hot_descriptor": "wpkh([<fp>]<xpub>/*)",
+  "hot_descriptor": "wpkh([<fp>]<tpub>/*)",
   "policy": {
     "max_derivation_index": 1000,
     "hold_secs": 86400,
@@ -131,6 +132,9 @@ the enrolled PIN digests, the chain backend, and the policy numbers:
   "chain_backend_auth": "<base64 user:pass>"
 }
 ```
+
+`hot_descriptor`'s extended-key flavour must match `network` — an `xpub` for `bitcoin`, a
+`tpub` for signet and regtest — and there is no `keygen --role hot` to get that right for you.
 
 `threshold` is `t`; the federation must be exactly `n = 2t − 1` with `t ≥ 2`
 (ADR-0013 §1), and `assemble` refuses any other shape — the descriptor is
@@ -277,16 +281,21 @@ removes that path, so reboot-death and the Lockdown latch hold even off-machine.
 Stated rather than hidden, since a documented deviation is acceptable and a silent
 one is not.
 
-### This release is NOT deployable to mainnet
+### Mainnet deployment is still not authorized here
 
-The vault now seals a `network`, and every node proves its backend is on that chain.
-What is still missing is the RELATION between the sealed network and the extended-key
-FLAVOUR of the hot and Escape descriptors: `keygen --role escape` emits a `tpub`
-whatever network the ceremony seals, and nothing at assemble, finalize or node load
-refuses a fully hash-consistent `bitcoin` vault that carries one. `keygen` prints a
-loud warning saying so on every run. `btc-policy-descriptor-network-kind-x00` makes
-`--network` mandatory there and adds the shared validator at all three boundaries;
-until it lands, seal `bitcoin` for test purposes only.
+The gap this section used to name — the missing RELATION between the sealed `network` and
+the extended-key FLAVOUR of the hot and Escape descriptors — is closed. `keygen --role
+escape` now REQUIRES `--network`, and one shared `policy-core` validator refuses a
+mismatch independently at assemble, at finalize and at node load, before any backend I/O.
+An artifact set whose flavour disagrees with its sealed `network` is refused even though its
+`protocol_version` is already 2 and every byte of it is hash-consistent, and the only remedy
+is a new ceremony — see `docs/UPGRADE-AND-ROTATION-POLICY.md` §1. Not every pre-x00 set is one:
+A-era `keygen` emitted a `tpub` unconditionally, so a pre-x00 `bitcoin` vault holds an escape
+key this refuses, while on signet or regtest that same key already agrees with the network.
+
+What remains is not a defect in this ceremony. Authorizing a PRODUCTION ceremony is owned
+by the tracking parent `btc-policy-5ag` and the rollout ladder (`docs/ROLLOUT-PLAN.md`);
+neither this change nor `btc-policy-sealed-network-v2-mn6` before it grants it.
 
 ### The rest
 
@@ -301,18 +310,17 @@ until it lands, seal `bitcoin` for test purposes only.
   ceremony omits the flag.
 * **`--secret-file` / `--preimage-file` exist at all.** They are automation escape
   hatches and say so loudly on every run that uses them.
-* **`keygen --role escape` emits a TESTNET-flavoured extended key** (`tpub…`)
-  unconditionally, including for a vault sealed to `bitcoin` — see the section above.
-  The prefix is a serialization hint, not a derivation input: the same seed derives the
-  same keys and the same scripts either way, and the printed `tpriv` re-derives the
-  wallet. Some mainnet wallets refuse to import a `tpub`, so a mainnet deployment should
-  generate the escape wallet on its own hardware and hand-write the bundle (which
-  is the recommended path regardless — see step 2). When you hand-write it, the
-  escape descriptor's xpub MUST NOT be the account key you also use as the user
-  key (or any node/recovery/coordinator key): non-hardened BIP32 derivation over a
-  public chain code means whoever holds that key's private half can derive every
-  escape address, silently turning duress into theft (ADR-0012 §10). `assemble`
-  now refuses this — it compares the escape wallet's derived children AND its
+* **A hand-written escape bundle must carry the flavour its network seals.**
+  `keygen --role escape --network` emits the right one (`xpub` for `bitcoin`, `tpub` for
+  signet and regtest) and all three boundaries refuse a mismatch, but a hardware-wallet
+  deployment exports the wallet from the device instead — which is the recommended path
+  regardless (see step 2). The prefix is a serialization hint, not a derivation input:
+  the same seed derives the same keys and the same scripts either way. When you
+  hand-write the bundle, the escape descriptor's extended key MUST NOT be the account key you
+  also use as the user key (or any node/recovery/coordinator key): non-hardened BIP32
+  derivation over a public chain code means whoever holds that key's private half can
+  derive every escape address, silently turning duress into theft (ADR-0012 §10).
+  `assemble` now refuses this — it compares the escape wallet's derived children AND its
   ancestor xpubs against every vault key and the coordinator key — but the
   independent generation is what makes the refusal never fire.
 * **The coordinator auth secret is written to disk** by `assemble`, at mode 0600.

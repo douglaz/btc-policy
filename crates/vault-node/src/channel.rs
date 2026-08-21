@@ -6352,6 +6352,17 @@ pub(crate) mod fixture {
             self.reseal();
         }
 
+        /// Re-seal the federation to a different pair of destination wallets. Both are
+        /// manifest preimage fields, so this is a NEW manifest with new endorsements —
+        /// the only way an artifact set can carry these strings and stay hash-consistent.
+        /// The derived `hot_spk`/`escape_spk` are deliberately NOT recomputed (a ranged
+        /// wallet has no single script), so do not use this where a spend is built.
+        pub(crate) fn reseal_wallets(&mut self, hot_desc: String, escape_desc: String) {
+            self.hot_desc = hot_desc;
+            self.escape_desc = escape_desc;
+            self.reseal();
+        }
+
         /// Recompute `manifest_hash` and every channel-key endorsement from the
         /// fixture's CURRENT sealed fields — what the setup ceremony would do.
         fn reseal(&mut self) {
@@ -7354,7 +7365,11 @@ mod identity {
     //! Channel identity + manifest/startup invariants (§1/§2).
     use super::fixture::{keypair, Fixture};
     use super::*;
+    use bitcoin::bip32::{Xpriv, Xpub};
     use bitcoin::secp256k1::{Message, Secp256k1};
+    use bitcoin::NetworkKind;
+    use miniscript::{Descriptor, DescriptorPublicKey};
+    use std::str::FromStr;
 
     #[test]
     fn channel_key_is_a_pure_function_and_differs_from_the_signing_key() {
@@ -7601,6 +7616,57 @@ mod identity {
                 && err.contains("network"),
             "the refusal must be the sealed-anchor mismatch and must name network: {err}"
         );
+    }
+
+    /// A ranged `wpkh(<xpub>/*)` wallet of a chosen extended-key flavour — the shape
+    /// `setup keygen --role escape` publishes, canonicalized as a config carries it.
+    fn ranged_wallet(kind: NetworkKind, seed: u8) -> String {
+        let xpriv = Xpriv::new_master(kind, &[seed; 32]).expect("master");
+        let text = format!("wpkh({}/*)", Xpub::from_priv(&Secp256k1::new(), &xpriv));
+        Descriptor::<DescriptorPublicKey>::from_str(&text)
+            .expect("wallet")
+            .to_string()
+    }
+
+    /// The node's own enforcement of the descriptor/network relation (bead
+    /// btc-policy-descriptor-network-kind-x00), on the artifact that motivates it: a
+    /// FULLY hash-consistent revision-2 set — sealed network `bitcoin`, `tpub` wallets,
+    /// `manifest_hash` and every endorsement recomputed over exactly those bytes — the
+    /// set an A-era ceremony produced. Every other startup check passes it, so it must
+    /// be refused at LOAD, before the channel manifest hash and long before any RPC.
+    #[test]
+    fn a_hash_consistent_artifact_whose_key_flavour_left_the_sealed_network_is_refused() {
+        let a_era = |network, hot, escape, anchor: &str| {
+            let mut fx = Fixture::new(2, 3);
+            fx.reseal_network(network);
+            fx.reseal_wallets(ranged_wallet(hot, 0xA1), ranged_wallet(escape, 0xB1));
+            fx.config(0, 0, anchor)
+        };
+        let refusal = |cfg: &str| {
+            crate::test_support::load_node(cfg)
+                .err()
+                .expect("a mismatched key flavour must not boot")
+                .to_string()
+        };
+        use bitcoin::Network::{Bitcoin, Regtest, Signet};
+        use NetworkKind::{Main, Test};
+        // The mainnet vault carrying the tpub wallets `keygen` used to emit.
+        let err = refusal(&a_era(Bitcoin, Test, Test, ""));
+        for needle in ["escape descriptor", "test-kind (tpub)", "bitcoin"] {
+            assert!(err.contains(needle), "no {needle:?} in the refusal: {err}");
+        }
+        // Escape right, hot wrong, beside a DEAD channel anchor: only the allowlist loop
+        // can refuse this pair, and only if the relation is checked BEFORE the manifest
+        // hash — a config this broken must never get as far as ChannelState::build.
+        let dead = format!("expected_manifest_hash = \"{}\"\n", to_hex(&[0u8; 32]));
+        let hot = refusal(&a_era(Bitcoin, Test, Main, &dead));
+        assert!(hot.contains("hot allowlist"), "wrong refusal: {hot}");
+        // Every consistent pair loads, so the refusals above are the relation talking and
+        // not ranged wallets being rejected for some other reason.
+        for (network, kind) in [(Bitcoin, Main), (Signet, Test), (Regtest, Test)] {
+            crate::test_support::load_node(&a_era(network, kind, kind, ""))
+                .unwrap_or_else(|e| panic!("{network} with its own key flavour must load: {e}"));
+        }
     }
 
     #[test]

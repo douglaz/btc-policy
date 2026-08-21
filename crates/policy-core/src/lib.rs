@@ -21,10 +21,13 @@
 //! enforcement and the Hold live in vault-node; the chain backend (real prevout
 //! ground truth) is V0-6 — v0 still trusts each input's `witness_utxo` for the
 //! prevout script.
+//!
+//! One non-PSBT invariant lives here too, over the same descriptors:
+//! [`check_descriptor_network_kind`] — extended-key flavour versus the sealed network.
 
 use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{Amount, Psbt, Script};
-use miniscript::{Descriptor, DescriptorPublicKey};
+use bitcoin::{Amount, Network, NetworkKind, Psbt, Script};
+use miniscript::{Descriptor, DescriptorPublicKey, ForEachKey};
 
 pub mod template;
 
@@ -179,6 +182,65 @@ pub fn derives_within(
         }
     }
     false
+}
+
+/// How a refusal names a flavour: the `NetworkKind` plus the prefix on the key.
+fn kind_name(kind: NetworkKind) -> &'static str {
+    match kind {
+        NetworkKind::Main => "main-kind (xpub)",
+        NetworkKind::Test => "test-kind (tpub)",
+    }
+}
+
+/// Bind a destination descriptor's extended-key FLAVOUR to the vault's sealed
+/// network (bead btc-policy-descriptor-network-kind-x00). `Ok(())` means every
+/// extended key in `descriptor` carries the kind `network` implies; `Err` names
+/// `role`, the expected network and kind, and the kind found — never key material.
+///
+/// The relation is deliberately TWO-VALUED, because that is all an extended key
+/// encodes: [`NetworkKind::Main`] for [`Network::Bitcoin`], [`NetworkKind::Test`]
+/// for Signet and Regtest alike. Signet-vs-regtest identity is the backend's
+/// chain/challenge invariant; no key prefix could carry it.
+///
+/// Every `XPub` and `MultiXPub` is visited (a BIP389 `<0;1>` key is ONE `MultiXPub`, not
+/// two `XPub`s), the FIRST offender is reported, and `Single` keys are network-neutral.
+///
+/// It exists because hash consistency cannot express it: an identical `manifest_hash`
+/// proves every node received the SAME network and descriptor strings, never that the
+/// two agree. Flavour is a serialization prefix rather than a derivation input, but the
+/// manifest is immutable, so a mismatch must be refused while re-ceremony is cheap.
+pub fn check_descriptor_network_kind(
+    role: &str,
+    descriptor: &Descriptor<DescriptorPublicKey>,
+    network: Network,
+) -> Result<(), String> {
+    let expected = NetworkKind::from(network);
+    // Record the FIRST mismatch: short-circuiting is not part of the visitor's contract.
+    let mut offender = None;
+    descriptor.for_each_key(|key| {
+        let kind = match key {
+            DescriptorPublicKey::XPub(xkey) => xkey.xkey.network,
+            DescriptorPublicKey::MultiXPub(xkey) => xkey.xkey.network,
+            DescriptorPublicKey::Single(_) => return true,
+        };
+        if kind != expected && offender.is_none() {
+            offender = Some(kind);
+        }
+        true
+    });
+    match offender {
+        None => Ok(()),
+        Some(kind) => Err(format!(
+            "{role} descriptor carries a {} extended key, but this vault seals network \
+             {network}, whose descriptors must be {}. The prefix is a serialization hint, not \
+             a derivation input, so this is not a wrong-key error — but the sealed artifact \
+             set cannot be re-flavoured and some mainnet wallet software refuses to import a \
+             tpub. Re-run the ceremony with the {role} wallet regenerated for {network} — for \
+             the escape role that is `btc-vault setup keygen --role escape --network {network}`.",
+            kind_name(kind),
+            kind_name(expected),
+        )),
+    }
 }
 
 /// Run the policy checks against a PSBT. `Ok(())` means every check passed; the
@@ -1130,5 +1192,111 @@ mod tests {
         let psbt = psbt_with(100_000, vec![(stranger, 90_000, false)]);
         let violation = classify(&psbt, &class_params()).expect_err("no class");
         assert_eq!(violation.code, ViolationCode::PsbtInconsistent);
+    }
+
+    // -- descriptor flavour vs the sealed network (bead x00) -----------------
+
+    /// An xpub of the given flavour — `xpub(seed)` above is unconditionally Test,
+    /// and the flavour is the axis this relation turns on.
+    fn xkey(kind: NetworkKind, seed: u8) -> Xpub {
+        let secp = Secp256k1::new();
+        let xpriv = Xpriv::new_master(kind, &[seed; 32]).expect("master key");
+        Xpub::from_priv(&secp, &xpriv)
+    }
+
+    fn desc(text: String) -> Descriptor<DescriptorPublicKey> {
+        Descriptor::from_str(&text).expect("valid descriptor")
+    }
+
+    /// A 2-of-3 `multi(...)` of ranged xpubs, one flavour per position.
+    fn multi(kinds: [NetworkKind; 3]) -> Descriptor<DescriptorPublicKey> {
+        let key = |i: usize| format!("{}/*", xkey(kinds[i], 0x51 + i as u8));
+        desc(format!("wsh(multi(2,{},{},{}))", key(0), key(1), key(2)))
+    }
+
+    /// The full cross-product: each of the three supported networks against each key
+    /// flavour, in the two shapes an allowlist wallet can take (single-path `/*` and
+    /// BIP389 multipath `<0;1>/*`, which is ONE `MultiXPub`, not two `XPub`s). Two
+    /// networks share `NetworkKind::Test` deliberately — signet and regtest are
+    /// indistinguishable to an extended key, so the relation must accept a tpub on
+    /// both and never try to tell them apart.
+    #[test]
+    fn every_network_accepts_exactly_its_own_extended_key_flavour() {
+        for (network, expected) in [
+            (Network::Bitcoin, NetworkKind::Main),
+            (Network::Signet, NetworkKind::Test),
+            (Network::Regtest, NetworkKind::Test),
+        ] {
+            for kind in [NetworkKind::Main, NetworkKind::Test] {
+                for shape in ["{}/*", "{}/<0;1>/*"] {
+                    let wallet = desc(format!(
+                        "wpkh({})",
+                        shape.replace("{}", &xkey(kind, 0x40).to_string())
+                    ));
+                    let verdict = check_descriptor_network_kind("hot allowlist", &wallet, network);
+                    assert_eq!(
+                        verdict.is_ok(),
+                        kind == expected,
+                        "{network} must accept exactly {expected:?} keys, got {verdict:?} for \
+                         a {kind:?} key in shape {shape}"
+                    );
+                    if let Err(refusal) = verdict {
+                        // The refusal names the role, the sealed network and BOTH
+                        // kinds — never a key, which is the operator's to keep.
+                        let net = network.to_string();
+                        for needle in ["hot allowlist", &net, kind_name(kind), kind_name(expected)]
+                        {
+                            assert!(refusal.contains(needle), "no {needle:?} in: {refusal}");
+                        }
+                        assert!(
+                            !refusal.contains(&xkey(kind, 0x40).to_string()),
+                            "the refusal must not print key material: {refusal}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A descriptor whose keys are not uniform: matching keys around ONE offender, in
+    /// the middle, so checking only the first or only the last key would pass it. The
+    /// all-matching mirror is what proves the refusal is the offender talking and not
+    /// the `multi(...)` shape.
+    #[test]
+    fn one_offending_key_among_matching_ones_is_still_refused_and_named() {
+        use NetworkKind::{Main, Test};
+        let refusal =
+            check_descriptor_network_kind("escape", &multi([Test, Main, Test]), Network::Regtest)
+                .expect_err("one main-kind key among test-kind ones must refuse");
+        assert!(
+            refusal.contains("escape") && refusal.contains(kind_name(Main)),
+            "the refusal must name the OFFENDER's kind, not the majority's: {refusal}"
+        );
+        check_descriptor_network_kind("escape", &multi([Test; 3]), Network::Regtest)
+            .expect("a uniformly test-kind descriptor seals on regtest");
+    }
+
+    /// A definite compressed pubkey carries no network byte, so it is neutral on every
+    /// network — refusing one would refuse hot and Escape destinations the node accepts
+    /// today (`vault-node/tests/sign.rs` allowlists `wpkh(<pubkey>)`). Beside an xpub it
+    /// must not short-circuit the check either.
+    #[test]
+    fn descriptors_of_definite_keys_are_network_neutral() {
+        let secp = Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0x61; 32]).expect("sk");
+        let definite = PublicKey::from_secret_key(&secp, &sk);
+        let single = desc(format!("wpkh({definite})"));
+        let beside = desc(format!(
+            "wsh(multi(2,{definite},{}/*))",
+            xkey(NetworkKind::Main, 0x62)
+        ));
+        for network in [Network::Bitcoin, Network::Signet, Network::Regtest] {
+            check_descriptor_network_kind("hot allowlist", &single, network)
+                .unwrap_or_else(|e| panic!("a definite key is neutral on {network}: {e}"));
+        }
+        check_descriptor_network_kind("escape", &beside, Network::Bitcoin)
+            .expect("a definite key beside a main-kind xpub seals on bitcoin");
+        check_descriptor_network_kind("escape", &beside, Network::Regtest)
+            .expect_err("the xpub beside it is still checked");
     }
 }
