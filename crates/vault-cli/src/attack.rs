@@ -460,15 +460,20 @@ impl Vault {
         let temp = TempDir::new("attack")?;
         let mut urandom = std::fs::File::open("/dev/urandom")?;
 
+        // Every scenario drives a private regtest chain, so that is the network the
+        // ceremony seals, the flavour these wallets are born at, and the one every
+        // ceremony-backed vault address in this harness renders against.
+        let network = Network::Regtest;
+
         let user = Actor::random(&secp, &mut urandom)?;
         let coordinator = Coordinator::random(&secp, &mut urandom)?;
-        let hot_wallet = Wallet::random(&secp, &mut urandom)?;
+        let hot_wallet = Wallet::random(&secp, &mut urandom, network.into())?;
         // Escape-key independence is a HARD assumption (ADR-0012 threat model): a
         // shared-seed escape turns duress into theft outright. This wallet is born
         // from its own seed, so the harness attacks the mechanism rather than a
         // deployment that already lost — and the ceremony below refuses to seal the
         // vault at all if it can detect an overlap.
-        let escape_wallet = Wallet::random(&secp, &mut urandom)?;
+        let escape_wallet = Wallet::random(&secp, &mut urandom, network.into())?;
         let hot_spk = hot_wallet.address_spk(&secp, HOT_INDEX)?;
         let escape_spk = escape_wallet.address_spk(&secp, 0)?;
         let attacker_spk = p2wpkh_spk(&Actor::random(&secp, &mut urandom)?);
@@ -497,6 +502,7 @@ impl Vault {
             duress_pin: DURESS_PIN.to_string(),
             pin_m_cost_kib: setup.pin_m_cost_kib,
             escape_feerate_floor: setup.escape_feerate_floor,
+            network,
         };
 
         // Round one of the REAL ceremony: every node births its own key in its own
@@ -542,7 +548,7 @@ impl Vault {
         let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str)?;
         let vault_spk = descriptor.script_pubkey();
         let witness_script = descriptor.explicit_script()?;
-        let vault_address = descriptor.address(Network::Regtest)?;
+        let vault_address = descriptor.address(params.network)?;
         let node_pubkeys = manifest.signing_pubkeys();
         let channel_pubkeys = manifest.channel_pubkeys();
 
@@ -664,7 +670,7 @@ impl Vault {
     /// splitting the funded one, so the coin under attack keeps its exact value and
     /// the escape's coverage arithmetic stays simple.
     fn fund_extra(&self, amount: Amount) -> Result<Utxo, Error> {
-        let address = self.descriptor.address(Network::Regtest)?;
+        let address = self.descriptor.address(self.params.network)?;
         let txid = self.bitcoind.call_str(
             "sendtoaddress",
             json!([address.to_string(), amount.to_btc()]),
@@ -1269,6 +1275,10 @@ impl Vault {
         const CONTROL: Amount = Amount::from_sat(100_000);
         let mut urandom = std::fs::File::open("/dev/urandom")?;
         let control_spk = p2wpkh_spk(&Actor::random(&self.secp, &mut urandom)?);
+        // EXPLICIT Regtest, deliberately NOT `self.params.network`: this address is a
+        // throwaway detector CONTROL paid on the harness's own private regtest chain.
+        // It consumes no ceremony or sealed artifact, so binding it to the vault's
+        // sealed network would claim a relation it does not have.
         let address = bitcoin::Address::from_script(&control_spk, Network::Regtest)?;
         self.bitcoind.call_str(
             "sendtoaddress",
@@ -4691,7 +4701,7 @@ fn toxic_parent() -> Result<String, Error> {
     // An external party deposits into the vault and the deposit stays unconfirmed.
     // Its parent is bitcoind's wallet transaction — nothing the federation
     // authorized — so it is exactly the input an escape must not chain onto.
-    let vault_address = vault.descriptor.address(Network::Regtest)?;
+    let vault_address = vault.descriptor.address(vault.params.network)?;
     let deposit_txid = vault.bitcoind.call_str(
         "sendtoaddress",
         // Explicitly opt this external parent into replacement so the harness can

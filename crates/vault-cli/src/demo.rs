@@ -180,6 +180,9 @@ fn node_params(hold_secs: u64, combine_slack_secs: u64) -> NodeParams {
         // minimum and stay fast.
         pin_m_cost_kib: 8,
         escape_feerate_floor: 1,
+        // Both demos drive a private regtest chain, so that is what the ceremony
+        // seals and what every address below renders against.
+        network: Network::Regtest,
     }
 }
 
@@ -254,8 +257,8 @@ impl Federation {
         // shared-seed escape turns the claw-back into theft outright. This wallet is
         // born from its own seed, and the ceremony below REFUSES to seal the vault if
         // it can detect any overlap with the user, node, or recovery keys.
-        let hot_wallet = Wallet::random(&secp, &mut urandom)?;
-        let escape_wallet = Wallet::random(&secp, &mut urandom)?;
+        let hot_wallet = Wallet::random(&secp, &mut urandom, params.network.into())?;
+        let escape_wallet = Wallet::random(&secp, &mut urandom, params.network.into())?;
         let hot_spk = hot_wallet.address_spk(&secp, HOT_INDEX)?;
         let escape_spk = escape_wallet.address_spk(&secp, 0)?;
         let attacker_spk = p2wpkh_spk(&Actor::random(&secp, &mut urandom)?);
@@ -320,7 +323,7 @@ impl Federation {
         let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str)?;
         let vault_spk = descriptor.script_pubkey();
         let witness_script = descriptor.explicit_script()?;
-        let vault_address = descriptor.address(Network::Regtest)?;
+        let vault_address = descriptor.address(params.network)?;
         println!(
             "      no machine holds two node secrets: each key was born in its own \
              `setup node-keygen`"
@@ -428,7 +431,7 @@ impl Federation {
 
     /// Fund the vault with one more confirmed coin.
     fn fund(&self, amount: Amount) -> Result<Utxo, Error> {
-        let address = self.descriptor.address(Network::Regtest)?;
+        let address = self.descriptor.address(self.params.network)?;
         let txid = self.bitcoind.call_str(
             "sendtoaddress",
             json!([address.to_string(), amount.to_btc()]),

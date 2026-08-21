@@ -85,6 +85,9 @@ max_derivation_index          u32
 escape_feerate_floor          u64        <- fire-time selector input
 escape_coverage_pct           u8         <- fire-time selector input
 escape_bump_max_fee_pct       u8         <- sealed ladder ceiling (ADR-0016 §3a)
+network                       u8         <- sealed vault network: 1=bitcoin,
+                                            2=DEFAULT PUBLIC signet, 3=regtest.
+                                            EXPLICIT codes, never an enum ordinal.
 nodes                         u32 count, then per node:
                                 node_id          u16
                                 signing_pubkey   fixed 33
@@ -92,26 +95,28 @@ nodes                         u32 count, then per node:
                                 endpoints        u32 count, then each as var (UTF-8)
 ```
 
-**Vector** — `wallet_id = 0x22*32`, `protocol_version = 1`, coordinator pubkey `03 8a3b…`,
+**Vector** — `wallet_id = 0x22*32`, `protocol_version = 2`, coordinator pubkey `03 8a3b…`,
 `max_msg_bytes = 1048576`, hot budget `(0x11111111, 0x22222222, 0x33333333)`, allowlist
 `["wpkh(hot)"]`, escape `"wpkh(escape)"`, `max_derivation_index = 5`,
 `escape_feerate_floor = 1`, `escape_coverage_pct = 95 (0x5f)`,
-`escape_bump_max_fee_pct = 0 (0x00)`, two nodes on `127.0.0.1:9000` / `127.0.0.1:9001`:
+`escape_bump_max_fee_pct = 0 (0x00)`, `network = bitcoin (0x01)`,
+two nodes on `127.0.0.1:9000` / `127.0.0.1:9001`:
 
 ```
 preimage:
-222222222222222222222222222222222222222222222222222222222222222201000000
+222222222222222222222222222222222222222222222222222222222222222202000000
 038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c236
 0000100000000000
 1111111100000000
 2222222200000000
 3333333300000000
 01000000 09000000 77706b6828686f7429
-0c000000 77706b68286573636170652
-905000000
+0c000000 77706b6828657363617065 29
+05000000
 0100000000000000
 5f
 00
+01
 02000000
 0000 031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f
      024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766
@@ -120,19 +125,35 @@ preimage:
      03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b
      01000000 0e000000 3132372e302e302e313a39303031
 
-digest: e1eacefbc4501240e2c01e61e9ca916b9245b2732a32690893ca0f17eb1aeb3b
+digest: 2780e91c2505d6d397809d6e31bcf5338a79e46f82a8ec46d4577d3d0c5ac27d
 ```
+
+The same membership at `network = signet (0x02)` digests to
+`e0d59168e0eec3c41ca3834f6fe109d4dbeadf9019018bcc6cc266b1162369ae` and at
+`network = regtest (0x03)` to
+`658e60a29ed973b968c793928cab6647f4df525403c1c2323a6961e79d54b04d`. Two more values than
+a single vector needs, deliberately: one vector cannot distinguish an encoder that writes
+the sealed network from one that writes a constant. All three are asserted over exactly this
+membership by `manifest_vector_is_frozen`, which also pins byte 148 to a literal `1`/`2`/`3`.
 
 (The preimage is one contiguous byte string; it is broken across lines above only to show the
 field boundaries. The canonical single-line form is `FROZEN_MANIFEST_PREIMAGE_HEX`.)
 
-Note `0100000000000000` (floor = 1), `5f` (coverage = 95) and `00`
-(`escape_bump_max_fee_pct` = 0) sitting between `max_derivation_index` and the node count. The
-first two are hash-bound precisely so a node provisioned with a different fire-time selector
-cannot boot into this federation. The third is hash-bound for the reason ADR-0016 §3a gives:
-"sealed" means in the PREIMAGE, and a ceiling present only in `manifest.json` would be a value
-the ceremony writes and no node is bound to. Nodes never enforce it (§4a) — they only prove it
-uniform. Appending that one byte is why `protocol_version` is `1` here and was `0` before.
+Note `0100000000000000` (floor = 1), `5f` (coverage = 95), `00`
+(`escape_bump_max_fee_pct` = 0) and `01` (network = bitcoin) sitting between
+`max_derivation_index` and the node count. The first two are hash-bound precisely so a node
+provisioned with a different fire-time selector cannot boot into this federation. The third is
+hash-bound for the reason ADR-0016 §3a gives: "sealed" means in the PREIMAGE, and a ceiling
+present only in `manifest.json` would be a value the ceremony writes and no node is bound to.
+Nodes never enforce it (§4a) — they only prove it uniform. Appending that one byte is why
+`protocol_version` was `1`, and `0` before that.
+
+The fourth byte is the sealed **vault network**. Its codes are written out by hand
+(`1`/`2`/`3`) and are NOT `Network as u8`: rust-bitcoin inserted `Testnet4` between `Testnet`
+and `Signet`, so an ordinal-derived preimage would have silently renumbered signet and regtest
+— changing the manifest hash of every already-sealed vault on a dependency bump. Appending it
+is why `protocol_version` is `2` here. Only `1`, `2` and `3` exist; testnet3, testnet4 and
+custom signets have no code, and adding one is a future manifest revision.
 
 ## Vector 3 — Channel endorsement
 
@@ -148,14 +169,14 @@ preimage:
 3333333333333333333333333333333333333333333333333333333333333333
 0100
 03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b
-01000000
+02000000
 01000000 0e000000 3132372e302e302e313a39303031
 
-digest: be2aa05e39b0c5858c00f288bc1ca4d7aae22c674c1df19826aac3d12944d18f
+digest: 012e04708f89931bc9e681869345a4c35c636ea4369f64e8d5d767b2df6b1c02
 ```
 
-`protocol_version` is inside these bytes, so an endorsement collected at revision 0 does not
-verify at revision 1 — the signature binds the schema revision, not just the membership.
+`protocol_version` is inside these bytes, so an endorsement collected at revision 1 does not
+verify at revision 2 — the signature binds the schema revision, not just the membership.
 
 ## Vector 4 — Channel envelope
 
@@ -167,13 +188,13 @@ detectable.
 fields : msg_type(var) ‖ protocol_version(u32) ‖ wallet_id(32) ‖ manifest_hash(32)
          ‖ from_node(u16) ‖ to_node(u16) ‖ payload(var) ‖ nonce(16) ‖ timestamp(u64)
 
-inputs : msg_type="partial", protocol_version=1, wallet_id=0x22*32,
+inputs : msg_type="partial", protocol_version=2, wallet_id=0x22*32,
          manifest_hash=0x33*32, from=1, to=2, payload=b"cGFydGlhbA==",
          nonce=0x44*16, timestamp=1752000000
 
 preimage:
 07000000 7061727469616c
-01000000
+02000000
 2222222222222222222222222222222222222222222222222222222222222222
 3333333333333333333333333333333333333333333333333333333333333333
 0100 0200
@@ -181,7 +202,7 @@ preimage:
 10000000 44444444444444444444444444444444
 00666d6800000000
 
-digest: ef653cb88931e6240d923505944beafe9b9a7057d3c32cfe3fd17a78cd065237
+digest: 0126519fe495be0af38c44bd22e56bf1e4891d46c459c0bf8b004300c81faf0e
 ```
 
 ## Vector 5 — User sig hash and Vector 6 — Coordinator request
@@ -209,13 +230,22 @@ alone. If it cannot, one of the two is wrong — and the vectors, not the prose,
 
 ## Caveats
 
-- These vectors pin **manifest schema revision 1** — the value `protocol_version` carries, and
+- These vectors pin **manifest schema revision 2** — the value `protocol_version` carries, and
   NOT the routable/authenticated transport v1, which is separate work. The domain tags stay
   `/v0`: they separate domains, not revisions, and retagging them would invalidate every digest
   for no gain. `protocol_version` is inside the manifest preimage, so a revision bump is a new
   manifest and therefore a new vault (see `docs/UPGRADE-AND-ROTATION-POLICY.md`). Revision 0's
-  vectors are not reproduced here; sealed hosts take no upgrade-in-place (ADR-0005), so a
-  revision-0 vault keeps computing revision-0 bytes with the binary it was sealed with.
+  and 1's vectors are not reproduced here; sealed hosts take no upgrade-in-place (ADR-0005), so
+  an older vault keeps computing its own revision's bytes with the binary it was sealed with.
+- **What the network byte does and does not do.** It makes the vault's chain federation-uniform:
+  a node configured for another chain computes a different `manifest_hash` and fails startup.
+  That is ALL it does here. It does not change BIP32 derivation or any scriptPubKey; it does not
+  prove the backend a node dials is on that chain (a separate startup check compares Core's own
+  `chain` and, for signet, its `signet_challenge`); it does not distinguish two regtest
+  instances, nor a fork that still reports `chain:"main"`; and at this revision it does not bind
+  the hot/Escape extended-key FLAVOUR to the sealed network — a hash-consistent `bitcoin` vault
+  carrying `tpub` descriptors is still accepted, which is why this revision is not deployable to
+  mainnet until `btc-policy-descriptor-network-kind-x00` lands.
 - The vectors cover hash **preimages and digests**, not signature encodings. Signatures are
   DER-encoded ECDSA over secp256k1 with the usual Bitcoin conventions.
 - Vectors 5 and 6 are referenced rather than reproduced here; a reviewer wanting full

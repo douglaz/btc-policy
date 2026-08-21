@@ -48,6 +48,107 @@ fn a_reorg_below_the_wallet_anchor_is_repaired_by_re_import_on_regtest() {
     run_reorg_repair().expect("descriptor-wallet reorg repair integration");
 }
 
+// --- the independent address / chain-identity oracle (bead
+//     btc-policy-sealed-network-v2-mn6 A6) ----------------------------------------
+
+/// One fixed vault-shaped descriptor, with fixed keys, so both the Rust renderer and
+/// C++ Bitcoin Core are answering the SAME question.
+const ORACLE_DESCRIPTOR: &str =
+    "wsh(multi(2,02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337,\
+     03462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b))";
+
+/// The addresses [`ORACLE_DESCRIPTOR`] encodes to, per network. CHECKED-IN constants:
+/// Core is compared against a value fixed in this repository, never against its own
+/// output. Replacing either side's expectation with the other side's runtime answer
+/// makes both tests tautological — they would then pass against ANY renderer — so the
+/// constants, not the comparison, are what carry the evidence.
+const ORACLE_ADDRESSES: [(&str, &str, &str); 3] = [
+    (
+        "main",
+        "bitcoin",
+        "bc1q7602zh8uwgnwpfaw4dvn20z5xd2ywer6gnp5l7h4w2tsnnqsu39s07pr84",
+    ),
+    (
+        "signet",
+        "signet",
+        "tb1q7602zh8uwgnwpfaw4dvn20z5xd2ywer6gnp5l7h4w2tsnnqsu39sckhva6",
+    ),
+    (
+        "regtest",
+        "regtest",
+        "bcrt1q7602zh8uwgnwpfaw4dvn20z5xd2ywer6gnp5l7h4w2tsnnqsu39s40a2gq",
+    ),
+];
+
+/// The DEFAULT test: the production renderer reproduces the frozen constants on all
+/// three networks. Runs everywhere, needs no bitcoind, and is what the ignored Core
+/// leg below is an independent second opinion ABOUT.
+#[test]
+fn the_production_renderer_reproduces_the_frozen_vault_addresses() {
+    use bitcoin::{Network, PublicKey};
+    use miniscript::Descriptor;
+    let descriptor =
+        Descriptor::<PublicKey>::from_str(ORACLE_DESCRIPTOR).expect("the oracle descriptor");
+    for (chain, vault_network, expected) in ORACLE_ADDRESSES {
+        let network = vault_node::parse_vault_network(vault_network).expect("supported");
+        assert_eq!(
+            network,
+            Network::from_core_arg(chain).expect("Core's own spelling"),
+            "each row's Core `-chain=` and vault spellings name the same network"
+        );
+        assert_eq!(
+            descriptor.address(network).expect("address").to_string(),
+            expected,
+            "{vault_network}: the renderer must reproduce the frozen address"
+        );
+    }
+}
+
+/// The INDEPENDENT leg: C++ Bitcoin Core, started offline and unsynced on each of the
+/// three supported networks, derives the same addresses from the same descriptor —
+/// and the default-signet daemon reports the exact `signet_challenge` this build pins.
+///
+/// It proves descriptor → scriptPubKey → address ENCODING agrees with an
+/// implementation sharing no code with rust-bitcoin/miniscript, and that
+/// `PUBLIC_SIGNET_CHALLENGE` is what Core's own default signet parameters say. It does
+/// NOT prove any real-chain behaviour, that these are the operator's intended
+/// addresses, or that any particular wallet accepts them.
+#[test]
+#[ignore = "spawns three offline bitcoind instances; run with --ignored"]
+fn bitcoin_core_independently_derives_the_frozen_vault_addresses() {
+    let temp = TempDir::new("oracle").expect("temp dir");
+    for (chain, vault_network, expected) in ORACLE_ADDRESSES {
+        let node = Bitcoind::start_on(chain, temp.path.join(chain), free_port().expect("port"))
+            .unwrap_or_else(|e| panic!("start an offline {chain} bitcoind: {e}"));
+        let info = node
+            .call("getdescriptorinfo", json!([ORACLE_DESCRIPTOR]))
+            .expect("getdescriptorinfo");
+        let checksummed = info["descriptor"].as_str().expect("canonical descriptor");
+        let derived = node
+            .call("deriveaddresses", json!([checksummed]))
+            .expect("deriveaddresses");
+        assert_eq!(
+            derived[0].as_str().expect("one address"),
+            expected,
+            "{chain}: Core must derive the frozen {vault_network} address"
+        );
+        let chain_info = node
+            .call("getblockchaininfo", json!([]))
+            .expect("getblockchaininfo");
+        assert_eq!(chain_info["chain"], chain, "the daemon is on {chain}");
+        let challenge = chain_info["signet_challenge"].as_str();
+        if chain == "signet" {
+            assert_eq!(
+                challenge,
+                Some(vault_node::chain::PUBLIC_SIGNET_CHALLENGE),
+                "the DEFAULT signet daemon's own challenge is what sealed code 2 means"
+            );
+        } else {
+            assert_eq!(challenge, None, "{chain} has no signet challenge");
+        }
+    }
+}
+
 /// The bead's central claim, against LIVE Core rather than a scripted transport
 /// (bead btc-policy-hn8): for one chain+mempool state that includes a confirmed
 /// unspent vault output, a confirmed vault output a mempool transaction has spent,
@@ -769,17 +870,27 @@ struct Bitcoind {
 
 impl Bitcoind {
     fn start(datadir: PathBuf, rpc_port: u16) -> Result<Bitcoind, Error> {
+        Bitcoind::start_on("regtest", datadir, rpc_port)
+    }
+
+    /// `chain` is Core's OWN `-chain=` spelling (`main`, `signet`, `regtest`), not a
+    /// vault-network name. Every instance is isolated and OFFLINE — its own datadir,
+    /// its own RPC port, `-connect=0` and `-listen=0` — because the address oracle
+    /// below needs Core's chain PARAMETERS, never its chain data: `getdescriptorinfo`
+    /// and `deriveaddresses` are pure functions of the descriptor and those params, so
+    /// they answer correctly on a mainnet node with zero blocks and no peers.
+    fn start_on(chain: &str, datadir: PathBuf, rpc_port: u16) -> Result<Bitcoind, Error> {
         std::fs::create_dir_all(&datadir)?;
         let child = Command::new("bitcoind")
-            .arg("-regtest")
+            .arg(format!("-chain={chain}"))
             .arg(format!("-datadir={}", datadir.display()))
             .arg(format!("-rpcport={rpc_port}"))
-            .args([
-                "-listen=0",
-                "-server=1",
-                "-txindex=1",
-                "-fallbackfee=0.0002",
-            ])
+            .args(["-connect=0", "-listen=0", "-server=1", "-txindex=1"])
+            .args(if chain == "regtest" {
+                &["-fallbackfee=0.0002"][..]
+            } else {
+                &[][..]
+            })
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -791,7 +902,12 @@ impl Bitcoind {
             auth: String::new(),
             endpoint: "/".into(),
         };
-        let cookie = node.datadir.join("regtest").join(".cookie");
+        // Core puts the cookie in the chain's subdirectory — except on mainnet, whose
+        // "subdirectory" is the datadir itself.
+        let cookie = node
+            .datadir
+            .join(if chain == "main" { "" } else { chain })
+            .join(".cookie");
         let started = Instant::now();
         while started.elapsed() < Duration::from_secs(60) {
             if let Ok(text) = std::fs::read_to_string(&cookie) {

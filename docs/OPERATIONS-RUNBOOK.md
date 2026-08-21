@@ -288,6 +288,18 @@ Read the startup error before changing anything.
   federation never agreed. Roll back whatever changed.
 - *Chain backend unreachable / missing `-txindex=1`* → fix the backend. The node fails closed on
   purpose.
+- *"bitcoind is on chain X, but this vault is sealed to Y"* → the WRONG CHAIN. Point the node at
+  a bitcoind for the sealed network. **Do not edit the config's `network`**: it is in the manifest
+  preimage, so changing it produces a hash mismatch rather than a working node — and if it
+  somehow matched, the node would scan, meter and broadcast against a chain that holds none of
+  the vault's coins.
+- *"bitcoind is on a CUSTOM signet"* or *"chain 'signet' but no signet_challenge"* → this vault
+  is sealed to the DEFAULT PUBLIC signet, and the backend is on a different one (or is too old
+  to report the challenge). Repoint it at the public signet. A custom signet is not supported at
+  this manifest revision; there is no config switch, and there should not be — a private signet
+  shares the chain name and nothing else.
+- *"unsupported vault network"* → the config names a chain this build does not seal. The only
+  values are `bitcoin`, `signet`, `regtest`.
 - *Wrong preimage* → the derived key does not match the published bundle; you have the wrong
   secret for that host.
 

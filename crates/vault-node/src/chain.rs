@@ -26,7 +26,7 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::{
-    consensus, Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Witness,
+    consensus, Amount, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Witness,
 };
 use serde_json::{json, Value};
 
@@ -280,6 +280,88 @@ pub const MAX_PACKAGE_ANCESTORS: usize = 24;
 /// would accept the ladder while being unable to relay its replacements, so the
 /// production startup check rejects it.
 pub const MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB: u64 = 1_000;
+
+/// The DEFAULT/GLOBAL PUBLIC signet's block challenge, exactly as `getblockchaininfo`
+/// reports it (lowercase hex, no `0x`). This constant, not the manifest, is what gives
+/// sealed network code 2 its meaning: `chain:"signet"` is a chain TYPE that every
+/// custom signet also reports, while the challenge is the script that must sign every
+/// block. It lives BESIDE the backend check rather than in the preimage on purpose — it
+/// defines what an already-sealed code means. Custom signet is unsupported and would
+/// need a NEW sealed identity and revision, not a configurable challenge. Pinned from a
+/// live offline default-signet Core response, whose provenance is owned by
+/// `bitcoin_core_independently_derives_the_frozen_vault_addresses` in
+/// `crates/vault-node/tests/bitcoind_backend.rs`.
+pub const PUBLIC_SIGNET_CHALLENGE: &str = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+
+/// Refuse unless the backend's own reported chain identity IS the sealed vault network.
+/// Consumes the `getblockchaininfo` the caller already fetched: no new RPC, no startup
+/// phase, no periodic recheck.
+///
+/// KNOWN RESIDUALS, stated rather than implied. Two independent regtest instances are
+/// indistinguishable here, and so is a fork that truthfully keeps reporting
+/// `chain:"main"` — this reads what Core SAYS, with no genesis or work comparison — and
+/// it runs once, so a backend swapped under a running node is not re-detected.
+fn verify_chain_identity(chain: &Value, sealed: Network) -> Result<(), Error> {
+    let sealed_name = crate::vault_network_name(sealed);
+    let reported = chain.get("chain").and_then(Value::as_str).ok_or_else(|| {
+        format!(
+            "bitcoind's getblockchaininfo reports no string `chain` field, so this node cannot \
+             confirm it is talking to a {sealed_name} backend; refusing to start rather than \
+             scan, meter and broadcast against an unidentified chain"
+        )
+    })?;
+    let observed = Network::from_core_arg(reported).map_err(|_| {
+        format!(
+            "bitcoind reports an unknown chain {reported:?}; this vault is sealed to \
+             {sealed_name} and this build supports only {}",
+            crate::SUPPORTED_VAULT_NETWORKS
+        )
+    })?;
+    if observed != sealed {
+        return Err(format!(
+            "bitcoind is on chain {reported:?}, but this vault is sealed to {sealed_name}: \
+             refusing to start. The vault UTXO view, confirmation state, escape coverage and \
+             every broadcast would all be computed against the wrong chain. Point this node at \
+             a {sealed_name} backend; a sealed host takes no config edit (ADR-0005)."
+        )
+        .into());
+    }
+    // Core OMITS `signet_challenge` on chains that have none (asserted against live
+    // main/regtest daemons by the Core oracle test). Treat a null or blank value as
+    // absent too, so a non-Core backend cannot pass by emitting an empty one.
+    let challenge = chain
+        .get("signet_challenge")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|challenge| !challenge.is_empty());
+    match (sealed, challenge) {
+        (Network::Signet, Some(challenge))
+            if challenge.eq_ignore_ascii_case(PUBLIC_SIGNET_CHALLENGE) =>
+        {
+            Ok(())
+        }
+        (Network::Signet, Some(challenge)) => Err(format!(
+            "bitcoind is on a CUSTOM signet: its signet_challenge is {challenge:?}, not the \
+             default PUBLIC signet challenge this vault's sealed network code means. Custom \
+             signets are unsupported — they share `chain:\"signet\"` with the public one while \
+             being an entirely different chain — so refusing to start."
+        )
+        .into()),
+        (Network::Signet, None) => Err(
+            "bitcoind reports chain \"signet\" but no signet_challenge, so this node cannot tell \
+             the default PUBLIC signet from a custom one. This vault is sealed to the public \
+             signet; refusing to start."
+                .into(),
+        ),
+        (_, Some(challenge)) => Err(format!(
+            "bitcoind reports chain {reported:?} yet also a signet_challenge ({challenge:?}): \
+             the response contradicts itself, so its chain identity cannot be trusted. Refusing \
+             to start."
+        )
+        .into()),
+        (_, None) => Ok(()),
+    }
+}
 
 /// Assemble the mempool-acceptance package for `tx` after validating every
 /// unconfirmed ancestor it chains off (ADR-0012, "build over the mempool UTXO
@@ -663,7 +745,10 @@ impl BitcoindBackend {
     /// without `-txindex=1`, and neither lookup is reliable against a stale IBD chain
     /// view. A higher `incrementalfee` would make a locally accepted ladder
     /// unreplaceable when it is needed.
-    pub fn verify_required_indexes(&self) -> Result<(), Error> {
+    pub fn verify_required_indexes(&self, sealed_network: Network) -> Result<(), Error> {
+        // The SEALED side must be supported too, and BEFORE any RPC: `Testnet` is
+        // otherwise ACCEPTED by a backend truthfully reporting `chain:"test"`.
+        crate::channel::network_code(sealed_network)?;
         // `getindexinfo`'s `synced` only means the txindex has caught up to THIS
         // node's current tip. During initial block download that tip still lags the
         // network, so the index can report `synced` over a stale chain view — the
@@ -673,6 +758,12 @@ impl BitcoindBackend {
         // is the authoritative "chain view is current" signal, so require it cleared
         // before this node consumes its key's one process generation.
         let chain = self.call("getblockchaininfo", json!([]))?;
+        // CHAIN IDENTITY FIRST, from the response this call already fetched (bead
+        // btc-policy-sealed-network-v2-mn6). "Caught up" on the WRONG chain is worse
+        // than "still catching up" on the right one: an IBD node refuses and waits,
+        // while a wrong-chain node reports a complete, current, entirely inapplicable
+        // UTXO view — no vault coins, no escape coverage, broadcasts to another chain.
+        verify_chain_identity(&chain, sealed_network)?;
         if chain.get("initialblockdownload").and_then(Value::as_bool) != Some(false) {
             return Err(
                 "bitcoind is still in initial block download: refusing to start until the chain \
@@ -2622,10 +2713,11 @@ pub(crate) mod mock {
 mod tests {
     use super::mock::MockBackend;
     use super::{
-        assemble_package, BitcoindBackend, ChainBackend, ColdScan, Prevout, VaultUnspentCache,
-        MAX_PACKAGE_ANCESTORS, MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB,
-        MAX_VAULT_SCAN_DELTA_BLOCKS,
+        assemble_package, BitcoindBackend, ChainBackend, ColdScan, Error, Prevout,
+        VaultUnspentCache, MAX_PACKAGE_ANCESTORS, MAX_SUPPORTED_INCREMENTAL_RELAY_SAT_KVB,
+        MAX_VAULT_SCAN_DELTA_BLOCKS, PUBLIC_SIGNET_CHALLENGE,
     };
+    use serde_json::json;
 
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
@@ -2633,7 +2725,8 @@ mod tests {
     use bitcoin::hex::DisplayHex;
     use bitcoin::transaction::Version;
     use bitcoin::{
-        Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        Amount, BlockHash, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+        Witness,
     };
     use std::collections::HashSet;
     use std::io::{Read, Write};
@@ -2943,7 +3036,7 @@ mod tests {
         let (addr, server) = scripted_rpc(vec![
             (
                 "getblockchaininfo",
-                serde_json::json!({ "initialblockdownload": false }),
+                serde_json::json!({ "chain": "regtest", "initialblockdownload": false }),
             ),
             (
                 "getindexinfo",
@@ -2959,7 +3052,7 @@ mod tests {
         let backend = BitcoindBackend::new(addr, String::new());
 
         backend
-            .verify_required_indexes()
+            .verify_required_indexes(Network::Regtest)
             .expect("a current, synced txindex satisfies the production backend contract");
         server.join().expect("scripted RPC completed");
     }
@@ -2969,7 +3062,7 @@ mod tests {
         let (addr, server) = scripted_rpc(vec![
             (
                 "getblockchaininfo",
-                serde_json::json!({ "initialblockdownload": false }),
+                serde_json::json!({ "chain": "regtest", "initialblockdownload": false }),
             ),
             (
                 "getindexinfo",
@@ -2984,7 +3077,7 @@ mod tests {
         ]);
         let backend = BitcoindBackend::new(addr, String::new());
         let error = backend
-            .verify_required_indexes()
+            .verify_required_indexes(Network::Regtest)
             .expect_err("a relay fee above the ladder's bound must fail startup")
             .to_string();
         assert!(
@@ -3007,13 +3100,13 @@ mod tests {
             let (addr, server) = scripted_rpc(vec![
                 (
                     "getblockchaininfo",
-                    serde_json::json!({ "initialblockdownload": false }),
+                    serde_json::json!({ "chain": "regtest", "initialblockdownload": false }),
                 ),
                 ("getindexinfo", result),
             ]);
             let backend = BitcoindBackend::new(addr, String::new());
             let error = backend
-                .verify_required_indexes()
+                .verify_required_indexes(Network::Regtest)
                 .expect_err("an unavailable confirmation index must fail startup")
                 .to_string();
             assert!(
@@ -3032,11 +3125,11 @@ mod tests {
     fn required_index_check_rejects_a_backend_in_initial_block_download() {
         let (addr, server) = scripted_rpc(vec![(
             "getblockchaininfo",
-            serde_json::json!({ "initialblockdownload": true }),
+            serde_json::json!({ "chain": "regtest", "initialblockdownload": true }),
         )]);
         let backend = BitcoindBackend::new(addr, String::new());
         let error = backend
-            .verify_required_indexes()
+            .verify_required_indexes(Network::Regtest)
             .expect_err("an IBD chain view must fail startup")
             .to_string();
         assert!(
@@ -3044,6 +3137,173 @@ mod tests {
             "the IBD failure must name its reason: {error}"
         );
         server.join().expect("scripted RPC completed");
+    }
+
+    /// A signet challenge that is NOT the public one: same shape, different keys, so
+    /// only the COMPARISON — not the parse, the length, or the presence — can tell it
+    /// from the real thing.
+    const CUSTOM: &str = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be4302103ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff52ae";
+
+    /// The backend chain-identity table (bead btc-policy-sealed-network-v2-mn6 A4).
+    ///
+    /// EVERY row scripts `getblockchaininfo` ALONE with `initialblockdownload: true`.
+    /// That one choice carries three properties: identity is decided from the response
+    /// this check already fetched (no new RPC); every identity diagnostic OUTRANKS the
+    /// IBD one; and a MATCHING row is proven to have passed identity precisely because
+    /// it reaches the IBD error. "Nothing later ran" is the ONE-reply script's doing, not
+    /// the recorded-request assertion's: a refusal raised after `getindexinfo` would fail
+    /// that call at the transport, so its message could not be the identity one. The
+    /// recorded request pins that the single call made was `getblockchaininfo`.
+    #[test]
+    fn backend_chain_identity_is_checked_before_ibd_and_before_any_later_rpc() {
+        let public = PUBLIC_SIGNET_CHALLENGE;
+        let padded = format!("  {}  ", public.to_uppercase());
+        // A row expects the IBD error exactly when its identity PASSES.
+        let ibd = "initial block download";
+        let (btc, sig, reg) = (Network::Bitcoin, Network::Signet, Network::Regtest);
+        // (Core's `chain`, its `signet_challenge`, the sealed network, expected
+        // refusal). `None` = ABSENT. Every failure message echoes the scripted
+        // response, so each row labels itself.
+        let rows: [(Option<&str>, Option<&str>, Network, &str); 20] = [
+            // The three matches, plus one equivalent challenge spelling: Core reports
+            // lowercase hex, and case or padding must not refuse a correct backend.
+            (Some("main"), None, btc, ibd),
+            (Some("signet"), Some(public), sig, ibd),
+            (Some("regtest"), None, reg, ibd),
+            (Some("signet"), Some(&padded), sig, ibd),
+            // All six cross-pairs.
+            (Some("signet"), Some(public), btc, "sealed to bitcoin"),
+            (Some("regtest"), None, btc, "sealed to bitcoin"),
+            (Some("main"), None, sig, "sealed to signet"),
+            (Some("regtest"), None, sig, "sealed to signet"),
+            (Some("main"), None, reg, "sealed to regtest"),
+            (Some("signet"), Some(public), reg, "sealed to regtest"),
+            // The two unsupported testnets, each named in its refusal.
+            (Some("test"), None, btc, "chain \"test\""),
+            (Some("testnet4"), None, btc, "chain \"testnet4\""),
+            // A chain field that cannot identify anything.
+            (None, None, btc, "no string `chain` field"),
+            (Some("mainnet"), None, btc, "unknown chain \"mainnet\""),
+            // Signet: the public challenge, or nothing.
+            (Some("signet"), None, sig, "no signet_challenge"),
+            (Some("signet"), Some(""), sig, "no signet_challenge"),
+            (Some("signet"), Some("   "), sig, "no signet_challenge"),
+            (Some("signet"), Some(CUSTOM), sig, "CUSTOM signet"),
+            // A challenge on a chain that cannot have one.
+            (Some("regtest"), Some(public), reg, "contradicts itself"),
+            (Some("main"), Some(public), btc, "contradicts itself"),
+        ];
+        let check = |sealed: Network, mut info: serde_json::Value, want: &str| {
+            info["initialblockdownload"] = serde_json::Value::Bool(true);
+            let script = vec![("getblockchaininfo", info.clone())];
+            let (addr, server, requests) = scripted_rpc_recording(script);
+            let error = BitcoindBackend::new(addr, String::new())
+                .verify_required_indexes(sealed)
+                .expect_err("every row here must fail startup")
+                .to_string();
+            assert!(
+                error.contains(want),
+                "row {info} sealed to {sealed}: expected {want:?}, got: {error}"
+            );
+            server.join().expect("scripted RPC completed");
+            let recorded = requests.lock().expect("recorded requests");
+            assert_eq!(
+                recorded.len(),
+                1,
+                "row {info}: identity is decided from the getblockchaininfo this check \
+                 already makes, and no RPC precedes it: {recorded:?}"
+            );
+            assert_eq!(recorded[0]["method"], "getblockchaininfo");
+        };
+        for (chain, challenge, sealed, want) in rows {
+            let mut info = json!({});
+            if let Some(chain) = chain {
+                info["chain"] = json!(chain);
+            }
+            if let Some(challenge) = challenge {
+                info["signet_challenge"] = json!(challenge);
+            }
+            check(sealed, info, want);
+        }
+        // The two shapes an `Option<&str>` row cannot express: a non-string chain
+        // field, and an explicit NULL challenge, which must read as ABSENT rather than
+        // as a challenge that fails to match.
+        check(btc, json!({"chain": 1}), "no string `chain` field");
+        let null = json!({"chain": "signet", "signet_challenge": null});
+        check(sig, null, "no signet_challenge");
+        // The SEALED side can be an unsupported `Network` too, which a backend reporting
+        // the matching test chain would MATCH. This address is deliberately unroutable:
+        // the refusal naming the network, not a transport error, proves no RPC happened.
+        let dead = BitcoindBackend::new("127.0.0.1:1".parse().expect("addr"), String::new());
+        for bad in [Network::Testnet, Network::Testnet4] {
+            let e = format!("{:?}", dead.verify_required_indexes(bad));
+            assert!(e.contains("not a supported vault network"), "{bad}: {e}");
+        }
+    }
+
+    /// The version preflight outranks every network I/O this node would otherwise do
+    /// (bead btc-policy-sealed-network-v2-mn6 A3), against ONE REACHABLE recording
+    /// server serving both legs in turn. Reachable and shared is the whole point: a dead
+    /// or absent endpoint records zero requests whatever the code does, so the negative
+    /// leg would prove nothing. The positive leg — same server, same address, one field
+    /// changed — shows the recorder can see a request at all.
+    #[test]
+    fn an_old_revision_config_is_refused_before_it_touches_the_backend() {
+        let (addr, server, requests) = scripted_rpc_recording(vec![(
+            "getblockchaininfo",
+            json!({ "chain": "regtest", "initialblockdownload": true }),
+        )]);
+        let fx = crate::channel::fixture::Fixture::new(2, 3);
+        let current = fx
+            .config(0, 0, "")
+            .replace("127.0.0.1:18443", &addr.to_string());
+        assert!(
+            current.contains(&addr.to_string()),
+            "the fixture no longer carries the [chain_backend] address this test rewrites"
+        );
+        // An OTHERWISE CURRENT config: same fields, same anchor, only the declared
+        // revision moved back. Without the preflight it would deserialize, build, and
+        // reach the backend — which is exactly what the recorder would then see.
+        let old = current.replace(
+            &format!("protocol_version = {}\n", crate::channel::PROTOCOL_VERSION),
+            "protocol_version = 1\n",
+        );
+        assert_ne!(old, current, "the declared revision line moved");
+
+        let refusal = load_and_validate_backend(&old)
+            .expect_err("an old manifest revision must not start")
+            .to_string();
+        assert!(
+            refusal.contains("unsupported manifest protocol_version 1"),
+            "the version diagnostic must outrank everything else: {refusal}"
+        );
+        assert!(
+            requests.lock().expect("recorded requests").is_empty(),
+            "a config refused for its revision must not have reached the chain backend"
+        );
+
+        // The positive leg, same server: a current config DOES reach it.
+        let reached = load_and_validate_backend(&current)
+            .expect_err("the scripted backend is in IBD, so startup still fails there")
+            .to_string();
+        assert!(
+            reached.contains("initial block download"),
+            "the current config must fail at the BACKEND, not at the version: {reached}"
+        );
+        server.join().expect("scripted RPC completed");
+        let recorded = requests.lock().expect("recorded requests");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the current config reaches the backend: {recorded:?}"
+        );
+        assert_eq!(recorded[0]["method"], "getblockchaininfo");
+    }
+
+    /// Load a config and then run the production backend validation, in the order
+    /// `vault-node`'s `main` does (load → validate → bind).
+    fn load_and_validate_backend(config: &str) -> Result<(), Error> {
+        crate::test_support::load_node(config)?.validate_chain_backend()
     }
 
     #[test]

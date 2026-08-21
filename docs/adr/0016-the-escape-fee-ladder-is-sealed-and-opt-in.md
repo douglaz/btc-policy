@@ -130,6 +130,11 @@ before the node-count `u32`: the tail is `max_derivation_index(u32)`,
 `nodes(u32 count, ...)`. `btc-policy-mby` must add that exact field to the canonical list when it
 adds it to the preimage; otherwise this ADR's new value would be present in `manifest.json` but not
 sealed by `manifest_hash`.
+(Superseded in part 2026-08-21 by `btc-policy-sealed-network-v2-mn6`: at manifest schema revision 2
+the sealed `network(u8)` follows `escape_bump_max_fee_pct`, so the ceiling is no longer the LAST
+field before the node count. Its position relative to `escape_coverage_pct` is unchanged, the
+revision-1 requirement above was met, and the tie-break stands — PROTOCOL-VECTORS.md is the tail's
+authority.)
 
 **4. The Ceremony presents the ladder and the recovery timelock as ONE question; the schema keeps
 them as TWO independent fields.** The coupling is a presentation affordance, not a data model.

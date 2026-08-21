@@ -16,7 +16,7 @@ Every change falls into exactly one of these. Knowing which one you are in is th
 | Category | What it covers | Cost |
 |---|---|---|
 | **A. Software upgrade** | New `vault-node` / `vault-cli` binaries | **New vault** — see §2. There is no in-place binary upgrade in v0. |
-| **B. Sealed-parameter change** | Anything in the manifest preimage — coordinator auth key, `max_msg_bytes`, the Hot budget triple, hot allowlist, escape descriptor, `max_derivation_index`, `escape_feerate_floor`, `escape_coverage_pct`, `escape_bump_max_fee_pct`, node set, endpoints, channel keys | **New vault.** Re-run the ceremony and move the coins. |
+| **B. Sealed-parameter change** | Anything in the manifest preimage — coordinator auth key, `max_msg_bytes`, the Hot budget triple, hot allowlist, escape descriptor, `max_derivation_index`, `escape_feerate_floor`, `escape_coverage_pct`, `escape_bump_max_fee_pct`, `network`, node set, endpoints, channel keys | **New vault.** Re-run the ceremony and move the coins. |
 | **C. Key rotation** | Any federation key, the user key, the escape keys, the recovery keys, or the coordinator auth key | **New vault** (the descriptor or the manifest changes). No in-place rotation exists in v0. |
 
 If you are unsure whether a value is sealed, the test is mechanical: does it feed

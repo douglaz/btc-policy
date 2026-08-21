@@ -88,6 +88,10 @@ _Avoid_: settings, policy file
 The immutable per-vault record, written once at setup, hash-pinned, distributed to every Node and backed up with the Descriptor backup (ADR-0013 §4). Pins the canonical vault descriptor, the Coordinator auth pubkey, and every Node's channel identity (signing pubkey, channel pubkey, transport endpoints) — the root of both channel and coordinator trust. Immutable: any change is a new Vault.
 _Avoid_: config (use Policy config), registry, membership file
 
+**Vault network**:
+The one chain a Vault is sealed to — exactly `bitcoin`, `signet`, or `regtest`, where "signet" means the DEFAULT PUBLIC signet and never any backend that merely reports `chain:"signet"`. Sealed into the Manifest preimage, so a Node configured for another chain cannot boot into the federation, and compared against that Node's own bitcoind chain identity at startup. It selects address encodings and identifies the backend chain; it does NOT change key derivation or any scriptPubKey. Testnet3, testnet4 and custom signets are unsupported — adding one is a new manifest revision, not a config value.
+_Avoid_: chain (when you mean the sealed parameter), testnet, network parameter, chain selector
+
 **Allowlist**:
 The Policy config's set of permitted destination wallets — descriptors with a bounded index, never fixed addresses. Contains at minimum the Hot wallet and the Escape wallet.
 _Avoid_: whitelist, address list

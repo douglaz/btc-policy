@@ -55,7 +55,7 @@ BaseManifest {                     # everything EXCEPT endorsements and config_h
   wallet_id,                       # = hash of the canonical vault descriptor
   vault_descriptor,                # canonical string with checksum (§1)
   policy_version,
-  protocol_version,                # MANIFEST SCHEMA REVISION (1), not transport v1; the channel
+  protocol_version,                # MANIFEST SCHEMA REVISION (2), not transport v1; the channel
                                    # envelope check compares against this same pinned value.
                                    # Node configs declare it and a startup preflight reads it
                                    # BEFORE the current schema, so an old manifest fails as a
@@ -67,14 +67,18 @@ BaseManifest {                     # everything EXCEPT endorsements and config_h
   hot_max_per_tx, hot_max_per_window, hot_window_secs,  # ADR-0014 Hot budget — see below; federation-UNIFORM
   hot_allowlist: [descriptor…], escape_descriptor, max_derivation_index,
   escape_feerate_floor, escape_coverage_pct, escape_bump_max_fee_pct,
+  network,                         # the sealed vault chain: bitcoin | signet | regtest
 }
 manifest_hash = H(canonical_bytes(BaseManifest))
-# canonical_bytes preimage — REVISION 1 AUTHORITATIVE (vault-node `base_manifest_bytes`);
+# canonical_bytes preimage — REVISION 2 AUTHORITATIVE (vault-node `base_manifest_bytes`);
 # reimplement from THIS list + order, NOT a naive serialization of every field above:
 #   `escape_bump_max_fee_pct` (u8) landed in the preimage with `protocol_version = 1`, in the one
 #   change ADR-0016 §3a requires: appending it moves `manifest_hash` for otherwise-identical
 #   inputs, so shipping it while still declaring 0 would produce exactly the opaque hash mismatch
-#   §3a exists to prevent. It is the final field before the node count.
+#   §3a exists to prevent. `network` (u8) landed the same way at `protocol_version = 2` and is
+#   now the final field before the node count. Its codes are EXPLICIT — 1 bitcoin, 2 default
+#   PUBLIC signet, 3 regtest — never an enum ordinal: rust-bitcoin inserted `Testnet4` mid-enum,
+#   which would have renumbered signet and regtest and moved every sealed vault's hash.
 #   EVERY variable-length run is LENGTH-PREFIXED u32. Both counts below were missing from earlier
 #   drafts of this list; omitting either yields a different hash and WRONG_MANIFEST on every node.
 #   docs/PROTOCOL-VECTORS.md encodes this SAME contract with a worked byte vector and had both
@@ -84,7 +88,7 @@ manifest_hash = H(canonical_bytes(BaseManifest))
 #   ‖ hot_max_per_tx(u64) ‖ hot_max_per_window(u64) ‖ hot_window_secs(u64)
 #   ‖ hot_allowlist(u32 COUNT ‖ each descriptor, sorted+deduped)
 #   ‖ escape_descriptor ‖ max_derivation_index(u32) ‖ escape_feerate_floor(u64)
-#   ‖ escape_coverage_pct(u8) ‖ escape_bump_max_fee_pct(u8)
+#   ‖ escape_coverage_pct(u8) ‖ escape_bump_max_fee_pct(u8) ‖ network(u8)
 #   ‖ nodes(u32 COUNT ‖ [ node_id(u16), signing_pubkey(33B compressed SEC1),
 #     channel_pubkey(33B compressed SEC1), endpoints(u32 COUNT ‖ each u32-len-prefixed UTF-8) ]…)
 # NOT serialized separately (bound TRANSITIVELY via wallet_id = H(canonical descriptor)):
@@ -156,6 +160,7 @@ escape_coverage_pct,               # e.g. 95 — §6
 escape_feerate_floor,              # panic feerate floor — §6
 protocol_version,                  # the manifest schema revision this config was written for. MANDATORY, no default: a startup preflight reads it before the rest of the schema, so a config written for an older revision fails as a version error instead of a missing field or a `manifest_hash` mismatch (ADR-0016 §3a). Validated against the pinned const and then never stored — the const is the one runtime version source
 escape_bump_max_fee_pct,           # the sealed escape-ladder ceiling (ADR-0016 §2). MANDATORY, no default, and ALSO a manifest preimage field (§4). The no-default rule here is for DIAGNOSTIC CLARITY, and it is NOT the ADR-0014 Hot-budget reason: a defaulted ceiling would NOT boot against a manifest sealed to a different one, because `ChannelState::build` would hash the default and fail the sealed anchor — which is exactly what `escape_coverage_pct`/`escape_feerate_floor` do, and those two DO carry serde defaults. What no-default buys is that an omitted field is reported as an omitted field instead of as an opaque `manifest_hash` mismatch. Nodes never ENFORCE it (ADR-0016 §4a) — the ceremony bounds it and the signer checks composed ladders against it; the node only proves it federation-uniform
+network,                           # the sealed vault chain, as one of exactly `bitcoin`, `signet` (the DEFAULT PUBLIC signet) or `regtest`. MANDATORY, no default, and ALSO a manifest preimage field (§4): a defaulted network would let a config that never names a chain boot against whichever one the default happened to be. Parsed ONCE here into `bitcoin::Network`; no other spelling exists in runtime state. Testnet3, testnet4, aliases (`main`) and custom signets are refused with the allowed set. It is also compared against the backend's own `getblockchaininfo` chain identity — and, on signet, its `signet_challenge` — before the node serves anything
 epsilon_secs,                      # T-margin ε — §6
 delivery_horizon_secs,             # V0-4b §0 pre-PIN carrier margin: a SpendRequest is refused (EXPIRY_TOO_SHORT / check `delivery_horizon`) unless `expiry ≥ now + delivery_horizon_secs`, so a carrier this node accepts can still reach and be processed by every peer before it lapses. Default 60; must satisfy `1 ≤ delivery_horizon_secs < max_commitment_age_secs`. Per-node (NOT a manifest field, unlike `max_msg_bytes`): a heterogeneous horizon — or the same horizon read off slightly different clocks — can remove nodes before they record an intent, so the admitting set may be a proper subset of the honest nodes that saw the carrier. Theft safety there does NOT come from counting admitters (a receipt authenticates its SENDER, never that the sender processed anything, so the tolerated `t − 1` compromised nodes can always emit `t − 1` of them); it comes from the fact that this refusal, like `EXPIRY_TOO_SHORT`, still fans the carrier out. Every node that signs and every node that refuses on its own clock forwards it, so each honest signer counts the whole honest set that saw the carrier: either that set reaches `t` and they all freeze — leaving only the `≤ t − 1` compromised partials, below quorum — or fewer than `t` nodes ever signed and no quorum of partials exists. `n = 2t − 1` (§1) is what guarantees `t` honest nodes remain after every tolerated withholder. A proper subset of honest nodes arming is still possible (an admitter plus forged receipts); that is fund-identical to the coordinator's accepted censorship and lands on the two-track residual — Lockdown at `T` → recovery, never theft. Skipped entirely in absent-channel mode, like the `max_msg_bytes` precondition — no peers, nothing to protect, and the `1 ≤ delivery_horizon_secs < max_commitment_age_secs` bound is likewise not enforced at startup there
 refresh_min_interval_secs,         # e.g. 2_592_000 (~30d) — §6

@@ -70,7 +70,7 @@
 //! | digest (tag)                                    | preimage fields, in order (LE; `var`=u32-len+bytes; `eps`=u32-count then each `var`) |
 //! |-------------------------------------------------|-------------------------------------------------------------------------------------|
 //! | channel-key  `btc-policy/channel-key/v0`        | `node_seckey[32]` (then `‖ counter:u8` on retry)                                    |
-//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), `max_msg_bytes:u64`, Hot-budget triple, canonical hot allowlist, escape descriptor, `max_derivation_index:u32`, `escape_feerate_floor:u64`, `escape_coverage_pct:u8`, `escape_bump_max_fee_pct:u8`, node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
+//! | manifest     `btc-policy/manifest/v0`           | `wallet_id[32]`, `protocol_version:u32`, `coordinator_auth_pubkey[33]` (ADR-0013 §4), `max_msg_bytes:u64`, Hot-budget triple, canonical hot allowlist, escape descriptor, `max_derivation_index:u32`, `escape_feerate_floor:u64`, `escape_coverage_pct:u8`, `escape_bump_max_fee_pct:u8`, `network:u8` (1=bitcoin, 2=public signet, 3=regtest), node-count:u32, per node(by id): `node_id:u16`, `signing_pubkey[33]`, `channel_pubkey[33]`, `endpoints:eps` |
 //! | endorsement  `btc-policy/channel-endorsement/v0`| `wallet_id[32]`, `manifest_hash[32]`, `node_id:u16`, `channel_pubkey[33]`, `protocol_version:u32`, `endpoints:eps` |
 //! | envelope     `btc-policy/channel-envelope/v0`   | `msg_type:var`, `protocol_version:u32`, `wallet_id[32]`, `manifest_hash[32]`, `sender_node_id:u16`, `recipient_node_id:u16`, `payload_b64_bytes:var`, `nonce:var`, `timestamp:u64` |
 //! | user-sig     `btc-policy/user-sig-hash/v0`      | per input in order: `user_der_sig:var`, `sighash_type:u8`                            |
@@ -95,7 +95,9 @@ use bitcoin::hashes::Hash;
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
-use bitcoin::{ecdsa, EcdsaSighashType, OutPoint, Psbt, PublicKey, ScriptBuf, Transaction, Txid};
+use bitcoin::{
+    ecdsa, EcdsaSighashType, Network, OutPoint, Psbt, PublicKey, ScriptBuf, Transaction, Txid,
+};
 use bytes::Bytes;
 use miniscript::psbt::PsbtExt;
 use serde::{Deserialize, Serialize};
@@ -110,11 +112,42 @@ use crate::replay::{MAX_COORD_NONCES, MAX_COORD_NONCE_BYTES};
 use crate::watchtower::{AlertQueue, FreshnessEvent, FreshnessKind};
 use crate::{Error, HotBudget};
 
-/// Manifest schema revision 1, not routable/authenticated transport v1. It moved
-/// with the appended ceiling byte (ADR-0016 §3a); `/v0` domain tags remain unchanged.
-/// Startup preflights the raw config's declared version against this one runtime
-/// source before [`crate::ConfigFile`] deserialization and retains no second copy.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Manifest schema revision 2, not routable/authenticated transport v1. It moved
+/// with the appended ceiling byte (ADR-0016 §3a) at revision 1 and with the sealed
+/// network byte (bead btc-policy-sealed-network-v2-mn6) at revision 2; `/v0` domain
+/// tags remain unchanged. Startup preflights the raw config's declared version
+/// against this one runtime source before [`crate::ConfigFile`] deserialization and
+/// retains no second copy.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The canonical sealed **network** codes (bead btc-policy-sealed-network-v2-mn6).
+/// EXPLICIT bytes, never `Network as u8` and never the enum's declaration order:
+/// rust-bitcoin INSERTED `Testnet4` between `Testnet` and `Signet`, which would have
+/// silently renumbered signet and regtest and changed the preimage of every already
+/// sealed vault. Code 2 means the DEFAULT/GLOBAL PUBLIC signet specifically — see
+/// [`crate::chain::PUBLIC_SIGNET_CHALLENGE`], which is what gives the byte its meaning.
+const NETWORK_CODE_BITCOIN: u8 = 0x01;
+const NETWORK_CODE_SIGNET: u8 = 0x02;
+const NETWORK_CODE_REGTEST: u8 = 0x03;
+
+/// The sealed network byte for `network`, or an error naming the supported set.
+/// Fallible because `bitcoin::Network` is wider than this vault supports: every value
+/// reaching the preimage comes through [`crate::parse_vault_network`], but the TYPE
+/// still admits testnet/testnet4, and inventing a byte for those would seal a vault
+/// this code cannot honour rather than refusing to seal one at all.
+pub(crate) fn network_code(network: Network) -> Result<u8, Error> {
+    match network {
+        Network::Bitcoin => Ok(NETWORK_CODE_BITCOIN),
+        Network::Signet => Ok(NETWORK_CODE_SIGNET),
+        Network::Regtest => Ok(NETWORK_CODE_REGTEST),
+        other => Err(format!(
+            "{other} is not a supported vault network: this manifest revision seals exactly \
+             {}",
+            crate::SUPPORTED_VAULT_NETWORKS
+        )
+        .into()),
+    }
+}
 
 /// Domain-separation tags (fixed consts — every digest names its tag so
 /// independent derivations agree; codex audit 2026-07-16).
@@ -467,6 +500,12 @@ struct ManifestNode {
 ///
 /// ADR-0016 §3a seals `escape_bump_max_fee_pct` here, after coverage and before the
 /// node count; `docs/PROTOCOL-VECTORS.md` pins the byte and the revision-1 bump.
+///
+/// The sealed **network** (bead btc-policy-sealed-network-v2-mn6) follows that ceiling,
+/// still before the node count, as one explicit [`network_code`] byte: the vault has
+/// exactly one chain, so nodes that disagree about it must fail startup rather than
+/// scan, meter and broadcast against different chains — where the UTXO view, the
+/// confirmation state and the escape's coverage are all silently wrong.
 #[allow(clippy::too_many_arguments)]
 fn base_manifest_bytes(
     wallet_id: &[u8; 32],
@@ -481,7 +520,8 @@ fn base_manifest_bytes(
     escape_feerate_floor: u64,
     escape_coverage_pct: u8,
     escape_bump_max_fee_pct: u8,
-) -> Vec<u8> {
+    network: Network,
+) -> Result<Vec<u8>, Error> {
     let mut e = Enc::new();
     e.fixed(wallet_id);
     e.u32(protocol_version);
@@ -507,6 +547,8 @@ fn base_manifest_bytes(
     e.u8(escape_coverage_pct);
     // The sealed escape-ladder ceiling (ADR-0016 §2/§3a), fixed-width `u8`.
     e.u8(escape_bump_max_fee_pct);
+    // The sealed vault network, one explicit canonical byte (see `network_code`).
+    e.u8(network_code(network)?);
     e.u32(nodes.len() as u32);
     for n in nodes {
         e.u16(n.node_id);
@@ -514,7 +556,7 @@ fn base_manifest_bytes(
         e.fixed(&n.channel_pubkey.inner.serialize());
         e.endpoints(&n.endpoints);
     }
-    e.0
+    Ok(e.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -531,8 +573,9 @@ fn compute_manifest_hash(
     escape_feerate_floor: u64,
     escape_coverage_pct: u8,
     escape_bump_max_fee_pct: u8,
-) -> [u8; 32] {
-    tagged_hash(
+    network: Network,
+) -> Result<[u8; 32], Error> {
+    Ok(tagged_hash(
         MANIFEST_TAG,
         &base_manifest_bytes(
             wallet_id,
@@ -547,8 +590,9 @@ fn compute_manifest_hash(
             escape_feerate_floor,
             escape_coverage_pct,
             escape_bump_max_fee_pct,
-        ),
-    )
+            network,
+        )?,
+    ))
 }
 
 /// Canonical bytes of the channel-key endorsement domain (§1): `(wallet_id,
@@ -777,7 +821,7 @@ pub mod ceremony {
     };
     use bitcoin::hex::DisplayHex;
     use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
-    use bitcoin::PublicKey;
+    use bitcoin::{Network, PublicKey};
     use miniscript::{Descriptor, DescriptorPublicKey};
     use std::str::FromStr;
 
@@ -856,6 +900,11 @@ pub mod ceremony {
         escape_feerate_floor: u64,
         escape_coverage_pct: u8,
         escape_bump_max_fee_pct: u8,
+        // The ONE chain this vault is sealed to. Seal the same value every node is
+        // configured with: a node whose network differs computes a different
+        // `manifest_hash` and fails startup, which is what makes "every node is on
+        // the vault's chain" a property of the artifacts rather than of the operator.
+        network: Network,
     ) -> Result<[u8; 32], Error> {
         let canonical_hot = hot_allowlist
             .iter()
@@ -867,7 +916,7 @@ pub mod ceremony {
         let canonical_escape =
             Descriptor::<DescriptorPublicKey>::from_str(escape_descriptor)?.to_string();
         let manifest = manifest_nodes(nodes, channel_pubkeys);
-        Ok(compute_manifest_hash(
+        compute_manifest_hash(
             wallet_id,
             PROTOCOL_VERSION,
             coordinator_auth_pubkey,
@@ -880,7 +929,8 @@ pub mod ceremony {
             escape_feerate_floor,
             escape_coverage_pct,
             escape_bump_max_fee_pct,
-        ))
+            network,
+        )
     }
 
     /// One node's channel-key endorsement, as lowercase-hex DER: that node's
@@ -3031,6 +3081,11 @@ impl ChannelState {
         // preimage carries binds nothing. Nodes never ENFORCE it (§4a) — the ceremony
         // and the signer do — so it is hashed here and read nowhere else.
         escape_bump_max_fee_pct: u8,
+        // The sealed vault network (bead btc-policy-sealed-network-v2-mn6): hashed
+        // here so a node pointed at another chain fails startup. The BACKEND's own
+        // chain identity is a separate check (`chain::verify_required_indexes`); this
+        // one only proves the federation agrees which chain it is on.
+        network: Network,
         alerts: Arc<Mutex<AlertQueue>>,
     ) -> Result<ChannelState, Error> {
         // Tokio's constructor panics above this implementation limit. Treat a
@@ -3171,11 +3226,12 @@ impl ChannelState {
             escape_feerate_floor,
             escape_coverage_pct,
             escape_bump_max_fee_pct,
-        );
+            network,
+        )?;
         let expected = from_hex_32(&cfg.expected_manifest_hash)
             .map_err(|_| Error::from("[channel] expected_manifest_hash is not 32-byte hex"))?;
         if expected != manifest_hash {
-            return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes, Hot budget, Hot-budget classification input, or escape_feerate_floor/escape_coverage_pct/escape_bump_max_fee_pct disagreeing with the federation-uniform manifest values is one cause)".into());
+            return Err("[channel] computed manifest_hash does not equal the sealed expected_manifest_hash (a max_msg_bytes, Hot budget, Hot-budget classification input, network, or escape_feerate_floor/escape_coverage_pct/escape_bump_max_fee_pct disagreeing with the federation-uniform manifest values is one cause)".into());
         }
 
         // Verify every node's channel-key endorsement against its signing key
@@ -6094,7 +6150,14 @@ pub(crate) mod fixture {
         pub(crate) escape_feerate_floor: u64,
         pub(crate) escape_coverage_pct: u8,
         pub(crate) escape_bump_max_fee_pct: u8,
+        /// The federation-uniform sealed network. Emitted into every generated config
+        /// for the same reason as the caps above, so a fixture re-sealed to another chain
+        /// still produces matching configs — a test wanting the DISAGREEMENT asks for it.
+        pub(crate) network: Network,
     }
+
+    /// The chain every channel fixture seals unless a test re-seals it.
+    pub(crate) const FIXTURE_NETWORK: Network = Network::Regtest;
 
     impl Fixture {
         /// `t`-of-`n` fixture with explicit listen ports (endpoint = 127.0.0.1:port).
@@ -6195,7 +6258,9 @@ pub(crate) mod fixture {
                 crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 crate::DEFAULT_ESCAPE_COVERAGE_PCT,
                 crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
-            );
+                FIXTURE_NETWORK,
+            )
+            .expect("the fixture network is a supported vault network");
 
             let mut entries = Vec::new();
             for (node_id, &fed_idx) in order.iter().enumerate() {
@@ -6242,6 +6307,7 @@ pub(crate) mod fixture {
                 escape_feerate_floor: crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 escape_coverage_pct: crate::DEFAULT_ESCAPE_COVERAGE_PCT,
                 escape_bump_max_fee_pct: crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
+                network: FIXTURE_NETWORK,
             }
         }
 
@@ -6277,6 +6343,15 @@ pub(crate) mod fixture {
             self.reseal();
         }
 
+        /// Re-seal the federation to a different network. Same story again: the network
+        /// is a manifest preimage field, so a vault on another chain is a NEW manifest
+        /// with new endorsements — which is what makes a config edited to another chain
+        /// a startup failure rather than a node quietly watching the wrong chain.
+        pub(crate) fn reseal_network(&mut self, network: Network) {
+            self.network = network;
+            self.reseal();
+        }
+
         /// Recompute `manifest_hash` and every channel-key endorsement from the
         /// fixture's CURRENT sealed fields — what the setup ceremony would do.
         fn reseal(&mut self) {
@@ -6303,7 +6378,9 @@ pub(crate) mod fixture {
                 self.escape_feerate_floor,
                 self.escape_coverage_pct,
                 self.escape_bump_max_fee_pct,
-            );
+                self.network,
+            )
+            .expect("the fixture network is a supported vault network");
             for entry in &mut self.entries {
                 let digest = endorsement_digest(
                     &self.wallet_id,
@@ -6409,7 +6486,7 @@ pub(crate) mod fixture {
             // re-sealed to a non-default floor/coverage would compute a different
             // `manifest_hash` and fail startup — the same discipline as the cap above.
             format!(
-                "listen_port = {}\n{}descriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nhot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\nmax_commitment_age_secs = 172800\npolicy_version = 1\nprotocol_version = {}\nescape_feerate_floor = {}\nescape_coverage_pct = {}\nescape_bump_max_fee_pct = {}\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
+                "listen_port = {}\n{}descriptor = \"{}\"\nallowlist = [\"{}\", \"{}\"]\nescape_descriptor = \"{}\"\nmax_derivation_index = 5\nhold_secs = {hold_secs}\nhot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\nmax_commitment_age_secs = 172800\npolicy_version = 1\nprotocol_version = {}\nescape_feerate_floor = {}\nescape_coverage_pct = {}\nescape_bump_max_fee_pct = {}\nnetwork = \"{}\"\npin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\ncoordinator_auth_pubkey = \"{}\"\n\n[chain_backend]\nrpc_addr = \"127.0.0.1:18443\"\nauth = \"dGVzdDp0ZXN0\"\n\n{channel}",
                 self.ports[self_id as usize],
                 crate::test_support::node_key_toml(&e.kdf),
                 self.descriptor,
@@ -6423,6 +6500,7 @@ pub(crate) mod fixture {
                 self.escape_feerate_floor,
                 self.escape_coverage_pct,
                 self.escape_bump_max_fee_pct,
+                crate::vault_network_name(self.network),
                 crate::argon2id_normal_phc("1234"),
                 crate::argon2id_duress_phc("9999"),
                 self.coord_pk,
@@ -6782,9 +6860,9 @@ mod golden {
     /// Regenerated when ADR-0014 added the Hot budget and its classification
     /// descriptors to the preimage; the V0-9 prefix through `max_msg_bytes` is
     /// byte-identical, which is what the offset assertions below check.
-    const FROZEN_MANIFEST_PREIMAGE_HEX: &str = "222222222222222222222222222222222222222222222222222222222222222201000000038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c2360000100000000000111111110000000022222222000000003333333300000000010000000900000077706b6828686f74290c00000077706b6828657363617065290500000001000000000000005f00020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031";
+    const FROZEN_MANIFEST_PREIMAGE_HEX: &str = "222222222222222222222222222222222222222222222222222222222222222202000000038a3ba5c99568d26602f4cf8038371da3c86057a96eb1b6a8de1b4f1be723c2360000100000000000111111110000000022222222000000003333333300000000010000000900000077706b6828686f74290c00000077706b6828657363617065290500000001000000000000005f0001020000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766010000000e0000003132372e302e302e313a39303030010002531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe33703462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b010000000e0000003132372e302e302e313a39303031";
     const FROZEN_MANIFEST_HASH_HEX: &str =
-        "e1eacefbc4501240e2c01e61e9ca916b9245b2732a32690893ca0f17eb1aeb3b";
+        "2780e91c2505d6d397809d6e31bcf5338a79e46f82a8ec46d4577d3d0c5ac27d";
 
     #[test]
     fn manifest_vector_is_frozen() {
@@ -6808,8 +6886,8 @@ mod golden {
         // max_msg_bytes:u64, hot_max_per_tx:u64, hot_max_per_window:u64,
         // hot_window_secs:u64, canonical hot descriptors, escape descriptor,
         // max_derivation_index:u32, escape_feerate_floor:u64,
-        // escape_coverage_pct:u8, escape_bump_max_fee_pct:u8, node-count:u32,
-        // then each node by id. The
+        // escape_coverage_pct:u8, escape_bump_max_fee_pct:u8, network:u8,
+        // node-count:u32, then each node by id. The
         // coordinator key is unconditional
         // — every vault is sealed to exactly one coordinator — so it always occupies offsets 36..69, the federation-uniform
         // `max_msg_bytes` (V0-4b §0) follows it at 69..77, and the ADR-0014 Hot
@@ -6825,20 +6903,29 @@ mod golden {
         };
         let hot_allowlist = vec!["wpkh(hot)".to_string()];
         let escape_descriptor = "wpkh(escape)";
-        let bytes = base_manifest_bytes(
-            &wallet_id,
-            PROTOCOL_VERSION,
-            &coord,
-            &nodes,
-            DEFAULT_MAX_MSG_BYTES,
-            hot_budget,
-            &hot_allowlist,
-            escape_descriptor,
-            5,
-            crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
-            crate::DEFAULT_ESCAPE_COVERAGE_PCT,
-            crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
-        );
+        // The sealed network is the ONLY input that varies across the three rows at the
+        // end of this test — same membership, coordinator, Hot budget and ceiling — which
+        // is what makes them kill an encoder feeding a CONSTANT code: under one, all
+        // three digests collapse onto the bitcoin one.
+        let manifest_bytes = |network| {
+            base_manifest_bytes(
+                &wallet_id,
+                PROTOCOL_VERSION,
+                &coord,
+                &nodes,
+                DEFAULT_MAX_MSG_BYTES,
+                hot_budget,
+                &hot_allowlist,
+                escape_descriptor,
+                5,
+                crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
+                crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+                crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
+                network,
+            )
+            .expect("a supported vault network")
+        };
+        let bytes = manifest_bytes(Network::Bitcoin);
         assert_eq!(to_hex(&bytes), FROZEN_MANIFEST_PREIMAGE_HEX);
         assert_eq!(
             bytes[36..69],
@@ -6865,10 +6952,54 @@ mod golden {
                  and cannot boot into this federation"
             );
         }
+        // The sealed network is ONE byte between the ladder ceiling and the node
+        // count. Both neighbours are asserted with it, so a reordering that preserves
+        // the byte MULTISET — swapping it with the ceiling, say — still moves an index
+        // here and fails: this pins the network byte by POSITION, not by length.
         assert_eq!(
-            to_hex(&tagged_hash(MANIFEST_TAG, &bytes)),
-            FROZEN_MANIFEST_HASH_HEX
+            bytes[146],
+            crate::DEFAULT_ESCAPE_COVERAGE_PCT,
+            "escape_coverage_pct still immediately precedes the ceiling"
         );
+        assert_eq!(
+            bytes[147],
+            crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
+            "the ladder ceiling still immediately precedes the network byte"
+        );
+        // Each supported network's code byte and full digest over that same input: the
+        // three digests `docs/PROTOCOL-VECTORS.md` §"Vector 2" publishes. The codes are
+        // LITERAL 1/2/3, not the `NETWORK_CODE_*` constants — restating those against
+        // themselves would pin nothing, and being explicit rather than `Network as u8` is
+        // the whole reason they exist (rust-bitcoin inserted `Testnet4` before `Signet`).
+        for (network, code, digest) in [
+            (Network::Bitcoin, 1u8, FROZEN_MANIFEST_HASH_HEX),
+            (
+                Network::Signet,
+                2,
+                "e0d59168e0eec3c41ca3834f6fe109d4dbeadf9019018bcc6cc266b1162369ae",
+            ),
+            (
+                Network::Regtest,
+                3,
+                "658e60a29ed973b968c793928cab6647f4df525403c1c2323a6961e79d54b04d",
+            ),
+        ] {
+            let bytes = manifest_bytes(network);
+            assert_eq!(
+                bytes[148], code,
+                "{network}: the sealed network is one explicit code byte at this exact slot"
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[149..153].try_into().expect("4 bytes")),
+                nodes.len() as u32,
+                "{network}: and the node count follows it, unmoved"
+            );
+            assert_eq!(
+                to_hex(&tagged_hash(MANIFEST_TAG, &bytes)),
+                digest,
+                "{network}: the published manifest digest is frozen"
+            );
+        }
     }
 
     #[test]
@@ -6899,7 +7030,9 @@ mod golden {
             crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             crate::DEFAULT_ESCAPE_COVERAGE_PCT,
             crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
-        );
+            Network::Regtest,
+        )
+        .expect("a supported vault network");
         let with_b = compute_manifest_hash(
             &wallet_id,
             PROTOCOL_VERSION,
@@ -6913,7 +7046,9 @@ mod golden {
             crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
             crate::DEFAULT_ESCAPE_COVERAGE_PCT,
             crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
-        );
+            Network::Regtest,
+        )
+        .expect("a supported vault network");
         assert_ne!(
             with_a, with_b,
             "a different coordinator key ⇒ a different vault"
@@ -6950,7 +7085,9 @@ mod golden {
                 crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 crate::DEFAULT_ESCAPE_COVERAGE_PCT,
                 crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
+                Network::Regtest,
             )
+            .expect("a supported vault network")
         };
         let sealed = hash_of(TEST_HOT_BUDGET);
         for (label, altered) in [
@@ -7016,7 +7153,9 @@ mod golden {
                 floor,
                 coverage,
                 crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
+                Network::Regtest,
             )
+            .expect("a supported vault network")
         };
         let sealed = hash_of(
             crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
@@ -7063,7 +7202,9 @@ mod golden {
                 crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 crate::DEFAULT_ESCAPE_COVERAGE_PCT,
                 crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
+                Network::Regtest,
             )
+            .expect("a supported vault network")
         };
         let hot = vec!["wpkh(hot)".to_string()];
         let sealed = hash_of(&hot, "wpkh(escape)", 5);
@@ -7145,6 +7286,7 @@ mod golden {
                 crate::DEFAULT_ESCAPE_FEERATE_FLOOR,
                 crate::DEFAULT_ESCAPE_COVERAGE_PCT,
                 crate::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
+                Network::Regtest,
             )
             .expect("valid ceremony descriptors")
         };
@@ -7166,10 +7308,10 @@ mod golden {
             PROTOCOL_VERSION,
             &["127.0.0.1:9001".to_string()],
         );
-        assert_eq!(to_hex(&pre), "22222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333010003462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b01000000010000000e0000003132372e302e302e313a39303031");
+        assert_eq!(to_hex(&pre), "22222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333010003462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b02000000010000000e0000003132372e302e302e313a39303031");
         assert_eq!(
             to_hex(&tagged_hash(ENDORSEMENT_TAG, &pre)),
-            "be2aa05e39b0c5858c00f288bc1ca4d7aae22c674c1df19826aac3d12944d18f"
+            "012e04708f89931bc9e681869345a4c35c636ea4369f64e8d5d767b2df6b1c02"
         );
     }
 
@@ -7186,10 +7328,10 @@ mod golden {
             &[0x44u8; 16],
             1_752_000_000,
         );
-        assert_eq!(to_hex(&pre), "070000007061727469616c0100000022222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333010002000c0000006347467964476c6862413d3d100000004444444444444444444444444444444400666d6800000000");
+        assert_eq!(to_hex(&pre), "070000007061727469616c0200000022222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333010002000c0000006347467964476c6862413d3d100000004444444444444444444444444444444400666d6800000000");
         assert_eq!(
             to_hex(&tagged_hash(ENVELOPE_TAG, &pre)),
-            "ef653cb88931e6240d923505944beafe9b9a7057d3c32cfe3fd17a78cd065237"
+            "0126519fe495be0af38c44bd22e56bf1e4891d46c459c0bf8b004300c81faf0e"
         );
     }
 
@@ -7288,8 +7430,25 @@ mod identity {
             "the fixture no longer emits the two lines these cases edit"
         );
 
+        let network = "network = \"regtest\"\n";
+        assert!(
+            valid.contains(network),
+            "the fixture no longer emits the sealed network line these cases edit"
+        );
         let old = valid.replace(&declared, "protocol_version = 0\n");
         let absent = valid.replace(&declared, "");
+        // Revision 1 is the immediately previous revision, and the one a real
+        // pre-network artifact set would declare.
+        let previous = valid.replace(&declared, "protocol_version = 1\n");
+        let old_no_network = previous.replace(network, "");
+        let old_other_network = previous.replace(network, "network = \"signet\"\n");
+        // DELIVER-3 names descriptor errors among what the version preflight outranks.
+        let descriptor_line = format!("descriptor = \"{}\"", fx.descriptor);
+        let old_bad_descriptor = previous.replace(&descriptor_line, "descriptor = \"nope(\"");
+        assert_ne!(
+            old_bad_descriptor, previous,
+            "the descriptor line this case corrupts is no longer in the config"
+        );
         // v0 AND a deliberately wrong anchor: the version must still win.
         let old_and_wrong_anchor = old.replace(
             &to_hex(&fx.manifest_hash),
@@ -7325,6 +7484,43 @@ mod identity {
                 valid.replace(ceiling, "escape_bump_max_fee_pct = 3\n"),
                 "does not equal the sealed expected_manifest_hash",
             ),
+            // Revision 2's field gets the same treatment from both sides: an old
+            // revision outranks its absence AND its disagreement, while at the
+            // current revision each reaches its own distinct diagnostic.
+            (
+                "an older revision that is also missing the network",
+                old_no_network,
+                "unsupported manifest protocol_version 1",
+            ),
+            (
+                "an older revision that also names another chain",
+                old_other_network,
+                "unsupported manifest protocol_version 1",
+            ),
+            (
+                "an older revision beside an unparseable descriptor",
+                old_bad_descriptor,
+                "unsupported manifest protocol_version 1",
+            ),
+            (
+                "the current revision missing the network",
+                valid.replace(network, ""),
+                // The MISSING-FIELD wording, not merely "network": the sealed-anchor
+                // mismatch below also names network, so a laxer expectation would
+                // still pass if the field ever acquired a serde default and booted
+                // whichever chain that default happened to be.
+                "missing field `network`",
+            ),
+            (
+                "the current revision at an unsupported network",
+                valid.replace(network, "network = \"testnet4\"\n"),
+                "unsupported vault network",
+            ),
+            (
+                "the current revision at a different sealed network",
+                valid.replace(network, "network = \"signet\"\n"),
+                "does not equal the sealed expected_manifest_hash",
+            ),
         ] {
             let err = crate::test_support::load_node(&cfg)
                 .err()
@@ -7338,8 +7534,8 @@ mod identity {
     }
 
     /// `protocol_version` is INSIDE the endorsement preimage, so an endorsement
-    /// collected during a revision-0 ceremony is not a valid endorsement at revision
-    /// 1 — the signature binds the revision. That is what stops a cross-version
+    /// collected during a revision-1 ceremony is not a valid endorsement at revision
+    /// 2 — the signature binds the revision. That is what stops a cross-version
     /// artifact set from being assembled into a vault whose nodes would each compute
     /// a different anchor.
     #[test]
@@ -7352,7 +7548,7 @@ mod identity {
                 &fx.manifest_hash,
                 entry.node_id,
                 &entry.channel_pk,
-                0,
+                PROTOCOL_VERSION - 1,
                 &entry.endpoints,
             )),
             &entry.fed_sk,
@@ -7370,10 +7566,41 @@ mod identity {
         };
         assert!(
             verify(&to_hex(&at_v0.serialize_der())).is_err(),
-            "a revision-0 endorsement must not verify against this revision"
+            "a previous-revision endorsement must not verify against this revision"
         );
         // Control: the fixture's own endorsement, made at the current revision, does.
         verify(&entry.endorsement_hex).expect("the current-revision endorsement verifies");
+    }
+
+    /// The sealed network is a FEDERATION-UNIFORM manifest field: a vault sealed on one
+    /// chain and a node configured for another do not share a manifest, so that node
+    /// fails startup instead of watching, metering and broadcasting against a chain the
+    /// vault does not live on, and the refusal names `network`. The positive half makes
+    /// this more than a string check: the fixture is RE-SEALED to signet (new hash, new
+    /// endorsements — what a ceremony on another chain produces) and its own config
+    /// still loads, so a build hashing a hardcoded network fails here.
+    #[test]
+    fn a_config_on_another_chain_does_not_share_the_sealed_manifest() {
+        let mut fx = Fixture::new(2, 3);
+        fx.reseal_network(Network::Signet);
+        let sealed_on_signet = fx.config(0, 0, "");
+        assert!(
+            sealed_on_signet.contains("network = \"signet\""),
+            "the re-sealed fixture emits its own network"
+        );
+        crate::test_support::load_node(&sealed_on_signet)
+            .expect("a signet-sealed federation loads the config it was sealed alongside");
+
+        let disagreeing = sealed_on_signet.replace("network = \"signet\"", "network = \"regtest\"");
+        let err = crate::test_support::load_node(&disagreeing)
+            .err()
+            .expect("a node on another chain must not boot into this federation")
+            .to_string();
+        assert!(
+            err.contains("does not equal the sealed expected_manifest_hash")
+                && err.contains("network"),
+            "the refusal must be the sealed-anchor mismatch and must name network: {err}"
+        );
     }
 
     #[test]
