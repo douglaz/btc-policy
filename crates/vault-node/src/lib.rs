@@ -1593,6 +1593,18 @@ impl Node {
         let escape_descriptor =
             Descriptor::<DescriptorPublicKey>::from_str(&config.escape_descriptor)
                 .map_err(|e| format!("bad escape_descriptor: {e}"))?;
+        // The sealed network binds the extended-key FLAVOUR of every destination this
+        // vault can pay (bead btc-policy-descriptor-network-kind-x00). policy-core
+        // states the rule once; this is a third INDEPENDENT enforcement, because neither
+        // thing a node can verify about its own artifacts covers it: a matching
+        // `manifest_hash` proves the federation received identical strings, never that
+        // network and descriptors agree, and the backend identity check proves which
+        // chain bitcoind is on, not which chain these keys were serialized for. Placed
+        // after both parse and before the channel manifest hash or any RPC.
+        policy_core::check_descriptor_network_kind("escape", &escape_descriptor, network)?;
+        for descriptor in &allowed {
+            policy_core::check_descriptor_network_kind("hot allowlist", descriptor, network)?;
+        }
         if config.hold_secs >= config.max_commitment_age_secs {
             return Err(format!(
                 "max_commitment_age_secs ({}) must exceed hold_secs ({})",

@@ -242,10 +242,12 @@ alone. If it cannot, one of the two is wrong — and the vectors, not the prose,
   That is ALL it does here. It does not change BIP32 derivation or any scriptPubKey; it does not
   prove the backend a node dials is on that chain (a separate startup check compares Core's own
   `chain` and, for signet, its `signet_challenge`); it does not distinguish two regtest
-  instances, nor a fork that still reports `chain:"main"`; and at this revision it does not bind
-  the hot/Escape extended-key FLAVOUR to the sealed network — a hash-consistent `bitcoin` vault
-  carrying `tpub` descriptors is still accepted, which is why this revision is not deployable to
-  mainnet until `btc-policy-descriptor-network-kind-x00` lands.
+  instances, nor a fork that still reports `chain:"main"`; and it does not bind the hot/Escape
+  extended-key FLAVOUR to the sealed network. That relation is enforced OUTSIDE the preimage, by
+  one `policy-core` validator run independently at assemble, at finalize and at node load
+  (`btc-policy-descriptor-network-kind-x00`). No byte was added for it and these digests are
+  unchanged — which is exactly why a fully hash-consistent revision-2 set whose flavour disagrees
+  is REFUSED rather than re-hashed, and why the remedy is a new ceremony rather than an edit.
 - The vectors cover hash **preimages and digests**, not signature encodings. Signatures are
   DER-encoded ECDSA over secp256k1 with the usual Bitcoin conventions.
 - Vectors 5 and 6 are referenced rather than reproduced here; a reviewer wanting full

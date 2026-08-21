@@ -16,7 +16,7 @@
 //!                                                                       the operator
 //!                                                                       writes down
 //!  escape device  setup keygen --role escape → escape.json  (PUBLIC)   + the escape
-//!                                                                       wallet secret
+//!                              --network <bitcoin|signet|regtest>       wallet secret
 //!  coordinator    setup assemble       → descriptor, wallet_id, manifest_hash,
 //!                                        coordinator auth key, INDEPENDENCE EVIDENCE,
 //!                                        one endorsement request per node
@@ -355,7 +355,8 @@ pub(crate) fn check_independence(inputs: &IndependenceInputs) -> Result<String, 
         return Err(
             "the escape descriptor is not a ranged wallet (no `/*`): each incident sweep \
                     must pay a fresh address, so a definite or scriptless escape is not the \
-                    intended wallet. Generate it with `btc-vault setup keygen --role escape`."
+                    intended wallet. Generate it with `btc-vault setup keygen --role escape \
+                    --network <bitcoin|signet|regtest>`."
                 .into(),
         );
     }
@@ -521,7 +522,8 @@ pub(crate) fn check_independence(inputs: &IndependenceInputs) -> Result<String, 
         }
         message.push_str(
             "\nRegenerate the escape wallet on a DIFFERENT device, from a DIFFERENT seed\n\
-             (`btc-vault setup keygen --role escape`), and run the ceremony again.\n",
+             (`btc-vault setup keygen --role escape --network <bitcoin|signet|regtest>`),\n\
+             and run the ceremony again.\n",
         );
         return Err(message.into());
     }
@@ -728,6 +730,25 @@ fn check_escape_bump_ceiling(policy: &PolicyParams) -> Result<(), Error> {
     Ok(())
 }
 
+/// Check every ceremony destination descriptor's extended-key flavour against the
+/// sealed network (bead btc-policy-descriptor-network-kind-x00). policy-core owns the
+/// relation and its diagnostic; this parses the strings and names their roles.
+fn check_ceremony_key_flavour(
+    escape_descriptor: &str,
+    hot_descriptors: &[String],
+    network: bitcoin::Network,
+) -> Result<(), Error> {
+    let hot = hot_descriptors
+        .iter()
+        .map(|d| ("hot allowlist", d.as_str()));
+    for (role, text) in std::iter::once(("escape", escape_descriptor)).chain(hot) {
+        let descriptor = Descriptor::<DescriptorPublicKey>::from_str(text)
+            .map_err(|e| format!("{role} descriptor does not parse: {e}"))?;
+        policy_core::check_descriptor_network_kind(role, &descriptor, network)?;
+    }
+    Ok(())
+}
+
 /// Disclose the rung-only ceiling, unknown base fee, and fixed timelock together.
 /// ADR-0016 §4 requires this until `btc-policy-wdu` makes the timelock selectable.
 fn ladder_disclosure(policy: &PolicyParams) -> String {
@@ -910,6 +931,8 @@ pub(crate) fn assemble(
     }
 
     check_escape_bump_ceiling(policy)?;
+    // The last moment the relation is free: the line below seals both into one hash.
+    check_ceremony_key_flavour(escape_descriptor, hot_descriptors, policy.network)?;
 
     let manifest_hash = ceremony::manifest_hash(
         &wallet_id,
@@ -1043,6 +1066,7 @@ usage: btc-vault setup <step>
 
   ON AN INDEPENDENT DEVICE (never a node host, never the coordinator):
     keygen       --role <escape|user|recovery> --out <file> [--secret-file <path>]
+                 --network <bitcoin|signet|regtest>  (escape only, MANDATORY)
 
   ON THE COORDINATOR (public bytes only):
     assemble     --input <ceremony.json> --out <dir>
@@ -1266,24 +1290,6 @@ fn node_endorse(args: &Args) -> Result<(), Error> {
     Ok(())
 }
 
-/// The A-era escape-keygen warning (bead btc-policy-sealed-network-v2-mn6 §9). The vault
-/// seals a network at revision 2, but this command still emits an unconditionally
-/// TEST-kind (`tpub…`) key and NOTHING validates that flavour against it — a
-/// hash-consistent mainnet artifact set carrying `tpub` descriptors is accepted today.
-/// Child B adds `--network` and the shared validator; until then this release is
-/// NON-DEPLOYABLE to mainnet and this print is all that stands between an operator and
-/// finding out at incident time.
-const ESCAPE_KEYGEN_NETWORK_WARNING: &str = "\
-  !! NETWORK-FLAVOUR MISMATCH IS NOT YET ENFORCED (btc-policy-descriptor-network-kind-x00).\n\
-     This key is TEST-flavoured (tpub) whatever network the vault seals, and no check\n\
-     refuses a bitcoin-network vault that carries it. The prefix is a serialization hint,\n\
-     not a derivation input — the same seed derives the same keys and scripts either way —\n\
-     but some mainnet wallets REFUSE to import a tpub, which is exactly the wrong thing to\n\
-     discover during an incident. For a bitcoin-network vault, generate this wallet on its\n\
-     own hardware and hand-write the bundle with a MAIN-kind xpub. This release is NOT\n\
-     deployable to mainnet until child B makes --network mandatory here and enforces the\n\
-     relation at assemble, finalize and node load.";
-
 fn keygen(args: &Args) -> Result<(), Error> {
     let role = args.get("role")?;
     let out = PathBuf::from(args.get("out")?);
@@ -1309,11 +1315,12 @@ fn keygen(args: &Args) -> Result<(), Error> {
             // every sweep pays a fresh address (DESIGN.md, destination allowlist),
             // origin'd so ADR-0003's fingerprint tripwire has something to compare.
             //
-            // STILL UNCONDITIONALLY TEST-KIND: binding the escape key's FLAVOUR to the
-            // sealed network is child B (btc-policy-descriptor-network-kind-x00), and
-            // until B lands this command cannot know the vault's network — so it warns
-            // loudly below rather than guessing.
-            let xpriv = Xpriv::new_master(NetworkKind::Test, &seed)?;
+            // `--network` is MANDATORY here and has no default (bead
+            // btc-policy-descriptor-network-kind-x00): the flavour it selects is checked at
+            // assemble, finalize and node load, so a guessed default would be a key three
+            // boundaries refuse — found after the escape device showed its secret and was put away.
+            let network = vault_node::parse_vault_network(args.get("network")?)?;
+            let xpriv = Xpriv::new_master(NetworkKind::from(network), &seed)?;
             let xpub = Xpub::from_priv(&secp, &xpriv);
             let fingerprint = xpriv.fingerprint(&secp);
             let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!(
@@ -1365,7 +1372,6 @@ fn keygen(args: &Args) -> Result<(), Error> {
         eprintln!("  of the user key: a shared seed turns duress into THEFT, because a");
         eprintln!("  post-wrench attacker holding the user key would control this wallet too.");
         eprintln!("  Generate it on a device that holds no other vault role.");
-        eprintln!("{ESCAPE_KEYGEN_NETWORK_WARNING}");
     }
     eprintln!("======================================================================\n");
     if let Some(path) = args.opt("secret-file") {
@@ -1727,6 +1733,12 @@ fn finalize_cmd(args: &Args, stage_failpoint: Option<usize>) -> Result<(), Error
     // so `assemble`'s gate is the only one, and a state edited here then re-endorsed
     // at the hash the refusal below prints would seal a ladder no release can honour.
     check_escape_bump_ceiling(&state.policy)?;
+    // Same reasoning as the ceiling above, for the descriptor/network relation: an
+    // operator who edits a flavour here can recompute the hash below and re-endorse it,
+    // reaching a state every downstream check passes. Run it BEFORE that recompute, so
+    // the refusal names the relation and not a stale anchor.
+    let hot = std::slice::from_ref(&state.hot_descriptor);
+    check_ceremony_key_flavour(&state.escape_descriptor, hot, state.policy.network)?;
 
     // The wallet_id recompute above covers the descriptor; the manifest hash commits
     // to everything ELSE the sealed anchor binds — the policy caps (`max_msg_bytes`,
@@ -2151,13 +2163,19 @@ mod tests {
         (seckey, PublicKey::new(seckey.public_key(&secp)))
     }
 
-    /// A ranged single-sig wallet with a declared origin, from a fixed seed.
-    fn wallet(seed: u8) -> Descriptor<DescriptorPublicKey> {
+    /// A ranged single-sig wallet with a declared origin, from a fixed seed. `kind` is
+    /// the extended-key flavour; every fixture here is on a test network, so `wallet` is
+    /// the Test-kind default and only the relation tests ask for the mainnet shape.
+    fn wallet_of(kind: NetworkKind, seed: u8) -> Descriptor<DescriptorPublicKey> {
         let secp = Secp256k1::new();
-        let xpriv = Xpriv::new_master(NetworkKind::Test, &[seed; 32]).expect("master");
+        let xpriv = Xpriv::new_master(kind, &[seed; 32]).expect("master");
         let xpub = Xpub::from_priv(&secp, &xpriv);
         let fingerprint = xpriv.fingerprint(&secp);
         Descriptor::from_str(&format!("wpkh([{fingerprint}]{xpub}/*)")).expect("wallet")
+    }
+
+    fn wallet(seed: u8) -> Descriptor<DescriptorPublicKey> {
+        wallet_of(NetworkKind::Test, seed)
     }
 
     fn policy() -> PolicyParams {
@@ -2458,6 +2476,97 @@ mod tests {
             "unexpected error: {err}"
         );
         seal(0).expect("the default zero ceiling assembles");
+    }
+
+    /// The relation is WIRED into the real seal path the CLI and the regtest harness
+    /// share, and refuses a mismatched Escape and a mismatched hot wallet
+    /// INDEPENDENTLY — one role is not coverage for the other. Remove only `assemble`'s
+    /// call and every row reaches a completed `Assembled { .. manifest_hash .. }`.
+    #[test]
+    fn assemble_refuses_a_key_flavour_that_left_the_sealed_network_before_it_seals_anything() {
+        use bitcoin::Network::{Bitcoin, Regtest};
+        use NetworkKind::{Main, Test};
+        let bundles: Vec<NodeBundle> = devices(3).into_iter().map(|(_, b)| b).collect();
+        let recovery: Vec<PublicKey> = (0x30u8..=0x32).map(|i| keypair(i).1).collect();
+        let (user, coord) = (keypair(1).1, keypair(0xC0).1);
+        let seal = |network, escape_kind, hot_kind| {
+            let policy = PolicyParams {
+                network,
+                ..policy()
+            };
+            let escape = wallet_of(escape_kind, 0xE0).to_string();
+            let hot = [wallet_of(hot_kind, 0xA0).to_string()];
+            assemble(&bundles, 2, user, &recovery, coord, &escape, &hot, &policy)
+        };
+        // The regtest vault offended by each role in turn, then the mainnet vault
+        // carrying the tpub `keygen` emitted before `--network`.
+        for (network, escape_kind, hot_kind, role, kind) in [
+            (Regtest, Main, Test, "escape", "main-kind"),
+            (Regtest, Test, Main, "hot allowlist", "main-kind"),
+            (Bitcoin, Test, Main, "escape", "test-kind"),
+        ] {
+            let err = seal(network, escape_kind, hot_kind)
+                .expect_err("a mismatched key flavour must not reach a sealed manifest")
+                .to_string();
+            assert!(
+                err.contains(role)
+                    && err.contains(kind)
+                    && err.contains(vault_node::vault_network_name(network)),
+                "unexpected error: {err}"
+            );
+        }
+        // Both consistent pairs seal, so the refusals above are the relation talking.
+        seal(Regtest, Test, Test).expect("a regtest vault seals its tpub wallets");
+        seal(Bitcoin, Main, Main).expect("a bitcoin vault seals its xpub wallets");
+    }
+
+    /// `keygen --role escape --network` is MANDATORY and selects the flavour all three
+    /// boundaries then enforce: `bitcoin` births an `xpub`, signet and regtest a `tpub`.
+    /// A missing or unsupported network refuses rather than guessing a default the
+    /// ceremony would reject later, after the escape device showed its secret.
+    #[test]
+    fn escape_keygen_births_the_flavour_its_network_seals_and_refuses_without_one() {
+        let temp = crate::fed::TempDir::new("setup-keygen").expect("temp dir");
+        let out = |name: &str| temp.path.join(name).display().to_string();
+        // `--network ""` is how a row asks for the flag to be ABSENT entirely.
+        let run = |network: &str, out: &str| {
+            let mut argv = vec!["--role", "escape", "--out", out];
+            if !network.is_empty() {
+                argv.extend(["--network", network]);
+            }
+            keygen(&Args::parse(&argv))
+        };
+        for (network, prefix) in [("bitcoin", "xpub"), ("signet", "tpub"), ("regtest", "tpub")] {
+            let path = out(network);
+            run(network, &path).unwrap_or_else(|e| panic!("keygen for {network}: {e}"));
+            let bundle: KeyBundle =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("bundle"))
+                    .expect("parse bundle");
+            let text = bundle
+                .descriptor
+                .expect("escape bundles carry a descriptor");
+            let parsed = Descriptor::from_str(&text).expect("escape descriptor");
+            let sealed = vault_node::parse_vault_network(network).expect("supported network");
+            assert!(
+                text.contains(prefix),
+                "a {network} key must be {prefix}: {text}"
+            );
+            // And it is sealable: this key passes the relation every boundary enforces.
+            policy_core::check_descriptor_network_kind("escape", &parsed, sealed)
+                .expect("keygen must birth a key its own network accepts");
+        }
+        let refused = |network| {
+            run(network, &out("refused"))
+                .expect_err("keygen must refuse")
+                .to_string()
+        };
+        assert!(
+            refused("").contains("missing --network"),
+            "no default network"
+        );
+        assert!(refused("testnet").contains("unsupported vault network"));
+        // And they land before the write, which is why the flag has no default.
+        assert!(!temp.path.join("refused").exists(), "a refusal wrote a key");
     }
 
     /// ADR-0016 §4's ceremony-time disclosure, at the only ceiling this release
@@ -3483,6 +3592,104 @@ mod tests {
             .expect("write endorsement");
         }
         ceremony
+    }
+
+    /// Swap the sealed wallet in `field` for the `(kind, seed)` one and RE-SEAL: recompute
+    /// `manifest_hash` from the state's own fields and have every device re-endorse it, as an
+    /// operator who edited the state and re-ran round two would. Without it the state fails the
+    /// hash recompute or a stale endorsement, which a test could not tell apart from a refusal.
+    fn reseal(run: &Ceremony, field: &str, kind: NetworkKind, seed: u8) {
+        run.edit_state(|state| {
+            state[field] = serde_json::json!(wallet_of(kind, seed).to_string());
+        });
+        let state = run.state();
+        let pubkey = |hex: &str| nodekey::parse_compressed_pubkey(hex).expect("sealed pubkey");
+        let (nodes, channel_pubkeys): (Vec<ceremony::CeremonyNode>, Vec<PublicKey>) = state
+            .nodes
+            .iter()
+            .map(|node| {
+                let sealed = ceremony::CeremonyNode {
+                    node_id: node.node_id,
+                    signing_pubkey: pubkey(&node.signing_pubkey),
+                    endpoints: node.endpoints.clone(),
+                };
+                (sealed, pubkey(&node.channel_pubkey))
+            })
+            .unzip();
+        let wallet_id = hex32(&state.wallet_id, "wallet_id").expect("wallet_id");
+        let manifest_hash = ceremony::manifest_hash(
+            &wallet_id,
+            &pubkey(&state.coordinator_auth_pubkey),
+            &nodes,
+            &channel_pubkeys,
+            state.policy.max_msg_bytes,
+            state.policy.hot_budget(),
+            std::slice::from_ref(&state.hot_descriptor),
+            &state.escape_descriptor,
+            state.policy.max_derivation_index,
+            state.policy.escape_feerate_floor,
+            state.policy.escape_coverage_pct,
+            state.policy.escape_bump_max_fee_pct,
+            state.policy.network,
+        )
+        .expect("recompute the anchor over the edited state");
+        run.edit_state(|value| {
+            value["manifest_hash"] = serde_json::json!(manifest_hash.to_lower_hex_string());
+        });
+        for node in &state.nodes {
+            let (preimage, bundle) = run
+                .devices
+                .iter()
+                .find(|(_, bundle)| bundle.signing_pubkey == node.signing_pubkey)
+                .expect("every sealed node is one of the published bundles");
+            let sk = nodekey::derive(preimage, &bundle.kdf().expect("kdf")).expect("derive");
+            let sig = ceremony::endorse(
+                &sk,
+                &wallet_id,
+                &manifest_hash,
+                node.node_id,
+                &bundle.endpoints,
+            );
+            let path = run.dir.join(format!("endorsement-{}.txt", node.node_id));
+            std::fs::write(path, format!("{sig}\n")).expect("write endorsement");
+        }
+    }
+
+    /// Why assemble-only checking is not enough (bead btc-policy-descriptor-network-kind-x00): an
+    /// operator who swaps a sealed destination wallet for the SAME key in the other flavour can
+    /// recompute the anchor and re-endorse it — wallet_id, hash, coordinator secret and all five
+    /// endorsements then verify, so finalize's own relation check is all that stands between that
+    /// state and a sealed vault off its network. It covers escape and hot INDEPENDENTLY: emptying
+    /// either argument alone must not leave the other row green.
+    #[test]
+    fn finalize_refuses_a_reendorsed_state_whose_key_flavour_left_the_sealed_network() {
+        for (field, role, seed) in [
+            ("escape_descriptor", "escape", 0xE0),
+            ("hot_descriptor", "hot allowlist", 0xA0),
+        ] {
+            let run = ceremony_through_endorse(5, 3);
+            reseal(&run, field, NetworkKind::Main, seed);
+            let error = match run.finalize() {
+                Err(error) => error.to_string(),
+                Ok(()) => panic!("a re-endorsed {role} flavour mismatch must not seal"),
+            };
+            assert!(
+                error.contains(role)
+                    && error.contains("regtest")
+                    && error.contains("main-kind (xpub)"),
+                "the refusal must name the relation, got: {error}"
+            );
+            assert!(
+                !run.sealed("manifest.json").exists() && !run.sealed("node-0.toml").exists(),
+                "the relation must refuse BEFORE anything is sealed"
+            );
+        }
+        // Control: the SAME edit in the MATCHING flavour still seals — nothing else proves
+        // the recompute and the five re-endorsements are real work, since the relation is
+        // checked first and a BROKEN reseal would refuse identically.
+        let control = ceremony_through_endorse(5, 3);
+        reseal(&control, "escape_descriptor", NetworkKind::Test, 0xE1);
+        control.finalize().expect("a re-endorsed match still seals");
     }
 
     /// ADR-0016 §4: a ceremony interrupted mid-write leaves NOTHING sealed and is

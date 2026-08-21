@@ -136,7 +136,7 @@ impl Wallet {
     /// `kind` is the flavour the vault's sealed network expects — Main for `bitcoin`,
     /// Test for signet/regtest. Passed in rather than hardcoded so every harness
     /// descriptor is flavour-consistent with its driver's network FROM BIRTH; child B
-    /// (btc-policy-descriptor-network-kind-x00) makes that relation an enforced
+    /// (btc-policy-descriptor-network-kind-x00) has since made that relation an enforced
     /// invariant rather than a harness convention.
     pub(crate) fn random(
         secp: &Secp256k1<All>,
