@@ -222,6 +222,10 @@ Stage 1 is close to what the repo can already do, but not reachable today:
   sealed vault cannot currently be spent from, refreshed, clawed back, or recovered by any
   command. Steps 1–6 above all need it.
 - **`btc-policy-wdu`** — the configurable timelock, or step 6 takes 180 days.
+- **`btc-policy-descriptor-network-kind-x00`** — the vault now seals a `network` (manifest
+  revision 2) and every node checks its backend is on that chain, but nothing yet binds the
+  hot/Escape extended-key FLAVOUR to it, so a hash-consistent `bitcoin` vault may still carry
+  `tpub` descriptors. That intermediate is explicitly NOT deployable, on any stage's mainnet rung.
 (**`btc-policy-bq6`**, hardware signing, is deliberately NOT on this list — see above and ADR-0015.
 Stage 1 runs on signet with a software user key, and the dust cap carries that risk through the
 capped mainnet rungs. It is required before the caps lift.)

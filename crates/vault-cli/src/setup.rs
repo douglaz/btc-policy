@@ -163,10 +163,39 @@ pub(crate) struct PolicyParams {
     /// Defaults to `0`; [`check_escape_bump_ceiling`] currently accepts nothing else.
     #[serde(default)]
     pub(crate) escape_bump_max_fee_pct: u8,
+    /// The vault's ONE chain (bead btc-policy-sealed-network-v2-mn6). Mandatory and
+    /// un-defaulted: a defaulted network would let a ceremony that never names a chain
+    /// seal one silently, into an immutable manifest. The adapter below is what keeps
+    /// this struct `Copy` — `bitcoin`'s serde feature stays off (it would also accept
+    /// `test`/`testnet4` and Core's `main`), and a `String` newtype would put an
+    /// allocation in the struct the ceremony and the config writer share by copy.
+    #[serde(with = "network_serde")]
+    pub(crate) network: bitcoin::Network,
     pub(crate) hot_max_per_tx: u64,
     pub(crate) hot_max_per_window: u64,
     pub(crate) hot_window_secs: u64,
     pub(crate) max_msg_bytes: u64,
+}
+
+/// The one serde adapter for [`PolicyParams::network`]: canonical spellings only, and
+/// exactly the ones [`vault_node::parse_vault_network`] accepts, so ceremony JSON and
+/// node TOML cannot disagree about what a network name means.
+mod network_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        network: &bitcoin::Network,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(vault_node::vault_network_name(*network))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<bitcoin::Network, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        vault_node::parse_vault_network(&raw).map_err(serde::de::Error::custom)
+    }
 }
 
 impl PolicyParams {
@@ -240,6 +269,7 @@ pub(crate) fn node_config_toml(config: &NodeConfig) -> String {
          escape_feerate_floor = {}\n\
          escape_coverage_pct = {}\n\
          escape_bump_max_fee_pct = {}\n\
+         network = \"{}\"\n\
          pin_normal_hash = \"{}\"\n\
          pin_duress_hash = \"{}\"\n\
          coordinator_auth_pubkey = \"{}\"\n",
@@ -265,6 +295,7 @@ pub(crate) fn node_config_toml(config: &NodeConfig) -> String {
         p.escape_feerate_floor,
         p.escape_coverage_pct,
         p.escape_bump_max_fee_pct,
+        vault_node::vault_network_name(p.network),
         config.pin_normal_hash,
         config.pin_duress_hash,
         config.coordinator_auth_pubkey,
@@ -893,6 +924,7 @@ pub(crate) fn assemble(
         policy.escape_feerate_floor,
         policy.escape_coverage_pct,
         policy.escape_bump_max_fee_pct,
+        policy.network,
     )?;
 
     let nodes = ceremony_nodes
@@ -1234,6 +1266,24 @@ fn node_endorse(args: &Args) -> Result<(), Error> {
     Ok(())
 }
 
+/// The A-era escape-keygen warning (bead btc-policy-sealed-network-v2-mn6 §9). The vault
+/// seals a network at revision 2, but this command still emits an unconditionally
+/// TEST-kind (`tpub…`) key and NOTHING validates that flavour against it — a
+/// hash-consistent mainnet artifact set carrying `tpub` descriptors is accepted today.
+/// Child B adds `--network` and the shared validator; until then this release is
+/// NON-DEPLOYABLE to mainnet and this print is all that stands between an operator and
+/// finding out at incident time.
+const ESCAPE_KEYGEN_NETWORK_WARNING: &str = "\
+  !! NETWORK-FLAVOUR MISMATCH IS NOT YET ENFORCED (btc-policy-descriptor-network-kind-x00).\n\
+     This key is TEST-flavoured (tpub) whatever network the vault seals, and no check\n\
+     refuses a bitcoin-network vault that carries it. The prefix is a serialization hint,\n\
+     not a derivation input — the same seed derives the same keys and scripts either way —\n\
+     but some mainnet wallets REFUSE to import a tpub, which is exactly the wrong thing to\n\
+     discover during an incident. For a bitcoin-network vault, generate this wallet on its\n\
+     own hardware and hand-write the bundle with a MAIN-kind xpub. This release is NOT\n\
+     deployable to mainnet until child B makes --network mandatory here and enforces the\n\
+     relation at assemble, finalize and node load.";
+
 fn keygen(args: &Args) -> Result<(), Error> {
     let role = args.get("role")?;
     let out = PathBuf::from(args.get("out")?);
@@ -1258,6 +1308,11 @@ fn keygen(args: &Args) -> Result<(), Error> {
             // A ranged single-sig wallet with a declared BIP32 origin: ranged so
             // every sweep pays a fresh address (DESIGN.md, destination allowlist),
             // origin'd so ADR-0003's fingerprint tripwire has something to compare.
+            //
+            // STILL UNCONDITIONALLY TEST-KIND: binding the escape key's FLAVOUR to the
+            // sealed network is child B (btc-policy-descriptor-network-kind-x00), and
+            // until B lands this command cannot know the vault's network — so it warns
+            // loudly below rather than guessing.
             let xpriv = Xpriv::new_master(NetworkKind::Test, &seed)?;
             let xpub = Xpub::from_priv(&secp, &xpriv);
             let fingerprint = xpriv.fingerprint(&secp);
@@ -1310,6 +1365,7 @@ fn keygen(args: &Args) -> Result<(), Error> {
         eprintln!("  of the user key: a shared seed turns duress into THEFT, because a");
         eprintln!("  post-wrench attacker holding the user key would control this wallet too.");
         eprintln!("  Generate it on a device that holds no other vault role.");
+        eprintln!("{ESCAPE_KEYGEN_NETWORK_WARNING}");
     }
     eprintln!("======================================================================\n");
     if let Some(path) = args.opt("secret-file") {
@@ -1553,7 +1609,11 @@ struct Artifact {
 }
 
 const STAGING_DIR: &str = ".finalize-staging";
-const SEALED_DIR: &str = "sealed-v1";
+/// The published artifact root. Deliberately NEUTRAL: the manifest's own
+/// `protocol_version` carries the schema revision, and a revision-bearing directory
+/// name is a second copy of it that goes stale the moment the revision moves — as
+/// `sealed-v1/` did at revision 2 (bead btc-policy-b8z).
+const SEALED_DIR: &str = "sealed";
 
 /// Stage the complete rendered set under this process's [`STAGING_DIR`], then make the
 /// manifest, every independently usable node config, and the backup visible through ONE
@@ -1705,6 +1765,7 @@ fn finalize_cmd(args: &Args, stage_failpoint: Option<usize>) -> Result<(), Error
         state.policy.escape_feerate_floor,
         state.policy.escape_coverage_pct,
         state.policy.escape_bump_max_fee_pct,
+        state.policy.network,
     )?
     .to_lower_hex_string();
     if recomputed_manifest_hash != state.manifest_hash {
@@ -1790,6 +1851,10 @@ fn finalize_cmd(args: &Args, stage_failpoint: Option<usize>) -> Result<(), Error
         // The sealed ladder ceiling, hash-bound since ADR-0016 §3a and therefore
         // recorded here for the same reason as the two fields above.
         "escape_bump_max_fee_pct": state.policy.escape_bump_max_fee_pct,
+        // The sealed vault network, hash-bound at manifest revision 2 and emitted in
+        // preimage order for the same recompute-from-manifest.json reason. The
+        // canonical spelling, never Core's `-chain=` argument.
+        "network": vault_node::vault_network_name(state.policy.network),
         "nodes": state.nodes.iter().map(|node| serde_json::json!({
             "node_id": node.node_id,
             "signing_pubkey": node.signing_pubkey,
@@ -2112,6 +2177,7 @@ mod tests {
             hot_max_per_window: 1_000_000,
             hot_window_secs: 172_800,
             max_msg_bytes: 1_048_576,
+            network: bitcoin::Network::Regtest,
         }
     }
 
@@ -2197,6 +2263,117 @@ mod tests {
             assert_eq!(node.node_id, index as u16);
             assert_eq!(node.signing_pubkey.to_string(), expected[index]);
         }
+    }
+
+    /// The ceremony's ONE network seam (bead btc-policy-sealed-network-v2-mn6 A2).
+    ///
+    /// `bitcoin::Network`'s own serde and `FromStr` would accept `test`, `testnet4` and
+    /// Core's `main` — two chains this vault cannot seal and one alias for a chain it
+    /// can. The adapter accepts exactly three canonical strings, and the field is
+    /// mandatory: a defaulted network would let a ceremony that never names a chain
+    /// seal one anyway, into an immutable manifest.
+    #[test]
+    fn the_ceremony_input_accepts_exactly_the_three_canonical_network_spellings() {
+        let base = serde_json::to_value(policy()).expect("PolicyParams serializes");
+        assert_eq!(
+            base["network"], "regtest",
+            "the canonical spelling round-trips through the adapter"
+        );
+        let parse = |raw: Option<serde_json::Value>| {
+            let mut value = base.clone();
+            let object = value.as_object_mut().expect("a JSON object");
+            match raw {
+                Some(network) => object.insert("network".to_string(), network),
+                None => object.remove("network"),
+            };
+            serde_json::from_value::<PolicyParams>(value)
+        };
+        for (spelling, expected) in [
+            ("bitcoin", bitcoin::Network::Bitcoin),
+            ("signet", bitcoin::Network::Signet),
+            ("regtest", bitcoin::Network::Regtest),
+        ] {
+            let policy = parse(Some(spelling.into())).expect("a canonical spelling is accepted");
+            assert_eq!(policy.network, expected, "{spelling}");
+        }
+        // The two testnets `bitcoin::Network` hands back, Core's mainnet spelling and
+        // its alias, then case, padding, emptiness and plain garbage.
+        let rejected = ["testnet", "testnet4", "test", "main", "mainnet"];
+        let rejected = rejected
+            .iter()
+            .chain(&["Bitcoin", " regtest ", "", "mutinynet"]);
+        for rejected in rejected.copied() {
+            let err = parse(Some(rejected.into()))
+                .expect_err("only the three canonical spellings are accepted")
+                .to_string();
+            assert!(
+                err.contains("unsupported vault network")
+                    && err.contains(vault_node::SUPPORTED_VAULT_NETWORKS),
+                "{rejected:?} must be refused with the allowed set: {err}"
+            );
+        }
+        assert!(
+            parse(Some(3.into()))
+                .expect_err("a non-string network is not a spelling at all")
+                .to_string()
+                .contains("string"),
+            "a non-string network must be refused"
+        );
+        assert!(
+            parse(None)
+                .expect_err("the network is mandatory")
+                .to_string()
+                .contains("missing field `network`"),
+            "an absent network must not silently default"
+        );
+    }
+
+    /// The gate is on REAL ceremony output, not the parse alone: the sealed network
+    /// reaches the manifest hash `assemble` seals AND the node config the federation is
+    /// sealed alongside. Two networks, since one cannot tell a threaded value from a
+    /// constant.
+    #[test]
+    fn the_sealed_network_reaches_both_the_manifest_hash_and_the_node_config() {
+        let devices = devices(3);
+        let bundles: Vec<NodeBundle> = devices.iter().map(|(_, b)| b.clone()).collect();
+        let (_, user) = keypair(1);
+        let recovery: Vec<PublicKey> = (0x30u8..=0x32).map(|i| keypair(i).1).collect();
+        let (_, coord) = keypair(0xC0);
+        let escape = wallet(0xE0).to_string();
+        let hot = vec![wallet(0xA0).to_string()];
+        let sealed = |network| {
+            let policy = PolicyParams {
+                network,
+                ..policy()
+            };
+            let assembled = assemble(&bundles, 2, user, &recovery, coord, &escape, &hot, &policy)
+                .expect("assemble");
+            let config = node_config_toml(&NodeConfig {
+                listen_port: 9000,
+                kdf: &bundles[0].kdf().expect("kdf"),
+                descriptor: &assembled.descriptor,
+                allowlist: &hot,
+                escape_descriptor: &escape,
+                policy: &policy,
+                coordinator_auth_pubkey: &coord.to_string(),
+                pin_normal_hash: "x",
+                pin_duress_hash: "y",
+                chain_backend: None,
+                channel_toml: "",
+            });
+            (assembled.manifest_hash, config)
+        };
+        let (signet_hash, signet_config) = sealed(bitcoin::Network::Signet);
+        let (regtest_hash, regtest_config) = sealed(bitcoin::Network::Regtest);
+        assert_ne!(
+            signet_hash, regtest_hash,
+            "the ceremony seals the network into manifest_hash, so two chains are two vaults"
+        );
+        assert!(
+            signet_config.contains("network = \"signet\"")
+                && regtest_config.contains("network = \"regtest\""),
+            "the one config writer emits the network it was sealed with"
+        );
     }
 
     /// ADR-0016 §3's four refusals, each reachable and each named distinctly. The
@@ -3139,8 +3316,12 @@ mod tests {
     }
 
     impl Ceremony {
+        /// The published artifact root, spelled LITERALLY rather than through
+        /// `SEALED_DIR` (bead btc-policy-sealed-network-v2-mn6 A8): a test that reads
+        /// the constant would follow any future rename silently, including back to a
+        /// revision-bearing name the docs and the b8z/sq7 target clauses no longer use.
         fn sealed(&self, rel: impl AsRef<Path>) -> PathBuf {
-            self.dir.join(SEALED_DIR).join(rel)
+            self.dir.join("sealed").join(rel)
         }
 
         fn state(&self) -> CeremonyState {
@@ -3409,7 +3590,20 @@ mod tests {
             !dir.join("node-0.toml").exists(),
             "publication must not expose an independently usable node config"
         );
-        assert!(dir.join(SEALED_DIR).join("node-0.toml").exists());
+        // The LITERAL neutral root, and its owner-only mode: the rename moved the
+        // directory name, not the atomic/0700 semantics it was published with.
+        use std::os::unix::fs::PermissionsExt;
+        let sealed = dir.join("sealed");
+        assert!(sealed.join("node-0.toml").exists());
+        assert_eq!(
+            std::fs::metadata(&sealed)
+                .expect("sealed dir")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the neutral sealed root is still owner-only"
+        );
     }
 
     /// The headline round trip: assemble → endorse → finalize seals a COMPLETE typed
@@ -3479,6 +3673,10 @@ mod tests {
             (
                 "escape_bump_max_fee_pct",
                 serde_json::json!(policy().escape_bump_max_fee_pct),
+            ),
+            (
+                "network",
+                serde_json::json!(vault_node::vault_network_name(policy().network)),
             ),
             (
                 "coordinator_auth_pubkey",

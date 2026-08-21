@@ -119,6 +119,7 @@ the enrolled PIN digests, the chain backend, and the policy numbers:
     "escape_feerate_floor": 20,
     "escape_coverage_pct": 95,
     "escape_bump_max_fee_pct": 0,
+    "network": "signet",
     "hot_max_per_tx": 50000000,
     "hot_max_per_window": 100000000,
     "hot_window_secs": 172800,
@@ -126,7 +127,7 @@ the enrolled PIN digests, the chain backend, and the policy numbers:
   },
   "pin_normal_hash": "$argon2id$...",
   "pin_duress_hash": "$argon2id$...",
-  "chain_backend_rpc_addr": "127.0.0.1:8332",
+  "chain_backend_rpc_addr": "127.0.0.1:38332",
   "chain_backend_auth": "<base64 user:pass>"
 }
 ```
@@ -159,6 +160,14 @@ This is where the vault is decided. It:
   nothing yet composes the replacement rungs a nonzero ceiling promises, and ADR-0005
   seals the hosts, so a vault sealed at a nonzero value would be ladderless for life
   while its operator believed they had opted in;
+* **seals the vault `network`** — exactly one of `bitcoin`, `signet` (the DEFAULT
+  PUBLIC signet, not any backend that reports `chain:"signet"`) or `regtest`. Testnet3,
+  testnet4, aliases such as `main`, and custom signets are refused with the allowed
+  set. The value goes into the manifest preimage, so a node configured for another
+  chain computes a different `manifest_hash` and fails startup rather than scanning,
+  metering and broadcasting against a chain the vault does not live on. It changes no
+  key derivation and no scriptPubKey — it selects address encodings and identifies the
+  backend chain;
 * computes `wallet_id` and `manifest_hash`, and prints one endorsement request per
   node.
 
@@ -192,37 +201,37 @@ btc-vault setup finalize --dir ./vault
 
 Verifies every endorsement (a bad one would otherwise be found by every node at
 startup, after the hosts are sealed, when the only remedy is re-provisioning), then
-writes `sealed-v1/`: the manifest, one `node-<id>.toml` per node, and `backup/`.
+writes `sealed/`: the manifest, one `node-<id>.toml` per node, and `backup/`.
 It also re-runs the ceiling bounds above against the state it is about to seal, because
 `assemble`'s gate is not the last word: a state edited afterwards and re-endorsed at the
 recomputed hash satisfies every other check, and no node ever bounds the ceiling.
 
 **The whole set is rendered and staged under `.finalize-staging.<pid>/` before ANY of it
-is published**, then that complete directory is atomically renamed to `sealed-v1/`
+is published**, then that complete directory is atomically renamed to `sealed/`
 (ADR-0016 §4). An interrupted `finalize` therefore exposes either no finalized set or
 one complete set—never an independently usable node config from a partial publication.
 That staging directory is per invocation, so two `finalize` runs that overlap in one
 ceremony directory cannot clear each other's staged set and publish the remnant as a
 complete seal: whichever loses fails, at the existing-set refusal below or at the rename.
-Both that staging directory and the `sealed-v1/` it becomes request owner-only mode at
+Both that staging directory and the `sealed/` it becomes request owner-only mode at
 creation (`mkdir` mode 0700); the umask can only remove bits, never add group/world access.
 That prevents another local account from
 traversing those inodes or changing entries inside them. It does NOT protect the directory
 entries that name those roots: the ceremony directory that contains them is still created at
 your umask, so an account able to write that parent can replace the staging root mid-ceremony
-or `sealed-v1/` afterwards. Run the ceremony on a host and medium you control; `btc-policy-b8z`
+or `sealed/` afterwards. Run the ceremony on a host and medium you control; `btc-policy-b8z`
 tracks a parent-namespace remedy.
 Re-running after a process interruption safely creates exactly one complete set, but it
 does NOT delete the interrupted run's staging directory, which holds the same secrets as
 the artifacts below (0600 node configs, the coordinator key). Remove it yourself once the
-retry has sealed. Once `sealed-v1/` exists, `finalize` refuses to
+retry has sealed. Once `sealed/` exists, `finalize` refuses to
 accept, merge, or overwrite it—even if its bytes appear identical—so an unsafe hand copy
 cannot be blessed without checking its file types and secret modes.
 
 That covers process interruption, which is what `finalize` can control. The rename is
-atomic but not `fsync`ed, so a HOST POWER LOSS can still leave a `sealed-v1/` whose
+atomic but not `fsync`ed, so a HOST POWER LOSS can still leave a `sealed/` whose
 contents are incomplete. That case is fail-closed rather than silent: the same existing-set
-refusal requires the operator to inspect and remove `sealed-v1/` before re-running, not
+refusal requires the operator to inspect and remove `sealed/` before re-running, not
 just to re-run. Nothing is lost either way: every artifact in it is re-derived from
 `ceremony-state.json` and the coordinator files beside it, none of which `finalize` modifies.
 
@@ -231,20 +240,20 @@ just to re-run. Nothing is lost either way: every artifact in it is re-derived f
 | File | Secret? | Notes |
 |---|---|---|
 | `descriptor.txt` | no | Back up promiscuously. Without it even valid recovery keys cannot find the coins. |
-| `manifest-hash.txt`, `wallet-id.txt`, `sealed-v1/manifest.json` | no | The immutable trust root every node is sealed to. |
+| `manifest-hash.txt`, `wallet-id.txt`, `sealed/manifest.json` | no | The immutable trust root every node is sealed to. |
 | `coordinator-auth.pubkey` | no | Pinned in the manifest. |
 | `coordinator-auth.secret` | **YES** | Store separately. Losing it with no backup **bricks the normal path** — the manifest pins its pubkey and is immutable, so the only exit is the recovery timelock. Rotation is a new vault; there is no in-place rotation in v0. |
 | `independence.txt` | no | The witnessed key-independence evidence. |
-| `sealed-v1/node-<id>.toml` | **YES** | Per-node config. Contains NO signing key (only the public wskdf derivation parameters), but DOES carry the chain-backend RPC credential and both Argon2 PIN digests — so `finalize` writes it owner-only (0600). Hand each to ITS node's host only, and securely delete the coordinator's copies after distribution; a leaked copy exposes the RPC credential and lets an attacker guess PINs offline. |
-| `sealed-v1/backup/` | mixed | The set to move to storage you control, off the coordinator. |
+| `sealed/node-<id>.toml` | **YES** | Per-node config. Contains NO signing key (only the public wskdf derivation parameters), but DOES carry the chain-backend RPC credential and both Argon2 PIN digests — so `finalize` writes it owner-only (0600). Hand each to ITS node's host only, and securely delete the coordinator's copies after distribution; a leaked copy exposes the RPC credential and lets an attacker guess PINs offline. |
+| `sealed/backup/` | mixed | The set to move to storage you control, off the coordinator. |
 
 Never in the artifacts, deliberately: the node preimages (each on its own
 operator's paper), the escape wallet secret, and the recovery keys.
 
 ## 6. Start each node, then seal
 
-```
-vault-node --config sealed-v1/node-<id>.toml     # then type that node's preimage
+```console
+vault-node --config sealed/node-<id>.toml     # then type that node's preimage
 ```
 
 The daemon reads the preimage on stdin, derives its signing key in RAM, and
@@ -266,7 +275,20 @@ removes that path, so reboot-death and the Lockdown latch hold even off-machine.
 ## Known v0 deviations
 
 Stated rather than hidden, since a documented deviation is acceptable and a silent
-one is not:
+one is not.
+
+### This release is NOT deployable to mainnet
+
+The vault now seals a `network`, and every node proves its backend is on that chain.
+What is still missing is the RELATION between the sealed network and the extended-key
+FLAVOUR of the hot and Escape descriptors: `keygen --role escape` emits a `tpub`
+whatever network the ceremony seals, and nothing at assemble, finalize or node load
+refuses a fully hash-consistent `bitcoin` vault that carries one. `keygen` prints a
+loud warning saying so on every run. `btc-policy-descriptor-network-kind-x00` makes
+`--network` mandatory there and adds the shared validator at all three boundaries;
+until it lands, seal `bitcoin` for test purposes only.
+
+### The rest
 
 * **PIN enrollment is not part of the ceremony.** `ceremony.json` takes the two
   Argon2id PHC digests as input; producing them is a separate step. The PINs
@@ -279,12 +301,11 @@ one is not:
   ceremony omits the flag.
 * **`--secret-file` / `--preimage-file` exist at all.** They are automation escape
   hatches and say so loudly on every run that uses them.
-* **`keygen --role escape` emits a TESTNET-flavoured extended key** (`tpub…`), like
-  every other key this v0 tree generates — there is no network parameter anywhere
-  in the codebase yet, and adding one here alone would be the first. The prefix is
-  a serialization hint, not a derivation input: the same seed derives the same keys
-  and the same scripts either way, and the printed `tpriv` re-derives the wallet.
-  Some mainnet wallets refuse to import a `tpub`, so a mainnet deployment should
+* **`keygen --role escape` emits a TESTNET-flavoured extended key** (`tpub…`)
+  unconditionally, including for a vault sealed to `bitcoin` — see the section above.
+  The prefix is a serialization hint, not a derivation input: the same seed derives the
+  same keys and the same scripts either way, and the printed `tpriv` re-derives the
+  wallet. Some mainnet wallets refuse to import a `tpub`, so a mainnet deployment should
   generate the escape wallet on its own hardware and hand-write the bundle (which
   is the recommended path regardless — see step 2). When you hand-write it, the
   escape descriptor's xpub MUST NOT be the account key you also use as the user

@@ -95,6 +95,9 @@ pub fn run_recovery_drill() -> Result<(), Error> {
     }
     let witness_script = descriptor.explicit_script()?;
     let vault_spk = descriptor.script_pubkey();
+    // EXPLICIT Regtest, deliberately NOT a sealed vault network: the recovery drill
+    // builds its OWN throwaway descriptor on a private regtest chain and runs no
+    // ceremony, so there is no sealed artifact here whose network this could follow.
     let vault_address = descriptor.address(Network::Regtest)?;
     println!(
         "      recovery branch present: older({}) + {}-of-{} (BIP68 time-lock, {} units of 512s)",

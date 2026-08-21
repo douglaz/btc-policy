@@ -133,10 +133,19 @@ pub(crate) struct Wallet {
 }
 
 impl Wallet {
-    pub(crate) fn random(secp: &Secp256k1<All>, urandom: &mut File) -> Result<Wallet, Error> {
+    /// `kind` is the flavour the vault's sealed network expects — Main for `bitcoin`,
+    /// Test for signet/regtest. Passed in rather than hardcoded so every harness
+    /// descriptor is flavour-consistent with its driver's network FROM BIRTH; child B
+    /// (btc-policy-descriptor-network-kind-x00) makes that relation an enforced
+    /// invariant rather than a harness convention.
+    pub(crate) fn random(
+        secp: &Secp256k1<All>,
+        urandom: &mut File,
+        kind: NetworkKind,
+    ) -> Result<Wallet, Error> {
         let mut seed = [0u8; 32];
         urandom.read_exact(&mut seed)?;
-        let xpriv = Xpriv::new_master(NetworkKind::Test, &seed)?;
+        let xpriv = Xpriv::new_master(kind, &seed)?;
         let xpub = Xpub::from_priv(secp, &xpriv);
         let parsed = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({xpub}/*)"))?;
         Ok(Wallet {
@@ -731,6 +740,11 @@ pub(crate) struct NodeParams {
     /// an otherwise ordinary escape inadmissible AT FIRE TIME without touching its
     /// ingress validity.
     pub(crate) escape_feerate_floor: u64,
+    /// The ONE chain this driver's vault is sealed to. It is what the ceremony hashes
+    /// into `manifest_hash`, what every node config declares, and what every
+    /// ceremony-backed address in this driver renders against — so a driver cannot
+    /// seal one chain and print addresses for another.
+    pub(crate) network: bitcoin::Network,
 }
 
 impl NodeParams {
@@ -753,6 +767,7 @@ impl NodeParams {
             escape_coverage_pct: vault_node::DEFAULT_ESCAPE_COVERAGE_PCT,
             // ADR-0016 §2's ladderless posture: the only value the ceremony accepts.
             escape_bump_max_fee_pct: vault_node::DEFAULT_ESCAPE_BUMP_MAX_FEE_PCT,
+            network: self.network,
             hot_max_per_tx: self.hot_budget.max_per_tx_sat,
             hot_max_per_window: self.hot_budget.max_per_window_sat,
             hot_window_secs: self.hot_budget.window_secs,

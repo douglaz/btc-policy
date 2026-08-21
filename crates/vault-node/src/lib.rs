@@ -62,7 +62,7 @@ use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1, SecretKey};
 use bitcoin::sighash::SighashCache;
-use bitcoin::{Amount, EcdsaSighashType, OutPoint, Psbt, PublicKey, ScriptBuf, Txid};
+use bitcoin::{Amount, EcdsaSighashType, Network, OutPoint, Psbt, PublicKey, ScriptBuf, Txid};
 use miniscript::{Descriptor, DescriptorPublicKey};
 use replay::{NonceDecision, NonceLog, ReplayLog, SignState, MAX_COORD_NONCE_BYTES};
 use serde::Deserialize;
@@ -547,6 +547,48 @@ fn best_effort_stderr(args: std::fmt::Arguments<'_>) {
 #[derive(Debug)]
 pub struct BadRequest(pub String);
 
+/// The canonical vault-network spellings, in the ONE order every diagnostic prints
+/// them. Testnet3, testnet4, aliases (`main`, `mainnet`, `test`) and custom signets
+/// are deliberately absent: a vault network is not a free-form chain selector, it is
+/// the sealed identity code 1/2/3 of `channel::base_manifest_bytes`, and code 2 means
+/// the default/global PUBLIC signet in particular.
+pub const SUPPORTED_VAULT_NETWORKS: &str = "bitcoin, signet, regtest";
+
+/// Parse a ceremony/config network spelling into the one runtime value. This is the
+/// ONLY seam where a network is a string: [`ConfigFile`], [`Node`], the manifest
+/// preimage, the backend identity check and the address renderers all carry
+/// `bitcoin::Network`, so no second spelling can drift. Deliberately NOT `Network`'s
+/// own serde/`FromStr`, which accept `testnet`/`testnet4` and Core's `main` spelling.
+pub fn parse_vault_network(raw: &str) -> Result<Network, Error> {
+    match raw {
+        "bitcoin" => Ok(Network::Bitcoin),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
+        other => Err(format!(
+            "unsupported vault network {other:?}: this vault seals exactly one of \
+             {SUPPORTED_VAULT_NETWORKS} (signet means the DEFAULT PUBLIC signet; testnet, \
+             testnet4 and custom signets are not supported)"
+        )
+        .into()),
+    }
+}
+
+/// The canonical spelling of a sealed network — the inverse of
+/// [`parse_vault_network`], and what every artifact and diagnostic writes. NOT Core's
+/// `-chain=` argument: Core spells mainnet `main`, this vault spells it `bitcoin`.
+pub fn vault_network_name(network: Network) -> &'static str {
+    match network {
+        Network::Bitcoin => "bitcoin",
+        Network::Signet => "signet",
+        Network::Regtest => "regtest",
+        // Unreachable: `Network` is wider, but a sealed one reaches `PolicyParams` only
+        // through `parse_vault_network` or a driver literal. This is the ARTIFACT
+        // spelling too (node config, `manifest.json`), not just a diagnostic — but those
+        // are written only after `network_code` refused anything else; a label beats a panic.
+        _ => "unsupported",
+    }
+}
+
 /// The node's policy config file (TOML, written once at deploy time).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -683,6 +725,11 @@ pub struct ConfigFile {
     /// Mandatory sealed rung-fee ceiling. No default: omission must not silently
     /// reproduce zero. It is hash-bound but never enforced node-side (ADR-0016 §4a).
     pub escape_bump_max_fee_pct: u8,
+    /// The vault's ONE chain, as a canonical [`parse_vault_network`] spelling. The
+    /// raw string stops here: [`Node::from_toml_str`] parses it once. Mandatory and
+    /// deliberately un-defaulted — a defaulted network would let a config that never
+    /// names a chain boot silently against whichever one the default happened to be.
+    pub network: String,
     /// The baked-at-setup policy identifier, bound into every commitment
     /// (policy is immutable, so this never changes).
     pub policy_version: u32,
@@ -1132,6 +1179,11 @@ pub struct Node {
     /// daemon can build the backend and spawn the driver after load
     /// ([`spawn_drivers`]).
     chain_backend: Option<(SocketAddr, String)>,
+    /// The ONE chain this node is sealed to, parsed once from the config seam. It is
+    /// hashed into `manifest_hash` (so the federation provably agrees on it) AND
+    /// compared against the backend's own reported chain identity before the daemon
+    /// serves anything ([`Node::validate_chain_backend`]).
+    network: Network,
     /// Unit tests build channel-valid nodes from configs that carry the required
     /// production backend stanza but intentionally launch no bitcoind. Keep their
     /// deterministic policy/state-machine tests off sockets; integration tests
@@ -1343,6 +1395,10 @@ impl Node {
             .into());
         }
         let config: ConfigFile = toml::from_str(raw).map_err(|e| format!("bad config: {e}"))?;
+        // The one string→`Network` seam (bead btc-policy-sealed-network-v2-mn6).
+        // Parsed before anything derives, hashes, or dials, so an unsupported chain
+        // spelling is a plain config error rather than a manifest-anchor mismatch.
+        let network = parse_vault_network(&config.network)?;
         let secp = Secp256k1::new();
         // Derive the federation signing key in RAM. Nothing this reads from the
         // config is secret; the secret arrived on stdin and dies with the process.
@@ -1879,6 +1935,9 @@ impl Node {
                     // The sealed ladder ceiling (ADR-0016 §3a): hashed here, so a node
                     // whose ceiling differs from the sealed one fails startup.
                     config.escape_bump_max_fee_pct,
+                    // The sealed vault network: same story, and the reason a config
+                    // edited to another chain cannot boot into this federation.
+                    network,
                     Arc::clone(&alerts),
                 )
             })
@@ -1941,6 +2000,7 @@ impl Node {
             authorized: Arc::new(Mutex::new(HashSet::new())),
             alerts,
             chain_backend,
+            network,
             #[cfg(test)]
             chain_backend_override: Some(Arc::new(crate::chain::mock::MockBackend::default())),
             #[cfg(test)]
@@ -2021,7 +2081,7 @@ impl Node {
         let Some((addr, auth)) = self.chain_backend.clone() else {
             return Ok(());
         };
-        BitcoindBackend::new(addr, auth).verify_required_indexes()
+        BitcoindBackend::new(addr, auth).verify_required_indexes(self.network)
     }
 
     /// Model B has no channel-less completion path: `/sign` structurally withholds
@@ -9260,6 +9320,7 @@ pub(crate) mod test_support {
              hot_window_secs = {}\n\
              max_commitment_age_secs = {max_commitment_age_secs}\npolicy_version = 1\n\
              protocol_version = {protocol_version}\nescape_bump_max_fee_pct = 0\n\
+             network = \"regtest\"\n\
              pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
              coordinator_auth_pubkey = \"{}\"\n{extra}",
             node_key_toml(&node_kdf),
@@ -9438,6 +9499,7 @@ pub(crate) mod test_support {
              hot_max_per_tx = {}\nhot_max_per_window = {}\nhot_window_secs = {}\n\
              max_commitment_age_secs = 172800\npolicy_version = 1\n\
              protocol_version = {protocol_version}\nescape_bump_max_fee_pct = 0\n\
+             network = \"regtest\"\n\
              pin_normal_hash = \"{}\"\npin_duress_hash = \"{}\"\n\
              coordinator_auth_pubkey = \"{}\"\n{budget_toml}",
             node_key_toml(&node_kdf),

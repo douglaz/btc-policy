@@ -229,6 +229,7 @@ fn fixture_config(hold_secs: u64, max_commitment_age_secs: u64, allow_escape: bo
          policy_version = {POLICY_VERSION}\n\
          protocol_version = {}\n\
          escape_bump_max_fee_pct = 0\n\
+         network = \"regtest\"\n\
          pin_normal_hash = \"{}\"\n\
          pin_duress_hash = \"{}\"\n\
          coordinator_auth_pubkey = \"{}\"\n",

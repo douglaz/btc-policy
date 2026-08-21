@@ -119,6 +119,9 @@ fn node_params() -> NodeParams {
         duress_pin: DURESS_PIN.to_string(),
         pin_m_cost_kib: 8,
         escape_feerate_floor: 1,
+        // This driver runs against the DEFAULT PUBLIC signet (docs/SIGNET-SPEND-RECORD.md);
+        // the node's own backend check refuses any custom signet at startup.
+        network: Network::Signet,
     }
 }
 
@@ -133,6 +136,9 @@ struct SignetFederation {
     vault_spk: ScriptBuf,
     hot_spk: ScriptBuf,
     escape_spk: ScriptBuf,
+    /// The sealed network, carried from the `NodeParams` the ceremony hashed so the
+    /// funding address below cannot be rendered against a different chain.
+    network: Network,
     #[allow(dead_code)]
     temp: TempDir,
 }
@@ -152,8 +158,9 @@ impl SignetFederation {
         let user = Actor::random(&secp, &mut urandom)?;
         let coordinator = Coordinator::random(&secp, &mut urandom)?;
         let coord_auth_pubkey = coordinator.pubkey.to_string();
-        let hot_wallet = Wallet::random(&secp, &mut urandom)?;
-        let escape_wallet = Wallet::random(&secp, &mut urandom)?;
+        let params = node_params();
+        let hot_wallet = Wallet::random(&secp, &mut urandom, params.network.into())?;
+        let escape_wallet = Wallet::random(&secp, &mut urandom, params.network.into())?;
         let hot_spk = hot_wallet.address_spk(&secp, HOT_INDEX)?;
         let escape_spk = escape_wallet.address_spk(&secp, 0)?;
         let recovery_keys: Vec<PublicKey> = (0..policy_core::RECOVERY_KEYS)
@@ -180,7 +187,6 @@ impl SignetFederation {
             .filter(|descriptor| **descriptor != escape_wallet.descriptor)
             .cloned()
             .collect();
-        let params = node_params();
 
         println!("[1/4] setup ceremony: assembling the descriptor + manifest");
         let manifest = Manifest::assemble(
@@ -200,7 +206,7 @@ impl SignetFederation {
         let descriptor = Descriptor::<PublicKey>::from_str(&descriptor_str)?;
         let vault_spk = descriptor.script_pubkey();
         let witness_script = descriptor.explicit_script()?;
-        let vault_address = descriptor.address(Network::Signet)?;
+        let vault_address = descriptor.address(params.network)?;
         for line in manifest.independence_report().lines() {
             if line.starts_with("VERDICT") {
                 println!("      escape/recovery independence — {line}");
@@ -268,6 +274,7 @@ impl SignetFederation {
             vault_spk,
             hot_spk,
             escape_spk,
+            network: params.network,
             temp,
         })
     }
@@ -276,7 +283,7 @@ impl SignetFederation {
 /// Send the vault its coin from the funding wallet and wait for one confirmation.
 /// Returns the confirmed vault UTXO (outpoint + txout) the spend will consume.
 fn fund_vault(fed: &SignetFederation, amount: Amount) -> Result<Utxo, Error> {
-    let vault_address = fed.descriptor.address(Network::Signet)?.to_string();
+    let vault_address = fed.descriptor.address(fed.network)?.to_string();
     let balance = wallet_rpc("getbalance", json!([]))?.as_f64().unwrap_or(0.0);
     println!(
         "[3/4] funding the vault: wallet '{}' balance {balance} tBTC",
