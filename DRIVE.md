@@ -2,9 +2,8 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** BUILD · **Bead:** btc-policy-descriptor-network-kind-x00 · **Branch:** beads/descriptor-network-kind-x00
-**Pending:** implement child B through one rb-lite run within its 520/95 hard caps, prove all three
-artifact-consumption boundaries independently, and keep the combined A+B state non-deployable
+**Phase:** LAND · **Beads:** btc-policy-descriptor-network-kind-x00 + btc-policy-5ag · **Branch:** beads/descriptor-network-kind-x00-close
+**Pending:** land the reviewed closure-only record after child B and its tracking parent completed
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -14,6 +13,12 @@ a `br ready` ranking.
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-descriptor-network-kind-x00` + tracking parent `btc-policy-5ag` (P1) — one shared
+  `policy-core` validator binds every XPub/MultiXPub destination to the sealed network at assemble,
+  finalize, and node load; definite keys stay neutral; Escape keygen now requires `--network`.
+  Merged #26 (`8848d66`) at 519/520 gross Rust and 92/95 gross non-Rust after B1-B6 mutations,
+  Codex+Opus review, independent audit, live Core, and both launch gates. This branch records both
+  closures; downstream rollout gates, not 5ag, authorize deployment.
 - `btc-policy-sealed-network-v2-mn6` (5ag child A, P1) — manifest revision 2 seals
   Bitcoin/default-public-Signet/Regtest as explicit codes 1/2/3; old revisions fail before current
   schema/hash/I/O; startup binds to the existing Core chain response and exact public-Signet
@@ -66,21 +71,15 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Implement `btc-policy-descriptor-network-kind-x00` (B) through rb-lite at **520 gross Rust / 95
-non-Rust**, every production/test/helper/fixture line included. It owns one shared policy-core
-descriptor visitor, independent assemble/finalize/node-load enforcement, required network-aware
-Escape keygen, and revision-2 A-era-mismatch re-ceremony documentation in `SETUP-CEREMONY.md`
-and `UPGRADE-AND-ROTATION-POLICY.md`. At 430 Rust with the finalize
-edit/recompute/re-endorse proof or hash-consistent node proof unwritten, stop; omit B7 corroboration
-before cutting B1-B6. The combined A+B state remains non-deployable until the tracking parent closes.
+Land this closure-only branch so fresh clones see `btc-policy-descriptor-network-kind-x00` and
+`btc-policy-5ag` closed. The work itself is already merged in #26; do not mix M2 implementation into
+this metadata PR.
 
 ## Next
-After rb-lite exits clean, independently verify B's red/mutation evidence, exact counts, local gate,
-live Core and launch obligations; run current-head Codex+Opus hardening and land one reviewed PR.
-Then close B and the tracking parent in reviewed records. B changes no preimage layout, performs no
-second version bump, and does not authorize production by itself.
-M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or network
-I/O. Then implement M2 operator core, M3 stable Core composer, M4 Spend command, and the parallel
+After the closure merges, claim ready child `btc-policy-mby-operator-core-signer-7vb` (M2) on a fresh
+branch and implement it through rb-lite at its hard **900 gross Rust / 160 non-Rust** caps, tests
+included. M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or
+network I/O. Then implement M3 stable Core composer, M4 Spend command, and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
 rb-lite. M4/M5 reuse one exact request across ordered stage-1 ingress attempts and report success
 only after Core observes node-side threshold combine/broadcast; M6 mutation-tests that non-ingress
