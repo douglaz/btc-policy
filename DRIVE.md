@@ -88,9 +88,12 @@ After this graph PR merges, claim only ready child A on a fresh branch, restore 
 implementation paths from recovery commit `9a4f946`, verify the patch checksum recorded under
 `/tmp/m2a-recovery` (`083f7d576c260a95561dfa1419e0f3f7a196b50c9693d6ec1b4cd25503d75b0c`);
 if that local recovery ref is unavailable, regenerate A from its executable bead rather than treating
-the hidden bytes as an upstream prerequisite. Continue through rb-lite at its hard **1,250 gross Rust /
-120 tracked non-Rust** caps. A may parse a captured pre-M1 manifest for cold use but rejects it before live hash
-validation, sibling reads, or network I/O. It must land and close before child B is claimed. Implement
+the hidden bytes as an upstream prerequisite. The recovery ref is only a baseline: its adjacent-secret
+load and secret-bearing `LiveVault` are stale. Replace them with A's explicit non-secret artifact
+directory plus separate credential path before review. Continue through rb-lite at its hard **1,250
+gross Rust / 120 tracked non-Rust** caps. A may parse a captured pre-M1 manifest for cold use but
+rejects it before live hash validation, sibling/credential reads, or network I/O. It must land and
+close before child B is claimed. Implement
 B through a separate rb-lite branch/PR at **1,050 gross Rust / 80 non-Rust**, preserving all 17 named
 test classes. Close tracking umbrella 7vb only after both merge and close. Then implement M3 stable
 Core composer, M4 Spend command, and the parallel
