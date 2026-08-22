@@ -71,7 +71,7 @@ fn coord_sign_as(req: &mut SignRequest, sk: &SecretKey, nonce: &str) {
 }
 
 /// Coord-sign `req` as the vault's pinned coordinator under a nonce unique to
-/// this call. A coordinator issues a fresh single-use nonce per **transmission**,
+/// this call. A coordinator issues a fresh single-use nonce per **logical request**,
 /// so this is also how a test re-sends an existing request (past a Hold, or
 /// retrying a lost call): the commitment is unchanged, so the anti-replay log
 /// still returns the one recorded verdict, but the transmission is fresh.
@@ -716,7 +716,7 @@ fn identical_resubmission_returns_the_recorded_accepted_verdict() {
     let first = expect_accepted(handle_sign(&fixture.node, &req, NOW).expect("decodable request"));
     // Resubmitting the identical COMMITMENT returns the recorded verdict without
     // re-evaluating. The re-send carries a fresh nonce because a nonce is
-    // single-use per transmission (ADR-0013 §2); idempotency is keyed on the
+    // single-use per logical request (ADR-0013 §2); idempotency is keyed on the
     // commitment, not the nonce, so the two gates compose instead of colliding.
     coord_sign(&mut req);
     let second = expect_accepted(handle_sign(&fixture.node, &req, NOW).expect("decodable request"));
@@ -948,7 +948,7 @@ fn a_held_hot_spend_is_answered_idempotently_on_a_re_send() {
     assert_eq!(first.remaining_secs, HOLD);
 
     // Half the Hold later, the coordinator re-sends with a fresh nonce (single-use
-    // per transmission). Idempotency is keyed on the COMMITMENT, so this returns
+    // per logical request). Idempotency is keyed on the COMMITMENT, so this returns
     // the one recorded verdict — the schedule the first acceptance fixed is never
     // reset, and the node never signs twice.
     coord_sign(&mut req);
@@ -1396,7 +1396,7 @@ mod coord_auth {
 
         // The identical request (same nonce, same signature) is a replay: the gate
         // rejects it BEFORE the anti-replay log's idempotent short-circuit, because
-        // a coordinator nonce is single-use per transmission. A genuine coordinator
+        // a coordinator nonce is single-use per logical request. A genuine coordinator
         // retry re-signs with a fresh nonce and gets the recorded verdict instead
         // (see `identical_resubmission_returns_the_recorded_signed_verdict`).
         let refusal = expect_refusal(handle_sign(&fixture.node, &req, NOW).expect("decodable"));

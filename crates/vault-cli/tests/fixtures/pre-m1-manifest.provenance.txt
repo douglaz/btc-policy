@@ -1,0 +1,26 @@
+Captured pre-M1 manifest.json — provenance
+==========================================
+
+file      pre-m1-manifest.json
+sha256    1758a90253c220e579a1fd759644dc572694e9e01065beb6217135ec620e87a9
+bytes     2875
+revision  5c05a6d ("beads: split operator CLI core into bounded children"), the
+          first parent of 53ae011 (PR #21) and so the last commit before manifest
+          revision 1 sealed the zero-only escape ceiling.
+
+These are the exact bytes that revision's OWN ceremony emitted, not a current set
+edited to look old. The PROCEDURE below reproduces the shape, never these bytes:
+that revision's `generate_node_identity` draws a random preimage and a random KDF
+salt, so a second run of it emits a different manifest with a different checksum.
+
+  git archive 5c05a6d | tar -x -C <scratch>
+  # beside that revision's `ceremony_through_endorse`, add this test:
+  #   let c = ceremony_through_endorse(3, 2); c.finalize().expect("finalize");
+  #   std::fs::copy(c.dir.join("manifest.json"), <out>).expect("copy");
+  cargo test -p vault-cli --bin btc-vault setup::tests::capture_pre_m1_manifest
+
+The keys, endpoints and hashes are that throwaway ceremony's own; no live vault is
+described here, and the manifest is never hash-authenticated under its own layout.
+What matters is the shape: `protocol_version` is 0, `recovery_timelock` is present,
+and the fields revisions 1 and 2 added — `escape_bump_max_fee_pct` and `network` —
+are absent, which is why a syntax-tolerant parser must still read it.

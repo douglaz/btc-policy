@@ -542,10 +542,11 @@ pub struct SignRequest {
     /// in `Debug`, so no owned copy of the pin outlives its compare or reaches a log.
     #[serde(default)]
     pub pin: Pin,
-    /// Fresh, single-use per-**transmission** nonce, bound into the
+    /// Fresh, single-use per-**logical-request** nonce, bound into the
     /// coordinator-auth canonical bytes; a node rejects a nonce it has already
-    /// seen (ADR-0013 §2/§3 freshness gate). A coordinator re-sending the same
-    /// spend (past a Hold, or retrying a lost call) issues a NEW nonce and
+    /// seen (ADR-0013 §2/§3 freshness gate). Endpoint failover within ONE logical
+    /// request re-offers the exact signed bytes, nonce included; a NEW logical
+    /// retry (past a Hold, or after a lost call) draws a fresh nonce and
     /// re-signs; idempotency is keyed on the commitment, not on this, so the two
     /// compose. `#[serde(default)]` so a body that omits it still decodes — into
     /// an empty nonce that no coordinator ever signs, hence a refusal, never an
@@ -603,7 +604,7 @@ pub struct RefreshRequest {
     /// Wire name `refresh` (ADR-0013 §2; see [`SignRequest::psbt`]).
     #[serde(rename = "refresh")]
     pub refresh_psbt: String,
-    /// Fresh, single-use per-**transmission** nonce; see [`SignRequest::nonce`] for
+    /// Fresh, single-use per-**logical-request** nonce; see [`SignRequest::nonce`] for
     /// the freshness rule this shares (the wire constrains length, not encoding).
     #[serde(default)]
     pub nonce: String,

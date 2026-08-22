@@ -2286,7 +2286,7 @@ mod tests {
 
         // The SAME commitment sent twice concurrently, as a coordinator racing its
         // own retry does it: identical spend, but a fresh single-use nonce (and so
-        // a fresh coord_sig) per transmission — a re-sent nonce is a replay by
+        // a fresh coord_sig) per logical request — a re-sent nonce is a replay by
         // definition (ADR-0013 §2) and would be refused at ingress instead of
         // exercising the anti-replay log this test is about.
         let mut second = request.clone();

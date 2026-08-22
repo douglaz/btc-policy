@@ -1,0 +1,651 @@
+//! The sealed-artifact trust boundary (bead btc-policy-mby-sealed-vault-ingress-s7u).
+//!
+//! [`parse_manifest`] is syntax-tolerant so a captured pre-M1 manifest can still be READ —
+//! cold recovery authority is the descriptor plus consensus. It is never hash-authenticated
+//! under a v0 layout and never becomes a [`LiveVault`]: the revision check fires before any
+//! current-field or hash error, before every sibling artifact read, and before any socket, and
+//! no version-dispatched legacy preimage exists here.
+//!
+//! Custody is SPLIT by INSTRUCTION, not by ceremony output. [`LiveVault::load_artifacts`] reads
+//! the non-secret runtime artifact directory the CALLER names: it never appends `sealed/backup`,
+//! never forms `<artifacts>/coordinator-auth.secret`, and never holds a secret — so it loads
+//! with that file absent and ignores a malformed decoy of that name beside the public artifacts.
+//! The coordinator's authority is the separate concrete [`CoordinatorCredential`], read from a
+//! second explicitly named path and verified against the pinned public key the vault carries.
+
+use std::io::Read;
+use std::net::SocketAddr;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+use std::str::FromStr;
+
+use bitcoin::hex::DisplayHex;
+use bitcoin::secp256k1::{Secp256k1, SecretKey};
+use bitcoin::{Amount, Network, PublicKey};
+use miniscript::{Descriptor, DescriptorPublicKey};
+use policy_core::{CheckParams, VaultTemplate};
+use serde::Deserialize;
+// The live schema: manifest revision 2 seals the network (bead btc-policy-sealed-network-v2-mn6).
+use vault_node::channel::{ceremony, PROTOCOL_VERSION as CURRENT_PROTOCOL_VERSION};
+use vault_node::nodekey::parse_compressed_pubkey as compressed_pubkey;
+use zeroize::Zeroizing;
+
+use crate::http::Error;
+
+/// One node as the manifest publishes it; every field defaults so an older
+/// revision still parses.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct ParsedNode {
+    pub(crate) node_id: u16,
+    pub(crate) signing_pubkey: String,
+    pub(crate) channel_pubkey: String,
+    pub(crate) transport_endpoints: Vec<String>,
+    pub(crate) channel_endorsement: String,
+}
+
+/// A manifest as READ, not as trusted: nothing here is cross-checked.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct ParsedManifest {
+    pub(crate) protocol_version: u32,
+    pub(crate) wallet_id: String,
+    pub(crate) vault_descriptor: String,
+    pub(crate) manifest_hash: String,
+    pub(crate) coordinator_auth_pubkey: String,
+    pub(crate) t: usize,
+    pub(crate) n: usize,
+    pub(crate) recovery_timelock: u32,
+    pub(crate) policy_version: u32,
+    pub(crate) max_msg_bytes: u64,
+    pub(crate) hot_max_per_tx: u64,
+    pub(crate) hot_max_per_window: u64,
+    pub(crate) hot_window_secs: u64,
+    pub(crate) hot_allowlist: Vec<String>,
+    pub(crate) escape_descriptor: String,
+    pub(crate) max_derivation_index: u32,
+    pub(crate) escape_feerate_floor: u64,
+    pub(crate) escape_coverage_pct: u8,
+    pub(crate) escape_bump_max_fee_pct: u8,
+    pub(crate) network: String,
+    pub(crate) nodes: Vec<ParsedNode>,
+}
+
+/// Read a manifest for COLD inspection: every field defaults, so an older revision parses.
+pub(crate) fn parse_manifest(text: &str) -> Result<ParsedManifest, Error> {
+    serde_json::from_str(text).map_err(|e| format!("manifest.json does not parse: {e}").into())
+}
+
+/// A vault whose complete artifact set was cross-checked, and therefore the only
+/// thing this crate authorizes against.
+pub(crate) struct LiveVault {
+    pub(crate) wallet_id: [u8; 32],
+    pub(crate) manifest_hash: [u8; 32],
+    /// The frozen descriptor in definite-key form (template + witness script);
+    /// `check_params.vault` is the same string for policy-core.
+    pub(crate) descriptor: Descriptor<PublicKey>,
+    pub(crate) template: VaultTemplate<PublicKey>,
+    pub(crate) check_params: CheckParams,
+    pub(crate) network: Network,
+    /// The sealed ladder ceiling (ADR-0016 §2); nodes never enforce it, the signer does.
+    pub(crate) escape_bump_max_fee_pct: u8,
+    /// Carried and type-checked, NOT manifest-hash authenticated: the one manifest
+    /// field that is neither in the hash preimage nor descriptor-derivable.
+    pub(crate) policy_version: u32,
+    /// The manifest-pinned coordinator identity, and only ever the PUBLIC half: the
+    /// scalar that matches it belongs to [`CoordinatorCredential`], which this type
+    /// neither loads nor holds nor can hand to child B's signer.
+    pub(crate) coordinator_pubkey: PublicKey,
+    /// Manifest-pinned loopback endpoints in node/endpoint order.
+    pub(crate) endpoints: Vec<SocketAddr>,
+}
+
+fn read(dir: &Path, name: &str) -> Result<String, Error> {
+    Ok(std::fs::read_to_string(dir.join(name))
+        .map_err(|e| format!("cannot read {name}: {e}"))?
+        .trim()
+        .to_string())
+}
+
+fn parsed<T: FromStr>(text: &str, what: &str) -> Result<T, Error>
+where
+    T::Err: std::fmt::Display,
+{
+    T::from_str(text).map_err(|e| format!("{what} does not parse: {e}").into())
+}
+
+fn bad<T>(detail: String) -> Result<T, Error> {
+    Err(detail.into())
+}
+
+impl LiveVault {
+    /// Load and validate the non-secret runtime artifact set in the directory the
+    /// caller EXPLICITLY names, or refuse. No ceremony root is inferred, no
+    /// `sealed/backup` is appended, no credential path is joined onto `dir`, and no
+    /// network I/O happens.
+    pub(crate) fn load_artifacts(dir: &Path) -> Result<LiveVault, Error> {
+        let text = read(dir, "manifest.json")?;
+        // The revision FIRST, from a minimal envelope rather than the decoded current schema:
+        // an old manifest is refused AS an old revision even when a later field does not fit
+        // today's types, and always before any sibling artifact read and any socket.
+        let envelope: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("manifest.json does not parse: {e}"))?;
+        let revision = &envelope["protocol_version"];
+        if revision.as_u64() != Some(u64::from(CURRENT_PROTOCOL_VERSION)) {
+            return bad(format!(
+                "manifest protocol_version {revision} is not the live revision \
+                 {CURRENT_PROTOCOL_VERSION}: a pre-M1 manifest parses for cold inspection but is \
+                 never hash-authenticated under its own layout and cannot become a live vault"
+            ));
+        }
+        let m = parse_manifest(&text)?;
+
+        let text = read(dir, "descriptor.txt")?;
+        let descriptor: Descriptor<PublicKey> = parsed(&text, "descriptor.txt")?;
+        let canonical = descriptor.to_string();
+        let claimed: Descriptor<PublicKey> = parsed(&m.vault_descriptor, "manifest descriptor")?;
+        if claimed.to_string() != canonical {
+            return bad("manifest vault_descriptor and descriptor.txt disagree".into());
+        }
+        let template = policy_core::parse_vault_template(&descriptor)
+            .map_err(|e| format!("the sealed descriptor is off-template: {e}"))?;
+        let wallet_id = crate::fed::wallet_id(&descriptor);
+        for (name, claimed) in [
+            ("wallet-id.txt", read(dir, "wallet-id.txt")?),
+            ("manifest wallet_id", m.wallet_id.clone()),
+        ] {
+            if claimed != wallet_id.to_lower_hex_string() {
+                return bad(format!("{name} is not H(canonical descriptor)"));
+            }
+        }
+        // `t`, `n` and `recovery_timelock` are the three consensus facts the ceremony
+        // reads back OUT of the descriptor rather than out of the hash preimage
+        // (`setup.rs`), so the parsed template is authoritative and a manifest that
+        // disagrees does not describe the vault it names.
+        let (t, n) = (template.threshold, template.node_keys.len());
+        let (lock, entries) = (template.recovery_timelock, m.nodes.len());
+        let (mt, mn, mlock) = (m.t, m.n, m.recovery_timelock);
+        if (mt, mn, mlock, entries) != (t, n, lock, n) {
+            return bad(format!(
+                "manifest {mt}-of-{mn} over {entries} nodes under older({mlock}) is not the \
+                 descriptor's {t}-of-{n} under older({lock})"
+            ));
+        }
+
+        // The sealed network, and both destination wallets bound to its flavour.
+        let network = vault_node::parse_vault_network(&m.network)?;
+        let escape: Descriptor<DescriptorPublicKey> =
+            parsed(&m.escape_descriptor, "escape descriptor")?;
+        policy_core::check_descriptor_network_kind("escape", &escape, network)?;
+        let mut allowed = Vec::new();
+        for text in &m.hot_allowlist {
+            let hot: Descriptor<DescriptorPublicKey> = parsed(text, "hot descriptor")?;
+            policy_core::check_descriptor_network_kind("hot allowlist", &hot, network)?;
+            allowed.push(hot);
+        }
+        allowed.push(escape.clone());
+
+        // The coordinator identity, PUBLIC half only. `dir.join("coordinator-auth.secret")`
+        // is a path this loader must never form: the ceremony tells the operator to store
+        // that credential away from the artifacts, so an adjacent file of that name is at
+        // best stale and at worst planted. [`CoordinatorCredential`] owns the secret.
+        let coordinator_pubkey = compressed_pubkey(&read(dir, "coordinator-auth.pubkey")?)?;
+        if m.coordinator_auth_pubkey != coordinator_pubkey.to_string() {
+            return bad("manifest coordinator_auth_pubkey and the backup pubkey disagree".into());
+        }
+
+        // Node identities and endpoints. `node_id` is the key's position in the
+        // descriptor's canonical order, so the two must agree entry for entry —
+        // an independent check rather than a re-reading of the hash below.
+        let (mut nodes, mut channels, mut endpoints) = (Vec::new(), Vec::new(), Vec::new());
+        for (index, node) in m.nodes.iter().enumerate() {
+            let signing = compressed_pubkey(&node.signing_pubkey)?;
+            if usize::from(node.node_id) != index || signing != template.node_keys[index] {
+                return bad(format!(
+                    "manifest node {index} claims node_id {} and a key that is not the \
+                     descriptor's at that position",
+                    node.node_id
+                ));
+            }
+            if node.transport_endpoints.is_empty() {
+                return bad(format!("manifest node {index} pins no endpoint"));
+            }
+            for endpoint in &node.transport_endpoints {
+                let addr: SocketAddr = parsed(endpoint, "transport endpoint")?;
+                if !addr.ip().is_loopback() {
+                    return bad(format!("node {index} endpoint {addr} is not loopback"));
+                }
+                endpoints.push(addr);
+            }
+            channels.push(compressed_pubkey(&node.channel_pubkey)?);
+            nodes.push(ceremony::CeremonyNode {
+                node_id: node.node_id,
+                signing_pubkey: signing,
+                endpoints: node.transport_endpoints.clone(),
+            });
+        }
+
+        // The anchor, recomputed from the manifest's own fields, then each node's
+        // endorsement over it.
+        let manifest_hash = ceremony::manifest_hash(
+            &wallet_id,
+            &coordinator_pubkey,
+            &nodes,
+            &channels,
+            m.max_msg_bytes,
+            vault_node::HotBudget {
+                max_per_tx_sat: m.hot_max_per_tx,
+                max_per_window_sat: m.hot_max_per_window,
+                window_secs: m.hot_window_secs,
+            },
+            &m.hot_allowlist,
+            &m.escape_descriptor,
+            m.max_derivation_index,
+            m.escape_feerate_floor,
+            m.escape_coverage_pct,
+            m.escape_bump_max_fee_pct,
+            network,
+        )?;
+        for (name, claimed) in [
+            ("manifest-hash.txt", read(dir, "manifest-hash.txt")?),
+            ("manifest manifest_hash", m.manifest_hash.clone()),
+        ] {
+            if claimed != manifest_hash.to_lower_hex_string() {
+                return bad(format!("{name} is not the manifest's own recomputed hash"));
+            }
+        }
+        for (node, channel) in m.nodes.iter().zip(&channels) {
+            ceremony::verify_endorsement(
+                &template.node_keys[usize::from(node.node_id)],
+                channel,
+                &wallet_id,
+                &manifest_hash,
+                node.node_id,
+                &node.transport_endpoints,
+                &node.channel_endorsement,
+            )
+            .map_err(|e| format!("node {} endorsement does not verify: {e}", node.node_id))?;
+        }
+
+        Ok(LiveVault {
+            wallet_id,
+            manifest_hash,
+            check_params: CheckParams {
+                vault: parsed(&canonical, "vault descriptor")?,
+                allowed,
+                escape: Some(escape),
+                max_derivation_index: m.max_derivation_index,
+                hot_max_per_tx: Amount::from_sat(m.hot_max_per_tx),
+            },
+            descriptor,
+            template,
+            network,
+            escape_bump_max_fee_pct: m.escape_bump_max_fee_pct,
+            policy_version: m.policy_version,
+            coordinator_pubkey,
+            endpoints,
+        })
+    }
+}
+
+/// The coordinator's authority over this vault, from a path the caller names OUTRIGHT.
+/// One concrete type — no capability trait, no keystore framework — and deliberately no
+/// `Debug`, so no diagnostic can print what it holds.
+pub(crate) struct CoordinatorCredential {
+    /// The scalar in the zeroize-on-drop byte form `secp256k1::SecretKey` lacks, so the
+    /// copy this type owns is erased when it drops, and so is the parse's own copy in
+    /// [`Self::load_file`]. Best effort, and only that: the `SecretKey` [`Self::seckey`]
+    /// hands a caller, and whatever the library copied internally, are beyond its reach.
+    seckey: Zeroizing<[u8; 32]>,
+}
+
+impl CoordinatorCredential {
+    /// Load the credential at the explicitly selected `path` and prove it derives
+    /// `pinned` — the manifest-pinned public key a [`LiveVault`] already cross-checked.
+    /// A secret that does not derive it is a normal path bricked from birth against an
+    /// immutable manifest, so this is a refusal and not a warning.
+    pub(crate) fn load_file(path: &Path, pinned: &PublicKey) -> Result<Self, Error> {
+        let text = read_secret(path)?;
+        let mut scalar: SecretKey = parsed(text.trim(), "coordinator credential")?;
+        let derived = PublicKey::new(scalar.public_key(&Secp256k1::new()));
+        let seckey = Zeroizing::new(scalar.secret_bytes());
+        // `SecretKey` is `Copy` and erases nothing on drop, so the copy this function
+        // owns is wiped HERE — before the refusal below as well as before the success,
+        // since a mismatched key is a secret too. `seckey` erases itself either way.
+        scalar.non_secure_erase();
+        if derived != *pinned {
+            return bad(format!(
+                "credential {} does not derive the manifest-pinned coordinator public key",
+                path.display()
+            ));
+        }
+        Ok(CoordinatorCredential { seckey })
+    }
+
+    /// The scalar, rebuilt for one call. Validated at load, so it cannot fail here.
+    pub(crate) fn seckey(&self) -> SecretKey {
+        SecretKey::from_slice(self.seckey.as_slice()).expect("validated at load")
+    }
+}
+
+/// Read a secret file: opened WITHOUT following a final symlink, then proved regular and
+/// owner-only from the OPEN file's own metadata — so both checks describe the bytes that
+/// were actually read, not a name that could be swapped between the check and the open.
+/// The text is zeroizing all the way to the caller.
+fn read_secret(path: &Path) -> Result<Zeroizing<String>, Error> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        // `O_NONBLOCK`: a FIFO here would hang the open before `is_file` can refuse it.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("cannot open credential {}: {e}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return bad(format!("{} is not a regular file", path.display()));
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return bad(format!(
+            "credential {} is mode {mode:04o}: it must be readable by its owner alone",
+            path.display()
+        ));
+    }
+    // Sized from the open file: a reallocation mid-read leaves an un-wiped prefix behind.
+    let mut text = Zeroizing::new(String::with_capacity(metadata.len() as usize + 1));
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("cannot read credential {}: {e}", path.display()))?;
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::setup::tests::{ceremony_through_endorse, Ceremony};
+    use bitcoin::hashes::{sha256, Hash};
+
+    /// The exact captured pre-M1 artifact and the checksum its provenance record states,
+    /// so a fixture edited in place fails HERE rather than quietly weakening the one test
+    /// whose whole point is that these bytes are historical.
+    const PRE_M1: &str = include_str!("../tests/fixtures/pre-m1-manifest.json");
+    const PRE_M1_SHA256: &str = "1758a90253c220e579a1fd759644dc572694e9e01065beb6217135ec620e87a9";
+
+    /// A REAL sealed set: the production `assemble` → per-device endorse →
+    /// `finalize` path, then its `sealed/backup/` operator artifact directory.
+    fn sealed_set() -> (Ceremony, std::path::PathBuf) {
+        let ceremony = ceremony_through_endorse(3, 2);
+        ceremony.finalize().expect("finalize");
+        let backup = ceremony.sealed("backup");
+        (ceremony, backup)
+    }
+
+    fn manifest_of(backup: &Path) -> ParsedManifest {
+        parse_manifest(&read(backup, "manifest.json").expect("manifest.json")).expect("parses")
+    }
+
+    /// The network-I/O sentinel: the fixture's OWN listeners, bound on every endpoint the
+    /// manifest pins and held since before the ceremony chose them, are still un-accepted
+    /// when `run` returns. A dialled or probed node would land on one, and nothing is bound
+    /// and released here, so no parallel test can race this for a port.
+    fn without_network_io<T>(ceremony: &Ceremony, run: impl FnOnce() -> T) -> T {
+        let out = run();
+        for listener in &ceremony.listeners {
+            let idle =
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+            assert!(idle, "loading a sealed artifact set must open no socket");
+        }
+        out
+    }
+
+    /// This vault's manifest with `pointer` replaced by `literal`, or by the OTHER vault's value.
+    fn spliced(original: &[u8], other: &[u8], pointer: &str, literal: &str) -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(original).expect("json");
+        let foreign: serde_json::Value = serde_json::from_slice(other).expect("json");
+        *value.pointer_mut(pointer).expect("field") = match literal {
+            "" => foreign.pointer(pointer).expect("foreign field").clone(),
+            text => serde_json::from_str(text).expect("literal"),
+        };
+        value.to_string().into_bytes()
+    }
+
+    /// The refusal `what` must earn. `LiveVault` deliberately carries no `Debug`,
+    /// so the tests do not ask a vault-bearing type to print itself.
+    fn refused(artifacts: &Path, what: &str) -> String {
+        match LiveVault::load_artifacts(artifacts) {
+            Ok(_) => panic!("{what} must be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The CAPTURED pre-M1 `manifest.json` — revision 0, byte-for-byte from the ceremony
+    /// at 5c05a6d, provenance beside it — PARSES for cold inspection, which is the whole
+    /// point of a syntax-tolerant reader. Live conversion still refuses it on the REVISION,
+    /// and it does so in a directory holding NOTHING else with no credential path passed:
+    /// a refusal naming a sibling artifact would prove the version gate ran too late.
+    #[test]
+    fn the_captured_pre_m1_manifest_parses_but_fails_conversion_on_its_version_first() {
+        assert_eq!(
+            sha256::Hash::hash(PRE_M1.as_bytes()).to_string(),
+            PRE_M1_SHA256,
+            "the fixture is not the bytes its provenance record names"
+        );
+        let old = parse_manifest(PRE_M1).expect("a pre-M1 manifest still parses");
+        assert_eq!(old.protocol_version, 0);
+        assert_eq!(old.recovery_timelock, 4_224_679, "a field revision 0 had");
+        assert_eq!(old.escape_bump_max_fee_pct, 0, "a field revision 1 added");
+        assert!(old.network.is_empty(), "a field revision 2 added");
+
+        let temp = crate::fed::TempDir::new("pre-m1").expect("temp dir");
+        std::fs::write(temp.path.join("manifest.json"), PRE_M1).expect("write");
+        let error = refused(&temp.path, "a pre-M1 manifest");
+        assert!(error.contains("protocol_version 0"), "{error}");
+        for later in ["descriptor.txt", "recomputed hash", "credential", "older("] {
+            assert!(!error.contains(later), "the version comes first: {error}");
+        }
+
+        // Nor can a malformed CURRENT field outrank that diagnostic: a version gate placed
+        // after the full decode answers "invalid type: string" for this file instead.
+        let mut broken: serde_json::Value = serde_json::from_str(PRE_M1).expect("json");
+        broken["recovery_timelock"] = "not a number".into();
+        std::fs::write(temp.path.join("manifest.json"), broken.to_string()).expect("write");
+        let error = refused(&temp.path, "an old manifest with a malformed current field");
+        assert!(error.contains("protocol_version 0"), "{error}");
+    }
+
+    /// One artifact at a time — a whole file, a JSON pointer taking another vault's value,
+    /// or one taking a literal: each is caught by its OWN cross-check, none reaches the
+    /// network, and the exact restored bytes convert again.
+    #[test]
+    fn each_independently_tampered_artifact_is_refused_before_any_network_io() {
+        // A leading `/` is a JSON pointer into manifest.json and a third column splices a
+        // literal, for a value two regtest vaults share; anything else is a file. Neither
+        // manifest anchor copy is authenticated by the file of that name, and `/network` is
+        // refused by the FLAVOUR guard — which runs before the anchor, so it proves itself.
+        // `/recovery_timelock` is answered by the descriptor-derived template, which is
+        // authoritative for all three consensus facts the manifest reads back.
+        const TAMPERS: [(&str, &str, &str); 11] = [
+            ("descriptor.txt", "vault_descriptor", ""),
+            ("wallet-id.txt", "wallet-id.txt", ""),
+            ("manifest-hash.txt", "manifest-hash.txt", ""),
+            ("coordinator-auth.pubkey", "coordinator_auth_pubkey", ""),
+            ("/nodes/0/signing_pubkey", "at that position", ""),
+            ("/nodes/0/transport_endpoints", "recomputed hash", ""),
+            ("/nodes/0/channel_endorsement", "does not verify", ""),
+            ("/wallet_id", "manifest wallet_id", ""),
+            ("/manifest_hash", "manifest manifest_hash", ""),
+            ("/recovery_timelock", "under older(1) is not", "1"),
+            ("/network", "test-kind (tpub)", "\"bitcoin\""),
+        ];
+        let (ceremony, backup) = sealed_set();
+        let (other, foreign) = sealed_set();
+        LiveVault::load_artifacts(&backup).expect("the untampered set converts");
+
+        for (target, needle, literal) in TAMPERS {
+            let json = target.starts_with('/');
+            let file = if json { "manifest.json" } else { target };
+            let original = std::fs::read(backup.join(file)).expect("artifact");
+            let mut swap = std::fs::read(foreign.join(file)).expect("the other vault's");
+            if json {
+                swap = spliced(&original, &swap, target, literal);
+            }
+            assert_ne!(original, swap, "{target} must change the sealed value");
+            std::fs::write(backup.join(file), &swap).expect("tamper");
+            // BOTH fixtures' listeners: this row swaps node 0's endpoints for the OTHER
+            // vault's, so a loader that dialled only that node lands solely on ITS listeners.
+            let quiet = || without_network_io(&other, || refused(&backup, target));
+            let error = without_network_io(&ceremony, quiet);
+            assert!(error.contains(needle), "{target}: {error}");
+            std::fs::write(backup.join(file), &original).expect("restore");
+            LiveVault::load_artifacts(&backup).expect("the exact restored bytes convert again");
+        }
+    }
+
+    /// The complete set converts, and every value the vault carries is one the
+    /// artifacts proved — including the endpoints, in node/endpoint order.
+    #[test]
+    fn a_complete_sealed_set_converts_and_carries_only_cross_checked_values() {
+        let (ceremony, backup) = sealed_set();
+        let vault = without_network_io(&ceremony, || {
+            LiveVault::load_artifacts(&backup).expect("converts")
+        });
+        let m = manifest_of(&backup);
+        assert_eq!(vault.wallet_id.to_lower_hex_string(), m.wallet_id);
+        assert_eq!(vault.manifest_hash.to_lower_hex_string(), m.manifest_hash);
+        assert_eq!(vault.descriptor.to_string(), m.vault_descriptor);
+        assert_eq!(vault.network, Network::Regtest);
+        assert_eq!(vault.escape_bump_max_fee_pct, 0);
+        // Type-checked and carried, NOT hash-authenticated — see the field's docs.
+        assert_eq!(vault.policy_version, m.policy_version);
+        assert_eq!(vault.template.threshold, m.t);
+        assert_eq!(vault.template.recovery_timelock, m.recovery_timelock);
+        assert_eq!(vault.check_params.allowed.len(), m.hot_allowlist.len() + 1);
+        let pinned = vault.coordinator_pubkey.to_string();
+        assert_eq!(pinned, m.coordinator_auth_pubkey);
+        let nodes = m.nodes.iter();
+        let pinned: Vec<String> = nodes.flat_map(|n| n.transport_endpoints.clone()).collect();
+        let loaded: Vec<String> = vault.endpoints.iter().map(SocketAddr::to_string).collect();
+        assert_eq!(loaded, pinned);
+    }
+
+    /// The runtime artifact directory is NON-SECRET. Built from the exact finalized bytes
+    /// with `coordinator-auth.secret` absent it still converts; a malformed decoy of that
+    /// name dropped beside the artifacts changes nothing, because the loader never forms
+    /// that path; and the credential the operator actually selected — stored elsewhere, as
+    /// the ceremony's own README instructs — still pairs with the vault. Any mutation that
+    /// reinstates `artifacts.join("coordinator-auth.secret")` dies on one of the three.
+    #[test]
+    fn artifacts_load_without_the_secret_and_an_adjacent_decoy_is_never_opened() {
+        let (ceremony, backup) = sealed_set();
+        let runtime = ceremony.sealed("runtime");
+        std::fs::create_dir_all(&runtime).expect("runtime dir");
+        for entry in std::fs::read_dir(&backup).expect("backup") {
+            let path = entry.expect("entry").path();
+            let name = path.file_name().expect("name").to_owned();
+            if name != "coordinator-auth.secret" {
+                std::fs::copy(&path, runtime.join(name)).expect("the exact finalized bytes");
+            }
+        }
+        assert!(!runtime.join("coordinator-auth.secret").exists());
+        let vault = without_network_io(&ceremony, || {
+            LiveVault::load_artifacts(&runtime).expect("the secret is not a runtime artifact")
+        });
+
+        std::fs::write(runtime.join("coordinator-auth.secret"), "not a key\n").expect("decoy");
+        LiveVault::load_artifacts(&runtime).expect("a decoy beside the artifacts is never read");
+
+        let elsewhere = crate::fed::TempDir::new("credential").expect("temp dir");
+        let selected = elsewhere.path.join("coordinator-auth.secret");
+        std::fs::copy(backup.join("coordinator-auth.secret"), &selected).expect("copy");
+        let credential = CoordinatorCredential::load_file(&selected, &vault.coordinator_pubkey)
+            .expect("the explicitly selected credential pairs with the vault");
+        let derived = credential.seckey().public_key(&Secp256k1::new());
+        assert_eq!(PublicKey::new(derived), vault.coordinator_pubkey);
+    }
+
+    /// Every way the selected credential can be wrong, each at its own boundary. The
+    /// symlink row is the sharpest: its TARGET is the control that loads, so the only
+    /// thing that can refuse the link is the no-follow open itself.
+    #[test]
+    fn the_credential_refuses_a_symlink_a_directory_a_loose_mode_and_a_foreign_key() {
+        let (_ceremony, backup) = sealed_set();
+        let vault = LiveVault::load_artifacts(&backup).expect("converts");
+        let temp = crate::fed::TempDir::new("credential").expect("temp dir");
+        let secret = std::fs::read_to_string(backup.join("coordinator-auth.secret")).expect("read");
+        let write = |name: &str, body: &str, mode: u32| -> std::path::PathBuf {
+            let path = temp.path.join(name);
+            std::fs::write(&path, body).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
+            path
+        };
+
+        let good = write("good", &secret, 0o600);
+        CoordinatorCredential::load_file(&good, &vault.coordinator_pubkey).expect("the control");
+        std::os::unix::fs::symlink(&good, temp.path.join("link")).expect("symlink");
+        std::fs::create_dir(temp.path.join("dir")).expect("dir");
+        write("group", &secret, 0o640);
+        write("world", &secret, 0o604);
+        write("malformed", "not a key\n", 0o600);
+        write("foreign", &format!("{}\n", "11".repeat(32)), 0o600);
+        for (name, needle) in [
+            ("link", "cannot open"),
+            ("dir", "not a regular file"),
+            ("group", "mode 0640"),
+            ("world", "mode 0604"),
+            ("malformed", "does not parse"),
+            ("foreign", "does not derive the manifest-pinned"),
+        ] {
+            let path = temp.path.join(name);
+            let error = match CoordinatorCredential::load_file(&path, &vault.coordinator_pubkey) {
+                Ok(_) => panic!("{name} must be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(error.contains(needle), "{name}: {error}");
+            assert!(!error.contains(secret.trim()), "{name} printed the secret");
+        }
+    }
+
+    /// The two halves are separate BY DECLARATION, which is a property of shape and so is
+    /// checked on the source: the policy half child B consumes declares no secret owner and
+    /// no credential FIELD, the credential owns its scalar in a zeroize-on-drop buffer, and
+    /// neither type derives `Debug`, so no diagnostic can print what a credential holds.
+    #[test]
+    fn the_policy_half_declares_no_secret_and_the_credential_erases_its_own() {
+        // The PRODUCTION half only. Scanning the whole file would let this test's own
+        // assertion literals satisfy it, which is how the first version of it passed
+        // against a credential whose scalar had been stripped of `Zeroizing`.
+        let source = include_str!("sealed.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let declaration = code
+            .split("pub(crate) struct LiveVault {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("the LiveVault declaration");
+        for banned in ["SecretKey", "seckey", "Zeroizing", "Credential"] {
+            // FIELDS only: the field docs NAME the credential type, so a scan over the
+            // whole declaration would answer for the comment rather than for a field.
+            let owns = declaration
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("///"))
+                .any(|line| line.contains(banned));
+            assert!(!owns, "LiveVault owns {banned}");
+        }
+        assert!(
+            code.contains("seckey: Zeroizing<[u8; 32]>"),
+            "the credential's scalar must be owned by a zeroize-on-drop buffer"
+        );
+        // Every spelling, not one literal: a reordered derive list, an extra derive, or a
+        // hand-written impl would print a `Zeroizing` scalar in full (zeroize derives it).
+        for kind in ["LiveVault", "CoordinatorCredential"] {
+            // `split_once`, not `split().next()`: the latter answers with the WHOLE
+            // half when the name is absent, so a renamed type would pass vacuously.
+            let (above, _) = code
+                .split_once(&format!("struct {kind} {{"))
+                .expect("the declaration");
+            let attributes = above.rsplit("\n\n").next().unwrap_or("");
+            let prints = attributes
+                .lines()
+                .any(|l| l.starts_with("#[") && l.contains("Debug"))
+                || code.contains(&format!("Debug for {kind}"));
+            assert!(!prints, "{kind} must not print itself");
+        }
+    }
+}

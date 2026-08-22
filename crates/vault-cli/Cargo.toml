@@ -12,6 +12,10 @@ path = "src/main.rs"
 [dependencies]
 base64 = { workspace = true }
 bitcoin = { workspace = true }
+# `O_NOFOLLOW`, so the coordinator credential is opened without following a final
+# symlink instead of being stat-ed and then re-opened by name. Already in the tree
+# (vault-node's termios FFI), so this adds a direct dep and no new crate.
+libc = { workspace = true }
 miniscript = { workspace = true }
 # The setup ceremony's public artifacts (node bundles, escape bundle, ceremony
 # input/state) are serde-derived JSON. Both crates are already in the tree via

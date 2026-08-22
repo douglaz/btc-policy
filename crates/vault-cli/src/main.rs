@@ -6,7 +6,13 @@ mod bitcoind;
 mod demo;
 mod fed;
 mod http;
+// The M2 operator substrate: the sealed-artifact trust boundary and the stage-1 ingress
+// client. M4/M5 add the commands that call them, so a binary build has no caller yet.
+#[cfg_attr(not(test), allow(dead_code))]
+mod ingress;
 mod recovery;
+#[cfg_attr(not(test), allow(dead_code))]
+mod sealed;
 mod setup;
 mod signet;
 
