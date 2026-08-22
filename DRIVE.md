@@ -2,8 +2,10 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** LAND · **Beads:** btc-policy-descriptor-network-kind-x00 + btc-policy-5ag · **Branch:** beads/descriptor-network-kind-x00-close
-**Pending:** land the reviewed closure-only record after child B and its tracking parent completed
+**Phase:** GRAPH · **Beads:** btc-policy-mby-operator-core-signer-7vb +
+btc-policy-mby-sealed-vault-ingress-s7u + btc-policy-mby-user-signer-tae ·
+**Branch:** beads/m2-split
+**Pending:** land the reviewed graph-only M2 budget-valve split before restoring any implementation
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -71,15 +73,27 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Land this closure-only branch so fresh clones see `btc-policy-descriptor-network-kind-x00` and
-`btc-policy-5ag` closed. The work itself is already merged in #26; do not mix M2 implementation into
-this metadata PR.
+Land a graph-only split of M2. The original 900-line rb-lite run reached 899 gross Rust lines with a
+validated-artifact loader and ordered stage-1 ingress but no `UserSigner` or software signer. Preserve
+those exact code bytes on local recovery ref `wip/m2a-artifact-ingress`; do not mix them into this
+recording PR. `btc-policy-mby-operator-core-signer-7vb` is now an open, unassigned tracking umbrella:
+child A `btc-policy-mby-sealed-vault-ingress-s7u` owns the loader/client and child B
+`btc-policy-mby-user-signer-tae` owns the frozen signing seam and signer. Exact graph:
+A depends on closed M1 + closed 5ag; B depends only on A; 7vb depends only on A+B. Existing M3 and
+`mby` dependents remain on 7vb. Codex and Opus xhigh independently required this split rather than
+hiding missing signer work or thinning trust-boundary tests.
 
 ## Next
-After the closure merges, claim ready child `btc-policy-mby-operator-core-signer-7vb` (M2) on a fresh
-branch and implement it through rb-lite at its hard **900 gross Rust / 160 non-Rust** caps, tests
-included. M2 may parse pre-M1 artifacts for cold use but rejects them before live hash validation or
-network I/O. Then implement M3 stable Core composer, M4 Spend command, and the parallel
+After this graph PR merges, claim only ready child A on a fresh branch, restore the eight reviewed
+implementation paths from recovery commit `9a4f946`, verify the patch checksum recorded under
+`/tmp/m2a-recovery` (`083f7d576c260a95561dfa1419e0f3f7a196b50c9693d6ec1b4cd25503d75b0c`);
+if that local recovery ref is unavailable, regenerate A from its executable bead rather than treating
+the hidden bytes as an upstream prerequisite. Continue through rb-lite at its hard **1,250 gross Rust /
+120 tracked non-Rust** caps. A may parse a captured pre-M1 manifest for cold use but rejects it before live hash
+validation, sibling reads, or network I/O. It must land and close before child B is claimed. Implement
+B through a separate rb-lite branch/PR at **1,050 gross Rust / 80 non-Rust**, preserving all 17 named
+test classes. Close tracking umbrella 7vb only after both merge and close. Then implement M3 stable
+Core composer, M4 Spend command, and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
 rb-lite. M4/M5 reuse one exact request across ordered stage-1 ingress attempts and report success
 only after Core observes node-side threshold combine/broadcast; M6 mutation-tests that non-ingress
@@ -91,11 +105,13 @@ complete-product dependents stay
 blocked on `mby`. `imb` owns confidential authenticated coordinator ingress and routable peer
 transport from stage 2 onward; the operator CLI remains on the coordinator host.
 
-The reviewed hard Rust caps are **4,050 gross lines total, additions plus deletions with every test
-line included**: M1 800, M2 900, M3 500, M4 500, M5 850, M6 500. The estimate is approximately
-1,450 production + 2,600 tests, so tests are 64.2% of the Rust budget; non-Rust evidence/docs total
-700. Exact scope and stop conditions live in each child bead. These caps supersede the old
-2,500–4,500 estimate, which never said whether tests or deletions counted.
+The reviewed hard Rust caps are now **5,450 gross lines total, additions plus deletions with every
+test/helper/fixture line included**: M1 800, M2-A 1,250, M2-B 1,050, M3 500, M4 500, M5 850,
+M6 500. M2-A's 1,025-line planning base includes approximately 415 test lines; M2-B's 780-line base
+includes approximately 340 test lines. All other children retain their recorded production/test
+splits. Tracked non-Rust caps total **740**: M1 220, M2-A 120, M2-B 80, M3 40, M4 80, M5 80,
+M6 120. These values replace M2's disproven 900/160 cap and the former 4,050/700 ladder totals; exact
+scope, arithmetic, reforecast checkpoints, and stop/split valves live in the two child beads.
 
 The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
 `coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's P3
