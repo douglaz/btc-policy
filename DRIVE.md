@@ -19,9 +19,11 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   credential verifies against the pinned public key and never enters `LiveVault`; old revisions fail
   before sibling/credential/network I/O; captured pre-M1 bytes, recovery timelock, hash/identity/
   endorsement checks, deterministic endpoint facts, exact-body/nonce reuse, sticky 400/413/replay
-  semantics, and Accepted payloads are pinned. Merged #29 (`0754689`) at 1,247/1,250 gross Rust and
-  82/120 gross non-Rust after rb-lite, 32/32 killed mutations, independent exact-byte local/live/launch
-  reruns, two current-head Codex rounds, and both CI launch gates. A remains pre-command substrate:
+  semantics, and Accepted payloads are pinned. Merged #29 (`0754689`); its exact
+  `0ed8095..0e85254` budget is 1,247/1,250 gross Rust and 82/120 tracked non-Rust, with the claim
+  commit's 43 lifecycle lines (41 DRIVE + 2 Beads) forming the base rather than the work. After
+  rb-lite, 32/32 killed mutations, independent exact-byte local/live/launch reruns, two current-head
+  Codex rounds, and both CI launch gates succeeded. A remains pre-command substrate:
   `btc-policy-http-bounded-ingress-response-qhe` is the mandatory M4 blocker for the inherited
   read-to-close deadline/cap/framing gap.
 - `btc-policy-descriptor-network-kind-x00` + tracking parent `btc-policy-5ag` (P1) — one shared
@@ -93,7 +95,7 @@ new code into this metadata PR.
 ## Next
 After this closure lands, claim ready child B on a fresh branch and implement it through a separate
 rb-lite run at **1,050 gross Rust / 80 non-Rust**, preserving all 17 named test classes. Close tracking
-umbrella 7vb only after both A and B close. Then implement M3 stable Core composer. Qhe may land
+umbrella 7vb only after both A and B close. Then implement M3 stable Core composer. `qhe` may land
 earlier, but its bounded deadline/cap/framing work MUST close after A and before M4. Then implement M4
 Spend command and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
@@ -114,7 +116,9 @@ approximately 415 test lines; M2-B's 780-line base includes approximately 340 te
 children retain their recorded production/test splits. Tracked non-Rust caps total **770**: M1 220,
 M2-A 120, M2-B 80, M3 40, M4 80, M5 80, M6 120, qhe 30. These values replace M2's disproven
 900/160 cap and the former 4,050/700 ladder totals; exact scope, arithmetic, reforecast checkpoints,
-and stop/split valves live in the executable beads.
+and stop/split valves live in the executable beads. Implementation budgets are gross tracked
+additions plus deletions over `<claim commit>..<reviewed head>`; the claim commit is the base, while
+gitignored `.rb-lite/` evidence is not tracked gross.
 
 The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
 `coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's P3
