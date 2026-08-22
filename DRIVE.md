@@ -2,9 +2,9 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** BUILD · **Bead:** btc-policy-mby-sealed-vault-ingress-s7u ·
-**Branch:** beads/m2a-sealed-vault-ingress-s7u
-**Pending:** finish child A through rb-lite within its 1,250 Rust / 120 tracked non-Rust hard caps
+**Phase:** LAND · **Bead:** btc-policy-mby-sealed-vault-ingress-s7u closure ·
+**Filed blocker:** btc-policy-http-bounded-ingress-response-qhe · **Branch:** beads/m2a-close
+**Pending:** land the reviewed closure-only record so fresh clones see A closed and M4 blocked on qhe
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -14,6 +14,16 @@ a `br ready` ranking.
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-mby-sealed-vault-ingress-s7u` (M2 child A, P1) — current revision-2 public/policy
+  artifacts load from one explicit non-secret directory; a separately selected owner-only/no-follow
+  credential verifies against the pinned public key and never enters `LiveVault`; old revisions fail
+  before sibling/credential/network I/O; captured pre-M1 bytes, recovery timelock, hash/identity/
+  endorsement checks, deterministic endpoint facts, exact-body/nonce reuse, sticky 400/413/replay
+  semantics, and Accepted payloads are pinned. Merged #29 (`0754689`) at 1,247/1,250 gross Rust and
+  82/120 gross non-Rust after rb-lite, 32/32 killed mutations, independent exact-byte local/live/launch
+  reruns, two current-head Codex rounds, and both CI launch gates. A remains pre-command substrate:
+  `btc-policy-http-bounded-ingress-response-qhe` is the mandatory M4 blocker for the inherited
+  read-to-close deadline/cap/framing gap.
 - `btc-policy-descriptor-network-kind-x00` + tracking parent `btc-policy-5ag` (P1) — one shared
   `policy-core` validator binds every XPub/MultiXPub destination to the sealed network at assemble,
   finalize, and node load; definite keys stay neutral; Escape keygen now requires `--network`.
@@ -72,22 +82,20 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Implement child A through rb-lite. PR #28 (`36e857c`) landed the reviewed A/B split after current-head
-Codex found and we corrected a custody contradiction: the runtime artifact directory is explicitly
-non-secret and the coordinator credential is an independent explicit path, never an adjacent-file
-default. Restore only the eight code paths from recovery commit `9a4f946` after verifying patch checksum
-`083f7d576c260a95561dfa1419e0f3f7a196b50c9693d6ec1b4cd25503d75b0c`. Those bytes are a baseline,
-not authority: replace their adjacent-secret load and secret-bearing `LiveVault`; add the captured
-historical fixture, deterministic network sentinels, endpoint diagnostics, complete nonce-doc sweep,
-recovery-timelock check, separate zeroizing credential, and all missing/decoy/mode/type/symlink proofs.
-Reforecast at 1,100; stop/split at 1,250 rather than thinning the trust-boundary tables.
+Land this closure-only branch. A is already CLOSED in its worktree record, qhe is filed with the
+reviewed deadline/cap/framing contract, and M4 directly depends on qhe. Final review found that the
+pre-existing shared HTTP helper lets one compromised first endpoint drip forever through the new
+sequential loop. Codex xhigh and Opus xhigh agreed this is P2 but disagreed on firing A's
+loader/ingress valve; the driver chose the narrower architecture because A has no production caller
+and its artifact/authority work is complete. Do not implement qhe or child B, alter the edge, or mix
+new code into this metadata PR.
 
 ## Next
-Land and close child A only after its exact local gate, ignored live-Core backend, four launch commands,
-current-head bot review, and both launch-gate jobs succeed. Then claim child B on a fresh branch and
-implement it through a separate rb-lite run at **1,050 gross Rust / 80 non-Rust**, preserving all 17
-named test classes. Close tracking umbrella 7vb only after both merge and close. Then implement M3 stable
-Core composer, M4 Spend command, and the parallel
+After this closure lands, claim ready child B on a fresh branch and implement it through a separate
+rb-lite run at **1,050 gross Rust / 80 non-Rust**, preserving all 17 named test classes. Close tracking
+umbrella 7vb only after both A and B close. Then implement M3 stable Core composer. Qhe may land
+earlier, but its bounded deadline/cap/framing work MUST close after A and before M4. Then implement M4
+Spend command and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
 rb-lite. M4/M5 reuse one exact request across ordered stage-1 ingress attempts and report success
 only after Core observes node-side threshold combine/broadcast; M6 mutation-tests that non-ingress
@@ -99,13 +107,14 @@ complete-product dependents stay
 blocked on `mby`. `imb` owns confidential authenticated coordinator ingress and routable peer
 transport from stage 2 onward; the operator CLI remains on the coordinator host.
 
-The reviewed hard Rust caps are now **5,450 gross lines total, additions plus deletions with every
+The reviewed hard Rust caps are now **5,630 gross lines total, additions plus deletions with every
 test/helper/fixture line included**: M1 800, M2-A 1,250, M2-B 1,050, M3 500, M4 500, M5 850,
-M6 500. M2-A's 1,025-line planning base includes approximately 415 test lines; M2-B's 780-line base
-includes approximately 340 test lines. All other children retain their recorded production/test
-splits. Tracked non-Rust caps total **740**: M1 220, M2-A 120, M2-B 80, M3 40, M4 80, M5 80,
-M6 120. These values replace M2's disproven 900/160 cap and the former 4,050/700 ladder totals; exact
-scope, arithmetic, reforecast checkpoints, and stop/split valves live in the two child beads.
+M6 500, plus HTTP deadline/cap/framing blocker qhe 180. M2-A's 1,025-line planning base includes
+approximately 415 test lines; M2-B's 780-line base includes approximately 340 test lines. All other
+children retain their recorded production/test splits. Tracked non-Rust caps total **770**: M1 220,
+M2-A 120, M2-B 80, M3 40, M4 80, M5 80, M6 120, qhe 30. These values replace M2's disproven
+900/160 cap and the former 4,050/700 ladder totals; exact scope, arithmetic, reforecast checkpoints,
+and stop/split valves live in the executable beads.
 
 The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
 `coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's P3
