@@ -2,9 +2,9 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** LAND · **Bead:** btc-policy-mby-sealed-vault-ingress-s7u closure ·
-**Filed blocker:** btc-policy-http-bounded-ingress-response-qhe · **Branch:** beads/m2a-close
-**Pending:** land the reviewed closure-only record so fresh clones see A closed and M4 blocked on qhe
+**Phase:** BUILD · **Bead:** btc-policy-mby-user-signer-tae ·
+**Branch:** beads/m2b-user-signer-tae
+**Pending:** implement child B through rb-lite within its 1,050 Rust / 80 non-Rust hard caps
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -84,18 +84,17 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Land this closure-only branch. A is already CLOSED in its worktree record, qhe is filed with the
-reviewed deadline/cap/framing contract, and M4 directly depends on qhe. Final review found that the
-pre-existing shared HTTP helper lets one compromised first endpoint drip forever through the new
-sequential loop. Codex xhigh and Opus xhigh agreed this is P2 but disagreed on firing A's
-loader/ingress valve; the driver chose the narrower architecture because A has no production caller
-and its artifact/authority work is complete. Do not implement qhe or child B, alter the edge, or mix
-new code into this metadata PR.
+Implement child B through rb-lite: the exact frozen `UserAuthorization`/`UserSigner` seam, one
+file-backed zeroizing software signer over A's secret-free `LiveVault`, mandatory full-prevtx truth,
+pre-sign wallet/policy/role/group validation, Escape rung shape/relay/whole-fee-ceiling validation,
+SIGHASH_ALL, and reusable generic all-Escape display. Preserve all exactly 17 named test classes,
+including positive Refresh and swapped all-Escape behavior. Reforecast at 850 and stop/split at
+1,050 rather than thinning tests or inventing wallet/signer/display frameworks.
 
 ## Next
-After this closure lands, claim ready child B on a fresh branch and implement it through a separate
-rb-lite run at **1,050 gross Rust / 80 non-Rust**, preserving all 17 named test classes. Close tracking
-umbrella 7vb only after both A and B close. Then implement M3 stable Core composer. `qhe` may land
+Land and close child B only after its exact local gate, ignored live-Core backend, launch commands,
+current-head bot review, and both launch-gate jobs succeed. Then close tracking umbrella 7vb, which
+unblocks M3. Implement M3 stable Core composer next. `qhe` may land
 earlier, but its bounded deadline/cap/framing work MUST close after A and before M4. Then implement M4
 Spend command and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
