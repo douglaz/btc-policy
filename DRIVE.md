@@ -2,10 +2,9 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** GRAPH · **Beads:** btc-policy-mby-operator-core-signer-7vb +
-btc-policy-mby-sealed-vault-ingress-s7u + btc-policy-mby-user-signer-tae ·
-**Branch:** beads/m2-split
-**Pending:** land the reviewed graph-only M2 budget-valve split before restoring any implementation
+**Phase:** BUILD · **Bead:** btc-policy-mby-sealed-vault-ingress-s7u ·
+**Branch:** beads/m2a-sealed-vault-ingress-s7u
+**Pending:** finish child A through rb-lite within its 1,250 Rust / 120 tracked non-Rust hard caps
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -73,29 +72,21 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Land a graph-only split of M2. The original 900-line rb-lite run reached 899 gross Rust lines with a
-validated-artifact loader and ordered stage-1 ingress but no `UserSigner` or software signer. Preserve
-those exact code bytes on local recovery ref `wip/m2a-artifact-ingress`; do not mix them into this
-recording PR. `btc-policy-mby-operator-core-signer-7vb` is now an open, unassigned tracking umbrella:
-child A `btc-policy-mby-sealed-vault-ingress-s7u` owns the loader/client and child B
-`btc-policy-mby-user-signer-tae` owns the frozen signing seam and signer. Exact graph:
-A depends on closed M1 + closed 5ag; B depends only on A; 7vb depends only on A+B. Existing M3 and
-`mby` dependents remain on 7vb. Codex and Opus xhigh independently required this split rather than
-hiding missing signer work or thinning trust-boundary tests.
+Implement child A through rb-lite. PR #28 (`36e857c`) landed the reviewed A/B split after current-head
+Codex found and we corrected a custody contradiction: the runtime artifact directory is explicitly
+non-secret and the coordinator credential is an independent explicit path, never an adjacent-file
+default. Restore only the eight code paths from recovery commit `9a4f946` after verifying patch checksum
+`083f7d576c260a95561dfa1419e0f3f7a196b50c9693d6ec1b4cd25503d75b0c`. Those bytes are a baseline,
+not authority: replace their adjacent-secret load and secret-bearing `LiveVault`; add the captured
+historical fixture, deterministic network sentinels, endpoint diagnostics, complete nonce-doc sweep,
+recovery-timelock check, separate zeroizing credential, and all missing/decoy/mode/type/symlink proofs.
+Reforecast at 1,100; stop/split at 1,250 rather than thinning the trust-boundary tables.
 
 ## Next
-After this graph PR merges, claim only ready child A on a fresh branch, restore the eight reviewed
-implementation paths from recovery commit `9a4f946`, verify the patch checksum recorded under
-`/tmp/m2a-recovery` (`083f7d576c260a95561dfa1419e0f3f7a196b50c9693d6ec1b4cd25503d75b0c`);
-if that local recovery ref is unavailable, regenerate A from its executable bead rather than treating
-the hidden bytes as an upstream prerequisite. The recovery ref is only a baseline: its adjacent-secret
-load and secret-bearing `LiveVault` are stale. Replace them with A's explicit non-secret artifact
-directory plus separate credential path before review. Continue through rb-lite at its hard **1,250
-gross Rust / 120 tracked non-Rust** caps. A may parse a captured pre-M1 manifest for cold use but
-rejects it before live hash validation, sibling/credential reads, or network I/O. It must land and
-close before child B is claimed. Implement
-B through a separate rb-lite branch/PR at **1,050 gross Rust / 80 non-Rust**, preserving all 17 named
-test classes. Close tracking umbrella 7vb only after both merge and close. Then implement M3 stable
+Land and close child A only after its exact local gate, ignored live-Core backend, four launch commands,
+current-head bot review, and both launch-gate jobs succeed. Then claim child B on a fresh branch and
+implement it through a separate rb-lite run at **1,050 gross Rust / 80 non-Rust**, preserving all 17
+named test classes. Close tracking umbrella 7vb only after both merge and close. Then implement M3 stable
 Core composer, M4 Spend command, and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
 rb-lite. M4/M5 reuse one exact request across ordered stage-1 ingress attempts and report success

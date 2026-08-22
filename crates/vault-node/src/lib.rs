@@ -9165,7 +9165,7 @@ mod preflight_concurrency {
         ));
 
         // The backend dies, and the coordinator retries the SAME pair with a fresh
-        // nonce (the nonce is single-use per transmission; idempotency lives on the pair).
+        // nonce (the nonce is single-use per logical request; idempotency lives on the pair).
         node.set_chain_backend(Arc::new(MockBackend {
             prevout_error: Some("backend unavailable".into()),
             ..Default::default()
@@ -9353,7 +9353,7 @@ pub(crate) mod test_support {
     /// request bytes — exactly what vault-cli does before relaying. Every request
     /// must clear the ingress coord-auth gate, so tests that RE-send a request
     /// (a coordinator retrying a timed-out or lost call) re-sign with a fresh
-    /// nonce: the nonce is single-use per transmission, while idempotency lives on
+    /// nonce: the nonce is single-use per logical request, while idempotency lives on
     /// the commitment, so the same spend re-sent this way still returns the one
     /// recorded verdict from the anti-replay log.
     pub(crate) fn coord_sign(request: &mut SignRequest, wallet_id: &[u8; 32], nonce: &str) {

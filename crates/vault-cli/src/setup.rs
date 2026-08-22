@@ -2149,8 +2149,9 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     /// Argon2id's floor: these tests are about WHAT is derived and WHAT travels,
     /// never about the cost of deriving it.
@@ -2208,6 +2209,25 @@ mod tests {
                     .expect("node identity")
             })
             .collect()
+    }
+
+    /// The same provisioning, but pinning each endpoint to a port whose listener this
+    /// fixture HOLDS. A sealed set's endpoints are what the loader's no-network-I/O
+    /// sentinel accepts on, so a fixture that bound a free port and released it would
+    /// race any parallel test for that port and could fail for that reason alone. The
+    /// never-bound endpoints `devices` uses are fine for every caller that dials none,
+    /// so only the ceremony fixture pays this. Non-blocking, so the sentinel's `accept`
+    /// answers immediately.
+    fn devices_holding_ports(n: usize) -> (Vec<(Preimage, NodeBundle)>, Vec<TcpListener>) {
+        let (mut devices, mut listeners) = (Vec::new(), Vec::new());
+        for _ in 0..n {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("free loopback port");
+            let addr = listener.local_addr().expect("addr").to_string();
+            listener.set_nonblocking(true).expect("nonblocking");
+            listeners.push(listener);
+            devices.push(generate_node_identity(addr, OPS, MEM_KIB).expect("node identity"));
+        }
+        (devices, listeners)
     }
 
     /// The bead's headline property, stated as a test: what a node publishes is
@@ -3418,10 +3438,13 @@ mod tests {
 
     /// A ceremony working directory carried with its `TempDir`, so the directory
     /// outlives the assertions and is removed afterwards.
-    struct Ceremony {
+    pub(crate) struct Ceremony {
         _temp: crate::fed::TempDir,
         dir: PathBuf,
         devices: Vec<(Preimage, NodeBundle)>,
+        /// One per pinned endpoint, bound BEFORE the ceremony chose it and held for
+        /// the fixture's life; see [`devices_holding_ports`] and the loader's sentinel.
+        pub(crate) listeners: Vec<TcpListener>,
     }
 
     impl Ceremony {
@@ -3429,7 +3452,7 @@ mod tests {
         /// `SEALED_DIR` (bead btc-policy-sealed-network-v2-mn6 A8): a test that reads
         /// the constant would follow any future rename silently, including back to a
         /// revision-bearing name the docs and the b8z/sq7 target clauses no longer use.
-        fn sealed(&self, rel: impl AsRef<Path>) -> PathBuf {
+        pub(crate) fn sealed(&self, rel: impl AsRef<Path>) -> PathBuf {
             self.dir.join("sealed").join(rel)
         }
 
@@ -3454,7 +3477,7 @@ mod tests {
             .expect("write state");
         }
 
-        fn finalize(&self) -> Result<(), Error> {
+        pub(crate) fn finalize(&self) -> Result<(), Error> {
             self.finalize_stopping_at(None)
         }
 
@@ -3472,11 +3495,11 @@ mod tests {
     /// bundles, run the real `assemble_cmd` over a `ceremony-input.json`, then have
     /// each device endorse the sealed anchor with the key its OWN preimage derives —
     /// exactly what `setup node-endorse` does on each host.
-    fn ceremony_through_endorse(n: usize, threshold: usize) -> Ceremony {
+    pub(crate) fn ceremony_through_endorse(n: usize, threshold: usize) -> Ceremony {
         let temp = crate::fed::TempDir::new("setup-finalize").expect("temp dir");
         let dir = temp.path.join("ceremony");
         std::fs::create_dir_all(&dir).expect("ceremony dir");
-        let devices = devices(n);
+        let (devices, listeners) = devices_holding_ports(n);
 
         let mut node_bundles = Vec::new();
         for (index, (_, bundle)) in devices.iter().enumerate() {
@@ -3561,6 +3584,7 @@ mod tests {
             _temp: temp,
             dir,
             devices,
+            listeners,
         };
         let state = ceremony.state();
         let wallet_id = hex32(&state.wallet_id, "wallet_id").expect("wallet_id");

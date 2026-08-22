@@ -1,0 +1,51 @@
+{
+  "coordinator_auth_pubkey": "03b12d5c9da9ea814ec19df16fb7daf1e32dfd085c0e5d2423d86e60e4bcb1badc",
+  "escape_coverage_pct": 95,
+  "escape_descriptor": "wpkh([bf0716cf]tpubD6NzVbkrYhZ4XySqftJmsqUAKTwJcf1JA6qnRztcSr9hhzRWCqNfQZunhqg7vFHvZyW3AxjUxk1ZyBAqgib7qcLuEmETGqJnNxeDu6L2e5J/*)#jj3eklqz",
+  "escape_feerate_floor": 1,
+  "hot_allowlist": [
+    "wpkh([95773939]tpubD6NzVbkrYhZ4YSoDXAZcKT8tanGaaLTpd1RYV2LTHJVZJ9XgLWLfcy5bpedMa7ULkTGxz1qTxKyqXSYCbLQobgWUqLySxP76Tm6uhqeu9ji/*)#w9vevf43"
+  ],
+  "hot_max_per_tx": 1000000,
+  "hot_max_per_window": 1000000,
+  "hot_window_secs": 172800,
+  "manifest_hash": "e86387e55a1bd240ff3ae3bc04d2856d8e57bbff3ba5bf0fb8ea6826bbf02800",
+  "max_derivation_index": 20,
+  "max_msg_bytes": 1048576,
+  "n": 3,
+  "nodes": [
+    {
+      "channel_endorsement": "30440220383a3ad544effd77c6f935319ccfa63225984809daf118bc83fb04f94ebeef790220628e80e8efc94c5e274b85bc23a9fc35660c855005a64e4f3dd2d998d362a18d",
+      "channel_pubkey": "038a68f4620dfcdb30a90255ee066f919fdaa435d15d528621740af84c35f197ea",
+      "node_id": 0,
+      "signing_pubkey": "02a04c7c7b2cd59213a6a058773b48a66dfb6e4a1b9a45795ce7e7cf5cca9db130",
+      "transport_endpoints": [
+        "127.0.0.1:9001"
+      ]
+    },
+    {
+      "channel_endorsement": "304402207682840507416cc4735418a161a68ddb37920751289299eff7be6a0875eb6e54022035f51eb26af36cb7395162103640124481dbc274e0eb58e4b3e7df920beadd5b",
+      "channel_pubkey": "02ff4c4db1286729650dffcc980aaf4c72ab06ca4638a9eb853ec31256107546e1",
+      "node_id": 1,
+      "signing_pubkey": "02a090eddb68a1811df468edbd02c6674aff286773446064c92bc4b272ab3dabe1",
+      "transport_endpoints": [
+        "127.0.0.1:9000"
+      ]
+    },
+    {
+      "channel_endorsement": "304402207d6c42c84e380a692b36fc431391baf64fd2a4e74aa436a7eeb531836ca3e7220220300c7624269d3ad893002e53f355a7789f54795d1bb8a19a5be9773142ac2c4f",
+      "channel_pubkey": "034cd9c767eef746b63d1c16b289db74734c82e613cdde80dbf17cba0b2121d334",
+      "node_id": 2,
+      "signing_pubkey": "03fe4d1062015264e7fd14f55d6224cf2f62993839a707d56d3aebf594a6e8ad41",
+      "transport_endpoints": [
+        "127.0.0.1:9002"
+      ]
+    }
+  ],
+  "policy_version": 1,
+  "protocol_version": 0,
+  "recovery_timelock": 4224679,
+  "t": 2,
+  "vault_descriptor": "wsh(or_i(and_v(v:pk(031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f),multi(2,02a04c7c7b2cd59213a6a058773b48a66dfb6e4a1b9a45795ce7e7cf5cca9db130,02a090eddb68a1811df468edbd02c6674aff286773446064c92bc4b272ab3dabe1,03fe4d1062015264e7fd14f55d6224cf2f62993839a707d56d3aebf594a6e8ad41)),and_v(v:older(4224679),multi(2,022ed557f5ad336b31a49857e4e9664954ac33385aa20a93e2d64bfe7f08f51277,036930f46dd0b16d866d59d1054aa63298b357499cd1862ef16f3f55f1cafceb82,0290999dbbf43034bffb1dd53eac1eb4c33a4ea1c4f48ba585cfde3830840f0555))))#79fdudzl",
+  "wallet_id": "682c4427570f0e3332a1c8382feb4470a355b24ae70dfd58bdb413648c1cf463"
+}
