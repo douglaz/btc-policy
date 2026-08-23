@@ -149,8 +149,9 @@ existed is worth more than a tidy list.
 ## Filed or adjudicated during this drive, not implemented here
 - `btc-policy-w2b` (P1) — M3's confirmed-only stage-1 composer loudly refuses a scanned vault coin spent
   in the mempool; it does not yet discover/include vault-authorized-unconfirmed descendants, so normal
-  Spend and its duress arm are unavailable while a prior Spend is unconfirmed. ADR-0012/0013 retain the
-  stronger node denominator and name this temporary narrowing. `w2b` depends on M3+qhe and directly blocks
+  Spend and its duress arm are unavailable while a prior Spend remains mempool-spent, with no protocol
+  time bound and no safe inference from eviction alone. ADR-0012/0013 retain the stronger node denominator
+  and name this temporary narrowing. `w2b` depends on M3+qhe and directly blocks
   `gbw`; before implementation it must re-derive the bounded ancestry mechanism and production-only budget.
 - `btc-policy-yw4` (P1) — finite Core/full-prevtx-memory/wire caps are mandatory, but a confirmed donor can
   use a pathological parent or enough UTXO fragmentation to make the first all-input composer refuse.
