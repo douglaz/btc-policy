@@ -2,10 +2,10 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** BUILD · **Bead:** btc-policy-mby-user-signer-tae ·
-**Branch:** beads/m2b-user-signer-tae
-**Pending:** finish child B through rb-lite within its 550 production-Rust / 80 production non-Rust caps;
-test code and test-only evidence are uncapped
+**Phase:** LAND · **Beads:** btc-policy-mby-user-signer-tae +
+btc-policy-mby-operator-core-signer-7vb · **Branch:** beads/m2b-closure
+**Pending:** land the reviewed B + tracking-umbrella closure records, then re-derive M3's
+production-only budget before claim; test code and test-only evidence remain uncapped
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -15,6 +15,16 @@ a `br ready` ranking.
 is the fourth — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-mby-user-signer-tae` + tracking umbrella `btc-policy-mby-operator-core-signer-7vb`
+  (M2 child B, P1) — one file-backed zeroizing software signer implements the frozen
+  `UserAuthorization`/`UserSigner` seam over A's secret-free `LiveVault`; mandatory full-prevtx truth,
+  derived Refresh/Hot/Escape classes, symmetric pair relations, Escape ladder relay/whole-fee bounds,
+  output-complete network-correct operator display, and all-fallible-work-before-SIGHASH_ALL are pinned.
+  Merged #31 (`c26e3ed`) from reviewed head `14ded92`; trees are identical. Production is 543/550 Rust
+  and 0/80 non-Rust. Tests were uncapped by owner direction: exactly 17 classes, 66/66 attributed
+  mutations, exact local/live/launch gates, two current-head Codex rounds, CodeRabbit, bot-gate, and
+  both CI launch jobs all cleared. Closing B and the umbrella unblocks M3; no command or PIN surface
+  landed here.
 - `btc-policy-mby-sealed-vault-ingress-s7u` (M2 child A, P1) — current revision-2 public/policy
   artifacts load from one explicit non-secret directory; a separately selected owner-only/no-follow
   credential verifies against the pinned public key and never enters `LiveVault`; old revisions fail
@@ -85,22 +95,18 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Implement child B through rb-lite: the exact frozen `UserAuthorization`/`UserSigner` seam, one
-file-backed zeroizing software signer over A's secret-free `LiveVault`, mandatory full-prevtx truth,
-pre-sign wallet/policy/role/group validation, Escape rung shape/relay/whole-fee-ceiling validation,
-SIGHASH_ALL, and reusable generic all-Escape display. Preserve all exactly 17 named test classes,
-including positive Refresh and swapped all-Escape behavior. By owner direction, budgets now constrain
-production rather than test size: B's reviewed tree measures 527 production lines before `#[cfg(test)]`
-plus 16 gross integration lines, or 543/550. It crossed the 520 reforecast without breaching the 550
-stop/split cap. Its exactly 17 classes, test-only helpers and fixtures, mutation harness, and red/green
-evidence have no line cap and must be judged by behavior, review, and gates rather than compressed to a
-number.
+Land the closure-only Beads/DRIVE record for B and tracking umbrella 7vb. PR #31 already merged and its
+reviewed/merged trees are identical; both beads are closed locally with exact production-budget,
+mutation, local-gate, current-head bot, duplicate live-Core, and duplicate launch-gate evidence. This
+branch changes no implementation. M3 is graph-ready only because the umbrella is closed; its legacy
+mixed production+test cap is not executable under the owner's production-only budget rule.
 
 ## Next
-Land and close child B only after its exact local gate, ignored live-Core backend, launch commands,
-current-head bot review, and both launch-gate jobs succeed. Then close tracking umbrella 7vb, which
-unblocks M3. Implement M3 stable Core composer next. `qhe` may land
-earlier, but its bounded deadline/cap/framing work MUST close after A and before M4. Then implement M4
+Before claiming M3, call Codex and Opus xhigh to re-read its current spec and code seam, remove
+overengineering, and derive a production-only hard cap; tests, test helpers, fixtures, mutations, and
+test evidence are excluded from that cap but remain mandatory. Then implement M3's stable Core composer
+through rb-lite. `qhe` may land earlier, but its bounded deadline/cap/framing work MUST close after A and
+before M4. Then implement M4
 Spend command and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
 rb-lite. M4/M5 reuse one exact request across ordered stage-1 ingress attempts and report success
