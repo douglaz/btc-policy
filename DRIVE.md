@@ -2,10 +2,10 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** LAND · **Beads:** btc-policy-mby-user-signer-tae +
-btc-policy-mby-operator-core-signer-7vb · **Branch:** beads/m2b-closure
-**Pending:** land the reviewed B + tracking-umbrella closure records, then re-derive M3's
-production-only budget before claim; test code and test-only evidence remain uncapped
+**Phase:** SHAPE · **Beads:** btc-policy-mby-spend-composer-l5p +
+btc-policy-http-bounded-ingress-response-qhe · **Branch:** beads/m3-shape
+**Pending:** land the independently reviewed M3/qhe/ADR scope, production-only budgets, qhe→M3 edge and
+`w2b`/`yw4` release-freeze blockers; then claim M3 while test code/test-only evidence remain uncapped
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -95,18 +95,26 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Land the closure-only Beads/DRIVE record for B and tracking umbrella 7vb. PR #31 already merged and its
-reviewed/merged trees are identical; both beads are closed locally with exact production-budget,
-mutation, local-gate, current-head bot, duplicate live-Core, and duplicate launch-gate evidence. This
-branch changes no implementation. M3 is graph-ready only because the umbrella is closed; its legacy
-mixed production+test cap is not executable under the owner's production-only budget rule.
+Record the corrected dormant M3 composer contract and the qhe handoff before either implementation is
+claimed. Final independent Codex gpt-5.6-sol xhigh + Opus xhigh review removed global
+`mempool_sequence` quiescence (unusable across a mainnet scan) in favor of opening/closing `gettxout` reads
+for selected coins under one tip, and reduced the closed read-only capability to eight methods. M3 keeps its
+650-Rust production-only cap: confirmed mature exact-script inventory, block-qualified full prevtxs without
+txindex, deterministic Hot+base-Escape PSBTs, dual fee/coverage bounds, and a durable `core-view` live CI
+leg. It lands unreachable, unbounded and lossy under the legacy HTTP helper. ADR-0012/0013 now name the
+temporary confirmed-only stage-1 narrowing; `btc-policy-w2b` blocks `gbw` until authorized-unconfirmed
+composition closes that pre-release limitation. qhe follows M3 and uses the simpler sufficient design:
+absolute deadline + whole-response cap + strict status/EOF framing, not a pre-EOF Content-Length state
+machine. Its production-only cap is 290 Rust. Tests, fixtures, mutations and evidence remain mandatory and
+uncapped.
 
 ## Next
-Before claiming M3, call Codex and Opus xhigh to re-read its current spec and code seam, remove
-overengineering, and derive a production-only hard cap; tests, test helpers, fixtures, mutations, and
-test evidence are excluded from that cap but remain mandatory. Then implement M3's stable Core composer
-through rb-lite. `qhe` may land earlier, but its bounded deadline/cap/framing work MUST close after A and
-before M4. Then implement M4
+Land this spec/graph correction, then claim and implement M3 through rb-lite at 650 production Rust /
+60 production non-Rust (reforecast 575/50; mandatory M3a/M3b split on projected breach). M3 closure must
+call out that its Core path is dormant, UNBOUNDED-AT-REST and LOSSY-AT-REST. Then claim qhe at 290/50
+(reforecast 250/42), rewire M3's one Core funnel plus ingress to the bounded byte transport, and close qhe
+before M4. Then re-derive M4's
+production-only budget and implement the
 Spend command and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
 rb-lite. M4/M5 reuse one exact request across ordered stage-1 ingress attempts and report success
@@ -124,22 +132,32 @@ each executable bead must be re-derived before claim as a **production-only** gr
 deletions in production code, production helpers/documentation, and integration wiring count; test
 modules, test-only helpers/fixtures, mutation harnesses, and test-only evidence do not. Exclusion from
 the cap is not exclusion from delivery: named red controls, mutation sensitivity, review, and all gates
-remain mandatory and may grow as needed. B is the first converted bead at 550 production Rust / 80
-production non-Rust. M3–M6 and `qhe` retain their existing scope and graph but their old mixed caps must
-not be used as production allowances; re-measure and record each production-only cap before its rb-lite
-claim. Counts are over `<claim commit>..<reviewed head>`; gitignored `.rb-lite/` evidence remains
-untracked evidence rather than production.
+remain mandatory and may grow as needed. Recorded converted caps are B 550/80, M3 650/60, and qhe
+290/50 production Rust/non-Rust. M4–M6 still carry retired mixed caps and must be re-measured before
+their rb-lite claims. Counts are over `<claim commit>..<reviewed head>`; gitignored `.rb-lite/` evidence
+remains untracked evidence rather than production.
 
 The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
 `coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's P3
 unwind/test-synchronization follow-ups do not reopen Carrier clock authority.
 
-`gbw`'s direct open blockers, refreshed from `br show btc-policy-gbw --json` on 2026-08-18:
-`mby`, `oy3`, `rt0`, `sqn`, `wdu`. `6nq`, `9yf`, `c9r` and `nia` are closed. The closed edges stay
+`gbw`'s direct open blockers, refreshed from `br show btc-policy-gbw --json` on 2026-08-23:
+`mby`, `oy3`, `rt0`, `sqn`, `wdu`, `w2b`, and `yw4`. `6nq`, `9yf`, `c9r` and `nia` are closed. The closed edges stay
 in the graph deliberately — `br ready` counts only open blockers, and the record that the gate
 existed is worth more than a tidy list.
 
 ## Filed or adjudicated during this drive, not implemented here
+- `btc-policy-w2b` (P1) — M3's confirmed-only stage-1 composer loudly refuses a scanned vault coin spent
+  in the mempool; it does not yet discover/include vault-authorized-unconfirmed descendants, so normal
+  Spend and its duress arm are unavailable while a prior Spend is unconfirmed. ADR-0012/0013 retain the
+  stronger node denominator and name this temporary narrowing. `w2b` depends on M3+qhe and directly blocks
+  `gbw`; before implementation it must re-derive the bounded ancestry mechanism and production-only budget.
+- `btc-policy-yw4` (P1) — finite Core/full-prevtx-memory/wire caps are mandatory, but a confirmed donor can
+  use a pathological parent or enough UTXO fragmentation to make the first all-input composer refuse.
+  Separately, M3's one-change consolidation leaves the one-UTXO topology M5 must reject. M3 bounds parent
+  fetch/cloning incrementally; M4 strips full parents after signing and preflights both wire envelopes.
+  `yw4` depends on M3+qhe+M4+M5 and blocks `gbw` until bounded protected-set/resource and reserve-topology
+  decisions close both donor-triggered and self-created fast-exit denial.
 - `btc-policy-cyberkrill-independent-claims-zgl` (P2) — the 5ag review withdrew cyberkrill as
   an independent address encoder and moved `00i` to A's flake-pinned Core oracle, but the rollout
   pre-funding checklist and `wdu` still use cyberkrill for whole-descriptor/timelock read-back.
