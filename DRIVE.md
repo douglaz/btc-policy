@@ -105,8 +105,9 @@ leg. It lands unreachable, unbounded and lossy under the legacy HTTP helper. ADR
 temporary confirmed-only stage-1 narrowing; `btc-policy-w2b` blocks `gbw` until authorized-unconfirmed
 composition closes that pre-release limitation. qhe follows M3 and uses the simpler sufficient design:
 absolute deadline + whole-response cap + strict status/EOF framing, not a pre-EOF Content-Length state
-machine. Its production-only cap is 290 Rust. Tests, fixtures, mutations and evidence remain mandatory and
-uncapped.
+machine; its authoritative bead additionally pins zeroizing ingress bytes, strict Core decoding, and the
+single typed 600-second bounded scan exception. Its production-only cap is 290 Rust. Tests, fixtures,
+mutations and evidence remain mandatory and uncapped.
 
 ## Next
 Land this spec/graph correction, then claim and implement M3 through rb-lite at 650 production Rust /
