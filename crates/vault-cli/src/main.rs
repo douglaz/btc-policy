@@ -14,6 +14,10 @@ mod recovery;
 #[cfg_attr(not(test), allow(dead_code))]
 mod sealed;
 mod setup;
+// The frozen user-signing seam over that boundary. M4/M5 add the commands that call
+// it, so a binary build has no caller yet.
+#[cfg_attr(not(test), allow(dead_code))]
+mod signer;
 mod signet;
 
 use std::process::ExitCode;
