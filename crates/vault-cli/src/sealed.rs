@@ -332,13 +332,17 @@ impl CoordinatorCredential {
 /// owner-only from the OPEN file's own metadata — so both checks describe the bytes that
 /// were actually read, not a name that could be swapped between the check and the open.
 /// The text is zeroizing all the way to the caller.
-fn read_secret(path: &Path) -> Result<Zeroizing<String>, Error> {
+///
+/// `pub(crate)` for child B's [`crate::signer::SoftwareSigner`], which reads the USER
+/// scalar under the identical no-follow/regular/owner-only rules. One reader, so the
+/// two secret files cannot drift apart on which paths they refuse.
+pub(crate) fn read_secret(path: &Path) -> Result<Zeroizing<String>, Error> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         // `O_NONBLOCK`: a FIFO here would hang the open before `is_file` can refuse it.
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|e| format!("cannot open credential {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot open secret file {}: {e}", path.display()))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return bad(format!("{} is not a regular file", path.display()));
@@ -346,14 +350,14 @@ fn read_secret(path: &Path) -> Result<Zeroizing<String>, Error> {
     let mode = metadata.permissions().mode() & 0o7777;
     if mode & 0o077 != 0 {
         return bad(format!(
-            "credential {} is mode {mode:04o}: it must be readable by its owner alone",
+            "secret file {} is mode {mode:04o}: it must be readable by its owner alone",
             path.display()
         ));
     }
     // Sized from the open file: a reallocation mid-read leaves an un-wiped prefix behind.
     let mut text = Zeroizing::new(String::with_capacity(metadata.len() as usize + 1));
     file.read_to_string(&mut text)
-        .map_err(|e| format!("cannot read credential {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot read secret file {}: {e}", path.display()))?;
     Ok(text)
 }
 
@@ -438,7 +442,19 @@ mod tests {
         std::fs::write(temp.path.join("manifest.json"), PRE_M1).expect("write");
         let error = refused(&temp.path, "a pre-M1 manifest");
         assert!(error.contains("protocol_version 0"), "{error}");
-        for later in ["descriptor.txt", "recomputed hash", "credential", "older("] {
+        // Every needle here is a LATER stage's own diagnostic, so the list is only as
+        // complete as those diagnostics' current wording. Child B made [`read_secret`]
+        // shared and reworded its three refusals from "credential" to "secret file", which
+        // is accurate — it now reads the USER scalar too — and which left the open/mode/
+        // read boundary named by nothing in this list. So "secret file" joins it, and
+        // "credential" stays for [`CoordinatorCredential::load_file`]'s own two.
+        for later in [
+            "descriptor.txt",
+            "recomputed hash",
+            "credential",
+            "secret file",
+            "older(",
+        ] {
             assert!(!error.contains(later), "the version comes first: {error}");
         }
 

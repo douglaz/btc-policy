@@ -2,9 +2,10 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** LAND · **Bead:** btc-policy-mby-sealed-vault-ingress-s7u closure ·
-**Filed blocker:** btc-policy-http-bounded-ingress-response-qhe · **Branch:** beads/m2a-close
-**Pending:** land the reviewed closure-only record so fresh clones see A closed and M4 blocked on qhe
+**Phase:** BUILD · **Bead:** btc-policy-mby-user-signer-tae ·
+**Branch:** beads/m2b-user-signer-tae
+**Pending:** finish child B through rb-lite within its 550 production-Rust / 80 production non-Rust caps;
+test code and test-only evidence are uncapped
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -84,18 +85,21 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Land this closure-only branch. A is already CLOSED in its worktree record, qhe is filed with the
-reviewed deadline/cap/framing contract, and M4 directly depends on qhe. Final review found that the
-pre-existing shared HTTP helper lets one compromised first endpoint drip forever through the new
-sequential loop. Codex xhigh and Opus xhigh agreed this is P2 but disagreed on firing A's
-loader/ingress valve; the driver chose the narrower architecture because A has no production caller
-and its artifact/authority work is complete. Do not implement qhe or child B, alter the edge, or mix
-new code into this metadata PR.
+Implement child B through rb-lite: the exact frozen `UserAuthorization`/`UserSigner` seam, one
+file-backed zeroizing software signer over A's secret-free `LiveVault`, mandatory full-prevtx truth,
+pre-sign wallet/policy/role/group validation, Escape rung shape/relay/whole-fee-ceiling validation,
+SIGHASH_ALL, and reusable generic all-Escape display. Preserve all exactly 17 named test classes,
+including positive Refresh and swapped all-Escape behavior. By owner direction, budgets now constrain
+production rather than test size: B's reviewed tree measures 527 production lines before `#[cfg(test)]`
+plus 16 gross integration lines, or 543/550. It crossed the 520 reforecast without breaching the 550
+stop/split cap. Its exactly 17 classes, test-only helpers and fixtures, mutation harness, and red/green
+evidence have no line cap and must be judged by behavior, review, and gates rather than compressed to a
+number.
 
 ## Next
-After this closure lands, claim ready child B on a fresh branch and implement it through a separate
-rb-lite run at **1,050 gross Rust / 80 non-Rust**, preserving all 17 named test classes. Close tracking
-umbrella 7vb only after both A and B close. Then implement M3 stable Core composer. `qhe` may land
+Land and close child B only after its exact local gate, ignored live-Core backend, launch commands,
+current-head bot review, and both launch-gate jobs succeed. Then close tracking umbrella 7vb, which
+unblocks M3. Implement M3 stable Core composer next. `qhe` may land
 earlier, but its bounded deadline/cap/framing work MUST close after A and before M4. Then implement M4
 Spend command and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
@@ -109,16 +113,16 @@ complete-product dependents stay
 blocked on `mby`. `imb` owns confidential authenticated coordinator ingress and routable peer
 transport from stage 2 onward; the operator CLI remains on the coordinator host.
 
-The reviewed hard Rust caps are now **5,630 gross lines total, additions plus deletions with every
-test/helper/fixture line included**: M1 800, M2-A 1,250, M2-B 1,050, M3 500, M4 500, M5 850,
-M6 500, plus HTTP deadline/cap/framing blocker qhe 180. M2-A's 1,025-line planning base includes
-approximately 415 test lines; M2-B's 780-line base includes approximately 340 test lines. All other
-children retain their recorded production/test splits. Tracked non-Rust caps total **770**: M1 220,
-M2-A 120, M2-B 80, M3 40, M4 80, M5 80, M6 120, qhe 30. These values replace M2's disproven
-900/160 cap and the former 4,050/700 ladder totals; exact scope, arithmetic, reforecast checkpoints,
-and stop/split valves live in the executable beads. Implementation budgets are gross tracked
-additions plus deletions over `<claim commit>..<reviewed head>`; the claim commit is the base, while
-gitignored `.rb-lite/` evidence is not tracked gross.
+The former 6,000-Rust/770-non-Rust aggregate mixed production and tests and is retired. From B onward,
+each executable bead must be re-derived before claim as a **production-only** gross cap: additions plus
+deletions in production code, production helpers/documentation, and integration wiring count; test
+modules, test-only helpers/fixtures, mutation harnesses, and test-only evidence do not. Exclusion from
+the cap is not exclusion from delivery: named red controls, mutation sensitivity, review, and all gates
+remain mandatory and may grow as needed. B is the first converted bead at 550 production Rust / 80
+production non-Rust. M3–M6 and `qhe` retain their existing scope and graph but their old mixed caps must
+not be used as production allowances; re-measure and record each production-only cap before its rb-lite
+claim. Counts are over `<claim commit>..<reviewed head>`; gitignored `.rb-lite/` evidence remains
+untracked evidence rather than production.
 
 The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
 `coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's P3
