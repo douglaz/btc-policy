@@ -2,10 +2,10 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** SHAPE · **Beads:** btc-policy-mby-spend-composer-l5p +
-btc-policy-http-bounded-ingress-response-qhe · **Branch:** beads/m3-shape
-**Pending:** land the independently reviewed M3/qhe/ADR scope, production-only budgets, qhe→M3 edge and
-`w2b`/`yw4` release-freeze blockers; then claim M3 while test code/test-only evidence remain uncapped
+**Phase:** IMPLEMENT · **Bead:** btc-policy-mby-spend-composer-l5p ·
+**Branch:** feat/m3-spend-composer
+**Pending:** implement the reviewed dormant M3 composer through rb-lite, keeping production code inside
+650 Rust / 60 non-Rust while test code and test-only evidence remain uncapped but mandatory
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -95,8 +95,8 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Record the corrected dormant M3 composer contract and the qhe handoff before either implementation is
-claimed. Final independent Codex gpt-5.6-sol xhigh + Opus xhigh review removed global
+Implement the corrected dormant M3 composer contract now recorded in the claimed
+`btc-policy-mby-spend-composer-l5p`. Final independent Codex gpt-5.6-sol xhigh + Opus xhigh review removed global
 `mempool_sequence` quiescence (unusable across a mainnet scan) in favor of opening/closing `gettxout` reads
 for selected coins under one tip, and reduced the closed read-only capability to eight methods. M3 keeps its
 650-Rust production-only cap: confirmed mature exact-script inventory, block-qualified full prevtxs without
@@ -110,7 +110,7 @@ single typed 600-second bounded scan exception. Its production-only cap is 290 R
 mutations and evidence remain mandatory and uncapped.
 
 ## Next
-Land this spec/graph correction, then claim and implement M3 through rb-lite at 650 production Rust /
+Finish and independently verify M3 through rb-lite at 650 production Rust /
 60 production non-Rust (reforecast 575/50; mandatory M3a/M3b split on projected breach). M3 closure must
 call out that its Core path is dormant, UNBOUNDED-AT-REST and LOSSY-AT-REST. Then claim qhe at 290/50
 (reforecast 250/42), rewire M3's one Core funnel plus ingress to the bounded byte transport, and close qhe
