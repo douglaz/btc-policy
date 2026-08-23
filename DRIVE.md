@@ -4,7 +4,8 @@
 Beads outside that frontier are NOT in scope for this drive.
 **Phase:** BUILD · **Bead:** btc-policy-mby-user-signer-tae ·
 **Branch:** beads/m2b-user-signer-tae
-**Pending:** resume child B through rb-lite within its terminal 1,420 Rust / 80 non-Rust hard caps
+**Pending:** finish child B through rb-lite within its 550 production-Rust / 80 production non-Rust caps;
+test code and test-only evidence are uncapped
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -88,12 +89,11 @@ Implement child B through rb-lite: the exact frozen `UserAuthorization`/`UserSig
 file-backed zeroizing software signer over A's secret-free `LiveVault`, mandatory full-prevtx truth,
 pre-sign wallet/policy/role/group validation, Escape rung shape/relay/whole-fee-ceiling validation,
 SIGHASH_ALL, and reusable generic all-Escape display. Preserve all exactly 17 named test classes,
-including positive Refresh and swapped all-Escape behavior. The original 340-line test estimate counted
-tests but was disproven: the stopped tree measures 487 production, 242 shared full-prevtx fixtures, 598
-lines for the 17 classes plus delimiter, and 10 integration lines, or 1,337 gross before its still-owed
-current-byte review. Codex and Opus xhigh independently found no honest compression path to 1,050 and
-preferred one coherent bead over an atomic bookkeeping split. Reforecast at 1,380 and stop at the
-terminal 1,420 cap; any further breach makes the recorded split mandatory, with no second re-cap.
+including positive Refresh and swapped all-Escape behavior. By owner direction, budgets now constrain
+production rather than test size: B measures 493 production lines before `#[cfg(test)]` plus 10 gross
+integration lines, reforecasts at 520, and stops/splits at 550. Its exactly 17 classes, test-only helpers
+and fixtures, mutation harness, and red/green evidence have no line cap and must be judged by behavior,
+review, and gates rather than compressed to a number.
 
 ## Next
 Land and close child B only after its exact local gate, ignored live-Core backend, launch commands,
@@ -112,17 +112,16 @@ complete-product dependents stay
 blocked on `mby`. `imb` owns confidential authenticated coordinator ingress and routable peer
 transport from stage 2 onward; the operator CLI remains on the coordinator host.
 
-The reviewed hard Rust caps are now **6,000 gross lines total, additions plus deletions with every
-test/helper/fixture line included**: M1 800, M2-A 1,250, M2-B 1,420, M3 500, M4 500, M5 850,
-M6 500, plus HTTP deadline/cap/framing blocker qhe 180. M2-A's 1,025-line planning base includes
-approximately 415 test lines; M2-B's corrected 1,337-line measured base includes 840 fixture/test
-lines, after the original 340-line estimate proved below the repository's comparable test rate. All other
-children retain their recorded production/test splits. Tracked non-Rust caps total **770**: M1 220,
-M2-A 120, M2-B 80, M3 40, M4 80, M5 80, M6 120, qhe 30. These values replace M2's disproven
-900/160 cap and the former 4,050/700 ladder totals; exact scope, arithmetic, reforecast checkpoints,
-and stop/split valves live in the executable beads. Implementation budgets are gross tracked
-additions plus deletions over `<claim commit>..<reviewed head>`; the claim commit is the base, while
-gitignored `.rb-lite/` evidence is not tracked gross.
+The former 6,000-Rust/770-non-Rust aggregate mixed production and tests and is retired. From B onward,
+each executable bead must be re-derived before claim as a **production-only** gross cap: additions plus
+deletions in production code, production helpers/documentation, and integration wiring count; test
+modules, test-only helpers/fixtures, mutation harnesses, and test-only evidence do not. Exclusion from
+the cap is not exclusion from delivery: named red controls, mutation sensitivity, review, and all gates
+remain mandatory and may grow as needed. B is the first converted bead at 550 production Rust / 80
+production non-Rust. M3–M6 and `qhe` retain their existing scope and graph but their old mixed caps must
+not be used as production allowances; re-measure and record each production-only cap before its rb-lite
+claim. Counts are over `<claim commit>..<reviewed head>`; gitignored `.rb-lite/` evidence remains
+untracked evidence rather than production.
 
 The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
 `coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's P3
