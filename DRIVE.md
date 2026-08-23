@@ -90,10 +90,11 @@ file-backed zeroizing software signer over A's secret-free `LiveVault`, mandator
 pre-sign wallet/policy/role/group validation, Escape rung shape/relay/whole-fee-ceiling validation,
 SIGHASH_ALL, and reusable generic all-Escape display. Preserve all exactly 17 named test classes,
 including positive Refresh and swapped all-Escape behavior. By owner direction, budgets now constrain
-production rather than test size: B measures 493 production lines before `#[cfg(test)]` plus 10 gross
-integration lines, reforecasts at 520, and stops/splits at 550. Its exactly 17 classes, test-only helpers
-and fixtures, mutation harness, and red/green evidence have no line cap and must be judged by behavior,
-review, and gates rather than compressed to a number.
+production rather than test size: B's reviewed tree measures 527 production lines before `#[cfg(test)]`
+plus 16 gross integration lines, or 543/550. It crossed the 520 reforecast without breaching the 550
+stop/split cap. Its exactly 17 classes, test-only helpers and fixtures, mutation harness, and red/green
+evidence have no line cap and must be judged by behavior, review, and gates rather than compressed to a
+number.
 
 ## Next
 Land and close child B only after its exact local gate, ignored live-Core backend, launch commands,
