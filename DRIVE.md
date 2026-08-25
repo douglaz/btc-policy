@@ -2,11 +2,10 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** IMPLEMENT · **Bead:** btc-policy-m3a-core-view-inventory-rha ·
-**Branch:** feat/m3a-core-view
-**Pending:** mechanically split and land the reviewed dormant Core adapter/inventory half at
-906 production Rust / 60 production non-Rust while test code and test-only evidence remain uncapped
-but mandatory
+**Phase:** LAND · **Bead:** btc-policy-m3a-core-view-inventory-rha ·
+**Branch:** beads/m3a-close
+**Pending:** land the closure record for merged M3a, then claim M3b without inheriting M3a's
+exits or evidence
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -16,6 +15,17 @@ a `br ready` ranking.
 legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-m3a-core-view-inventory-rha` (M3a, P1) — the dormant eight-read loopback Core
+  adapter and stable confirmed-inventory seam bind public-Signet/IBD identity, exact vault
+  scripts, three-pass tip stability, grouped block-qualified full-prevtx truth, early finalized
+  size, incremental 64-MiB projection, and checked fee signals without exposing a command.
+  Merged #34 (`d9a130c`) from reviewed head `d8a1f17`; trees are identical. The valid-identifier
+  reflection repair prevents a hostile Core from copying a 64-hex cookie password into a
+  txid/blockhash/outpoint diagnostic. Final production is 900/906 Rust and 59/60 non-Rust;
+  tests/evidence were uncapped and mandatory. Fresh governed evidence records 43/43 killed
+  mutations, exact local gate, both LIVE legs, all four launch commands, final identity,
+  two current-head Codex rounds, bot-gate exit 0, and both duplicate CI launch jobs. qhe still
+  owns bounded byte transport; M3b owns final values, policy, parents, and authorization.
 - `btc-policy-mby-user-signer-tae` + tracking umbrella `btc-policy-mby-operator-core-signer-7vb`
   (M2 child B, P1) — one file-backed zeroizing software signer implements the frozen
   `UserAuthorization`/`UserSigner` seam over A's secret-free `LiveVault`; mandatory full-prevtx truth,
@@ -96,29 +106,16 @@ legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why e
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-The first rb-lite implementation of M3 exercised the complete reviewed contract and its final governed
-`r13` bytes passed 43/43 mutations, the exact local gate, both LIVE legs and all four launch commands, but
-measured **895 production Rust against the 650 hard stop**. The code-only floor was 667, so this is an
-estimation miss rather than a trimming opportunity. Codex gpt-5.6-sol xhigh and Opus xhigh found no
-money-path defect and independently required the recorded split. Original
-`btc-policy-mby-spend-composer-l5p` is now tracking-only.
-
-Implement M3a `btc-policy-m3a-core-view-inventory-rha`: the independently compilable eight-read
-`CoreRpc`, public-Signet/IBD binding, one physical stable-inventory module, exact early pair/vsize
-preflight, block-qualified full-prevtx authority, incremental 64-MiB projection, and node fee
-reads/conversion. Its one-time artifact-ratification caps are 906 production Rust / 60 production
-non-Rust, with reforecast triggers 800/52. Its required 38-row floor grew through review to 43 red-first
-rows (`m46`–`m50`), an inventory/preflight-only
-`core-view` LIVE leg and TEST-PLAN text, and a fresh shared-lock/hash-bound serial DONE run. No command or
-reachable root caller lands. The legacy Core funnel remains dormant, unbounded in time/body/framing and
-lossy at invalid UTF-8 until qhe.
+PR #34 is merged and M3a's implementation/evidence is complete. This closure branch records that
+result and releases both dependency-ordered successors. The original M3 remains tracking-only:
+its unsplit attempt measured 895 production Rust against a 650 hard stop, so Codex and Opus required
+the landed M3a/M3b split rather than thinning the contract.
 
 ## Next
-Finish and independently verify M3a through rb-lite at 906/60 (reforecast 800/52), then land it alone.
-M3b `btc-policy-m3b-spend-composition-nq8` depends on M3a and owns the two `LiveVault` fields plus final
+Claim M3b `btc-policy-m3b-spend-composition-nq8` next. It owns the two `LiveVault` fields plus final
 values, sealed Escape floor, full-parent/SIGHASH attachment, dust/coverage/policy and the frozen
 authorization. Its caps are 280/10 (reforecast 245/8), it owns seven local mutations, and its final stack
-must run all 50 M3 rows (43 M3a plus seven M3b). qhe also depends on M3a and may land before or after M3b; whichever lands second
+must run all 50 M3 rows (43 M3a plus seven M3b). qhe may land before or after M3b; whichever lands second
 rebases and runs the full M3+qhe mutation/gate union under the shared evidence lock. Close tracking
 `l5p` after M3b; qhe is not a tracker prerequisite, but it remains a direct M4 prerequisite.
 
