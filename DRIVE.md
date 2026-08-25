@@ -2,16 +2,17 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** LAND · **Beads:** btc-policy-m3b-spend-composition-nq8 +
-btc-policy-mby-spend-composer-l5p · **Branch:** chore/m3b-closure
-**Pending:** land the audited closure records for merged M3b and its M3 tracker, then claim qhe
-as the mandatory bounded byte-transport blocker before M4
-**Delivered:** M3b is 228/280 production Rust and 6/10 production non-Rust. Tests, fixtures,
-mutations and evidence were uncapped and mandatory: 50/50 mutations, exact local gate, both
-LIVE legs, all four launch commands, and final-byte identity all passed.
-**Do-NOT-build:** M4 command/root reachability, another Core method or inventory layer, coin
-selection, unconfirmed ancestry, Escape rungs, BIP32 origins, key/PIN/coordinator/relay/watch/
-broadcast work, output-topology repair, or a generic composer/fee-policy framework.
+**Phase:** BUILD · **Bead:** btc-policy-http-bounded-ingress-response-qhe ·
+**Branch:** feat/http-bounded-ingress-response
+**Pending:** replace read-to-close transport on stage-1 ingress and M3a Core RPC with one
+byte-preserving absolute-deadline/whole-response-cap boundary, then prove the full M3+qhe stack
+**Baseline:** 225 production Rust lines; reforecast at 250 and hard-stop at 290. Production
+non-Rust is 36 lines; reforecast at 42 and hard-stop at 50. Tests, fixtures, mutations and
+evidence are uncapped and mandatory.
+**Do-NOT-build:** M4 command/root reachability, async/runtime conversion, an HTTP framework
+rewrite, endpoint concurrency, streaming/chunked JSON, TLS/remote transport, a generic deadline
+table, new wallet/Core methods, node body caps, signer/nonce/schema changes, or inherited Legacy
+caller hardening.
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -124,12 +125,16 @@ legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why e
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Land the closure-only M3b/M3 record after independent field-level and graph audit. The
-implementation is already merged as #36 and its code tree is identical to the reviewed head.
+Implement qhe through rb-lite over merged M3. Preserve Legacy behavior for pre-M3 callers while
+adding one byte-preserving bounded `Attempt` transport for ordered ingress and the closed
+read-only Core method set. A single monotonic deadline covers connect/write/status/header/body;
+whole raw responses are capped with strict status and EOF framing, and consumer adapters retain
+no peer-reflected secret text.
 
 ## Next
-Claim and complete qhe at 290/50 (reforecast 250/42) over merged M3b, then run the full M3+qhe
-mutation/gate union under the shared evidence lock before M4.
+Land qhe at 290/50 maximum after every qhe mutation and the complete 50-row M3 suite, exact
+AGENTS gate, both LIVE legs, and all four launch commands pass on final bytes under the shared
+evidence lock. Then close qhe and re-derive M4's production-only budget before its rb-lite claim.
 
 qhe rewires M3a's one Core funnel plus ingress to the bounded
 byte transport, and close qhe before M4. Then re-derive M4's
