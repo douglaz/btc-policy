@@ -23,6 +23,13 @@
 //! after the closing reads: value arriving or changing later can still make the base
 //! inadmissible at fire time, which degrades to Lockdown/Recovery.
 //!
+//! NO refusal here interpolates a Core-derived txid, block hash, outpoint or script: a
+//! hostile loopback listener is handed the Basic auth head before it answers, and a
+//! 64-hex cookie password is a syntactically VALID txid, so anything it names is a
+//! reflection channel. The typed values are kept and checked internally; only the
+//! contradiction and its remedy cross out, with the trusted numbers that cannot carry a
+//! secret (heights, confirmations, vouts, byte and vsize bounds).
+//!
 //! This module has NO caller. Final output values, the sealed Escape floor, the full
 //! parents' attachment, `SIGHASH_ALL`, dust/coverage/policy and the frozen authorization
 //! all belong to `btc-policy-m3b-spend-composition-nq8`. It lands dormant behind
@@ -33,8 +40,7 @@ use std::collections::BTreeMap;
 use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version;
 use bitcoin::{
-    Amount, BlockHash, Network, OutPoint, Psbt, PublicKey, ScriptBuf, Sequence, Transaction, TxOut,
-    Txid,
+    Amount, BlockHash, Network, Psbt, PublicKey, ScriptBuf, Sequence, Transaction, TxOut, Txid,
 };
 use miniscript::Descriptor;
 
@@ -313,23 +319,20 @@ fn candidates(
     let mut opening = Vec::with_capacity(coins.len());
     for coin in coins {
         let Some(view) = core.txout(coin.outpoint)? else {
-            return Ok(Err(unavailable(coin.outpoint)));
+            return Ok(Err(UNAVAILABLE.into()));
         };
         tips.push(view.best_block);
         // Immaturity is a STABLE fact about a coinbase and is terminal; confirmedness
         // and the value/script pair are cross-source agreement, which a reorg explains.
         if view.coinbase && view.confirmations < COINBASE_MATURITY {
             return bad(format!(
-                "vault coin {} is an immature coinbase at {} of {COINBASE_MATURITY} \
+                "a scanned vault coin is an immature coinbase at {} of {COINBASE_MATURITY} \
                  confirmations",
-                coin.outpoint, view.confirmations
+                view.confirmations
             ));
         }
         if view.confirmations == 0 || view.value != coin.value || view.script != coin.script {
-            return Ok(Err(format!(
-                "gettxout for {} contradicts the scan record",
-                coin.outpoint
-            )));
+            return Ok(Err("a gettxout read contradicts its scan record".into()));
         }
         opening.push(view);
     }
@@ -345,14 +348,12 @@ fn candidates(
     for (txid, members) in groups {
         let height = coins[members[0]].height;
         let Some(block) = core.block_hash(height)? else {
-            return Ok(Err(format!(
-                "no block at scanned height {height} for {txid}"
-            )));
+            return Ok(Err(format!("no block at scanned height {height}")));
         };
         let Some(parent) = core.block_transaction(txid, block)? else {
-            return Ok(Err(format!(
-                "{txid} is absent from {block}, the block at its scanned height"
-            )));
+            return Ok(Err(
+                "a scanned parent is absent from the block at its scanned height".into(),
+            ));
         };
         // The projection is INCREMENTAL and duplicated across both PSBT input-map sets,
         // and it is checked before this parent is retained: on refusal the in-flight
@@ -370,9 +371,7 @@ fn candidates(
         }
         projected = bytes;
         if parent.compute_txid() != txid {
-            return Ok(Err(format!(
-                "the full transaction for {txid} hashes elsewhere"
-            )));
+            return Ok(Err("a fetched full transaction hashes elsewhere".into()));
         }
         for index in members {
             let vout = coins[index].outpoint.vout as usize;
@@ -381,7 +380,7 @@ fn candidates(
             });
             if !agrees {
                 return Ok(Err(format!(
-                    "the full transaction for {txid} contradicts vout {vout}"
+                    "a fetched full transaction contradicts vout {vout}"
                 )));
             }
         }
@@ -393,14 +392,13 @@ fn candidates(
     // The CLOSING read of every selected candidate.
     for (coin, opened) in coins.iter().zip(&opening) {
         let Some(view) = core.txout(coin.outpoint)? else {
-            return Ok(Err(unavailable(coin.outpoint)));
+            return Ok(Err(UNAVAILABLE.into()));
         };
         tips.push(view.best_block);
         if view.value != opened.value || view.script != opened.script {
-            return Ok(Err(format!(
-                "{} changed between its opening and closing read",
-                coin.outpoint
-            )));
+            return Ok(Err(
+                "a vault coin changed between its opening and closing read".into(),
+            ));
         }
     }
     Ok(Ok(parents))
@@ -410,31 +408,26 @@ fn candidates(
 /// that is gone from the UTXO set is mempool-spent or otherwise unavailable. Confirmation
 /// is not the remedy — the conflicting spend may never confirm — so the guidance is
 /// reconciliation, and `btc-policy-w2b` owns composing over authorized-unconfirmed value.
-fn unavailable(outpoint: OutPoint) -> String {
-    format!(
-        "vault coin {outpoint} is confirmed in the scan yet absent from the UTXO set at the \
-         same tip: it is spent in the mempool or otherwise unavailable. This composer spends \
-         every confirmed vault coin, so the whole command is refused rather than composing an \
-         under-covered escape from the remainder. Do not reissue until independent chain \
-         reconciliation accounts for that coin."
-    )
-}
+const UNAVAILABLE: &str = "a scanned confirmed vault coin is absent from the UTXO set at the \
+     same tip: it is spent in the mempool or otherwise unavailable. This composer spends every \
+     confirmed vault coin, so the whole command is refused rather than composing an \
+     under-covered escape from the remainder. Do not reissue until independent chain \
+     reconciliation accounts for that coin.";
 
 /// Canonical outpoint order, no duplicate, nothing off the one definite vault script,
 /// and a nonempty set. All four are stable facts, so all four are terminal.
 fn sorted_unique(mut coins: Vec<ScanCoin>, vault_spk: &ScriptBuf) -> Result<Vec<ScanCoin>, Error> {
     coins.sort_by_key(|coin| coin.outpoint);
-    if let Some(pair) = coins
+    if coins
         .windows(2)
-        .find(|pair| pair[0].outpoint == pair[1].outpoint)
+        .any(|pair| pair[0].outpoint == pair[1].outpoint)
     {
-        return bad(format!("scantxoutset reported {} twice", pair[0].outpoint));
+        return bad("scantxoutset reported one outpoint twice".into());
     }
-    if let Some(foreign) = coins.iter().find(|coin| coin.script != *vault_spk) {
-        return bad(format!(
-            "scantxoutset returned {}, which does not pay the definite vault script",
-            foreign.outpoint
-        ));
+    if coins.iter().any(|coin| coin.script != *vault_spk) {
+        return bad(
+            "scantxoutset returned a record that does not pay the definite vault script".into(),
+        );
     }
     if coins.is_empty() {
         return bad("the sealed vault holds no confirmed coin to spend".into());
@@ -504,7 +497,7 @@ mod tests {
     use crate::sealed::LiveVault;
     use crate::setup::tests::{ceremony_through_endorse, Ceremony};
     use bitcoin::base64::prelude::{Engine as _, BASE64_STANDARD};
-    use bitcoin::{TxIn, Witness};
+    use bitcoin::{OutPoint, TxIn, Witness};
     use miniscript::DescriptorPublicKey;
     use serde_json::{json, Value};
     use std::cell::{Cell, RefCell};
@@ -1351,7 +1344,7 @@ mod tests {
             (
                 "an opening value that contradicts the scan",
                 Box::new(|f: &mut Fake| f.value_at = HashMap::from([(0, Amount::from_sat(7))])),
-                "contradicts the scan record",
+                "contradicts its scan record",
                 false,
             ),
             (
@@ -1360,13 +1353,13 @@ mod tests {
                     let spk = elsewhere.clone();
                     move |f: &mut Fake| f.script_at = HashMap::from([(0, spk.clone())])
                 }),
-                "contradicts the scan record",
+                "contradicts its scan record",
                 false,
             ),
             (
                 "a scanned coin reported unconfirmed",
                 Box::new(|f: &mut Fake| f.confirmations_at = HashMap::from([(0, 0)])),
-                "contradicts the scan record",
+                "contradicts its scan record",
                 false,
             ),
             (
@@ -1475,10 +1468,12 @@ mod tests {
     }
 
     /// 13. A scanned confirmed vault coin that is mempool-spent under an unmoved tip
-    ///     refuses the WHOLE inventory, before any fee signal is read, naming the coin and
-    ///     telling the operator NOT to reissue until independent reconciliation. It never
-    ///     prepares an under-covered set from the remainder: the surviving coin appears in
-    ///     no prepared view, because no prepared view is returned.
+    ///     refuses the WHOLE inventory, before any fee signal is read, saying what
+    ///     happened and telling the operator NOT to reissue until independent
+    ///     reconciliation. It never prepares an under-covered set from the remainder: the
+    ///     surviving coin appears in no prepared view, because no prepared view is
+    ///     returned. The refusal does NOT name the coin: the scan's txids are the hostile
+    ///     Core's to choose, and class 19 is where that channel is closed.
     #[test]
     fn a_mempool_spent_scanned_coin_refuses_the_whole_inventory_before_any_fee_read() {
         let (vault, parts) = sealed();
@@ -1495,7 +1490,7 @@ mod tests {
             let mut order: Vec<OutPoint> = spent.coins.iter().map(|coin| coin.outpoint).collect();
             order.sort();
             let gone = order[usize::from(null > 1)];
-            // Which coin, what happened, and what NOT to do about it.
+            // What happened, and what NOT to do about it.
             assert!(
                 error.contains("spent in the mempool or otherwise unavailable"),
                 "{error}"
@@ -1514,9 +1509,12 @@ mod tests {
             let claim = error.to_lowercase();
             assert!(!claim.contains("wait for confirmation"), "{error}");
             assert!(!claim.contains("until it confirms"), "{error}");
+            // And the coin's own outpoint stays OUT of it. A scan record is the peer's
+            // text: its txid is 32 bytes it chose, which is exactly the width of a Core
+            // cookie password. Class 19 drives that reflection end to end.
             assert!(
-                error.contains(&gone.to_string()),
-                "{what} names the coin: {error}"
+                !error.contains(&gone.to_string()) && !error.contains(&gone.txid.to_string()),
+                "{what} named the coin: {error}"
             );
             // Refused BEFORE the liveness snapshot, and with nothing to hand anyone.
             assert_eq!(spent.issued("estimatesmartfee"), 0, "{what}");

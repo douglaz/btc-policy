@@ -146,9 +146,10 @@ impl CoreRpc {
     fn rpc(&self, method: &str, params: Value, absent: Absent) -> Result<Value, Error> {
         let read = crate::sealed::read_secret(&self.cookie)?;
         let credential = Zeroizing::new(read.trim().to_string());
-        // Core writes its cookie as ONE line, so a CR or LF in it means the FILE is
-        // malformed. It could not split this request head: the next line base64-encodes
-        // the credential, so no raw byte of it ever reaches a header.
+        // The `trim` above accepts the surrounding whitespace an ordinary one-line Core
+        // cookie file carries, so the credential actually SENT is CR/LF-free; an EMBEDDED
+        // CR or LF survives that trim and means the FILE is malformed. Neither could split
+        // this request head anyway: the next line base64-encodes the credential.
         if credential.contains(['\r', '\n']) {
             return Err("the Core cookie is not CR/LF-free, so it is malformed".into());
         }

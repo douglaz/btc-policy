@@ -1,10 +1,16 @@
 //! Opt-in LIVE-bitcoind suite for the stage-1 Core seam and the inventory it feeds (bead
-//! btc-policy-m3a-core-view-inventory-rha). Like the backend suite it spawns real
-//! daemons, so every test here is `#[ignore]`d and opted into together:
+//! btc-policy-m3a-core-view-inventory-rha). Every LIVE class here spawns real daemons the
+//! way the backend suite does, so all of them are `#[ignore]`d and opted into together:
 //!
 //!   nix develop -c cargo test --locked -p vault-cli --test core_view -- --ignored --test-threads=1
 //!
-//! What it proves that the in-process classes cannot: that the eight closed reads answer
+//! ONE class is deliberately outside that set. Class 19, at the foot of this file, drives
+//! the same real `CoreRpc` against a SCRIPTED HOSTILE listener rather than a daemon, so it
+//! is neither slow nor opt-in and runs in the ordinary `cargo test --workspace` gate. It
+//! lives here because this is the only target that can reach `CoreRpc` and `prepare_view`
+//! together, not because it needs bitcoind.
+//!
+//! What the live classes prove that the in-process ones cannot: that the eight closed reads answer
 //! a REAL Core over real cookie auth; that a full previous transaction resolves through
 //! `getblockhash` plus a BLOCK-QUALIFIED `getrawtransaction` on a daemon running with NO
 //! `-txindex` at all; that Core's own `-8`/`-5` refusals are the absences this adapter
@@ -48,6 +54,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bitcoin::base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -722,4 +729,168 @@ fn a_live_default_signet_is_bound_to_its_challenge_and_a_custom_one_is_refused()
         .expect_err("a custom signet must be refused")
         .to_string();
     assert!(error.contains("CUSTOM signet"), "{error}");
+}
+
+/// The Core cookie password class 19 selects, and the exact text the hostile endpoint
+/// echoes back at it. A txid is 32 bytes, so a 64-hex password IS a syntactically valid
+/// one — nothing downstream can reject it as malformed, which is the whole premise.
+const REFLECTED: &str = "9f2b7c41e8d05a36bb14fe902c7d83a51609e4bd77cf2a08e35db461cc9017fa";
+
+/// One WHOLE request off a stream: the head, then exactly the body length it declares. A
+/// single `read` may return a prefix even on loopback, so reading once would make this
+/// fixture pass by luck rather than by framing.
+fn whole_request(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read as _;
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(1) => raw.push(byte[0]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => panic!("the request head never finished: {raw:?}"),
+        }
+        if raw.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let len: usize = String::from_utf8_lossy(&raw)
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .expect("a declared Content-Length")
+        .trim()
+        .parse()
+        .expect("a numeric Content-Length");
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).expect("the declared body");
+    raw.extend_from_slice(&body);
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// A HOSTILE loopback endpoint: it answers Core's SUCCESS envelope from a script of
+/// `result` values, echoes back whichever request id it was sent, and records every raw
+/// request — head and body — so the credential it received can be read off the wire
+/// rather than assumed. It spawns no daemon, which is why class 19 is not `#[ignore]`d.
+fn hostile(results: Vec<Value>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for result in results {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let raw = whole_request(&mut stream);
+            let body = raw.split("\r\n\r\n").nth(1).expect("a request body");
+            let request: Value = serde_json::from_str(body).expect("a JSON request");
+            recorded.lock().expect("lock").push(raw.clone());
+            let reply =
+                json!({"result": result, "error": Value::Null, "id": request["id"]}).to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                reply.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    (addr, requests)
+}
+
+/// 19. A hostile loopback Core cannot REFLECT the credential it was just handed into an
+///     inventory diagnostic through a VALID typed identifier. Classes 18a/18b close the
+///     `getblockchaininfo` half of this channel; this is the other half, and the one a
+///     redaction of error TEXT does not reach: the endpoint here answers an entirely
+///     well-formed, correctly typed, HTTP 200 `scantxoutset` whose `txid` is the exact
+///     64-hex cookie password it read out of the `Authorization: Basic` head it was sent.
+///     That value is decoded, sorted and carried through the seam as a real `Txid` — the
+///     bracket even asks Core about it — and what must never come back out is the
+///     identifier itself. Driven through the REAL `CoreRpc` over a real owner-only cookie
+///     file, so what is exercised is the adapter/inventory boundary and not a helper.
+///     `m50` restores one raw interpolation and this class goes red.
+#[test]
+fn a_hostile_core_cannot_reflect_the_cookie_password_through_a_valid_typed_identifier() {
+    let sealed = sealed_vault();
+    let temp = fed::TempDir::new("core-view-reflection").expect("temp dir");
+    let secret = format!("__cookie__:{REFLECTED}");
+    let cookie = temp.path.join("core.cookie");
+    // Written the way Core writes one: a single line with a trailing newline.
+    std::fs::write(&cookie, format!("{secret}\n")).expect("write");
+    std::fs::set_permissions(&cookie, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let credential = BASE64_STANDARD.encode(&secret);
+
+    let echoed: bitcoin::Txid = REFLECTED
+        .parse()
+        .expect("a 64-hex password is a valid txid");
+    assert_eq!(
+        echoed.to_string(),
+        REFLECTED,
+        "and it prints back unchanged"
+    );
+
+    let tip = "11".repeat(32);
+    let vault_spk = sealed.vault.descriptor.script_pubkey();
+    let identity = json!({
+        "chain": "regtest",
+        "initialblockdownload": false,
+        "bestblockhash": tip,
+    });
+    let record = json!({
+        "txid": REFLECTED,
+        "vout": 0,
+        "amount": 0.001,
+        "scriptPubKey": format!("{vault_spk:x}"),
+        "height": 411,
+    });
+    let scan = |unspents: Value| json!({"success": true, "bestblock": tip, "unspents": unspents});
+
+    let worlds: [(&str, Vec<Value>, &str); 2] = [
+        // The reflected txid arrives TWICE, so the duplicate-record refusal runs.
+        (
+            "a duplicated reflected scan record",
+            vec![identity.clone(), scan(json!([record, record]))],
+            "scantxoutset reported one outpoint twice",
+        ),
+        // It arrives once and is honest all the way to a `gettxout` that answers null
+        // under an unmoved tip, so the whole-inventory coverage refusal runs.
+        (
+            "a reflected scan record whose coin is gone from the UTXO set",
+            vec![identity, scan(json!([record])), Value::Null, json!(tip)],
+            "spent in the mempool or otherwise unavailable",
+        ),
+    ];
+    for (what, replies, remedy) in worlds {
+        let calls = replies.len();
+        let (addr, requests) = hostile(replies);
+        let core = CoreRpc::new(addr, cookie.clone()).expect("a loopback adapter");
+        let error = refusal(sealed.prepare(&core), what);
+
+        // The endpoint really was handed the credential, on the wire. Without this,
+        // "it did not leak" would also be true of an endpoint that never had it.
+        let seen = requests.lock().expect("lock").clone();
+        assert_eq!(seen.len(), calls, "{what}: {seen:?}");
+        assert!(
+            seen[0].contains(&format!("Authorization: Basic {credential}\r\n")),
+            "the hostile endpoint must see the Basic auth head: {what}"
+        );
+        // Where the bracket got past the scan, the peer's own value went back OUT as a
+        // live typed identifier — preserved internally, and withheld only at the
+        // operator boundary. Where it did not, nothing after the scan names it either.
+        let forwarded = seen.iter().skip(2).any(|raw| raw.contains(REFLECTED));
+        assert_eq!(forwarded, calls > 2, "{what}: {seen:?}");
+
+        // The refusal carries neither the password nor the encoded credential. This
+        // stands AHEAD of the remedy check on purpose: an assertion aborts its class,
+        // `m50` restores the interpolation that also rewords the refusal, and a remedy
+        // check reached first would swallow the mutation and leave the leak unobserved.
+        for leak in [REFLECTED, credential.as_str()] {
+            assert!(
+                !error.contains(leak),
+                "{what} reflected the credential into the diagnostic: {error}"
+            );
+        }
+        // And redaction did not empty it: what went wrong is still there, in this seam's
+        // own words.
+        assert!(error.contains(remedy), "{what}: {error}");
+    }
 }
