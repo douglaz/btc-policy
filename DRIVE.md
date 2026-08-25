@@ -6,9 +6,9 @@ Beads outside that frontier are NOT in scope for this drive.
 **Branch:** feat/http-bounded-ingress-response
 **Pending:** replace read-to-close transport on stage-1 ingress and M3a Core RPC with one
 byte-preserving absolute-deadline/whole-response-cap boundary, then prove the full M3+qhe stack
-**Baseline:** 225 production Rust lines; reforecast at 250 and hard-stop at 290. Production
-non-Rust is 36 lines; reforecast at 42 and hard-stop at 50. Tests, fixtures, mutations and
-evidence are uncapped and mandatory.
+**Measured baseline:** 511 production Rust lines; reforecast at 560 and hard-stop at 634
+(103 lines of >=20% contingency plus 20 review). Production non-Rust remains hard-stopped at
+50. Tests, fixtures, mutations and evidence are uncapped and mandatory.
 **Do-NOT-build:** M4 command/root reachability, async/runtime conversion, an HTTP framework
 rewrite, endpoint concurrency, streaming/chunked JSON, TLS/remote transport, a generic deadline
 table, new wallet/Core methods, node body caps, signer/nonce/schema changes, or inherited Legacy
@@ -125,14 +125,15 @@ legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why e
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Implement qhe through rb-lite over merged M3. Preserve Legacy behavior for pre-M3 callers while
-adding one byte-preserving bounded `Attempt` transport for ordered ingress and the closed
-read-only Core method set. A single monotonic deadline covers connect/write/status/header/body;
-whole raw responses are capped with strict status and EOF framing, and consumer adapters retain
-no peer-reflected secret text.
+Resume qhe through rb-lite after its mandatory production-cap STOP. Independent reviews found
+the 511-line artifact direct rather than overengineered: even deleting every changed comment and
+blank leaves 376 gross, while the 290 cap underpriced gross replacement and exact framing. The
+owner ratified 511 + 103 contingency + 20 review = 634 instead of landing an unreachable qhe-a
+and duplicating the governed run. Fix the two low-severity compatibility/deadline findings and
+complete every named uncapped evidence row before any closure claim.
 
 ## Next
-Land qhe at 290/50 maximum after every qhe mutation and the complete 50-row M3 suite, exact
+Land qhe at 634/50 maximum after every qhe mutation and the complete 50-row M3 suite, exact
 AGENTS gate, both LIVE legs, and all four launch commands pass on final bytes under the shared
 evidence lock. Then close qhe and re-derive M4's production-only budget before its rb-lite claim.
 
