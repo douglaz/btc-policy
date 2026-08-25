@@ -50,7 +50,7 @@ watch it go red against the unfixed code first. A test asserting behaviour that
 was already correct is indistinguishable from a test asserting nothing.
 
 Gate for this repo — the stale-flake assertion (from CI's `launch-gate` job) plus three of
-the four legs of CI's `check` matrix, each in the same form CI runs it:
+the five legs of CI's `check` matrix, each in the same form CI runs it:
 
 ```bash
 nix flake metadata --no-update-lock-file >/dev/null && \
@@ -71,14 +71,22 @@ details here are load-bearing — without `fmt` a non-rustfmt-clean edit passes 
 fails CI, and without `--locked` cargo silently *regenerates* `Cargo.lock` on drift instead
 of reporting it, validating a dependency graph that is not the committed one.
 
-Not included, and this is the gap to hold in mind: the matrix's fourth leg `regtest-backend`,
-which needs `bitcoind` and runs `#[ignore]`d tests, and the separate `launch-gate` job
+Not included, and this is the gap to hold in mind: the matrix's two LIVE legs, which both
+need `bitcoind` and run `#[ignore]`d tests —
+
+```bash
+nix develop -c cargo test --locked -p vault-node --test bitcoind_backend -- --ignored --test-threads=1
+nix develop -c cargo test --locked -p vault-cli --test core_view -- --ignored --test-threads=1
+```
+
+— and the separate `launch-gate` job
 (`attack all` + all three demos, ~47 min — measured on the THREE-demo gate, runs 31292932691
 on the merged `037022b` (47.3), 31266297634 (47.2) and 31239283223 (47.5); the two-demo gate ran
 47.1, so adding recovery-drill cost essentially nothing).
 
 So this gate can go green on a tree CI rejects, and the honest framing is a rule rather than a
-list: **anything exercised only by `regtest-backend` or by `launch-gate` is untested here.** Two
+list: **anything exercised only by `regtest-backend`, by `core-view`, or by `launch-gate` is
+untested here.** Two
 earlier versions of this paragraph tried to enumerate the cases — "the one case", then "exactly
 two" — and both were wrong, because the set is not bounded by what the tests cover. Worked
 example that neither enumeration caught: rename `crates/vault-cli/src/recovery.rs`, updating the

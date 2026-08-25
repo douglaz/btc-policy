@@ -2,17 +2,18 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** SHAPE · **Beads:** btc-policy-mby-spend-composer-l5p +
-btc-policy-http-bounded-ingress-response-qhe · **Branch:** beads/m3-shape
-**Pending:** land the independently reviewed M3/qhe/ADR scope, production-only budgets, qhe→M3 edge and
-`w2b`/`yw4` release-freeze blockers; then claim M3 while test code/test-only evidence remain uncapped
+**Phase:** IMPLEMENT · **Bead:** btc-policy-m3a-core-view-inventory-rha ·
+**Branch:** feat/m3a-core-view
+**Pending:** mechanically split and land the reviewed dormant Core adapter/inventory half at
+906 production Rust / 60 production non-Rust while test code and test-only evidence remain uncapped
+but mandatory
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
 a `br ready` ranking.
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
-(the stale-flake assertion plus three of the four legs of CI's `check` matrix; `regtest-backend`
-is the fourth — see AGENTS.md for why each part is load-bearing)
+(on the current five-leg CI `check` matrix, this standard local gate covers three legs; both LIVE
+legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why each part is load-bearing)
 
 ## Done
 - `btc-policy-mby-user-signer-tae` + tracking umbrella `btc-policy-mby-operator-core-signer-7vb`
@@ -95,26 +96,34 @@ is the fourth — see AGENTS.md for why each part is load-bearing)
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Record the corrected dormant M3 composer contract and the qhe handoff before either implementation is
-claimed. Final independent Codex gpt-5.6-sol xhigh + Opus xhigh review removed global
-`mempool_sequence` quiescence (unusable across a mainnet scan) in favor of opening/closing `gettxout` reads
-for selected coins under one tip, and reduced the closed read-only capability to eight methods. M3 keeps its
-650-Rust production-only cap: confirmed mature exact-script inventory, block-qualified full prevtxs without
-txindex, deterministic Hot+base-Escape PSBTs, dual fee/coverage bounds, and a durable `core-view` live CI
-leg. It lands unreachable, unbounded and lossy under the legacy HTTP helper. ADR-0012/0013 now name the
-temporary confirmed-only stage-1 narrowing; `btc-policy-w2b` blocks `gbw` until authorized-unconfirmed
-composition closes that pre-release limitation. qhe follows M3 and uses the simpler sufficient design:
-absolute deadline + whole-response cap + strict status/EOF framing, not a pre-EOF Content-Length state
-machine; its authoritative bead additionally pins zeroizing ingress bytes, strict Core decoding, and the
-single typed 600-second bounded scan exception. Its production-only cap is 290 Rust. Tests, fixtures,
-mutations and evidence remain mandatory and uncapped.
+The first rb-lite implementation of M3 exercised the complete reviewed contract and its final governed
+`r13` bytes passed 43/43 mutations, the exact local gate, both LIVE legs and all four launch commands, but
+measured **895 production Rust against the 650 hard stop**. The code-only floor was 667, so this is an
+estimation miss rather than a trimming opportunity. Codex gpt-5.6-sol xhigh and Opus xhigh found no
+money-path defect and independently required the recorded split. Original
+`btc-policy-mby-spend-composer-l5p` is now tracking-only.
+
+Implement M3a `btc-policy-m3a-core-view-inventory-rha`: the independently compilable eight-read
+`CoreRpc`, public-Signet/IBD binding, one physical stable-inventory module, exact early pair/vsize
+preflight, block-qualified full-prevtx authority, incremental 64-MiB projection, and node fee
+reads/conversion. Its one-time artifact-ratification caps are 906 production Rust / 60 production
+non-Rust, with reforecast triggers 800/52. Its required 38-row floor grew through review to 43 red-first
+rows (`m46`–`m50`), an inventory/preflight-only
+`core-view` LIVE leg and TEST-PLAN text, and a fresh shared-lock/hash-bound serial DONE run. No command or
+reachable root caller lands. The legacy Core funnel remains dormant, unbounded in time/body/framing and
+lossy at invalid UTF-8 until qhe.
 
 ## Next
-Land this spec/graph correction, then claim and implement M3 through rb-lite at 650 production Rust /
-60 production non-Rust (reforecast 575/50; mandatory M3a/M3b split on projected breach). M3 closure must
-call out that its Core path is dormant, UNBOUNDED-AT-REST and LOSSY-AT-REST. Then claim qhe at 290/50
-(reforecast 250/42), rewire M3's one Core funnel plus ingress to the bounded byte transport, and close qhe
-before M4. Then re-derive M4's
+Finish and independently verify M3a through rb-lite at 906/60 (reforecast 800/52), then land it alone.
+M3b `btc-policy-m3b-spend-composition-nq8` depends on M3a and owns the two `LiveVault` fields plus final
+values, sealed Escape floor, full-parent/SIGHASH attachment, dust/coverage/policy and the frozen
+authorization. Its caps are 280/10 (reforecast 245/8), it owns seven local mutations, and its final stack
+must run all 50 M3 rows (43 M3a plus seven M3b). qhe also depends on M3a and may land before or after M3b; whichever lands second
+rebases and runs the full M3+qhe mutation/gate union under the shared evidence lock. Close tracking
+`l5p` after M3b; qhe is not a tracker prerequisite, but it remains a direct M4 prerequisite.
+
+Then complete qhe at 290/50 (reforecast 250/42), rewire M3a's one Core funnel plus ingress to the bounded
+byte transport, and close qhe before M4. Then re-derive M4's
 production-only budget and implement the
 Spend command and the parallel
 M5 known-outpoint Escape / M6 stage-1 artifact-to-command evidence children one at a time through
@@ -133,10 +142,11 @@ each executable bead must be re-derived before claim as a **production-only** gr
 deletions in production code, production helpers/documentation, and integration wiring count; test
 modules, test-only helpers/fixtures, mutation harnesses, and test-only evidence do not. Exclusion from
 the cap is not exclusion from delivery: named red controls, mutation sensitivity, review, and all gates
-remain mandatory and may grow as needed. Recorded converted caps are B 550/80, M3 650/60, and qhe
-290/50 production Rust/non-Rust. M4–M6 still carry retired mixed caps and must be re-measured before
-their rb-lite claims. Counts are over `<claim commit>..<reviewed head>`; gitignored `.rb-lite/` evidence
-remains untracked evidence rather than production.
+remain mandatory and may grow as needed. Recorded converted caps are B 550/80, M3a 906/60, M3b 280/10,
+and qhe 290/50 production Rust/non-Rust. Original M3 is tracking-only and has no implementation cap.
+M4–M6 still carry retired mixed caps and must be re-measured before their rb-lite claims. Counts are over
+`<claim commit>..<reviewed head>`; gitignored `.rb-lite/` evidence remains untracked evidence rather than
+production.
 
 The broader channel and coordinator high-water repairs remain separately owned by `r1g` and
 `coord-highwater-carrier-recovery-i3p`; neither is folded into the operator CLI. PR #18's P3

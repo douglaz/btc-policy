@@ -2,13 +2,14 @@
 #
 # Two jobs, and the split is the point:
 #
-#   `check`      — FOUR matrix legs: fmt, clippy -D warnings, the whole test suite
+#   `check`      — FIVE matrix legs: fmt, clippy -D warnings, the whole test suite
 #                  (including the V0-7 property/fuzz suites, which live in the
-#                  workspace), and `regtest-backend`. The fourth is not covered by the
-#                  third and the distinction is the point: `cargo test` SKIPS the
-#                  `#[ignore]`d bitcoind-backend tests, so without its own leg the
-#                  backend's live-Core behaviour is ungated. Fast, and the thing every
-#                  push should be able to wait for.
+#                  workspace), `regtest-backend`, and `core-view`. The last two are not
+#                  covered by the third and the distinction is the point: `cargo test`
+#                  SKIPS every `#[ignore]`d test, so without their own legs the live-Core
+#                  behaviour of the node backend and of the operator CLI's read-only Core
+#                  seam is ungated. Fast, and the thing every push should be able to wait
+#                  for.
 #
 #   `launch-gate` — `attack all` (every adversarial scenario) plus ALL THREE demos
 #                  (first-light, theft-refused, recovery-drill). This is the custody
@@ -136,6 +137,18 @@ jobs:
           # every failure mode is a silent fallback. ~37s, so it belongs in the fast job.
           - name: regtest-backend
             run: nix develop -c cargo test --locked -p vault-node --test bitcoind_backend -- --ignored --test-threads=1
+          # The operator CLI's read-only Core seam against REAL daemons (bead
+          # btc-policy-m3a-core-view-inventory-rha): a regtest node with NO `-txindex`, where
+          # a full previous transaction resolves only through `getblockhash` plus a
+          # block-qualified `getrawtransaction`, plus two offline signets: the DEFAULT
+          # one's own `signet_challenge` is what the sealed network code means, and a
+          # custom one sharing `chain:"signet"` with it is refused. Same reason as the
+          # leg above — `cargo test` skips these — and a different daemon shape, so it
+          # does not ride on that one. Its six tests take ~2s; the leg's CI cost is the
+          # from-scratch build every matrix leg pays — 80-107s per step for the backend
+          # leg, over CI runs 32673409843, 32659365635, 32655976719 and 32579756639.
+          - name: core-view
+            run: nix develop -c cargo test --locked -p vault-cli --test core_view -- --ignored --test-threads=1
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
