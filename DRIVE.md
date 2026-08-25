@@ -2,10 +2,16 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** LAND · **Bead:** btc-policy-m3a-core-view-inventory-rha ·
-**Branch:** beads/m3a-close
-**Pending:** land the closure record for merged M3a, then claim M3b without inheriting M3a's
-exits or evidence
+**Phase:** BUILD · **Bead:** btc-policy-m3b-spend-composition-nq8 ·
+**Branch:** feat/m3b-spend-composition
+**Pending:** compose the dormant deterministic Spend/base-Escape authorization over M3a's
+prepared view, then prove the complete 50-row M3 stack without inheriting M3a exits
+**Baseline:** 221 production Rust lines; reforecast at 245 and hard-stop at 280. Production
+non-Rust is 6 lines; reforecast at 8 and hard-stop at 10. Tests, fixtures, mutations and
+evidence are uncapped and mandatory.
+**Do-NOT-build:** a CLI/root caller, new Core method or inventory layer, qhe transport, coin
+selection, unconfirmed ancestry, Escape rungs, BIP32 origins, key/PIN/coordinator/relay/watch/
+broadcast work, output-topology repair, or a generic composer/fee-policy framework.
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -106,20 +112,20 @@ legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why e
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-PR #34 is merged and M3a's implementation/evidence is complete. This closure branch records that
-result and releases both dependency-ordered successors. The original M3 remains tracking-only:
-its unsplit attempt measured 895 production Rust against a 650 hard stop, so Codex and Opus required
-the landed M3a/M3b split rather than thinning the contract.
+Implement M3b `btc-policy-m3b-spend-composition-nq8` through rb-lite. Add only the two
+manifest-authenticated secret-free `LiveVault` fee/coverage fields and one dormant composition
+module. It derives caller-network Hot destination plus canonical index-0 Escape, consumes only
+M3a's `PreparedView`, applies checked fee/value/dust/coverage arithmetic, attaches every verified
+full parent and explicit SIGHASH_ALL, then requires final Hot/Escape policy before returning the
+frozen `UserAuthorization::Spend`. No command or production root caller lands.
 
 ## Next
-Claim M3b `btc-policy-m3b-spend-composition-nq8` next. It owns the two `LiveVault` fields plus final
-values, sealed Escape floor, full-parent/SIGHASH attachment, dust/coverage/policy and the frozen
-authorization. Its caps are 280/10 (reforecast 245/8), it owns seven local mutations, and its final stack
-must run all 50 M3 rows (43 M3a plus seven M3b). qhe may land before or after M3b; whichever lands second
-rebases and runs the full M3+qhe mutation/gate union under the shared evidence lock. Close tracking
-`l5p` after M3b; qhe is not a tracker prerequisite, but it remains a direct M4 prerequisite.
+Land M3b alone at 280/10 maximum after its seven local mutations and the complete 50-row M3
+stack, exact AGENTS gate, both LIVE legs and all four launch commands pass on final bytes. Close
+tracking `l5p` after M3b. Then complete qhe at 290/50 (reforecast 250/42), rebase it over M3b,
+and run the full M3+qhe mutation/gate union under the shared evidence lock before M4.
 
-Then complete qhe at 290/50 (reforecast 250/42), rewire M3a's one Core funnel plus ingress to the bounded
+qhe rewires M3a's one Core funnel plus ingress to the bounded
 byte transport, and close qhe before M4. Then re-derive M4's
 production-only budget and implement the
 Spend command and the parallel

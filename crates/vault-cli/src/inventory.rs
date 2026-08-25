@@ -30,9 +30,9 @@
 //! contradiction and its remedy cross out, with the trusted numbers that cannot carry a
 //! secret (heights, confirmations, vouts, byte and vsize bounds).
 //!
-//! This module has NO caller. Final output values, the sealed Escape floor, the full
-//! parents' attachment, `SIGHASH_ALL`, dust/coverage/policy and the frozen authorization
-//! all belong to `btc-policy-m3b-spend-composition-nq8`. It lands dormant behind
+//! Its ONE caller is [`crate::compose`], itself dormant. Final output values, the sealed
+//! Escape floor, ATTACHING those parents, `SIGHASH_ALL`, dust/coverage/policy and the
+//! authorization belong to `btc-policy-m3b-spend-composition-nq8`. It lands dormant behind
 //! [`crate::core_view`], whose transport is unbounded and lossy until qhe closes.
 
 use std::collections::BTreeMap;

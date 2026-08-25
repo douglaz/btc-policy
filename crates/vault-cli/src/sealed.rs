@@ -89,6 +89,12 @@ pub(crate) struct LiveVault {
     pub(crate) network: Network,
     /// The sealed ladder ceiling (ADR-0016 §2); nodes never enforce it, the signer does.
     pub(crate) escape_bump_max_fee_pct: u8,
+    /// The base Escape's own sealed floor in sat/vB, and the percentage of the selected
+    /// input value its one output must still cover (ADR-0016 §3). Both are already in the
+    /// manifest hash preimage recomputed below, both are secret-free, and the composer
+    /// (`btc-policy-m3b-spend-composition-nq8`) is their only reader.
+    pub(crate) escape_feerate_floor: u64,
+    pub(crate) escape_coverage_pct: u8,
     /// Carried and type-checked, NOT manifest-hash authenticated: the one manifest
     /// field that is neither in the hash preimage nor descriptor-derivable.
     pub(crate) policy_version: u32,
@@ -281,6 +287,8 @@ impl LiveVault {
             template,
             network,
             escape_bump_max_fee_pct: m.escape_bump_max_fee_pct,
+            escape_feerate_floor: m.escape_feerate_floor,
+            escape_coverage_pct: m.escape_coverage_pct,
             policy_version: m.policy_version,
             coordinator_pubkey,
             endpoints,
