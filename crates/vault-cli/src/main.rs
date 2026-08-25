@@ -3,9 +3,14 @@
 mod adversary;
 mod attack;
 mod bitcoind;
+// M3b's dormant composition over that inventory. Unlike its siblings it carries no
+// `#[cfg(test)]` of its own — every one of its tests lives in `tests/core_view.rs`, which
+// includes it by path — so the allowance is unconditional rather than `not(test)`.
+#[allow(dead_code)]
+mod compose;
 // The dormant M3a Core seam and the stable inventory it feeds (`mod inventory` below).
-// M3b's composer and the M4 command that calls it are the callers, so a binary build
-// has none yet.
+// Its one caller is `mod compose` above, which the M4 command has yet to reach, so a
+// binary build still dispatches to none of the three.
 #[cfg_attr(not(test), allow(dead_code))]
 mod core_view;
 mod demo;
