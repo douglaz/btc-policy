@@ -12,9 +12,8 @@ recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product 
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
 a `br ready` ranking.
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
-(on this claim base, the stale-flake assertion plus three of the four existing CI `check` legs;
-`regtest-backend` is the omitted LIVE leg. M3a must add `core-view` as a fifth leg, after which
-both LIVE legs are omitted here — see AGENTS.md for why each part is load-bearing)
+(on the current five-leg CI `check` matrix, this standard local gate covers three legs; both LIVE
+legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why each part is load-bearing)
 
 ## Done
 - `btc-policy-mby-user-signer-tae` + tracking umbrella `btc-policy-mby-operator-core-signer-7vb`
@@ -108,7 +107,8 @@ Implement M3a `btc-policy-m3a-core-view-inventory-rha`: the independently compil
 `CoreRpc`, public-Signet/IBD binding, one physical stable-inventory module, exact early pair/vsize
 preflight, block-qualified full-prevtx authority, incremental 64-MiB projection, and node fee
 reads/conversion. Its one-time artifact-ratification caps are 906 production Rust / 60 production
-non-Rust, with reforecast triggers 800/52. It owns 38 red-first rows, an inventory/preflight-only
+non-Rust, with reforecast triggers 800/52. Its required 38-row floor grew through review to 43 red-first
+rows (`m46`–`m50`), an inventory/preflight-only
 `core-view` LIVE leg and TEST-PLAN text, and a fresh shared-lock/hash-bound serial DONE run. No command or
 reachable root caller lands. The legacy Core funnel remains dormant, unbounded in time/body/framing and
 lossy at invalid UTF-8 until qhe.
@@ -118,7 +118,7 @@ Finish and independently verify M3a through rb-lite at 906/60 (reforecast 800/52
 M3b `btc-policy-m3b-spend-composition-nq8` depends on M3a and owns the two `LiveVault` fields plus final
 values, sealed Escape floor, full-parent/SIGHASH attachment, dust/coverage/policy and the frozen
 authorization. Its caps are 280/10 (reforecast 245/8), it owns seven local mutations, and its final stack
-must run all 45 M3 rows. qhe also depends on M3a and may land before or after M3b; whichever lands second
+must run all 50 M3 rows (43 M3a plus seven M3b). qhe also depends on M3a and may land before or after M3b; whichever lands second
 rebases and runs the full M3+qhe mutation/gate union under the shared evidence lock. Close tracking
 `l5p` after M3b; qhe is not a tracker prerequisite, but it remains a direct M4 prerequisite.
 
