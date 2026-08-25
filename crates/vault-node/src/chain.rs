@@ -301,7 +301,11 @@ pub const PUBLIC_SIGNET_CHALLENGE: &str = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e
 /// indistinguishable here, and so is a fork that truthfully keeps reporting
 /// `chain:"main"` — this reads what Core SAYS, with no genesis or work comparison — and
 /// it runs once, so a backend swapped under a running node is not re-detected.
-fn verify_chain_identity(chain: &Value, sealed: Network) -> Result<(), Error> {
+///
+/// `pub` for the operator CLI's stage-1 Core view (bead
+/// btc-policy-m3a-core-view-inventory-rha), which binds its own inventory to the sealed
+/// network through THIS check rather than a second public-Signet implementation.
+pub fn verify_chain_identity(chain: &Value, sealed: Network) -> Result<(), Error> {
     let sealed_name = crate::vault_network_name(sealed);
     let reported = chain.get("chain").and_then(Value::as_str).ok_or_else(|| {
         format!(

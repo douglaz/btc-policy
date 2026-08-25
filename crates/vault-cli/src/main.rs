@@ -3,9 +3,16 @@
 mod adversary;
 mod attack;
 mod bitcoind;
+// The dormant M3a Core seam and the stable inventory it feeds (`mod inventory` below).
+// M3b's composer and the M4 command that calls it are the callers, so a binary build
+// has none yet.
+#[cfg_attr(not(test), allow(dead_code))]
+mod core_view;
 mod demo;
 mod fed;
 mod http;
+#[cfg_attr(not(test), allow(dead_code))]
+mod inventory;
 // The M2 operator substrate: the sealed-artifact trust boundary and the stage-1 ingress
 // client. M4/M5 add the commands that call them, so a binary build has no caller yet.
 #[cfg_attr(not(test), allow(dead_code))]
