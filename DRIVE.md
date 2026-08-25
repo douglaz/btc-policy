@@ -2,14 +2,14 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** BUILD · **Bead:** btc-policy-m3b-spend-composition-nq8 ·
-**Branch:** feat/m3b-spend-composition
-**Pending:** compose the dormant deterministic Spend/base-Escape authorization over M3a's
-prepared view, then prove the complete 50-row M3 stack without inheriting M3a exits
-**Baseline:** 221 production Rust lines; reforecast at 245 and hard-stop at 280. Production
-non-Rust is 6 lines; reforecast at 8 and hard-stop at 10. Tests, fixtures, mutations and
-evidence are uncapped and mandatory.
-**Do-NOT-build:** a CLI/root caller, new Core method or inventory layer, qhe transport, coin
+**Phase:** LAND · **Beads:** btc-policy-m3b-spend-composition-nq8 +
+btc-policy-mby-spend-composer-l5p · **Branch:** chore/m3b-closure
+**Pending:** land the audited closure records for merged M3b and its M3 tracker, then claim qhe
+as the mandatory bounded byte-transport blocker before M4
+**Delivered:** M3b is 228/280 production Rust and 6/10 production non-Rust. Tests, fixtures,
+mutations and evidence were uncapped and mandatory: 50/50 mutations, exact local gate, both
+LIVE legs, all four launch commands, and final-byte identity all passed.
+**Do-NOT-build:** M4 command/root reachability, another Core method or inventory layer, coin
 selection, unconfirmed ancestry, Escape rungs, BIP32 origins, key/PIN/coordinator/relay/watch/
 broadcast work, output-topology repair, or a generic composer/fee-policy framework.
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
@@ -21,6 +21,18 @@ a `br ready` ranking.
 legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why each part is load-bearing)
 
 ## Done
+- `btc-policy-m3b-spend-composition-nq8` + tracking
+  `btc-policy-mby-spend-composer-l5p` (M3b/M3, P1) — deterministic dormant composition consumes
+  M3a's stable confirmed inventory, preserves the exact Hot amount plus mandatory vault change,
+  builds the same-input base Escape, applies checked fee/dust/coverage arithmetic, attaches every
+  verified full parent and explicit SIGHASH_ALL, and re-runs final Hot/Escape policy before
+  returning the frozen authorization. Merged #36 (`2006f98`) from reviewed head `3b60388`; trees
+  are identical. Final M3b production is 228/280 Rust and 6/10 non-Rust; tests/evidence were
+  uncapped and mandatory. Fresh governed evidence records 50/50 killed mutations, exact local
+  gate, core-view LIVE 7, regtest-backend LIVE 4, all four launch commands, 17/17 final identity
+  checks, two current-head Codex rounds, CodeRabbit with no actionable comments, bot-gate exit 0,
+  and both duplicate launch jobs. The seam remains dormant and confirmed-only; qhe still owns
+  bounded byte transport before M4.
 - `btc-policy-m3a-core-view-inventory-rha` (M3a, P1) — the dormant eight-read loopback Core
   adapter and stable confirmed-inventory seam bind public-Signet/IBD identity, exact vault
   scripts, three-pass tip stability, grouped block-qualified full-prevtx truth, early finalized
@@ -112,18 +124,12 @@ legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why e
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Implement M3b `btc-policy-m3b-spend-composition-nq8` through rb-lite. Add only the two
-manifest-authenticated secret-free `LiveVault` fee/coverage fields and one dormant composition
-module. It derives caller-network Hot destination plus canonical index-0 Escape, consumes only
-M3a's `PreparedView`, applies checked fee/value/dust/coverage arithmetic, attaches every verified
-full parent and explicit SIGHASH_ALL, then requires final Hot/Escape policy before returning the
-frozen `UserAuthorization::Spend`. No command or production root caller lands.
+Land the closure-only M3b/M3 record after independent field-level and graph audit. The
+implementation is already merged as #36 and its code tree is identical to the reviewed head.
 
 ## Next
-Land M3b alone at 280/10 maximum after its seven local mutations and the complete 50-row M3
-stack, exact AGENTS gate, both LIVE legs and all four launch commands pass on final bytes. Close
-tracking `l5p` after M3b. Then complete qhe at 290/50 (reforecast 250/42), rebase it over M3b,
-and run the full M3+qhe mutation/gate union under the shared evidence lock before M4.
+Claim and complete qhe at 290/50 (reforecast 250/42) over merged M3b, then run the full M3+qhe
+mutation/gate union under the shared evidence lock before M4.
 
 qhe rewires M3a's one Core funnel plus ingress to the bounded
 byte transport, and close qhe before M4. Then re-derive M4's
