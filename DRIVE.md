@@ -158,7 +158,7 @@ deletions in production code, production helpers/documentation, and integration 
 modules, test-only helpers/fixtures, mutation harnesses, and test-only evidence do not. Exclusion from
 the cap is not exclusion from delivery: named red controls, mutation sensitivity, review, and all gates
 remain mandatory and may grow as needed. Recorded converted caps are B 550/80, M3a 906/60, M3b 280/10,
-and qhe 290/50 production Rust/non-Rust. Original M3 is tracking-only and has no implementation cap.
+and qhe 634/50 production Rust/non-Rust. Original M3 is tracking-only and has no implementation cap.
 M4–M6 still carry retired mixed caps and must be re-measured before their rb-lite claims. Counts are over
 `<claim commit>..<reviewed head>`; gitignored `.rb-lite/` evidence remains untracked evidence rather than
 production.
