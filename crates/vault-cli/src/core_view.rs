@@ -10,20 +10,21 @@
 //! [`crate::sealed::read_secret`], encodes it, and drops it before returning. There is no
 //! username/password argument, environment source or adjacent default.
 //!
-//! **DORMANT, UNBOUNDED-AT-REST and LOSSY-AT-REST.** The funnel posts through
-//! [`crate::http`], whose read-to-close carries no whole-response cap, whose decode
-//! REPLACES invalid UTF-8 bytes, and which keeps TWO UNWIPED copies of the encoded
-//! credential that every allocation on this side of the call holds in [`Zeroizing`]:
-//! `http::post_head`'s own `auth_header` and the request head it interpolates that
-//! header into (`http.rs:32-44`). This module owns only the LOGICAL envelope over already
-//! decoded text; the byte-level deadline, cap, framing and strict decoding belong to
-//! `btc-policy-http-bounded-ingress-response-qhe`, which replaces that one call site.
-//! Nothing dispatches here until it does.
+//! **DORMANT, and BOUNDED at the byte level** since bead
+//! btc-policy-http-bounded-ingress-response-qhe. The funnel posts through
+//! [`crate::http`] under [`http::Policy::core`]: ONE monotonic deadline over the whole
+//! exchange — 60 seconds, or the scan's own 600 — a 16-MiB cap on the ENTIRE raw
+//! response, strict status and EOF framing, and a request built into one pre-reserved
+//! zeroizing allocation, so the encoded credential no longer has an unwiped head
+//! `String` to sit in. This module still owns only the LOGICAL envelope, over text that
+//! is now decoded STRICTLY: an invalid UTF-8 byte refuses the exchange instead of
+//! arriving here as U+FFFD. That 16 MiB bounds the WIRE; what decoding that many bytes
+//! then costs in heap — this parser still builds a whole [`Value`] — is `btc-policy-yw4`.
+//! Nothing dispatches here: M4 is the first caller.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Duration;
 
 use bitcoin::base64::prelude::{Engine as _, BASE64_STANDARD};
 use bitcoin::consensus::encode::deserialize_hex;
@@ -39,12 +40,6 @@ const ROOT_PATH: &str = "/";
 
 /// The fixed id every request carries and every reply must echo back.
 const RPC_ID: &str = "btc-vault-core-view";
-
-/// The socket timeout handed to the legacy transport, sized for a full-chain
-/// `scantxoutset`. It bounds one READ, not the whole exchange: a peer that answers a byte
-/// at a time holds the call open, which is part of what UNBOUNDED-AT-REST means above. The
-/// real per-exchange deadline arrives with qhe, along with the call site it bounds.
-const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// bitcoind's `RPC_INVALID_ADDRESS_OR_KEY`: block-qualified `getrawtransaction` reports a
 /// txid ABSENT FROM THAT BLOCK with it; missing block DATA is a different, terminal code.
@@ -155,16 +150,36 @@ impl CoreRpc {
         }
         let auth = Zeroizing::new(BASE64_STANDARD.encode(credential.as_bytes()));
         let body = json!({"jsonrpc": "1.0", "id": RPC_ID, "method": method, "params": params});
-        let sent = http::post_json(
+        // Which TYPED exchange exhausted its bound, not merely which socket did. Raw
+        // transport failure collapses to this module's own `Error`: no ingress delivery
+        // semantics reach a read-only Core call, and none could be honoured here.
+        let refuse = |what: String| -> Error { format!("core {method}: {what}").into() };
+        let sent = http::post_attempt(
             self.addr,
             ROOT_PATH,
             body.to_string().as_bytes(),
             Some(auth.as_str()),
-            EXCHANGE_TIMEOUT,
-        )
-        // Which TYPED exchange exhausted its bound, not merely which socket did.
-        .map_err(|e| format!("core {method}: {e}"))?;
-        reply(&sent.body, sent.status, method, absent)
+            http::Policy::core(method),
+        );
+        let (status, bytes) = match sent {
+            http::Attempt::Status {
+                status,
+                body: Some(bytes),
+            } => (status, bytes),
+            http::Attempt::Status { status, .. } => {
+                return Err(refuse(format!(
+                    "HTTP {status} arrived without a whole framed body inside its bounds"
+                )))
+            }
+            http::Attempt::NotSent(e) | http::Attempt::NoStatus(e) => {
+                return Err(refuse(e.to_string()))
+            }
+        };
+        // STRICT, where the legacy transport was lossy: a byte Core could not have meant
+        // must not reach the parser below as U+FFFD and decode as something else.
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|e| refuse(format!("the reply is not UTF-8: {e}")))?;
+        reply(text, status, method, absent)
     }
 }
 
@@ -400,6 +415,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// The cookie every fixture writes. Non-obvious, so a diagnostic that leaked it
     /// could not match by accident.
@@ -1110,10 +1126,11 @@ mod tests {
     }
 
     /// 7. The BYTE boundary is qhe's, not this parser's, and the residual is stated
-    ///    rather than implied: this reply arrives already decoded, so a byte the legacy
-    ///    helper replaced with U+FFFD is indistinguishable here from one Core sent. The
+    ///    rather than implied: [`reply`] receives text, so a byte the LEGACY helper
+    ///    replaced with U+FFFD would be indistinguishable here from one Core sent. The
     ///    logical envelope still holds, and the corrupted value still fails its own
-    ///    typed decode rather than passing as something else.
+    ///    typed decode rather than passing as something else. What now keeps such a byte
+    ///    from ever reaching this function at all is class 20 below.
     #[test]
     fn the_byte_level_decode_boundary_belongs_to_qhe() {
         let lossy = json!({"result": "\u{fffd}\u{fffd}", "error": null, "id": RPC_ID}).to_string();
@@ -1123,6 +1140,172 @@ mod tests {
             .expect_err("a replaced byte is not a block hash")
             .to_string();
         assert!(error.contains("does not parse"), "{error}");
+    }
+
+    /// A loopback endpoint answering ONE connection with exactly these raw bytes, for
+    /// the rows where what is under test is the wire and not a JSON value.
+    fn raw_wire(raw: Vec<u8>) -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = whole_request(&mut stream);
+                let _ = stream.write_all(&raw);
+            }
+        });
+        addr
+    }
+
+    /// 20. **The bounded byte boundary** (bead btc-policy-http-bounded-ingress-response-qhe).
+    ///     Every row is one raw reply a hostile or broken local Core can write, and each
+    ///     one is refused BEFORE [`reply`] sees it — while the same bytes through the
+    ///     LEGACY helper still behave exactly as they always did, which is what makes
+    ///     each row a statement about this funnel rather than about the transport in
+    ///     general. The Legacy halves are the adjacent controls: they are what a
+    ///     mutation putting this funnel back on `http::post_json` would produce.
+    #[test]
+    fn the_core_funnel_decodes_strictly_where_the_legacy_transport_was_lossy() {
+        let temp = crate::fed::TempDir::new("core-view-bounded").expect("temp dir");
+        let cookie = cookie_file(&temp.path, COOKIE);
+        let envelope = |body: &str| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let valid = json!({"result": hash(0xaa).to_string(), "error": null, "id": RPC_ID});
+
+        // An invalid UTF-8 byte inside an otherwise perfect reply. STRICT here; U+FFFD
+        // to a legacy caller, which is the pre-qhe behaviour every other caller keeps.
+        let text = valid.to_string().replace("aa", "\u{0}\u{0}");
+        let mut invalid = envelope(&text).into_bytes();
+        for byte in invalid.iter_mut() {
+            if *byte == 0 {
+                *byte = 0xff;
+            }
+        }
+        let core = CoreRpc::new(raw_wire(invalid.clone()), cookie.clone()).expect("adapter");
+        let error = refusal(core.best_block_hash(), "an invalid UTF-8 reply");
+        assert!(
+            error.contains("core getbestblockhash: the reply is not UTF-8"),
+            "an invalid byte must be refused at the transport, not left to a typed \
+             decode that happens to fail for its own reasons: {error}"
+        );
+        let legacy = http::post_json(raw_wire(invalid), "/", b"{}", None, Duration::from_secs(5))
+            .expect("the legacy transport still answers");
+        assert!(
+            legacy.body.contains('\u{fffd}'),
+            "the legacy control must still REPLACE the byte: {}",
+            legacy.body
+        );
+
+        // A framing defect: chunked transfer, a short body, and a status line no strict
+        // parser accepts. None of them may reach the JSON parser, and each still names
+        // the typed exchange that failed.
+        let framing: [(&str, String); 3] = [
+            (
+                "a chunked reply",
+                format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}",
+                    valid
+                ),
+            ),
+            (
+                "a body shorter than its Content-Length",
+                format!("HTTP/1.1 200 OK\r\nContent-Length: 9999\r\n\r\n{}", valid),
+            ),
+            (
+                "a status line that only looks like one",
+                format!("garbage 200\r\n\r\n{valid}"),
+            ),
+        ];
+        for (what, raw) in framing {
+            let core =
+                CoreRpc::new(raw_wire(raw.clone().into_bytes()), cookie.clone()).expect("adapter");
+            let error = refusal(core.best_block_hash(), what);
+            assert!(
+                error.starts_with("core getbestblockhash:"),
+                "{what}: {error}"
+            );
+            assert!(
+                !error.contains(&hash(0xaa).to_string()),
+                "{what} must not report a value it never framed: {error}"
+            );
+            // The legacy control: every one of these IS accepted by the pre-qhe
+            // transport, so the strictness is this funnel's and not the peer's doing.
+            let legacy = http::post_json(
+                raw_wire(raw.into_bytes()),
+                "/",
+                b"{}",
+                None,
+                Duration::from_secs(5),
+            );
+            assert!(
+                legacy.is_ok(),
+                "{what}: the legacy control must still parse"
+            );
+        }
+
+        // The 16-MiB cap, from the other side: a reply whose WHOLE raw length is past it
+        // is refused with no value, while the reply just under it decodes.
+        let cap = 16 * 1024 * 1024;
+        let huge = json!({"result": "x".repeat(cap), "error": null, "id": RPC_ID}).to_string();
+        let core =
+            CoreRpc::new(raw_wire(envelope(&huge).into_bytes()), cookie.clone()).expect("adapter");
+        let error = refusal(core.best_block_hash(), "a reply past the 16 MiB cap");
+        assert!(
+            error.contains("without a whole framed body inside its bounds"),
+            "a reply past the 16 MiB cap must be refused BY THE CAP, before any typed \
+             decode gets a chance to fail for its own reasons: {error}"
+        );
+        let fits =
+            json!({"result": hash(0xaa).to_string(), "error": null, "id": RPC_ID}).to_string();
+        let core = CoreRpc::new(raw_wire(envelope(&fits).into_bytes()), cookie).expect("adapter");
+        assert_eq!(
+            core.best_block_hash().expect("a reply inside the cap"),
+            hash(0xaa),
+            "the adjacent control: an ordinary reply still decodes"
+        );
+    }
+
+    /// 21. The funnel is still ONE call site, and the policy it hands the transport is
+    ///     derived from the method it is issuing — which is what makes `scantxoutset`
+    ///     the only long deadline. `http::Policy::core` owns the mapping itself and
+    ///     pins every one of the eight methods against it; what this pins is that the
+    ///     funnel asks that question at all, rather than naming a constant policy, a
+    ///     hard-coded method, or the legacy transport.
+    #[test]
+    fn the_one_funnel_selects_its_policy_from_the_method_it_is_issuing() {
+        let code: String = include_str!("core_view.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<&str>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("http::post_attempt(").count(),
+            1,
+            "one bounded call site, and only one"
+        );
+        assert!(
+            // The CALL, not one line of rustfmt's output: a trailing comma is formatting,
+            // and pinning it would make an unrelated reflow read as a policy regression.
+            code.contains("http::Policy::core(method)"),
+            "the policy must be derived from the method being issued"
+        );
+        for legacy in [
+            "http::post_json",
+            "http::get_json",
+            "Policy::Legacy",
+            "Policy::ingress",
+        ] {
+            assert!(
+                !code.contains(legacy),
+                "the Core funnel must not reach {legacy}"
+            );
+        }
     }
 
     /// Drive one read against a scripted Wire and return the refusal it must earn. Each

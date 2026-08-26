@@ -125,6 +125,10 @@ It is reachable on the same coordinator relay path as `/sign`, and the coordinat
 
 Every requirement in this doc is tagged with the milestone that gates it. Why the walking skeleton died: its discovery value was spent by the grill (the protocol is now designed on paper), its one-shot `/sign` contradicted the real two-phase protocol vault-proto exists to unify, and its demo undersold the product.
 
+### The coordinator's HTTP transport
+
+`crates/vault-cli/src/http.rs` is one small synchronous client over `std::net` rather than an HTTP crate, and since `btc-policy-http-bounded-ingress-response-qhe` it carries one `Policy` with two shapes. `Legacy` is the pre-M3 exchange, unchanged and deliberately kept: a fixed connect, a per-READ inactivity timeout, an unbounded read to close and a lossy body — which is what a readiness probe polling a node that is still starting actually needs, and what the demo, the adversary harness and the signet faucet keep. The BOUNDED shapes are ordered stage-1 ingress (the caller's deadline, 64 KiB) and the closed read-only Core funnel (60 seconds, or 600 for the single typed `scantxoutset`; 16 MiB). They create ONE monotonic deadline before connect and spend it across connect, partial writes, the whole response and the terminal EOF; they hold the entire raw response in one exactly-`cap+1` zeroizing allocation that never grows; they frame strictly at EOF; and they hand back BYTES, which Core decodes as strict UTF-8 and ingress borrows only the acknowledgement fields from. `NotSent` — the one outcome that authorizes reissuing a signed request — is reachable before connect and nowhere else. That 16 MiB bounds the WIRE, not the heap a decoded reply costs (`btc-policy-yw4`), and neither bounded path is reachable from a command yet: the operator Spend command is the first caller.
+
 ### Policy model
 
 A node's policy is a **closed, hardcoded set of checks** parameterized by a per-node config file — not a rule engine, not a DSL. Adding a check type means shipping code. This is deliberate: an extensible engine is exactly the complexity the dependency-discipline constraint forbids until a real need shows up.

@@ -1988,6 +1988,83 @@ mod tests {
         assert_eq!(status, 405, "/pending must not accept a mutating verb");
     }
 
+    /// The RAW bytes this real axum server answers one `Connection: close` request
+    /// with, read to EOF.
+    fn raw_exchange(addr: SocketAddr, head: &str, body: &[u8]) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .write_all(head.as_bytes())
+            .and_then(|()| stream.write_all(body))
+            .expect("write request");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read response");
+        raw
+    }
+
+    /// What a REAL axum answer looks like on the wire, pinned here because the
+    /// coordinator's bounded ingress client (bead
+    /// btc-policy-http-bounded-ingress-response-qhe) frames `/sign` replies STRICTLY and
+    /// has no chunked decoder: it requires `HTTP/1.1` plus a three-digit status, a
+    /// terminated header block, at most one `Content-Length` matched
+    /// ASCII-case-insensitively — hyper writes its header names in LOWER case, which is
+    /// exactly why that matching is case-insensitive — no `Transfer-Encoding` at all,
+    /// and EOF after a body of precisely the declared length. If an axum or hyper
+    /// upgrade ever moves this surface to chunked framing or drops the length, M4's
+    /// ordered delivery would refuse every acknowledgement the federation sends; the
+    /// break belongs here, on the side that produces the bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sign_surface_answers_bytes_the_bounded_ingress_client_can_frame() {
+        let (node, request) = node_and_valid_request();
+        let addr = spawn_app(app(Arc::new(node))).await;
+        let body = spend_body(&request);
+        let raw = spawn_blocking(move || {
+            raw_exchange(addr, &post_head("/sign", body.len()), body.as_bytes())
+        })
+        .await
+        .expect("client task");
+
+        let text = String::from_utf8(raw.clone()).expect("a UTF-8 response");
+        let (head, answered) = text.split_once("\r\n\r\n").expect("a terminated head");
+        let mut lines = head.split("\r\n");
+        let status = lines.next().expect("a status line");
+        let code = status
+            .strip_prefix("HTTP/1.1 ")
+            .and_then(|rest| rest.get(..3))
+            .and_then(|digits| digits.parse::<u16>().ok())
+            .expect("HTTP/1.1 plus three digits");
+        assert!((100..=599).contains(&code), "{status}");
+        let mut lengths = Vec::new();
+        for line in lines {
+            let (name, value) = line.split_once(':').expect("a header line with a colon");
+            assert!(
+                !name.ends_with(' ') && !name.starts_with([' ', '\t']),
+                "no space before the colon and no obs-fold: {line:?}"
+            );
+            assert!(
+                !name.eq_ignore_ascii_case("transfer-encoding"),
+                "the bounded client has no chunked decoder: {line:?}"
+            );
+            if name.eq_ignore_ascii_case("content-length") {
+                lengths.push(value.trim().parse::<usize>().expect("a byte count"));
+            }
+        }
+        assert_eq!(
+            lengths,
+            vec![answered.len()],
+            "exactly one Content-Length, equal to the body that arrived: {text:?}"
+        );
+        // MEASURED rather than assumed: hyper writes `content-length` in lower case, so
+        // a client matching that name literally would read every real node answer as
+        // unframed — and, worse, would not see a lower-case `transfer-encoding` either.
+        assert!(
+            head.contains("content-length:") && !head.contains("Content-Length:"),
+            "the real header name is lower case: {head:?}"
+        );
+        // The `Connection: close` this client sent is honoured, or `read_to_end` above
+        // would not have returned: EOF is what the bounded exchange completes on.
+        assert!(!answered.is_empty(), "a /sign answer has a body: {text:?}");
+    }
+
     /// Send a `Connection: close` request and read its full response. Oversized
     /// requests tolerate axum closing before the client finishes writing.
     fn send(addr: SocketAddr, head: &str, body: &[u8], tolerate_write_err: bool) -> (u16, String) {
