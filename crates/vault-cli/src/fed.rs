@@ -1679,4 +1679,49 @@ mod tests {
             previous = fee;
         }
     }
+
+    /// The readiness probe stays on the LEGACY transport (bead
+    /// btc-policy-http-bounded-ingress-response-qhe keeps every pre-M3 caller as it
+    /// was). This is not a preference: `wait_ready` polls a node that is still coming
+    /// up, so what it needs is a per-attempt inactivity timeout, and a bounded policy
+    /// would refuse this projection the moment the node wrote it slowly. The node
+    /// below answers a byte at a time — every gap well inside the 500 ms the probe
+    /// allows one read — and a 500 ms whole-exchange deadline would end it.
+    #[test]
+    fn the_readiness_probe_still_reads_a_slow_node_to_close() {
+        let projection = "{\"alerts\":[],\"cursor\":0}";
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{projection}",
+            projection.len()
+        );
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let (mut head, mut byte) = (Vec::new(), [0u8; 1]);
+            while !head.ends_with(b"\r\n\r\n") {
+                match std::io::Read::read(&mut stream, &mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => return,
+                }
+            }
+            for byte in reply.as_bytes() {
+                if std::io::Write::write_all(&mut stream, &[*byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        assert!(
+            NodeProcess::is_serving(addr),
+            "a slow but shaped projection is still a serving node"
+        );
+        assert!(
+            started.elapsed() > Duration::from_millis(500),
+            "and it really did outlast the 500 ms one bounded exchange would have had"
+        );
+    }
 }

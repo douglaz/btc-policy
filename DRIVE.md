@@ -2,16 +2,17 @@
 
 **Scope:** the `br ready` frontier, highest priority first. One bead = one branch = one PR.
 Beads outside that frontier are NOT in scope for this drive.
-**Phase:** LAND · **Beads:** btc-policy-m3b-spend-composition-nq8 +
-btc-policy-mby-spend-composer-l5p · **Branch:** chore/m3b-closure
-**Pending:** land the audited closure records for merged M3b and its M3 tracker, then claim qhe
-as the mandatory bounded byte-transport blocker before M4
-**Delivered:** M3b is 228/280 production Rust and 6/10 production non-Rust. Tests, fixtures,
-mutations and evidence were uncapped and mandatory: 50/50 mutations, exact local gate, both
-LIVE legs, all four launch commands, and final-byte identity all passed.
-**Do-NOT-build:** M4 command/root reachability, another Core method or inventory layer, coin
-selection, unconfirmed ancestry, Escape rungs, BIP32 origins, key/PIN/coordinator/relay/watch/
-broadcast work, output-topology repair, or a generic composer/fee-policy framework.
+**Phase:** BUILD · **Bead:** btc-policy-http-bounded-ingress-response-qhe ·
+**Branch:** feat/http-bounded-ingress-response
+**Pending:** replace read-to-close transport on stage-1 ingress and M3a Core RPC with one
+byte-preserving absolute-deadline/whole-response-cap boundary, then prove the full M3+qhe stack
+**Measured baseline:** 511 production Rust lines; reforecast at 560 and hard-stop at 634
+(103 lines of >=20% contingency plus 20 review). Production non-Rust remains hard-stopped at
+50. Tests, fixtures, mutations and evidence are uncapped and mandatory.
+**Do-NOT-build:** M4 command/root reachability, async/runtime conversion, an HTTP framework
+rewrite, endpoint concurrency, streaming/chunked JSON, TLS/remote transport, a generic deadline
+table, new wallet/Core methods, node body caps, signer/nonce/schema changes, or inherited Legacy
+caller hardening.
 **Selection:** `br ready` showed several unblocked P1s on 2026-08-18; `mby` is next because its
 recorded 2026-07-30 Codex+Fable split identifies it as the whole-ladder product blocker, after the
 bounded custody fix chosen ahead of it (`q6v`/`sxt`) closed. This is an explicit drive choice, not
@@ -124,12 +125,17 @@ legs, `regtest-backend` and `core-view`, are omitted — see AGENTS.md for why e
   from `9yf` after its public negative-control branch was deleted on 2026-08-10.
 
 ## Now
-Land the closure-only M3b/M3 record after independent field-level and graph audit. The
-implementation is already merged as #36 and its code tree is identical to the reviewed head.
+Resume qhe through rb-lite after its mandatory production-cap STOP. Independent reviews found
+the 511-line artifact direct rather than overengineered: even deleting every changed comment and
+blank leaves 376 gross, while the 290 cap underpriced gross replacement and exact framing. The
+owner ratified 511 + 103 contingency + 20 review = 634 instead of landing an unreachable qhe-a
+and duplicating the governed run. Fix the two low-severity compatibility/deadline findings and
+complete every named uncapped evidence row before any closure claim.
 
 ## Next
-Claim and complete qhe at 290/50 (reforecast 250/42) over merged M3b, then run the full M3+qhe
-mutation/gate union under the shared evidence lock before M4.
+Land qhe at 634/50 maximum after every qhe mutation and the complete 50-row M3 suite, exact
+AGENTS gate, both LIVE legs, and all four launch commands pass on final bytes under the shared
+evidence lock. Then close qhe and re-derive M4's production-only budget before its rb-lite claim.
 
 qhe rewires M3a's one Core funnel plus ingress to the bounded
 byte transport, and close qhe before M4. Then re-derive M4's
@@ -152,7 +158,7 @@ deletions in production code, production helpers/documentation, and integration 
 modules, test-only helpers/fixtures, mutation harnesses, and test-only evidence do not. Exclusion from
 the cap is not exclusion from delivery: named red controls, mutation sensitivity, review, and all gates
 remain mandatory and may grow as needed. Recorded converted caps are B 550/80, M3a 906/60, M3b 280/10,
-and qhe 290/50 production Rust/non-Rust. Original M3 is tracking-only and has no implementation cap.
+and qhe 634/50 production Rust/non-Rust. Original M3 is tracking-only and has no implementation cap.
 M4–M6 still carry retired mixed caps and must be re-measured before their rb-lite claims. Counts are over
 `<claim commit>..<reviewed head>`; gitignored `.rb-lite/` evidence remains untracked evidence rather than
 production.

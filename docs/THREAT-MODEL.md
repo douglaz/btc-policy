@@ -317,6 +317,25 @@ cross-lock pin release exists. The NonceLog replay/fan-out tombstone keeps immut
 removed only when ordinary pruning observes both signed wall expiry and `D` ended.
 Candidate/fire-window expiry remains independent.
 
+**R12 — The coordinator's bounded transport caps the WIRE, and only two call sites.** Since
+`btc-policy-http-bounded-ingress-response-qhe` the coordinator's stage-1 ingress and its one
+read-only Core funnel run under a monotonic deadline created BEFORE connect (the caller's own;
+60 seconds ordinary, 600 for `scantxoutset`) and a cap on the ENTIRE raw response (64 KiB,
+16 MiB), so a manifest-pinned peer or a local Core that drips or answers forever costs one
+deadline rather than a coordinator. Three limits are real and stated rather than implied. That
+16 MiB is a RAW-WIRE cap: M3a's parser still decodes a whole `serde_json::Value`, so the heap
+that many bytes then cost is bounded BY that wire input and is not a total-memory claim —
+broader resource amplification is `btc-policy-yw4`. Zeroization is equally narrow: the
+pre-reserved request bytes and raw response allocation are zeroizing. The retained
+acknowledgement is ordinary application storage, but its string is constructed only from the
+caller's local, non-secret commitment id; no peer-chosen string survives into it. Serde's parser
+scratch and M3a's typed Core values are a documented non-zeroizing residual that no diagnostic or
+operator output echoes. And every OTHER caller —
+readiness, the demo, the adversary harness, the signet faucet — keeps the pre-M3 unbounded
+read-to-close deliberately, so what this closes is those two call sites and nothing else. Both
+remain DORMANT: no CLI command dispatches to either, and `btc-policy-mby-spend-command-6mp` is
+the first caller.
+
 ## 8. What a reviewer should attack first
 
 Ranked by "most damaging if wrong":

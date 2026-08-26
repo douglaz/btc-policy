@@ -756,6 +756,106 @@ fn a_live_default_signet_is_bound_to_its_challenge_and_a_custom_one_is_refused()
     assert!(error.contains("CUSTOM signet"), "{error}");
 }
 
+/// LIVE-8. The BOUNDED transport against a REAL daemon (bead
+/// btc-policy-http-bounded-ingress-response-qhe). Every live class above now runs through
+/// it — the funnel has no other path — so this one pins the two things their success only
+/// implies: that a real bitcoind's own wire bytes satisfy the strict framing this client
+/// requires, MEASURED rather than assumed, and that the whole-response cap and 60-second
+/// deadline are slack a real reply sits well inside rather than bounds it grazes.
+#[test]
+#[ignore = "spawns a regtest bitcoind; run with --ignored"]
+fn the_bounded_transport_frames_a_real_bitcoind_reply_inside_its_own_bounds() {
+    let sealed = sealed_vault();
+    let temp = fed::TempDir::new("core-view-bounded").expect("temp dir");
+    let node = funded(&temp, &sealed.vault, 101);
+    let body =
+        json!({"jsonrpc": "1.0", "id": "suite", "method": "getblockchaininfo", "params": []})
+            .to_string();
+
+    // The real bounded exchange, through the real policy the funnel selects.
+    let started = Instant::now();
+    let attempt = http::post_attempt(
+        node.addr,
+        "/",
+        body.as_bytes(),
+        Some(&node.auth),
+        http::Policy::core("getblockchaininfo"),
+    );
+    let http::Attempt::Status {
+        status,
+        body: Some(bytes),
+    } = attempt
+    else {
+        panic!("a real daemon must answer one whole framed response");
+    };
+    assert_eq!(status, 200);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "a real reply must complete in under 10 seconds: {elapsed:?}"
+    );
+    assert!(
+        bytes.len() < 64 * 1024,
+        "and its decoded body must stay under 64 KiB: {} bytes",
+        bytes.len()
+    );
+    // STRICT UTF-8, the way the funnel decodes it, and a real JSON-RPC envelope.
+    let text = std::str::from_utf8(&bytes).expect("a real Core reply is UTF-8");
+    let reply: Value = serde_json::from_str(text).expect("one JSON value");
+    assert_eq!(reply["result"]["chain"], json!("regtest"));
+
+    // The same daemon's RAW bytes, so what this client's strict framing depends on is
+    // measured against the real server rather than against a fixture of it. bitcoind
+    // writes `Content-Length` capitalised where hyper writes it lower case, which is
+    // exactly why both names are matched ASCII-case-insensitively.
+    let raw = raw_core_exchange(node.addr, &node.auth, &body);
+    let text = String::from_utf8(raw).expect("a UTF-8 response");
+    let (head, answered) = text.split_once("\r\n\r\n").expect("a terminated head");
+    let mut lines = head.split("\r\n");
+    let status = lines.next().expect("a status line");
+    assert!(
+        status.starts_with("HTTP/1.1 200 "),
+        "a strict status line: {status:?}"
+    );
+    let mut lengths = Vec::new();
+    for line in lines {
+        let (name, value) = line.split_once(':').expect("a header line with a colon");
+        assert!(
+            !name.ends_with(' ') && !name.starts_with([' ', '\t']),
+            "no space before the colon and no obs-fold: {line:?}"
+        );
+        assert!(
+            !name.eq_ignore_ascii_case("transfer-encoding"),
+            "this client has no chunked decoder: {line:?}"
+        );
+        if name.eq_ignore_ascii_case("content-length") {
+            lengths.push(value.trim().parse::<usize>().expect("a byte count"));
+        }
+    }
+    assert_eq!(
+        lengths,
+        vec![answered.len()],
+        "exactly one Content-Length, equal to the body that arrived: {head:?}"
+    );
+}
+
+/// One raw `Connection: close` JSON-RPC exchange, read to EOF, so the daemon's own
+/// framing bytes can be asserted rather than the client's view of them.
+fn raw_core_exchange(addr: SocketAddr, auth: &str, body: &str) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+    let head = format!(
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("write head");
+    stream.write_all(body.as_bytes()).expect("write body");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    raw
+}
+
 /// The Core cookie password class 19 selects, and the exact text the hostile endpoint
 /// echoes back at it. A txid is 32 bytes, so a 64-hex password IS a syntactically valid
 /// one — nothing downstream can reject it as malformed, which is the whole premise.
