@@ -517,7 +517,7 @@ mod tests {
         }
     }
 
-    /// An owner-only cookie file, as `read_secret` requires.
+    /// An owner-only cookie file, as `read_core_cookie` requires.
     fn cookie_file(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("core.cookie");
         std::fs::write(&path, body).expect("write");
