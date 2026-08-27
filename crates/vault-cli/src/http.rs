@@ -34,11 +34,10 @@ pub enum Attempt {
     NotSent(Error),
     /// A write may have happened and no status line came back.
     NoStatus(Error),
-    /// A status line came back. `body` is `None` when the rest failed after it —
-    /// the status is still KNOWN, which is what keeps a 400 an explicit
-    /// no-delivery even when its body never arrives. Bytes, not text: a Core reply
-    /// must decode STRICTLY and an ingress reply must not materialize peer text at
-    /// all, and neither is expressible once this has been through `from_utf8_lossy`.
+    /// A status line came back. `body` is `None` when the rest failed after it, but the
+    /// status is still KNOWN. Bytes, not text: a Core reply must decode STRICTLY and an
+    /// ingress reply must not materialize peer text at all, and neither is expressible
+    /// once this has been through `from_utf8_lossy`.
     Status {
         status: u16,
         body: Option<Zeroizing<Vec<u8>>>,
@@ -1098,8 +1097,8 @@ mod tests {
     }
 
     /// 4. Every framing defect at EOF, one row per deviation. A green row keeps its
-    ///    body; a red row keeps its STATUS and drops the body, which is what makes a
-    ///    400 an explicit no-delivery even when nothing else about it parsed.
+    ///    body; a red row keeps its STATUS and drops the body, so the transport phase
+    ///    remains observable even when nothing else about the response parsed.
     #[test]
     fn every_header_content_length_and_transfer_encoding_defect_is_framed_at_eof() {
         let whole: [(&str, &str, &str); 9] = [

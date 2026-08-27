@@ -4,11 +4,12 @@
 //!
 //!   nix develop -c cargo test --locked -p vault-cli --test core_view -- --ignored --test-threads=1
 //!
-//! Two groups are deliberately outside that set and run in the ordinary
+//! Three groups are deliberately outside that set and run in the ordinary
 //! `cargo test --workspace` gate. Class 19 drives the same real `CoreRpc` against a
 //! SCRIPTED HOSTILE listener rather than a daemon, so it is neither slow nor opt-in; it
 //! lives here because this is the only target that can reach `CoreRpc` and `prepare_view`
-//! together. And the M3b COMPOSITION classes at the foot of this file
+//! together. Class 20 proves the Core cookie's byte cap and allocation shape without a
+//! daemon. And the M3b COMPOSITION classes at the foot of this file
 //! (`btc-policy-m3b-spend-composition-nq8`) answer a typed in-process fake Core. They are
 //! here by the owner's DELIBERATE choice, not by necessity: every new M3b test is kept
 //! under `tests/`, which is what keeps it outside the production-only line budget, and this
