@@ -316,12 +316,12 @@ INHERITED = [
     },
     {
         "id": 'm15-cookie-cached-at-construction',
-        "state": 'ACTIVE',
+        "state": 'REANCHORED_FROM=20260825T1932Z-m3b-zero-final/red-first.py',
         "file": 'crates/vault-cli/src/core_view.rs',
         "edits": [
             [
-                '        let read = crate::sealed::read_secret(&self.cookie)?;',
-                '        let read = crate::sealed::read_secret(&self.cookie)\n            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::from("__cookie__:stale")));',
+                '        let read = crate::sealed::read_core_cookie(&self.cookie)?;',
+                '        let read = crate::sealed::read_core_cookie(&self.cookie)\n            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::from("__cookie__:stale")));',
             ],
         ],
         "command": [
@@ -335,6 +335,26 @@ INHERITED = [
         ],
         "filter": 'core_view::tests::the_cookie_is_read_per_call',
         "needle": 'a removed cookie stops the next call',
+        "prior": {
+            "file": 'crates/vault-cli/src/core_view.rs',
+            "edits": [
+                [
+                    '        let read = crate::sealed::read_secret(&self.cookie)?;',
+                    '        let read = crate::sealed::read_secret(&self.cookie)\n            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::from("__cookie__:stale")));',
+                ],
+            ],
+            "command": [
+                'cargo',
+                'test',
+                '--locked',
+                '-p',
+                'vault-cli',
+                '--bin',
+                'btc-vault',
+            ],
+            "filter": 'core_view::tests::the_cookie_is_read_per_call',
+            "needle": 'a removed cookie stops the next call',
+        },
     },
     {
         "id": 'm16-loopback-requirement-dropped',
@@ -1161,12 +1181,12 @@ INHERITED = [
     },
     {
         "id": 'q01-deadline-restarted-at-every-phase',
-        "state": 'ACTIVE',
+        "state": 'REANCHORED_FROM=20260826T0553Z-qhe-union-final/qhe-red-first.py',
         "file": 'crates/vault-cli/src/http.rs',
         "edits": [
             [
-                '    let left = || match budget.checked_sub(now().saturating_duration_since(start)) {\n        Some(left) if !left.is_zero() => Some(left),\n        _ => None,\n    };',
-                '    let left = || Some(budget);',
+                '    let left = || match deadline.checked_duration_since(now()) {\n        Some(left) if !left.is_zero() => Some(left),\n        _ => None,\n    };',
+                '    let left = || Some(CONNECT_CEILING);',
             ],
         ],
         "command": [
@@ -1180,15 +1200,35 @@ INHERITED = [
         ],
         "filter": 'http::tests::the_bounded_deadline_starts_before_connect',
         "needle": 'must not connect',
+        "prior": {
+            "file": 'crates/vault-cli/src/http.rs',
+            "edits": [
+                [
+                    '    let left = || match budget.checked_sub(now().saturating_duration_since(start)) {\n        Some(left) if !left.is_zero() => Some(left),\n        _ => None,\n    };',
+                    '    let left = || Some(budget);',
+                ],
+            ],
+            "command": [
+                'cargo',
+                'test',
+                '--locked',
+                '-p',
+                'vault-cli',
+                '--bin',
+                'btc-vault',
+            ],
+            "filter": 'http::tests::the_bounded_deadline_starts_before_connect',
+            "needle": 'must not connect',
+        },
     },
     {
         "id": 'q02-deadline-does-not-cover-connect',
-        "state": 'ACTIVE',
+        "state": 'REANCHORED_FROM=20260826T0553Z-qhe-union-final/qhe-red-first.py',
         "file": 'crates/vault-cli/src/http.rs',
         "edits": [
             [
                 '    let Some(first) = left() else {\n        return Attempt::NotSent(format!("connect {addr}: the deadline expired first").into());\n    };',
-                '    let first = budget;',
+                '    let first = CONNECT_CEILING;',
             ],
         ],
         "command": [
@@ -1202,6 +1242,26 @@ INHERITED = [
         ],
         "filter": 'http::tests::the_bounded_deadline_starts_before_connect',
         "needle": 'an expired deadline must not connect',
+        "prior": {
+            "file": 'crates/vault-cli/src/http.rs',
+            "edits": [
+                [
+                    '    let Some(first) = left() else {\n        return Attempt::NotSent(format!("connect {addr}: the deadline expired first").into());\n    };',
+                    '    let first = budget;',
+                ],
+            ],
+            "command": [
+                'cargo',
+                'test',
+                '--locked',
+                '-p',
+                'vault-cli',
+                '--bin',
+                'btc-vault',
+            ],
+            "filter": 'http::tests::the_bounded_deadline_starts_before_connect',
+            "needle": 'an expired deadline must not connect',
+        },
     },
     {
         "id": 'q03-cap-truncates-instead-of-refusing',
@@ -1513,12 +1573,12 @@ INHERITED = [
     },
     {
         "id": 'q17-ingress-put-back-on-the-legacy-transport',
-        "state": 'ACTIVE',
+        "state": 'REANCHORED_FROM=20260826T0553Z-qhe-union-final/qhe-red-first.py',
         "file": 'crates/vault-cli/src/ingress.rs',
         "edits": [
             [
-                '        let attempt =\n            http::post_attempt(*addr, "/sign", &body, None, http::Policy::ingress(timeout));',
-                '        let attempt =\n            http::post_attempt(*addr, "/sign", &body, None, http::Policy::Legacy(timeout));',
+                '    http::post_attempt(addr, "/sign", body, None, http::Policy::ingress(deadline))',
+                '    http::post_attempt(addr, "/sign", body, None, http::Policy::Legacy(PER_ENDPOINT))',
             ],
         ],
         "command": [
@@ -1530,8 +1590,28 @@ INHERITED = [
             '--bin',
             'btc-vault',
         ],
-        "filter": 'ingress::tests::a_dripping_first_endpoint_cannot_suppress',
+        "filter": 'ingress::tests::a_dripping_first_endpoint_costs_one_aggregate',
         "needle": 'one deadline, not its own patience',
+        "prior": {
+            "file": 'crates/vault-cli/src/ingress.rs',
+            "edits": [
+                [
+                    '        let attempt =\n            http::post_attempt(*addr, "/sign", &body, None, http::Policy::ingress(timeout));',
+                    '        let attempt =\n            http::post_attempt(*addr, "/sign", &body, None, http::Policy::Legacy(timeout));',
+                ],
+            ],
+            "command": [
+                'cargo',
+                'test',
+                '--locked',
+                '-p',
+                'vault-cli',
+                '--bin',
+                'btc-vault',
+            ],
+            "filter": 'ingress::tests::a_dripping_first_endpoint_cannot_suppress',
+            "needle": 'one deadline, not its own patience',
+        },
     },
     {
         "id": 'q18-peer-commitment-string-retained',
@@ -1755,12 +1835,12 @@ INHERITED = [
     },
     {
         "id": 'q28-legacy-callers-switched-to-the-bounded-policy',
-        "state": 'ACTIVE',
+        "state": 'REANCHORED_FROM=20260826T0553Z-qhe-union-final/qhe-red-first.py',
         "file": 'crates/vault-cli/src/http.rs',
         "edits": [
             [
                 '        Policy::Legacy(timeout) => legacy(addr, request, timeout),',
-                '        Policy::Legacy(timeout) => bounded(addr, request, timeout, INGRESS_CAP, &Instant::now),',
+                '        Policy::Legacy(timeout) => bounded(addr, request, Instant::now() + timeout, INGRESS_CAP, &Instant::now),',
             ],
         ],
         "command": [
@@ -1774,6 +1854,26 @@ INHERITED = [
         ],
         "filter": 'fed::tests::the_readiness_probe_still_reads_a_slow_node_to_close',
         "needle": 'still a serving node',
+        "prior": {
+            "file": 'crates/vault-cli/src/http.rs',
+            "edits": [
+                [
+                    '        Policy::Legacy(timeout) => legacy(addr, request, timeout),',
+                    '        Policy::Legacy(timeout) => bounded(addr, request, timeout, INGRESS_CAP, &Instant::now),',
+                ],
+            ],
+            "command": [
+                'cargo',
+                'test',
+                '--locked',
+                '-p',
+                'vault-cli',
+                '--bin',
+                'btc-vault',
+            ],
+            "filter": 'fed::tests::the_readiness_probe_still_reads_a_slow_node_to_close',
+            "needle": 'still a serving node',
+        },
     },
     {
         "id": 'q29-ingress-cap-loosened-past-64-kib',
@@ -1887,12 +1987,12 @@ INHERITED = [
     },
     {
         "id": 'q34-read-loop-restarts-the-budget-for-every-read',
-        "state": 'ACTIVE',
+        "state": 'REANCHORED_FROM=20260826T0553Z-qhe-union-final/qhe-red-first.py',
         "file": 'crates/vault-cli/src/http.rs',
         "edits": [
             [
                 '        let Some(wait) = left() else {\n            break Err(format!("response from {addr}: the deadline expired"));\n        };',
-                '        let wait = budget;',
+                '        let wait = CONNECT_CEILING;',
             ],
         ],
         "command": [
@@ -1906,6 +2006,26 @@ INHERITED = [
         ],
         "filter": 'http::tests::the_deadline_covers_the_status_header_and_body_reads_alike',
         "needle": 'a deadline spent before a strict status line decides nothing',
+        "prior": {
+            "file": 'crates/vault-cli/src/http.rs',
+            "edits": [
+                [
+                    '        let Some(wait) = left() else {\n            break Err(format!("response from {addr}: the deadline expired"));\n        };',
+                    '        let wait = budget;',
+                ],
+            ],
+            "command": [
+                'cargo',
+                'test',
+                '--locked',
+                '-p',
+                'vault-cli',
+                '--bin',
+                'btc-vault',
+            ],
+            "filter": 'http::tests::the_deadline_covers_the_status_header_and_body_reads_alike',
+            "needle": 'a deadline spent before a strict status line decides nothing',
+        },
     },
     {
         "id": 'q35-borrowed-answer-drifts-from-the-protocol-wire-shape',
@@ -2072,7 +2192,188 @@ INHERITED = [
 ]
 
 # The rows M4-SA owns. Each restores one behaviour this child introduces.
-OWNED = []
+OWNED = [
+    {
+        "id": 'M4-25-aggregate-deadline-rebuilt-from-a-remaining-duration',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/ingress.rs',
+        "edits": [
+            [
+                '    let mut attempts = Vec::new();\n    for addr in endpoints {',
+                '    let mut attempts = Vec::new();\n    let remaining = aggregate.saturating_duration_since(now());\n    for addr in endpoints {',
+            ],
+            [
+                '        let deadline = now()\n            .checked_add(PER_ENDPOINT)\n            .unwrap_or(aggregate)\n            .min(aggregate);',
+                '        let deadline = now() + remaining;',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'ingress::tests::every_endpoint_is_handed_the_minimum',
+        "needle": 'each endpoint is handed min(now + 60s, aggregate), and no rebased duration',
+    },
+    {
+        "id": 'M4-26-endpoint-handed-the-aggregate-instead-of-its-own-slice',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/ingress.rs',
+        "edits": [
+            [
+                '        let deadline = now()\n            .checked_add(PER_ENDPOINT)\n            .unwrap_or(aggregate)\n            .min(aggregate);',
+                '        let deadline = aggregate;',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'ingress::tests::every_endpoint_is_handed_the_minimum',
+        "needle": 'each endpoint is handed min(now + 60s, aggregate), and no rebased duration',
+    },
+    {
+        "id": 'M4-27-sticky-advancement-moved-below-status-decoding',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/ingress.rs',
+        "edits": [
+            [
+                '        // A request byte may already have reached this node, so reissue authority ends\n        // HERE — before any status or body is decoded, and for 400 and 413 alike. Sticky:\n        // no arm below restores it.\n        if !matches!(attempt, Attempt::NotSent(_)) {\n            delivery = Delivery::PossiblyDeliveredExact;\n        }\n        match attempt {',
+                '        match attempt {',
+            ],
+            [
+                '            } => {\n                match answer.as_deref().map(|bytes| serde_json::from_slice(bytes)) {',
+                '            } => {\n                delivery = Delivery::PossiblyDeliveredExact;\n                match answer.as_deref().map(|bytes| serde_json::from_slice(bytes)) {',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'ingress::tests::the_sticky_disposition_follows_the_typed_transport_phases',
+        "needle": 'connect refused, then a 400: disposition',
+    },
+    {
+        "id": 'M4-28-a-first-413-suppresses-the-next-endpoint',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/ingress.rs',
+        "edits": [
+            [
+                '            // No status, 400, 413 and every other status: each is already sticky above and\n            // decides nothing more, so 400 and 413 alike go on to the next endpoint.\n            _ => {}',
+                '            Attempt::Status { status: 413, .. } => break,\n            _ => {}',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'ingress::tests::the_sticky_disposition_follows_the_typed_transport_phases',
+        "needle": 'a first 413 does not suppress the next: payload',
+    },
+    {
+        "id": 'M4-29-replay-judged-after-its-own-attempt-advanced-the-state',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/ingress.rs',
+        "edits": [
+            [
+                '                            && prior == Delivery::PossiblyDeliveredExact =>',
+                '                            && delivery == Delivery::PossiblyDeliveredExact =>',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'ingress::tests::the_sticky_disposition_follows_the_typed_transport_phases',
+        "needle": 'a first-attempt replay continues: payload',
+    },
+    {
+        "id": 'M4-47-core-cookie-returns-to-an-unbounded-read',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/sealed.rs',
+        "edits": [
+            [
+                '    read_file(path, Some(MAX_CORE_COOKIE_BYTES))',
+                '    read_file(path, None)',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--test',
+            'core_view',
+            '--',
+        ],
+        "filter": 'the_core_cookie_read_is_bounded_at_its_cap',
+        "needle": 'cap + 1 must be refused',
+    },
+    {
+        "id": 'M4SA-R01-replay-judged-on-a-parallel-state-excluding-a-400',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/ingress.rs',
+        "edits": [
+            [
+                '        let prior = delivery;',
+                '        let prior = match attempts.last().map(|fact| &fact.outcome) {\n            Some(Outcome::Status(400)) => Delivery::DefinitelyNotSent,\n            _ => delivery,\n        };',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'ingress::tests::the_sticky_disposition_follows_the_typed_transport_phases',
+        "needle": "a 400, then a peer's replay, stops: payload",
+    },
+    {
+        "id": 'M4SA-R02-a-purported-re-anchor-is-byte-identical-to-its-active-definition',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/tests/evidence/m4_mutation_rows.py',
+        "edits": [
+            [
+                '                    \'    let Some(first) = left() else {\\n        return Attempt::NotSent(format!("connect {addr}: the deadline expired first").into());\\n    };\',\n                    \'    let first = budget;\',',
+                '                    \'    let Some(first) = left() else {\\n        return Attempt::NotSent(format!("connect {addr}: the deadline expired first").into());\\n    };\',\n                    \'    let first = CONNECT_CEILING;\',',
+            ],
+        ],
+        "command": [
+            'python3',
+            'crates/vault-cli/tests/evidence/m4_mutation_rows.py',
+        ],
+        "filter": 'verify',
+        "needle": 'the re-anchor is byte-identical to its active definition',
+    },
+]
 
 
 def rows():

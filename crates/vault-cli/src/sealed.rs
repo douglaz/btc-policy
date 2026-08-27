@@ -345,13 +345,29 @@ impl CoordinatorCredential {
 /// scalar under the identical no-follow/regular/owner-only rules. One reader, so the
 /// two secret files cannot drift apart on which paths they refuse.
 pub(crate) fn read_secret(path: &Path) -> Result<Zeroizing<String>, Error> {
+    read_file(path, None)
+}
+
+/// The Core cookie's whole-file cap: Core writes one short `__cookie__:` line.
+pub(crate) const MAX_CORE_COOKIE_BYTES: usize = 4096;
+
+/// The Core cookie, over that same open and BOUNDED: ONE `cap + 1` zeroizing buffer, never
+/// grown, so exactly the cap is accepted only once EOF confirms it and cap+1 is refused.
+pub(crate) fn read_core_cookie(path: &Path) -> Result<Zeroizing<String>, Error> {
+    read_file(path, Some(MAX_CORE_COOKIE_BYTES))
+}
+
+/// The one reader both go through; `cap` bounds the WHOLE file, `None` being unbounded.
+fn read_file(path: &Path, cap: Option<usize>) -> Result<Zeroizing<String>, Error> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         // `O_NONBLOCK`: a FIFO here would hang the open before `is_file` can refuse it.
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| format!("cannot open secret file {}: {e}", path.display()))?;
-    let metadata = file.metadata()?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
     if !metadata.is_file() {
         return bad(format!("{} is not a regular file", path.display()));
     }
@@ -361,6 +377,24 @@ pub(crate) fn read_secret(path: &Path) -> Result<Zeroizing<String>, Error> {
             "secret file {} is mode {mode:04o}: it must be readable by its owner alone",
             path.display()
         ));
+    }
+    if let Some(cap) = cap {
+        let mut raw = Zeroizing::new(vec![0u8; cap + 1]);
+        let mut filled = 0;
+        while filled < raw.len() {
+            match file.read(&mut raw[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return bad(format!("cannot read secret file {}: {e}", path.display())),
+            }
+        }
+        if filled > cap {
+            return bad(format!("{} is over its {cap}-byte cap", path.display()));
+        }
+        return std::str::from_utf8(&raw[..filled])
+            .map(|text| Zeroizing::new(text.to_owned()))
+            .map_err(|e| format!("secret file {} is not UTF-8: {e}", path.display()).into());
     }
     // Sized from the open file: a reallocation mid-read leaves an un-wiped prefix behind.
     let mut text = Zeroizing::new(String::with_capacity(metadata.len() as usize + 1));
