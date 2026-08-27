@@ -2341,7 +2341,7 @@ OWNED = [
         "edits": [
             [
                 '        let prior = delivery;',
-                '        let prior = match attempts.last().map(|fact| &fact.outcome) {\n            Some(Outcome::Status(400)) => Delivery::DefinitelyNotSent,\n            _ => delivery,\n        };',
+                '        let prior = match attempts.last() {\n            Some(EndpointFact { outcome: Outcome::Status(400), .. }) => Delivery::DefinitelyNotSent,\n            _ => delivery,\n        };',
             ],
         ],
         "command": [
