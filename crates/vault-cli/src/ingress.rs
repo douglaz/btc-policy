@@ -98,6 +98,11 @@ const PER_ENDPOINT: Duration = Duration::from_secs(60);
 /// expected commitment or on a `NONCE_REPLAYED` that follows a possible delivery of this
 /// same request. `aggregate` is the ABSOLUTE instant the whole offer must end by.
 ///
+/// It bounds the WHOLE offer, not each endpoint: a slow one spends up to `PER_ENDPOINT`
+/// of it and the endpoints after it get only what is left, so a caller that wants every
+/// endpoint to have a full slice sizes `aggregate` at `endpoints.len()` of them from the
+/// call. A shorter one is a deliberate bound on the offer, not an oversight.
+///
 /// `expected_commitment_id` is the caller's OWN id for these exact request bytes,
 /// computed and passed in by M4; nothing here derives it from the request, and only
 /// this local string can ever be retained.
@@ -462,8 +467,11 @@ mod tests {
             ("an unexpected non-5xx status",           &["418 Teapot", "400 Bad"],                    Possibly, false, 2),
             ("an unparseable 200 body",                &["garbage", "400 Bad"],                       Possibly, false, 2),
             ("Accepted stops",                         &["accepted", "refusal"],                      Possibly, true,  1),
-            // 413 is this node's answer about THIS body, not the federation's: it advances
-            // like any other status and the next endpoint is still offered the request.
+            // A 413 is ONE endpoint's answer and no status is custody proof: an honest
+            // node refuses an oversized body before it parses anything, but a pinned one
+            // that read the body and then answered 413 is indistinguishable from here. It
+            // advances like any other status and the next endpoint is still offered the
+            // request.
             ("a first 413 does not suppress the next", &["413 Large", "accepted"],                    Possibly, true,  2),
             ("413 after a 400 still continues",        &["400 Bad", "413 Large", "accepted"],         Possibly, true,  3),
             ("413 cannot erase a possible delivery",   &["503 Unavailable", "413 Large", "accepted"], Possibly, true,  3),

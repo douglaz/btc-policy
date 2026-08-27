@@ -835,11 +835,11 @@ mod tests {
         }
     }
 
-    /// 1. The ONE deadline is created BEFORE connect and consulted again before every
-    ///    blocking operation, never restarted. The injected clock is what makes the
-    ///    difference observable: it advances a third of the budget per read, so a
-    ///    correct exchange runs out on a HEALTHY peer that answers instantly, while a
-    ///    deadline restarted per phase — or set once and never re-read — completes.
+    /// 1. The ONE deadline the CALLER supplies already covers connect, and is consulted
+    ///    again before every blocking operation, never restarted. The injected clock is
+    ///    what makes the difference observable: it advances a third of the budget per
+    ///    read, so a correct exchange runs out on a HEALTHY peer that answers instantly,
+    ///    while a deadline restarted per phase — or set once and never re-read — completes.
     #[test]
     fn the_bounded_deadline_starts_before_connect_and_is_never_restarted() {
         // A deadline already spent before connect: nothing may be written, and no
