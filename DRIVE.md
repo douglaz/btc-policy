@@ -1,56 +1,46 @@
-# DRIVE — M4-SA assurance transfer → M4-SB → M4-C
+# DRIVE — M4-SA → M4-SB → M4-C
 
-**Scope:** frozen M4-SA → M4-SB → M4-C; M4-S and
-`btc-policy-mby-spend-command-6mp` are tracking-only parents. Combined ceiling remains
-1497 gross production Rust lines within the historical outer 1500-line ceiling; the
-3-line reserve is non-spendable. Documentation hard total remains 320 gross lines.
+**Scope:** M4-SB → M4-C; merged M4-SA is a prerequisite, while M4-S and
+`btc-policy-mby-spend-command-6mp` are tracking-only parents. Combined ceiling:
+1497 gross production Rust lines: the allocated combined hard total within the
+historical outer 1500-line ceiling. The remaining 3 lines are non-spendable
+reserve, not child contingency or scope. Documentation hard total is 320 gross
+lines.
 
-**Baseline:** ~0 production lines for this GRAPH adjudication. A's production-path
-content/reference is frozen at `bbe9c25f5bf340b2bf906ee6ee181dc832f834e2`, where it
-measured 176/207 gross production Rust, 0/0 docs, and 364/465 independent raw-added
-Drive lines. The later governance-only commit changes `HEAD` but not those frozen
-implementation bytes. Tests, test-only helpers, mutation
-definitions, and evidence remain mandatory and uncapped.
+**Baseline:** ~150 lines — Stage B Rust 150/164/181/200, docs 7/7/9/11, and a
+450 raw-added-line Drive brake. Ledger totals are gross additions plus deletions
+(a move deletes plus adds); every Rust/docs table caps gross, independently of
+the Drive brake.
 
-**Phase:** PROVE · **Bead:** btc-policy-m4-sa-ingress-cookie-2xi · **Branch:** beads/m4-sa-ingress-cookie
+**Phase:** BUILD · **Bead:** btc-policy-m4-sb-erasure-policy-version-2g5 · **Branch:** beads/m4-sb-erasure-policy-version
 
-**Pending:** regenerate A's complete governed evidence from scratch on the clean
-post-GRAPH committed head. Bind that head and mechanically prove all six frozen A
-implementation/test/manifest paths remain byte-identical to
-`bbe9c25f5bf340b2bf906ee6ee181dc832f834e2`. Do not claim a clean A panel, start a
-fifth A round, inherit a prior exit, or change scheduling semantics.
+**Pending:** run only M4-SB through its one rb-lite run of at most four rounds.
+This work PR closes/syncs merged M4-SA and carries B implementation; B itself
+remains open until the later M4-C work PR.
 
-**Do-NOT-build:** Any persistent/final A production, test, manifest, documentation, or
-Beads edit during PROVE; a minimum-slice/fairness mechanism; normal Spend
-grammar/route/watch/reporting; scalar/signer/node/proto work; async/concurrency/TLS; a
-new wire variant; cap increases; or WIP ancestry.
+**Do-NOT-build:** Any normal Spend grammar/route/watch/reporting, parser,
+terminal-input work, endpoint refusal reporter, signer display/txid/substitution
+consumer, new wire variant, or change to A's transport semantics.
 
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 
 ## Now
 
-GRAPH transfer commit `fae350cd95dd96ba6a85f58ed198c78a37111650` installed the
-owner-approved B/C obligations and was independently audited clean. Keep A
-`in_progress`, B/C open, and the A→B→C graph unchanged. Preserve A's rb-lite run as
-historical provenance. Delete and regenerate every partial/mixed-head evidence roll-up;
-no historical ledger, gate, mutation, LIVE, launch, manifest, identity, verdict, or
-`DONE` is reusable.
+M4-SB only: sealed 68, signer 32, channel 12, server 8, node-lib 70, proto 10;
+200 gross Rust hard; DESIGN 6 and ADR-0013 5 for 11 gross docs hard; Drive 450
+raw-added-line brake.
 
 ## Next
 
-Run the current 99-row A union red and restored green, exact Gate, both ignored LIVE
-legs, all three demos, `attack all`, ledger/re-anchor/manifest/final
-identity/verdict, and `DONE`. Governed mutations alone may transiently edit row targets
-under the common exclusive lock, with before/after hashes, exact restoration, and zero
-final diff; they do not thaw A. After independently verifying the completed evidence,
-land the A work PR with the round-four exit and owner exception disclosed. A remains
-open until the later B work PR closes/syncs it. B must regenerate the full
-inherited+A+B evidence union after adding the transferred rows; C owns the R12
-correction with first product reachability.
+After B squash-merges, create the fresh C branch from merged B. The C work PR
+closes/syncs B and the tracking-only M4-S parent. Replace this file in full with
+the exact C-BUILD record durably embedded in the generated C bead description; do
+not retain B's Pending, Now, Next, cap, ownership, or branch text.
 
 ## Budget and review
 
-No production or documentation cap changes. The owner explicitly approved transferring
-custody-adjacent assurance timing from A to the already-required B/C work rather than a
-disguised fifth A round or a fresh implementation recut. PR review and CI remain
-mandatory; no historical or partial evidence exit is inherited.
+Combined child hard totals are exactly 1497 gross Rust and 320 gross
+documentation; the historical outer 1500 Rust ceiling leaves a non-spendable
+3-line reserve.
+A fourth round is allowed; a round-four panel that is not READY/clean or needs
+another fix returns to GRAPH. There is no fifth round or cap increase.
