@@ -12,42 +12,41 @@ Drive lines. The later governance-only commit changes `HEAD` but not those froze
 implementation bytes. Tests, test-only helpers, mutation
 definitions, and evidence remain mandatory and uncapped.
 
-**Phase:** GRAPH · **Bead:** btc-policy-m4-sa-ingress-cookie-2xi · **Branch:** beads/m4-sa-ingress-cookie
+**Phase:** PROVE · **Bead:** btc-policy-m4-sa-ingress-cookie-2xi · **Branch:** beads/m4-sa-ingress-cookie
 
-**Pending:** record the owner-approved one-time assurance transfer after A's sole
-rb-lite run stopped at round four with exit 12. Freeze A production; transfer four
-round-four test/evidence corrections to B and the R12 correction to C. Do not claim a
-clean A panel, start a fifth A round, or change scheduling semantics.
+**Pending:** regenerate A's complete governed evidence from scratch on the clean
+post-GRAPH committed head. Bind that head and mechanically prove all six frozen A
+implementation/test/manifest paths remain byte-identical to
+`bbe9c25f5bf340b2bf906ee6ee181dc832f834e2`. Do not claim a clean A panel, start a
+fifth A round, inherit a prior exit, or change scheduling semantics.
 
-**Do-NOT-build:** Any persistent/final A production, test, or manifest edit during
-GRAPH; a minimum-slice/fairness mechanism; normal Spend grammar/route/watch/reporting; scalar/signer/node/proto work;
-async/concurrency/TLS; a new wire variant; cap increases; or WIP ancestry.
+**Do-NOT-build:** Any persistent/final A production, test, manifest, documentation, or
+Beads edit during PROVE; a minimum-slice/fairness mechanism; normal Spend
+grammar/route/watch/reporting; scalar/signer/node/proto work; async/concurrency/TLS; a
+new wire variant; cap increases; or WIP ancestry.
 
 **Gate:** `nix flake metadata --no-update-lock-file >/dev/null && nix develop -c bash -c 'cargo fmt --all --check && cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'`
 
 ## Now
 
-The only tracked updates are resolved beads JSONL and this Drive record. Keep A
+GRAPH transfer commit `fae350cd95dd96ba6a85f58ed198c78a37111650` installed the
+owner-approved B/C obligations and was independently audited clean. Keep A
 `in_progress`, B/C open, and the A→B→C graph unchanged. Preserve A's rb-lite run as
-historical provenance. Remove the untracked Python bytecode cache as cleanup before
-identity measurement, and treat every partial/mixed-head A evidence artifact as invalid.
+historical provenance. Delete and regenerate every partial/mixed-head evidence roll-up;
+no historical ledger, gate, mutation, LIVE, launch, manifest, identity, verdict, or
+`DONE` is reusable.
 
 ## Next
 
-After an independent exact graph/spec audit, commit only the governance changes, then
-move directly to A's governed final evidence on that new clean committed `HEAD`. Before
-the run, mechanically prove every A implementation/test/manifest path is byte-identical
-to the frozen `bbe9c25f5bf340b2bf906ee6ee181dc832f834e2` snapshot; the evidence binds
-and reports both the frozen production reference and the actual governance-only `HEAD`.
-Then regenerate the current 99-row A union red and
-restored green, exact Gate, both ignored LIVE legs, all three demos, `attack all`,
-ledger/re-anchor/manifest/final identity/verdict, and `DONE` from scratch. Governed
-mutations alone may transiently edit row targets under the common exclusive lock, with
-before/after hashes, exact restoration, and zero final diff; they do not thaw A. Then land the
-A work PR with the round-four exit and owner exception disclosed. A remains open until
-the later B work PR closes/syncs it. B must regenerate the full inherited+A+B evidence
-union after adding the transferred rows; C owns the R12 correction with first product
-reachability.
+Run the current 99-row A union red and restored green, exact Gate, both ignored LIVE
+legs, all three demos, `attack all`, ledger/re-anchor/manifest/final
+identity/verdict, and `DONE`. Governed mutations alone may transiently edit row targets
+under the common exclusive lock, with before/after hashes, exact restoration, and zero
+final diff; they do not thaw A. After independently verifying the completed evidence,
+land the A work PR with the round-four exit and owner exception disclosed. A remains
+open until the later B work PR closes/syncs it. B must regenerate the full
+inherited+A+B evidence union after adding the transferred rows; C owns the R12
+correction with first product reachability.
 
 ## Budget and review
 
