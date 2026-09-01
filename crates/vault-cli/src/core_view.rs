@@ -6,8 +6,8 @@
 //! async task and no background work. [`CoreRpc`] is the one concrete adapter, and every
 //! one of its methods funnels through [`CoreRpc::rpc`], the single place a method name
 //! exists and the single place a credential is materialized. The adapter stores the
-//! cookie PATH; each call reads it through child A's no-follow/regular/owner-only
-//! [`crate::sealed::read_secret`], encodes it, and drops it before returning. There is no
+//! cookie PATH; each call reads it through child A's no-follow/regular/owner-only,
+//! 4096-byte-capped [`crate::sealed::read_core_cookie`], encodes it, and drops it. There is no
 //! username/password argument, environment source or adjacent default.
 //!
 //! **DORMANT, and BOUNDED at the byte level** since bead
@@ -20,7 +20,11 @@
 //! is now decoded STRICTLY: an invalid UTF-8 byte refuses the exchange instead of
 //! arriving here as U+FFFD. That 16 MiB bounds the WIRE; what decoding that many bytes
 //! then costs in heap — this parser still builds a whole [`Value`] — is `btc-policy-yw4`.
-//! Nothing dispatches here: M4 is the first caller.
+//! Before M4-C there is no reachable normal-product owner of this seam. When M4-C lands,
+//! the operator Spend command is its sole intended production owner: it constructs the
+//! direct [`CoreRpc`] adapter, passes it as `&dyn CoreView` to `compose_spend` for
+//! composition reads, and calls that same typed adapter directly for post-delivery watch
+//! reads. `compose_spend` accepts the preconstructed adapter and never constructs [`CoreRpc`].
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -139,7 +143,7 @@ impl CoreRpc {
     /// THE funnel. Every method above names its RPC here and nowhere else, and the
     /// credential exists only for this exchange.
     fn rpc(&self, method: &str, params: Value, absent: Absent) -> Result<Value, Error> {
-        let read = crate::sealed::read_secret(&self.cookie)?;
+        let read = crate::sealed::read_core_cookie(&self.cookie)?;
         let credential = Zeroizing::new(read.trim().to_string());
         // The `trim` above accepts the surrounding whitespace an ordinary one-line Core
         // cookie file carries, so the credential actually SENT is CR/LF-free; an EMBEDDED
@@ -513,7 +517,7 @@ mod tests {
         }
     }
 
-    /// An owner-only cookie file, as `read_secret` requires.
+    /// An owner-only cookie file, as `read_core_cookie` requires.
     fn cookie_file(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("core.cookie");
         std::fs::write(&path, body).expect("write");

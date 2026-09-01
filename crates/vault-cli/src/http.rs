@@ -7,8 +7,8 @@
 //! btc-policy-http-bounded-ingress-response-qhe). [`Policy::Legacy`] is what every pre-M3
 //! caller keeps: a fixed connect, a per-READ inactivity timeout, an unbounded read to
 //! close, and a lossy `String` body. The BOUNDED policies — [`Policy::ingress`] for
-//! ordered stage-1 delivery, [`Policy::core`] for the closed read-only Core reads — create
-//! ONE monotonic deadline BEFORE connect, recompute the time left before every blocking
+//! ordered stage-1 delivery, [`Policy::core`] for the closed read-only Core reads — carry
+//! ONE ABSOLUTE `Instant` deadline, recompute the time left before every blocking
 //! operation, cap the WHOLE raw response (status line, headers, separator and body) with
 //! cap+1 detection, and complete only at EOF inside both bounds. They hand back BYTES in a
 //! zeroizing allocation: what peer text means is the consumer's decision, not this
@@ -34,11 +34,10 @@ pub enum Attempt {
     NotSent(Error),
     /// A write may have happened and no status line came back.
     NoStatus(Error),
-    /// A status line came back. `body` is `None` when the rest failed after it —
-    /// the status is still KNOWN, which is what keeps a 400 an explicit
-    /// no-delivery even when its body never arrives. Bytes, not text: a Core reply
-    /// must decode STRICTLY and an ingress reply must not materialize peer text at
-    /// all, and neither is expressible once this has been through `from_utf8_lossy`.
+    /// A status line came back. `body` is `None` when the rest failed after it, but the
+    /// status is still KNOWN. Bytes, not text: a Core reply must decode STRICTLY and an
+    /// ingress reply must not materialize peer text at all, and neither is expressible
+    /// once this has been through `from_utf8_lossy`.
     Status {
         status: u16,
         body: Option<Zeroizing<Vec<u8>>>,
@@ -70,12 +69,12 @@ pub enum Policy {
     Legacy(Duration),
     /// One absolute deadline over connect, writes and the whole response, plus a cap on
     /// the entire raw response.
-    Bounded { deadline: Duration, cap: usize },
+    Bounded { deadline: Instant, cap: usize },
 }
 
 impl Policy {
-    /// Ordered stage-1 ingress: the CALLER's deadline, and 64 KiB.
-    pub fn ingress(deadline: Duration) -> Policy {
+    /// Ordered stage-1 ingress: the CALLER's own ABSOLUTE deadline, and 64 KiB.
+    pub fn ingress(deadline: Instant) -> Policy {
         Policy::Bounded {
             deadline,
             cap: INGRESS_CAP,
@@ -85,12 +84,15 @@ impl Policy {
     /// The closed read-only Core reads. `scantxoutset` is the ONE typed exception, and
     /// deliberately not the first row of a per-method deadline table.
     pub fn core(method: &str) -> Policy {
-        let deadline = match method {
+        let budget = match method {
             "scantxoutset" => CORE_SCAN_DEADLINE,
             _ => CORE_DEADLINE,
         };
+        // Absolute from here, and CHECKED: a clock near the representable end clamps to an
+        // already-expired deadline rather than panicking inside a read-only Core call.
+        let now = Instant::now();
         Policy::Bounded {
-            deadline,
+            deadline: now.checked_add(budget).unwrap_or(now),
             cap: CORE_CAP,
         }
     }
@@ -240,21 +242,21 @@ fn legacy(addr: SocketAddr, request: &[u8], timeout: Duration) -> Attempt {
     }
 }
 
-/// ONE bounded exchange. The deadline is created BEFORE connect and the time left is
-/// recomputed before every blocking operation, so connect, each partial write and the
-/// whole response spend the SAME budget. `now` is injected because a deadline silently
-/// RESET at each phase still finishes on time under any sleep a test could write.
+/// ONE bounded exchange over the caller's own ABSOLUTE deadline: the time left is
+/// recomputed against that instant before every blocking operation, so connect, each
+/// partial write and the whole response spend the SAME deadline and no phase rebases it
+/// from a remaining duration. `now` is injected because a deadline silently RESET at each
+/// phase still finishes on time under any sleep a test could write.
 fn bounded(
     addr: SocketAddr,
     request: &[u8],
-    budget: Duration,
+    deadline: Instant,
     cap: usize,
     now: &dyn Fn() -> Instant,
 ) -> Attempt {
-    let start = now();
     // `None` is EXPIRED, and zero counts as expired: the socket API refuses a zero
     // timeout, and a zero-length wait is not a wait.
-    let left = || match budget.checked_sub(now().saturating_duration_since(start)) {
+    let left = || match deadline.checked_duration_since(now()) {
         Some(left) if !left.is_zero() => Some(left),
         _ => None,
     };
@@ -662,9 +664,17 @@ mod tests {
     }
 
     /// Drive one bounded exchange, with the real clock and the real request builder.
+    /// `budget` is spelled as a duration for readability and turned into the ABSOLUTE
+    /// instant the exchange now takes here, at the one place a row starts.
     fn probe(peer: &Peer, budget: Duration, cap: usize) -> Attempt {
         let request = request(peer.addr, "/sign", Some(b"{}"), None);
-        bounded(peer.addr, &request, budget, cap, &Instant::now)
+        bounded(
+            peer.addr,
+            &request,
+            Instant::now() + budget,
+            cap,
+            &Instant::now,
+        )
     }
 
     /// `(status, body as text)`. `None` status is `NoStatus`, and `NotSent` PANICS: every
@@ -723,6 +733,12 @@ mod tests {
         fn reads(&self) -> u32 {
             *self.reads.lock().expect("lock")
         }
+
+        /// `budget` after this clock's own base: the absolute deadline a row hands the
+        /// exchange, computed WITHOUT consuming a sample.
+        fn at(&self, budget: Duration) -> Instant {
+            self.base + budget
+        }
     }
 
     /// A monotonic clock that runs FAST: real elapsed time multiplied by `factor`. The
@@ -745,6 +761,10 @@ mod tests {
 
         fn now(&self) -> Instant {
             self.started + self.started.elapsed() * self.factor
+        }
+
+        fn at(&self, budget: Duration) -> Instant {
+            self.started + budget
         }
     }
 
@@ -814,11 +834,11 @@ mod tests {
         }
     }
 
-    /// 1. The ONE deadline is created BEFORE connect and consulted again before every
-    ///    blocking operation, never restarted. The injected clock is what makes the
-    ///    difference observable: it advances a third of the budget per read, so a
-    ///    correct exchange runs out on a HEALTHY peer that answers instantly, while a
-    ///    deadline restarted per phase — or set once and never re-read — completes.
+    /// 1. The ONE deadline the CALLER supplies already covers connect, and is consulted
+    ///    again before every blocking operation, never restarted. The injected clock is
+    ///    what makes the difference observable: it advances a third of the budget per
+    ///    read, so a correct exchange runs out on a HEALTHY peer that answers instantly,
+    ///    while a deadline restarted per phase — or set once and never re-read — completes.
     #[test]
     fn the_bounded_deadline_starts_before_connect_and_is_never_restarted() {
         // A deadline already spent before connect: nothing may be written, and no
@@ -826,7 +846,8 @@ mod tests {
         let closed = peer(vec![Reply::eof(&response("", "{}"))]);
         let clock = FakeClock::new(SLACK);
         let sent = request(closed.addr, "/sign", Some(b"{}"), None);
-        let attempt = bounded(closed.addr, &sent, SLACK, CAP, &|| clock.now());
+        let spent = clock.at(Duration::ZERO);
+        let attempt = bounded(closed.addr, &sent, spent, CAP, &|| clock.now());
         let Attempt::NotSent(why) = attempt else {
             panic!("an expired deadline must not connect");
         };
@@ -834,8 +855,8 @@ mod tests {
         assert_eq!(closed.connections(), 0, "the peer must see no connection");
         assert_eq!(
             clock.reads(),
-            2,
-            "one sample before connect, one to check it"
+            1,
+            "one sample, against a deadline already reached"
         );
 
         // Past connect, on a peer that answers a COMPLETE response instantly: the budget
@@ -847,7 +868,8 @@ mod tests {
         let fast = peer(vec![Reply::eof(&response("Content-Length: 2\r\n", "{}"))]);
         let clock = FakeClock::new(SLACK / 3);
         let sent = request(fast.addr, "/sign", Some(b"{}"), None);
-        let (_, unfinished) = observed(bounded(fast.addr, &sent, SLACK, CAP, &|| clock.now()));
+        let deadline = clock.at(SLACK);
+        let (_, unfinished) = observed(bounded(fast.addr, &sent, deadline, CAP, &|| clock.now()));
         assert_eq!(
             unfinished, None,
             "a deadline that covers connect, write and read must expire mid-exchange"
@@ -872,10 +894,12 @@ mod tests {
     #[test]
     fn a_deadline_spent_after_connect_is_no_status_and_never_not_sent() {
         let listening = peer(vec![Reply::eof(&response("", "{}"))]);
-        // Two steps of two thirds: the pre-connect check passes, the write's does not.
-        let clock = FakeClock::new(SLACK * 2 / 3);
+        // One whole step per sample: the pre-connect check passes on the clock's own base,
+        // and the write's next sample has reached the deadline.
+        let clock = FakeClock::new(SLACK);
         let sent = request(listening.addr, "/sign", Some(b"{}"), None);
-        let attempt = bounded(listening.addr, &sent, SLACK, CAP, &|| clock.now());
+        let deadline = clock.at(SLACK);
+        let attempt = bounded(listening.addr, &sent, deadline, CAP, &|| clock.now());
         let Attempt::NoStatus(why) = attempt else {
             panic!("a post-connect deadline is NoStatus, never NotSent");
         };
@@ -903,7 +927,8 @@ mod tests {
         let sent = request(late.addr, "/sign", Some(b"{}"), None);
         let clock = ScaledClock::new(FACTOR);
         let started = Instant::now();
-        let refused = observed(bounded(late.addr, &sent, BUDGET, CAP, &|| clock.now()));
+        let deadline = clock.at(BUDGET);
+        let refused = observed(bounded(late.addr, &sent, deadline, CAP, &|| clock.now()));
         let blocked = started.elapsed();
         assert_eq!(
             refused,
@@ -1072,8 +1097,8 @@ mod tests {
     }
 
     /// 4. Every framing defect at EOF, one row per deviation. A green row keeps its
-    ///    body; a red row keeps its STATUS and drops the body, which is what makes a
-    ///    400 an explicit no-delivery even when nothing else about it parsed.
+    ///    body; a red row keeps its STATUS and drops the body, so the transport phase
+    ///    remains observable even when nothing else about the response parsed.
     #[test]
     fn every_header_content_length_and_transfer_encoding_defect_is_framed_at_eof() {
         let whole: [(&str, &str, &str); 9] = [
@@ -1330,21 +1355,36 @@ mod tests {
     ///    method that gets the long deadline.
     #[test]
     fn every_policy_is_the_one_its_caller_was_given() {
+        // Ingress carries the CALLER's own absolute instant through untouched: nothing
+        // here derives it, and nothing here may rebuild it from a duration.
+        let chosen = Instant::now() + SHORT;
         assert_eq!(
-            Policy::ingress(SHORT),
+            Policy::ingress(chosen),
             Policy::Bounded {
-                deadline: SHORT,
+                deadline: chosen,
                 cap: 64 * 1024,
             },
-            "ordered ingress runs on the CALLER's deadline and 64 KiB"
+            "ordered ingress runs on the CALLER's absolute deadline and 64 KiB"
         );
-        assert_eq!(
-            Policy::core("scantxoutset"),
-            Policy::Bounded {
-                deadline: Duration::from_secs(600),
-                cap: 16 * 1024 * 1024,
-            },
-            "scantxoutset is the ONE long Core deadline"
+        // Core derives its own instant, so what a row can pin is the BUDGET it derived:
+        // the deadline has to land inside the window the construction itself spanned.
+        let derived = |method: &str, budget: Duration, what: &str| {
+            let before = Instant::now();
+            let policy = Policy::core(method);
+            let after = Instant::now();
+            let Policy::Bounded { deadline, cap } = policy else {
+                panic!("{method}: a Core policy is bounded");
+            };
+            assert_eq!(cap, 16 * 1024 * 1024, "{method}");
+            assert!(
+                deadline >= before + budget && deadline <= after + budget,
+                "{method}: {what}"
+            );
+        };
+        derived(
+            "scantxoutset",
+            Duration::from_secs(600),
+            "scantxoutset is the ONE long Core deadline",
         );
         // The other seven closed reads, named so a table cannot drift from the seam.
         for method in [
@@ -1356,13 +1396,10 @@ mod tests {
             "estimatesmartfee",
             "getmempoolinfo",
         ] {
-            assert_eq!(
-                Policy::core(method),
-                Policy::Bounded {
-                    deadline: Duration::from_secs(60),
-                    cap: 16 * 1024 * 1024,
-                },
-                "{method}"
+            derived(
+                method,
+                Duration::from_secs(60),
+                "the ordinary Core deadline",
             );
         }
     }
@@ -1464,7 +1501,7 @@ mod tests {
         // is reserved that a parallel test could race for.
         let refused = SocketAddr::from(([127, 0, 0, 1], 0));
         let sent = request(refused, "/sign", Some(b"{}"), None);
-        let attempt = bounded(refused, &sent, SHORT, CAP, &Instant::now);
+        let attempt = bounded(refused, &sent, Instant::now() + SHORT, CAP, &Instant::now);
         let Attempt::NotSent(why) = attempt else {
             panic!("a refused connect is the one NotSent there is");
         };
@@ -1488,7 +1525,7 @@ mod tests {
             drop(accepted);
         });
         let huge = request(addr, "/sign", Some(&vec![b'x'; 8 * 1024 * 1024]), None);
-        let attempt = bounded(addr, &huge, SHORT, CAP, &Instant::now);
+        let attempt = bounded(addr, &huge, Instant::now() + SHORT, CAP, &Instant::now);
         let Attempt::NoStatus(why) = attempt else {
             panic!("a stalled write is NoStatus, never NotSent");
         };
@@ -1667,7 +1704,13 @@ mod tests {
         let listening = peer(vec![Reply::eof(&response("Content-Length: 2\r\n", "{}"))]);
         let sent = request(listening.addr, "/", Some(b"{\"m\":1}"), Some("Y29va2ll"));
         assert_eq!(
-            observed(bounded(listening.addr, &sent, SLACK, CAP, &Instant::now)),
+            observed(bounded(
+                listening.addr,
+                &sent,
+                Instant::now() + SLACK,
+                CAP,
+                &Instant::now
+            )),
             (Some(200), Some("{}".into()))
         );
         let seen = String::from_utf8_lossy(&listening.request()).into_owned();

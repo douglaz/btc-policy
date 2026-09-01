@@ -8,13 +8,18 @@
 //! Each attempt also leaves one typed [`EndpointFact`] so an all-down federation is still
 //! diagnosable; those facts are written from the typed outcome and never read back.
 //!
+//! ONE aggregate absolute deadline covers the whole ordered offer. Immediately before each
+//! endpoint the client recomputes `min(now + 60s, aggregate)` and spends THAT instant on
+//! the bounded exchange, so no endpoint can hold the offer past the aggregate and one
+//! reached at or after it is refused BEFORE its socket rather than opening one.
+//!
 //! **No outcome here is quorum or final-success evidence.** At loop end
 //! [`Delivery::PossiblyDeliveredExact`] starts M4's conservative Core watch, and only that
 //! Core observation decides whether a command succeeded. btc-policy-imb owns confidential
 //! authenticated transport from stage 2 onward.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vault_proto::{Accepted, RefusalCode, TaggedRequest};
 
@@ -25,10 +30,11 @@ use crate::http::{self, Attempt, Error};
 /// wrong one is a double submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Delivery {
-    /// No signable command was accepted or staged. NOT a claim that nothing reached a
-    /// node: before answering 400 one may consume a coordinator nonce and record the
-    /// spend arm's per-carrier intent — bookkeeping no `stage`/`confirm` can resolve.
-    /// That is why a NEW logical retry re-signs with a fresh nonce, not this one.
+    /// NOTHING was written. Every attempt that leaves this standing failed BEFORE a
+    /// request byte left, so no node can have consumed the coordinator nonce or recorded
+    /// the spend arm's per-carrier intent — bookkeeping no `stage`/`confirm` can resolve.
+    /// A node answering 400 may already have done both, which is why a 400 does not stay
+    /// here; a NEW logical retry re-signs with a fresh nonce rather than reusing this one.
     DefinitelyNotSent,
     PossiblyDeliveredExact,
 }
@@ -84,9 +90,18 @@ enum Answer<'a> {
     Refusal { code: RefusalCode },
 }
 
+/// The per-endpoint slice of the aggregate deadline. A CEILING, never an extension: each
+/// endpoint gets the smaller of it and whatever is left of the aggregate.
+const PER_ENDPOINT: Duration = Duration::from_secs(60);
+
 /// Offer `request` to `endpoints` in order, stopping on an `Accepted` for the caller's
-/// expected commitment, on HTTP 413, or on a `NONCE_REPLAYED` that follows a possible
-/// delivery of this same request.
+/// expected commitment or on a `NONCE_REPLAYED` that follows a possible delivery of this
+/// same request. `aggregate` is the ABSOLUTE instant the whole offer must end by.
+///
+/// It bounds the WHOLE offer, not each endpoint: a slow one spends up to `PER_ENDPOINT`
+/// of it and the endpoints after it get only what is left, so a caller that wants every
+/// endpoint to have a full slice sizes `aggregate` at `endpoints.len()` of them from the
+/// call. A shorter one is a deliberate bound on the offer, not an oversight.
 ///
 /// `expected_commitment_id` is the caller's OWN id for these exact request bytes,
 /// computed and passed in by M4; nothing here derives it from the request, and only
@@ -95,7 +110,34 @@ pub(crate) fn deliver(
     endpoints: &[SocketAddr],
     request: &TaggedRequest,
     expected_commitment_id: &str,
-    timeout: Duration,
+    aggregate: Instant,
+) -> Result<Ingress, Error> {
+    // Production: the real clock and the real bounded transport, and nothing else.
+    offer(
+        endpoints,
+        request,
+        expected_commitment_id,
+        aggregate,
+        &Instant::now,
+        &post_signed,
+    )
+}
+
+/// Production's own transport: the bounded HTTP exchange under that ABSOLUTE deadline.
+fn post_signed(addr: SocketAddr, body: &[u8], deadline: Instant) -> Attempt {
+    http::post_attempt(addr, "/sign", body, None, http::Policy::ingress(deadline))
+}
+
+/// The implementation boundary the tests drive: module-private, and the ONLY seam — a
+/// scripted clock and a scripted transport, which is what lets a test observe the exact
+/// absolute instant every endpoint is given.
+fn offer(
+    endpoints: &[SocketAddr],
+    request: &TaggedRequest,
+    expected_commitment_id: &str,
+    aggregate: Instant,
+    now: &dyn Fn() -> Instant,
+    post: &dyn Fn(SocketAddr, &[u8], Instant) -> Attempt,
 ) -> Result<Ingress, Error> {
     // Serialized ONCE: every endpoint gets byte-identical bytes, so a node that
     // accepts and a node that never answers are answering about the same request.
@@ -107,8 +149,15 @@ pub(crate) fn deliver(
         // The disposition BEFORE this attempt: a replay stops only when an EARLIER
         // attempt already made this exact request possibly delivered.
         let prior = delivery;
-        let attempt =
-            http::post_attempt(*addr, "/sign", &body, None, http::Policy::ingress(timeout));
+        // Recomputed IMMEDIATELY before this endpoint from the clock, never rebased from a
+        // remaining duration: `checked_add` clamps to the aggregate at the end of the
+        // representable range instead of panicking, and the aggregate is the ceiling no
+        // endpoint may outlive. At or past it, the transport opens no socket at all.
+        let deadline = now()
+            .checked_add(PER_ENDPOINT)
+            .unwrap_or(aggregate)
+            .min(aggregate);
+        let attempt = post(*addr, &body, deadline);
         // Recorded from the TYPED outcome, then never read back: every arm below
         // decides on `attempt` itself, so no diagnostic can move a transition.
         attempts.push(EndpointFact {
@@ -119,21 +168,19 @@ pub(crate) fn deliver(
                 Attempt::Status { status, .. } => Outcome::Status(*status),
             },
         });
+        // A request byte may already have reached this node, so reissue authority ends
+        // HERE — before any status or body is decoded, and for 400 and 413 alike. Sticky:
+        // no arm below restores it.
+        if !matches!(attempt, Attempt::NotSent(_)) {
+            delivery = Delivery::PossiblyDeliveredExact;
+        }
         match attempt {
             // Nothing was written, so this endpoint decides nothing.
             Attempt::NotSent(_) => continue,
-            // A write may have happened and no status came back.
-            Attempt::NoStatus(_) => delivery = Delivery::PossiblyDeliveredExact,
-            // Explicit no-delivery for this endpoint, body read or not.
-            Attempt::Status { status: 400, .. } => continue,
-            // Oversized for the 1 MiB transport cap every node compiles in (the
-            // manifest cap answers 400), so stop — an earlier delivery still stands.
-            Attempt::Status { status: 413, .. } => break,
             Attempt::Status {
                 status: 200,
                 body: answer,
             } => {
-                delivery = Delivery::PossiblyDeliveredExact;
                 match answer.as_deref().map(|bytes| serde_json::from_slice(bytes)) {
                     Some(Ok(Answer::Accepted {
                         commitment_id,
@@ -168,8 +215,9 @@ pub(crate) fn deliver(
                     _ => {}
                 }
             }
-            // 408, 5xx and any other unexpected status: the body may have been read.
-            Attempt::Status { .. } => delivery = Delivery::PossiblyDeliveredExact,
+            // No status, 400, 413 and every other status: each is already sticky above and
+            // decides nothing more, so 400 and 413 alike go on to the next endpoint.
+            _ => {}
         }
     }
     Ok(Ingress {
@@ -189,6 +237,12 @@ mod tests {
     use vault_proto::{Refusal, SignRequest, SignResponse};
 
     const WAIT: Duration = Duration::from_secs(5);
+
+    /// The aggregate deadline a green row runs under, as the ABSOLUTE instant `deliver`
+    /// now takes: `budget` from the moment the row starts.
+    fn within(budget: Duration) -> Instant {
+        Instant::now() + budget
+    }
 
     /// Port 0 is unassignable, so the kernel refuses a connect to it immediately and
     /// deterministically. That is what `gone` uses instead of binding an ephemeral port
@@ -399,10 +453,13 @@ mod tests {
     #[test]
     fn the_sticky_disposition_follows_the_typed_transport_phases() {
         use Delivery::{DefinitelyNotSent as NotSent, PossiblyDeliveredExact as Possibly};
-        let cases: [(&str, &[&str], Delivery, bool, usize); 21] = [
-            ("connect refused, then a 400",            &["gone", "400 Bad"],                          NotSent,  false, 1),
-            ("HTTP 400 is explicit no-delivery",       &["400 Bad", "400 Bad"],                       NotSent,  false, 2),
-            ("a 400 whose body read fails",            &["400-truncated", "400 Bad"],                 NotSent,  false, 2),
+        let cases: [(&str, &[&str], Delivery, bool, usize); 24] = [
+            // Only a PRE-CONNECT failure leaves reissue authority standing. Every other
+            // phase — 400 and 413 included — advances before any status or body is read.
+            ("two refused connects stay reissuable",   &["gone", "gone"],                             NotSent,  false, 0),
+            ("connect refused, then a 400",            &["gone", "400 Bad"],                          Possibly, false, 1),
+            ("a 400 is no claim that nothing was sent",&["400 Bad", "400 Bad"],                       Possibly, false, 2),
+            ("a 400 whose body read fails",            &["400-truncated", "400 Bad"],                 Possibly, false, 2),
             ("an ambiguous write/read, then a 400",    &["hangup", "400 Bad"],                        Possibly, false, 2),
             ("an HTTP 200 refusal",                    &["refusal", "400 Bad"],                       Possibly, false, 2),
             ("HTTP 408",                               &["408 Timeout", "400 Bad"],                   Possibly, false, 2),
@@ -410,10 +467,19 @@ mod tests {
             ("an unexpected non-5xx status",           &["418 Teapot", "400 Bad"],                    Possibly, false, 2),
             ("an unparseable 200 body",                &["garbage", "400 Bad"],                       Possibly, false, 2),
             ("Accepted stops",                         &["accepted", "refusal"],                      Possibly, true,  1),
-            ("413 stops, inventing no delivery",       &["400 Bad", "413 Large", "accepted"],         NotSent,  false, 2),
-            ("413 cannot erase a possible delivery",   &["503 Unavailable", "413 Large", "accepted"], Possibly, false, 2),
+            // A 413 is ONE endpoint's answer and no status is custody proof: an honest
+            // node refuses an oversized body before it parses anything, but a pinned one
+            // that read the body and then answered 413 is indistinguishable from here. It
+            // advances like any other status and the next endpoint is still offered the
+            // request.
+            ("a first 413 does not suppress the next", &["413 Large", "accepted"],                    Possibly, true,  2),
+            ("413 after a 400 still continues",        &["400 Bad", "413 Large", "accepted"],         Possibly, true,  3),
+            ("413 cannot erase a possible delivery",   &["503 Unavailable", "413 Large", "accepted"], Possibly, true,  3),
             ("pre-staging capacity, then Accepted",    &["capacity", "accepted"],                     Possibly, true,  2),
             ("a refusal, then a peer's replay, stops", &["refusal", "replayed", "accepted"],          Possibly, false, 2),
+            // The previously missing sequence: a 400 counts as a possible delivery, so the
+            // replay that follows it is most likely OURS and the loop stops at it.
+            ("a 400, then a peer's replay, stops",     &["400 Bad", "replayed", "accepted"],          Possibly, false, 2),
             ("a first-attempt replay continues",       &["replayed", "accepted"],                     Possibly, true,  2),
             // The bounded transport's own rows. Every one of them is a 200, so each
             // still records a possible delivery — none of them is an acceptance.
@@ -426,7 +492,7 @@ mod tests {
         ];
         for (name, script, delivery, payload, contacted) in cases {
             let (endpoints, seen) = federation(script);
-            let out = deliver(&endpoints, &signed_request(), EXPECTED, WAIT).expect(name);
+            let out = deliver(&endpoints, &signed_request(), EXPECTED, within(WAIT)).expect(name);
             assert_eq!(out.delivery, delivery, "{name}: disposition");
             assert_eq!(out.accepted.is_some(), payload, "{name}: payload");
             assert_eq!(seen.lock().expect("lock").len(), contacted, "{name}: contacted");
@@ -437,21 +503,126 @@ mod tests {
         }
     }
 
-    /// A first endpoint that DRIPS cannot suppress an honest second one. Every gap it
-    /// leaves is inside a per-read inactivity timeout, so only the deadline over the
-    /// whole exchange ends it — and it ends it in about one deadline, not in the thirty
-    /// seconds this endpoint is prepared to keep dripping for.
+    /// Drive the seam with a scripted clock and a transport that opens NO socket, and
+    /// report the ABSOLUTE deadline each endpoint was handed, in order. `offsets` are what
+    /// the clock answers, sample by sample, from `base`; the last one repeats.
+    fn scripted(
+        base: Instant,
+        offsets: &[Duration],
+        aggregate: Instant,
+        endpoints: usize,
+    ) -> (Vec<Instant>, Ingress) {
+        let sampled = Mutex::new(0usize);
+        let clock = || {
+            let mut at = sampled.lock().expect("lock");
+            let now = base + offsets[(*at).min(offsets.len() - 1)];
+            *at += 1;
+            now
+        };
+        let given = Mutex::new(Vec::new());
+        let post = |addr: SocketAddr, _body: &[u8], deadline: Instant| {
+            given.lock().expect("lock").push(deadline);
+            Attempt::NotSent(format!("connect {addr}: scripted, no socket").into())
+        };
+        let addrs = vec![REFUSED; endpoints];
+        let out = offer(
+            &addrs,
+            &signed_request(),
+            EXPECTED,
+            aggregate,
+            &clock,
+            &post,
+        )
+        .expect("the seam");
+        let given = given.lock().expect("lock").clone();
+        (given, out)
+    }
+
+    /// The EXACT absolute instant every endpoint is handed, at several sampled times:
+    /// `min(now + 60s, aggregate)`, recomputed against the clock immediately before that
+    /// endpoint. A deadline rebased from a REMAINING duration — `now + (aggregate - start)`
+    /// — would hand each endpoint the whole remaining budget again and outlive the
+    /// aggregate; a deadline that is simply the aggregate would hand all three the same
+    /// instant. Both are visible here because the instants are computed, not timed.
     #[test]
-    fn a_dripping_first_endpoint_cannot_suppress_an_honest_second() {
-        let deadline = Duration::from_millis(400);
+    fn every_endpoint_is_handed_the_minimum_of_its_own_slice_and_the_aggregate() {
+        let base = Instant::now();
+        // Sampled at 0s, 30s and 90s of a 120-second aggregate: the first two are inside
+        // their own 60-second slice, and the third is capped by the aggregate itself.
+        let offsets = [0, 30, 90].map(Duration::from_secs);
+        let aggregate = base + Duration::from_secs(120);
+        let (given, out) = scripted(base, &offsets, aggregate, 3);
+        assert_eq!(
+            given,
+            vec![
+                base + Duration::from_secs(60),
+                base + Duration::from_secs(90),
+                aggregate,
+            ],
+            "each endpoint is handed min(now + 60s, aggregate), and no rebased duration"
+        );
+        assert_eq!(
+            out.attempts.len(),
+            3,
+            "every endpoint was offered exactly one"
+        );
+        assert_eq!(
+            out.delivery,
+            Delivery::DefinitelyNotSent,
+            "a scripted pre-connect failure writes nothing"
+        );
+    }
+
+    /// Past the aggregate every remaining endpoint is handed the aggregate ITSELF — an
+    /// instant already spent — and the REAL bounded transport turns that into a
+    /// pre-connect `NotSent` that opens no socket at all.
+    #[test]
+    fn an_endpoint_reached_at_or_past_the_aggregate_opens_no_socket() {
+        let base = Instant::now();
+        let aggregate = base + Duration::from_secs(10);
+        let offsets = [Duration::from_secs(0), Duration::from_secs(3600)];
+        let (given, _) = scripted(base, &offsets, aggregate, 2);
+        assert_eq!(
+            given,
+            vec![aggregate, aggregate],
+            "the aggregate is the ceiling, both inside its own slice and long past it"
+        );
+
+        // The real transport, a real listener, and an aggregate that is already gone.
+        let (endpoints, seen) = federation(&["accepted"]);
+        let out =
+            deliver(&endpoints, &signed_request(), EXPECTED, Instant::now()).expect("deliver");
+        assert_eq!(
+            out.delivery,
+            Delivery::DefinitelyNotSent,
+            "nothing was written"
+        );
+        assert!(out.accepted.is_none(), "and nothing was accepted");
+        assert_eq!(seen.lock().expect("lock").len(), 0, "no socket was opened");
+        let Outcome::NotSent(why) = &out.attempts[0].outcome else {
+            panic!(
+                "a spent aggregate is pre-connect NotSent: {:?}",
+                out.attempts[0]
+            )
+        };
+        assert!(why.contains("deadline expired"), "{why}");
+    }
+
+    /// A first endpoint that DRIPS costs ONE deadline and no more. Every gap it leaves is
+    /// inside a per-read inactivity timeout, so only a deadline over the whole exchange
+    /// ends it — and the absolute instant this client hands the transport does end it, in
+    /// about one aggregate rather than in the thirty seconds the endpoint is prepared to
+    /// keep dripping for. What that aggregate was spent on the endpoints after it do not
+    /// get: the second is refused BEFORE its socket.
+    #[test]
+    fn a_dripping_first_endpoint_costs_one_aggregate_and_not_its_own_patience() {
+        let aggregate = Duration::from_millis(400);
         let (endpoints, seen) = federation(&["drip", "accepted"]);
-        let started = std::time::Instant::now();
-        let out = deliver(&endpoints, &signed_request(), EXPECTED, deadline).expect("deliver");
+        let started = Instant::now();
+        let out =
+            deliver(&endpoints, &signed_request(), EXPECTED, within(aggregate)).expect("deliver");
         let elapsed = started.elapsed();
-        let ack = out.accepted.expect("the honest endpoint must be reached");
-        assert_eq!(ack.commitment_id, EXPECTED);
         assert_eq!(out.delivery, Delivery::PossiblyDeliveredExact);
-        assert_eq!(seen.lock().expect("lock").len(), 2, "both were contacted");
         assert!(
             elapsed < DRIP_FOR / 3,
             "the dripper must cost one deadline, not its own patience: {elapsed:?}"
@@ -464,6 +635,15 @@ mod tests {
                 out.attempts[0]
             )
         };
+        assert!(out.accepted.is_none(), "the aggregate was already spent");
+        assert_eq!(seen.lock().expect("lock").len(), 1, "one socket, not two");
+        let Outcome::NotSent(why) = &out.attempts[1].outcome else {
+            panic!(
+                "a spent aggregate is pre-connect NotSent: {:?}",
+                out.attempts[1]
+            )
+        };
+        assert!(why.contains("deadline expired"), "{why}");
     }
 
     /// A hostile endpoint cannot put text of its own choosing into a retained
@@ -474,7 +654,7 @@ mod tests {
     fn no_peer_chosen_text_survives_into_an_acknowledgement_or_a_fact() {
         let script = &["refusal-reflecting", "accepted-reflecting", "accepted"];
         let (endpoints, _) = federation(script);
-        let out = deliver(&endpoints, &signed_request(), EXPECTED, WAIT).expect("deliver");
+        let out = deliver(&endpoints, &signed_request(), EXPECTED, within(WAIT)).expect("deliver");
         let ack = out.accepted.expect("the third endpoint accepts");
         // The retained id is the LOCAL one, and it is the local one even though an
         // endpoint offered a perfectly well-formed acceptance carrying the secret.
@@ -507,7 +687,7 @@ mod tests {
     fn every_attempt_is_byte_identical_and_one_command_draws_one_nonce() {
         let (endpoints, seen) = federation(&["refusal", "503 Unavailable", "accepted"]);
         let request = signed_request();
-        deliver(&endpoints, &request, EXPECTED, WAIT).expect("deliver");
+        deliver(&endpoints, &request, EXPECTED, within(WAIT)).expect("deliver");
         let bodies = seen.lock().expect("lock").clone();
         assert_eq!(bodies.len(), 3);
         assert!(
@@ -534,7 +714,7 @@ mod tests {
     #[test]
     fn every_attempt_leaves_an_endpoint_fact_that_carries_no_peer_bytes() {
         let (down, _) = federation(&["gone", "gone"]);
-        let out = deliver(&down, &signed_request(), EXPECTED, WAIT).expect("deliver");
+        let out = deliver(&down, &signed_request(), EXPECTED, within(WAIT)).expect("deliver");
         assert_eq!(out.delivery, Delivery::DefinitelyNotSent);
         let addresses: Vec<SocketAddr> = out.attempts.iter().map(|f| f.endpoint).collect();
         assert_eq!(addresses, down, "one fact per endpoint, in attempt order");
@@ -547,7 +727,7 @@ mod tests {
 
         let (endpoints, _) = federation(&["hangup", "refusal", "503 Up", "400 Bad", "accepted"]);
         let request = signed_request();
-        let out = deliver(&endpoints, &request, EXPECTED, WAIT).expect("deliver");
+        let out = deliver(&endpoints, &request, EXPECTED, within(WAIT)).expect("deliver");
         let Outcome::NoStatus(why) = &out.attempts[0].outcome else {
             panic!("a hangup after the write is NoStatus")
         };

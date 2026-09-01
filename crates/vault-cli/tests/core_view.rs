@@ -4,11 +4,12 @@
 //!
 //!   nix develop -c cargo test --locked -p vault-cli --test core_view -- --ignored --test-threads=1
 //!
-//! Two groups are deliberately outside that set and run in the ordinary
+//! Three groups are deliberately outside that set and run in the ordinary
 //! `cargo test --workspace` gate. Class 19 drives the same real `CoreRpc` against a
 //! SCRIPTED HOSTILE listener rather than a daemon, so it is neither slow nor opt-in; it
 //! lives here because this is the only target that can reach `CoreRpc` and `prepare_view`
-//! together. And the M3b COMPOSITION classes at the foot of this file
+//! together. Class 20 proves the Core cookie's byte cap and allocation shape without a
+//! daemon. And the M3b COMPOSITION classes at the foot of this file
 //! (`btc-policy-m3b-spend-composition-nq8`) answer a typed in-process fake Core. They are
 //! here by the owner's DELIBERATE choice, not by necessity: every new M3b test is kept
 //! under `tests/`, which is what keeps it outside the production-only line budget, and this
@@ -1020,6 +1021,90 @@ fn a_hostile_core_cannot_reflect_the_cookie_password_through_a_valid_typed_ident
     }
 }
 
+/// One owner-only cookie file of exactly these bytes, written the way Core writes one.
+fn cookie_of(dir: &std::path::Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    path
+}
+
+/// 20. The Core cookie read is BOUNDED at 4096 bytes over child A's own
+///     no-follow/regular/owner-only open. Exactly the cap is accepted — but only once EOF
+///     confirms it, which is why the buffer is `cap + 1` and not `cap` — and one byte more
+///     is refused before the credential is encoded, so no request reaches the wire at all.
+///     Every refusal names the path the CALLER selected, because no default is inferred
+///     anywhere and "which file" is the operator's first question.
+#[test]
+fn the_core_cookie_read_is_bounded_at_its_cap_and_refuses_one_byte_past_it() {
+    let temp = fed::TempDir::new("core-cookie-cap").expect("temp dir");
+    let cap = crate::sealed::MAX_CORE_COOKIE_BYTES;
+    assert_eq!(cap, 4096, "the sealed whole-file cap for a Core cookie");
+
+    // Exactly the cap: the whole file comes back, nothing truncated.
+    let exact = cookie_of(&temp.path, "exact.cookie", &b"c".repeat(cap));
+    let read = crate::sealed::read_core_cookie(&exact).expect("exactly the cap is a cookie");
+    assert_eq!(
+        read.len(),
+        cap,
+        "the whole file arrives, and none of it is cut"
+    );
+
+    // One byte past it, refused by the cap and naming the path.
+    let over = cookie_of(&temp.path, "over.cookie", &b"c".repeat(cap + 1));
+    let error = crate::sealed::read_core_cookie(&over)
+        .expect_err("cap + 1 must be refused")
+        .to_string();
+    assert!(error.contains(&over.display().to_string()), "{error}");
+    assert!(
+        error.contains(&format!("over its {cap}-byte cap")),
+        "{error}"
+    );
+
+    // And refused BEFORE anything is written: the endpoint sees no request at all.
+    let (addr, requests) = hostile(vec![json!("11".repeat(32))]);
+    let refused = CoreRpc::new(addr, over)
+        .expect("a loopback adapter")
+        .best_block_hash()
+        .expect_err("an oversized cookie stops the call")
+        .to_string();
+    assert!(refused.contains("-byte cap"), "{refused}");
+    assert!(
+        requests.lock().expect("lock").is_empty(),
+        "no request may be written under an unusable cookie"
+    );
+
+    // A cookie that is not UTF-8 is refused by path too, rather than by an anonymous
+    // decode failure somewhere downstream.
+    let invalid = cookie_of(&temp.path, "utf8.cookie", &[b'_', 0xff, 0xfe]);
+    let error = crate::sealed::read_core_cookie(&invalid)
+        .expect_err("a non-UTF-8 cookie must be refused")
+        .to_string();
+    assert!(error.contains(&invalid.display().to_string()), "{error}");
+    assert!(error.contains("is not UTF-8"), "{error}");
+
+    // The ALLOCATION SHAPE, structurally: exactly one `cap + 1` zeroizing buffer and no
+    // way for it to grow. `zeroize` cannot wipe an allocation `Vec` has already
+    // abandoned, so a buffer that reallocated would leave the credential behind it.
+    let code = code_only(include_str!("../src/sealed.rs"));
+    assert_eq!(
+        code.matches("Zeroizing::new(vec![0u8; cap + 1])").count(),
+        1,
+        "one zeroizing allocation of exactly cap + 1, and only one"
+    );
+    let bounded = code
+        .split("if let Some(cap) = cap {")
+        .nth(1)
+        .and_then(|rest| rest.split("String::with_capacity").next())
+        .expect("the bounded read");
+    for growth in ["push(", "resize(", "extend", "reserve(", "read_to_end"] {
+        assert!(
+            !bounded.contains(growth),
+            "the bounded cookie buffer must never grow: {growth}"
+        );
+    }
+}
+
 // =====================================================================================
 // M3b — the dormant deterministic Spend + mandatory base-Escape composition
 // (bead btc-policy-m3b-spend-composition-nq8).
@@ -1966,20 +2051,24 @@ fn a_foreign_network_refuses_before_core_and_the_final_policy_verdict_is_authori
     assert!(error.contains("classifies as Escape"), "{error}");
 }
 
-/// DORMANCY EVIDENCE — required by the bead, and deliberately UNNUMBERED: it is not one of
-///     the numbered M3b acceptance classes. The seam is dormant by construction: the
-///     composer has no production caller and the CLI dispatch names none of the three
-///     dormant modules. The governed evidence driver separately audits the complete call
-///     graph, item visibility and real CLI behaviour.
-#[test]
-fn the_composer_has_no_production_caller_or_cli_dispatch() {
-    // No production Rust outside `compose.rs` names `compose_spend`.
-    let mut callers = Vec::new();
+/// One source with every comment line removed. Every dormancy scan below runs on this,
+/// because what those claims are about is CODE: `core_view.rs`'s module contract NAMES
+/// the seam's future M4-C owner in prose, and a sentence about a caller is not a caller.
+fn code_only(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+/// Every production Rust file in the workspace, comment lines stripped.
+fn production_sources() -> Vec<(String, String)> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crates")
         .to_path_buf();
     let mut pending = vec![root];
+    let mut sources = Vec::new();
     while let Some(dir) = pending.pop() {
         for entry in std::fs::read_dir(&dir).expect("readable") {
             let path = entry.expect("entry").path();
@@ -1987,29 +2076,73 @@ fn the_composer_has_no_production_caller_or_cli_dispatch() {
                 pending.push(path);
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let rel = path.display().to_string();
-                let production = rel.contains("/src/") && !rel.ends_with("/src/compose.rs");
-                if production
-                    && std::fs::read_to_string(&path)
-                        .expect("utf-8")
-                        .contains("compose_spend")
-                {
-                    callers.push(rel);
+                if rel.contains("/src/") {
+                    let text = std::fs::read_to_string(&path).expect("utf-8");
+                    sources.push((rel, code_only(&text)));
                 }
             }
         }
     }
     assert!(
+        sources.len() > 10,
+        "the walk must reach the production tree"
+    );
+    sources
+}
+
+/// DORMANCY EVIDENCE — required by the bead, and deliberately UNNUMBERED: it is not one of
+///     the numbered M3b acceptance classes. All FOUR claims this child must leave standing,
+///     read off the production tree rather than argued: no Spend grammar, no
+///     `commands::spend`, no `main -> spend` route, and no production caller of
+///     `compose_spend`. The governed evidence driver separately audits the complete call
+///     graph, item visibility and real CLI behaviour.
+#[test]
+fn no_spend_grammar_commands_module_main_route_or_compose_caller_exists() {
+    let sources = production_sources();
+
+    // 1. No production Rust outside `compose.rs` names `compose_spend` in code.
+    let callers: Vec<&String> = sources
+        .iter()
+        .filter(|(rel, code)| !rel.ends_with("/src/compose.rs") && code.contains("compose_spend"))
+        .map(|(rel, _)| rel)
+        .collect();
+    assert!(
         callers.is_empty(),
         "compose_spend has production callers: {callers:?}"
     );
 
-    // ...and the CLI dispatch itself names none of the dormant three.
-    let main = include_str!("../src/main.rs");
+    // 2. There is no `commands` module anywhere, so no `commands::spend` to route to.
+    let declared: Vec<&String> = sources
+        .iter()
+        .filter(|(_, code)| code.contains("mod commands") || code.contains("commands::spend"))
+        .map(|(rel, _)| rel)
+        .collect();
+    assert!(
+        declared.is_empty(),
+        "a commands module exists: {declared:?}"
+    );
+
+    // 3. `main` routes to none of the dormant three, so no `main -> spend` path exists.
+    let main = &sources
+        .iter()
+        .find(|(rel, _)| rel.ends_with("/vault-cli/src/main.rs"))
+        .expect("the CLI entry point")
+        .1;
     let dispatch = main.split("fn main()").nth(1).expect("the dispatch");
-    for banned in ["compose", "inventory", "core_view", "CoreRpc"] {
+    for banned in ["compose", "inventory", "core_view", "CoreRpc", "ingress"] {
         assert!(
             !dispatch.contains(banned),
             "the CLI dispatch reaches {banned}"
+        );
+    }
+
+    // 4. And there is no Spend GRAMMAR to reach it by: no top-level `spend` argument arm
+    //    and no usage line offering one. The pre-existing `["signet", "spend"]` driver is
+    //    a different, already-reachable command and is deliberately left alone.
+    for spelling in ["[\"spend\"", "btc-vault spend"] {
+        assert!(
+            !main.contains(spelling),
+            "the CLI grammar offers a Spend command: {spelling}"
         );
     }
 }
