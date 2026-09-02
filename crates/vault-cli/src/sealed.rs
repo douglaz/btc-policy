@@ -563,7 +563,7 @@ mod tests {
         // refused by the FLAVOUR guard — which runs before the anchor, so it proves itself.
         // `/recovery_timelock` is answered by the descriptor-derived template, which is
         // authoritative for all three consensus facts the manifest reads back.
-        const TAMPERS: [(&str, &str, &str); 11] = [
+        const TAMPERS: [(&str, &str, &str); 12] = [
             ("descriptor.txt", "vault_descriptor", ""),
             ("wallet-id.txt", "wallet-id.txt", ""),
             ("manifest-hash.txt", "manifest-hash.txt", ""),
@@ -575,6 +575,7 @@ mod tests {
             ("/manifest_hash", "manifest manifest_hash", ""),
             ("/recovery_timelock", "under older(1) is not", "1"),
             ("/network", "test-kind (tpub)", "\"bitcoin\""),
+            ("/max_msg_bytes", "recomputed hash", "999999"),
         ];
         let (ceremony, backup) = sealed_set();
         let (other, foreign) = sealed_set();
@@ -616,9 +617,9 @@ mod tests {
         assert_eq!(vault.escape_bump_max_fee_pct, 0);
         // Type-checked and carried, NOT hash-authenticated — see the field's docs.
         assert_eq!(vault.policy_version, m.policy_version);
-        // `max_msg_bytes` IS in the hash preimage (the tamper table above proves the
-        // anchor catches a change), and reaches a `usize` only through the checked
-        // conversion — never an `as` that could truncate a sealed value.
+        // `max_msg_bytes` IS hash-authenticated — the tamper table above splices it and
+        // the anchor catches it — and reaches a `usize` only through the checked
+        // conversion, never an `as` that could truncate a sealed value.
         assert_eq!(vault.max_msg_bytes, m.max_msg_bytes);
         let cap = vault
             .channel_body_cap()
@@ -686,21 +687,29 @@ mod tests {
         };
         cred.authenticate_spend(&mut request, &vault.wallet_id)
             .expect("the credential authenticates in place");
-        let digest = Message::from_digest(request.coord_request().auth_digest(&vault.wallet_id));
-        let der = <Vec<u8> as bitcoin::hex::FromHex>::from_hex(&request.coord_sig).expect("hex");
-        let sig = Signature::from_der(&der).expect("DER");
-        Secp256k1::verification_only()
-            .verify_ecdsa(&digest, &sig, &vault.coordinator_pubkey.inner)
-            .expect("the signature verifies under the manifest-pinned coordinator key");
+        let signature = request.coord_sig.clone();
+        assert!(
+            verifies(vault, &request, &signature),
+            "under the pinned key"
+        );
         request
+    }
+
+    /// Whether `coord_sig` verifies as the coordinator's authentication of `request`'s
+    /// canonical bytes under the vault's manifest-pinned PUBLIC half.
+    fn verifies(vault: &LiveVault, request: &SignRequest, coord_sig: &str) -> bool {
+        let digest = Message::from_digest(request.coord_request().auth_digest(&vault.wallet_id));
+        let der = <Vec<u8> as bitcoin::hex::FromHex>::from_hex(coord_sig).expect("hex");
+        let sig = Signature::from_der(&der).expect("DER");
+        let secp = Secp256k1::verification_only();
+        secp.verify_ecdsa(&digest, &sig, &vault.coordinator_pubkey.inner)
+            .is_ok()
     }
 
     /// The credential AUTHENTICATES and hands nothing else back: each call draws its own
     /// single-use nonce and signs the canonical bytes that nonce belongs to, verifiably under
     /// the manifest-pinned public half. That it returns no key, scalar, bytes or callback is a
-    /// property of the DECLARATION, so it is checked on the production source — a method
-    /// handing back secret authority would let a caller sign outside the one guarded scalar
-    /// this type rebuilds, sees signed, and drops.
+    /// property of the DECLARATION, so it is checked on the production source.
     #[test]
     fn the_credential_authenticates_in_place_and_hands_back_no_secret_authority() {
         let (_ceremony, backup) = sealed_set();
@@ -713,13 +722,16 @@ mod tests {
         let second = authenticated(&credential, &vault, "one");
         assert_ne!(first.nonce, second.nonce, "each call draws a fresh nonce");
         assert_ne!(first.coord_sig, second.coord_sig, "over its own nonce");
-        // A different body under the SAME credential is a different signature, so the
-        // verification above is answering for these bytes and not for the key alone.
-        let other = authenticated(&credential, &vault, "two");
-        assert_ne!(other.coord_sig, first.coord_sig);
+        // BODY-bound, not merely key-bound: a fresh nonce alone would make any two
+        // signatures differ, so the claim is checked the other way round — this exact
+        // signature over a request whose canonical bytes moved does not verify.
+        let mut tampered = first.clone();
+        tampered.psbt = "two".to_string();
+        let bound = !verifies(&vault, &tampered, &first.coord_sig);
+        assert!(bound, "the authentication is bound to the request bytes");
 
         let code = production_half();
-        let block = credential_impl(code);
+        let block = impl_block(code, "CoordinatorCredential");
         assert_eq!(
             public_signatures(block),
             [
@@ -777,9 +789,8 @@ mod tests {
         }
     }
 
-    /// The PRODUCTION half of this file only. Scanning the whole thing would let a test's
-    /// own assertion literals satisfy the scans below, which is how the first version of
-    /// one passed against a credential whose scalar had been stripped of `Zeroizing`.
+    /// The PRODUCTION half only: scanning the whole file would let a test's own assertion
+    /// literals satisfy the scans below, which is how one of them once passed vacuously.
     fn production_half() -> &'static str {
         let source = include_str!("sealed.rs");
         source.split("#[cfg(test)]").next().unwrap_or(source)
@@ -793,10 +804,6 @@ mod tests {
         body.split("\n}\n").next().expect("its end")
     }
 
-    fn credential_impl(code: &'static str) -> &'static str {
-        impl_block(code, "CoordinatorCredential")
-    }
-
     /// Every `pub(crate) fn` signature line in one impl block, in source order.
     fn public_signatures(block: &'static str) -> Vec<&'static str> {
         block
@@ -806,9 +813,8 @@ mod tests {
             .collect()
     }
 
-    /// Whether a signature is one the guard may expose: no `SecretKey` in or out, no
-    /// borrowed or bare byte view, no raw-key callback, no `Deref` — and, for the ONE
-    /// permitted byte exposure, a form that CONSUMES the guard instead of borrowing it.
+    /// Whether a signature is one the guard may expose: no `SecretKey` in or out, no borrowed
+    /// or bare byte view, no raw-key callback, no `Deref`, and a CONSUMING byte exposure only.
     fn permitted_surface(signature: &str) -> bool {
         let (params, returned) = signature.split_once("->").unwrap_or((signature, ""));
         !["SecretKey", "&[u8", "-> [u8", "Fn(", "dyn ", "Deref"]
@@ -839,12 +845,11 @@ mod tests {
         found
     }
 
-    /// The milestone scalar guard: its complete operational surface, the shapes that
-    /// surface may never take, and — WORKSPACE-WIDE — that exactly one implementation
-    /// anywhere owns a secret under that name, at its intended private definition here.
-    /// The local check alone is evadable: a parallel secret-owning `Scalar` declared in
-    /// any other normal-build file would hand out everything this one refuses to, and
-    /// nothing scanning only this file would notice.
+    /// The milestone scalar guard: its complete operational surface, the shapes that surface
+    /// may never take, and — WORKSPACE-WIDE — that exactly one implementation anywhere owns a
+    /// secret under that name, at its intended private definition here. The local check alone
+    /// is evadable: a parallel secret-owning `Scalar` in any other normal-build file would hand
+    /// out everything this one refuses to, and a scan of this file alone would not notice.
     #[test]
     fn the_scalar_guard_is_the_sole_secret_owner_and_exposes_only_its_pinned_surface() {
         let code = production_half();

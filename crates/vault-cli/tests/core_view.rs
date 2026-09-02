@@ -2346,10 +2346,12 @@ fn the_node_publishes_one_body_cap_one_envelope_sizer_and_one_commitment() {
         builders[0].ends_with("/vault-cli/src/attack.rs"),
         "the one independent derivation is the adversary's: {builders:?}"
     );
-    // No local body cap either, so nothing sizes a request against a second number.
+    // And no second DEFINITION of the cap on the coordinator side. Reading the published
+    // one is the whole point of publishing it, so the needle is the declaration rather
+    // than the name: a `const` here would be the second number this class forbids.
     for (rel, code) in &sources {
-        let local_cap = rel.contains("/vault-cli/") && code.contains("MAX_BODY_BYTES");
-        assert!(!local_cap, "{rel} keeps a body cap of its own");
+        let own_cap = rel.contains("/vault-cli/") && code.contains("MAX_BODY_BYTES: usize =");
+        assert!(!own_cap, "{rel} defines a body cap of its own");
     }
 }
 

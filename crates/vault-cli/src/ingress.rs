@@ -517,6 +517,16 @@ mod tests {
         let sampled = Mutex::new(0usize);
         let clock = || {
             let mut at = sampled.lock().expect("lock");
+            // Direct-indexed, one offset per sample. The bound is ASSERTED rather than
+            // left to the index panic, because a seam that samples more often than the
+            // test scripted is exactly what a deadline rebased from a remaining duration
+            // does — one extra read before the loop — and it should report the property
+            // it broke rather than an out-of-bounds.
+            assert!(
+                *at < offsets.len(),
+                "the scripted clock ran out of samples: each endpoint is handed \
+                 min(now + 60s, aggregate), and no rebased duration"
+            );
             let now = base + offsets[*at];
             *at += 1;
             now
