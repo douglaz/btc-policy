@@ -14776,8 +14776,9 @@ mod duress {
     }
 
     fn eventually(mut predicate: impl FnMut() -> bool) -> bool {
+        // PACED, not spun: 10_000 bare yields elapse in ~1ms, under one loaded ingest.
         (0..10_000).any(|_| {
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_micros(100));
             predicate()
         })
     }
