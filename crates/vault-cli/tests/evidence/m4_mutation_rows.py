@@ -2580,6 +2580,10 @@ M4SB_OWNED = [
         "id": 'M4SB-R03-psbtinconsistent-defining-docs-omit-policy-version',
         "state": 'ACTIVE',
         "file": 'docs/adr/0013-concrete-protocol-schemas.md',
+        # Each edit is its OWN red case against the pristine source, not one combined
+        # mutation: the bead requires this row to fail against EACH omission, and a single
+        # mutation that drops both facts at once leaves either one of them unproven.
+        "independent": True,
         "edits": [
             [
                 '(`PSBT_INCONSISTENT`, `check = "policy_version"`)',
@@ -2642,6 +2646,9 @@ def verify(root=ROOT):
         elif not row["filter"].strip():
             faults.append(f"{rid}: the command is not focused on a filter")
         text = (root / row["file"]).read_text()
+        independent = row.get("independent", False)
+        if independent and len(row["edits"]) < 2:
+            faults.append(f"{rid}: an independent row needs more than one red case")
         applied = text
         for index, (old, new) in enumerate(row["edits"]):
             if old == new:
@@ -2650,6 +2657,10 @@ def verify(root=ROOT):
                 faults.append(
                     f"{rid}: edit {index} has {text.count(old)} exact targets in {row['file']}"
                 )
+            if independent:
+                # Each edit is its own mutation of the ORIGINAL bytes, so there is no order
+                # to be ambiguous: uniqueness against `text` above is the whole requirement.
+                continue
             # Order matters: each edit is applied to the result of the one before it, so a
             # later target that has already been consumed is an ambiguous order, not a row.
             if applied.count(old) != 1:
