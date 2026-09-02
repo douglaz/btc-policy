@@ -2647,7 +2647,7 @@ const ARM_CARRIER_TAG: &str = "btc-policy/vault-node/arm-carrier/v0";
 const ARM_SIGNATURE_TAG: &str = "btc-policy/vault-node/arm-signature/v0";
 
 fn arm_signature_tag(coord_sig: &str) -> [u8; 32] {
-    // Every call site has already passed `verify_coord_signature`. Reparse and
+    // Every call site has already passed `verify_coord_request`. Reparse and
     // serialize the verified DER value so text aliases such as upper/lowercase hex
     // share one replay memo key.
     let der = Vec::<u8>::from_hex(coord_sig).expect("verified coordinator signature is hex");
@@ -4589,7 +4589,7 @@ fn handle_outer_stale_spend(
     let vault_proto::TaggedRequest::Spend(spend) = request else {
         return stale();
     };
-    if verify_coord_signature(node, spend.coord_request(), &spend.coord_sig).is_err() {
+    if verify_coord_request(node, spend.coord_request(), &spend.coord_sig).is_err() {
         return stale();
     }
     if spend.nonce.is_empty()
@@ -4721,7 +4721,7 @@ fn handle_channel_body_with_clocks(
                     && !spend.nonce.is_empty()
                     && spend.nonce.len() <= MAX_COORD_NONCE_BYTES
                     && ensure_request_propagatable(node, request.as_ref()).is_ok()
-                    && verify_coord_signature(node, spend.coord_request(), &spend.coord_sig).is_ok()
+                    && verify_coord_request(node, spend.coord_request(), &spend.coord_sig).is_ok()
                 {
                     let signature_tag = arm_signature_tag(&spend.coord_sig);
                     match channel.carrier_memo_lookup(
@@ -4880,7 +4880,7 @@ fn handle_channel_body_with_clocks(
                     None
                 };
                 if let Some(carrier) = carrier {
-                    // Resample. `lookup_now` predates `verify_coord_signature` and — on
+                    // Resample. `lookup_now` predates `verify_coord_request` and — on
                     // the conflicting-signature branch — a full memory-hard carrier
                     // derivation, which is deliberately expensive and can be queued
                     // behind the one global KDF slot. Reusing it would let a receipt
@@ -5757,9 +5757,9 @@ fn handle_sign_after_lock(
 
     // 3. Bind this decision to the exact transactions. The commitments carry
     //    this node's OWN baked `policy_version` (from config, not the request):
-    //    the node always evaluates and signs against its own static policy, so
-    //    the request's `policy_version` is coordinator metadata that cannot
-    //    change what gets signed and needs no separate match check here. The two
+    //    the node always evaluates and signs against its own static policy, and
+    //    the request's own `policy_version` was already required to EQUAL it by
+    //    [`verify_coord_request`], before any nonce or state moved. The two
     //    are DISTINCT commitments — the pair of §4.
     let commitment_id = commitment_of(node, &spend, request.expiry).commitment_id();
     let escape_commitment_id = commitment_of(node, &escape, request.expiry).commitment_id();
@@ -6962,10 +6962,10 @@ pub(crate) fn commitment_id_for(node: &Node, psbt: &Psbt, expiry: u64) -> String
     commitment_of(node, psbt, expiry).commitment_id()
 }
 
-/// Build the [`Commitment`] for `psbt` under this node's wallet, at the
+/// Build the [`Commitment`] for `psbt` under `wallet_id` and `policy_version`, at the
 /// coordinator-proposed `expiry`. Every transaction-identifying field —
 /// `version`, `lock_time`, each input's outpoint and `sequence`, and the
-/// outputs — is read from the node's OWN unsigned tx, so the commitment binds
+/// outputs — is read from the caller-supplied `psbt.unsigned_tx`, so it binds
 /// the exact transaction (ADR-0012): two txs differing in any of them get
 /// distinct ids. The fee is `Σ input value − Σ output value`,
 /// taking input values from each `witness_utxo` (v0 trusts the PSBT's prevout
@@ -6974,7 +6974,12 @@ pub(crate) fn commitment_id_for(node: &Node, psbt: &Psbt, expiry: u64) -> String
 /// `witness_utxo`, outputs exceeding inputs) still gets a stable commitment id
 /// here and its refusal downstream — and any change to a prevout amount yields
 /// a different fee, hence a different id.
-fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
+pub fn commitment_for(
+    wallet_id: [u8; 32],
+    policy_version: u32,
+    psbt: &Psbt,
+    expiry: u64,
+) -> Commitment {
     let inputs = psbt
         .unsigned_tx
         .input
@@ -6982,7 +6987,7 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
         .map(|txin| CommitmentInput {
             txid: txin.previous_output.txid.to_byte_array(),
             vout: txin.previous_output.vout,
-            // Read this input's nSequence from the node's OWN copy of the
+            // Read this input's nSequence from the caller's own decoded
             // unsigned tx (ADR-0012) — never a coordinator-supplied summary.
             sequence: txin.sequence.to_consensus_u32(),
         })
@@ -7007,8 +7012,8 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
         .iter()
         .fold(0u64, |acc, txout| acc.saturating_add(txout.value.to_sat()));
     Commitment {
-        wallet_id: node.wallet_id,
-        // nVersion and nLockTime, read from the node's own unsigned tx so the
+        wallet_id,
+        // nVersion and nLockTime, read from `psbt.unsigned_tx` so the
         // commitment binds the exact transaction (ADR-0012).
         version: psbt.unsigned_tx.version.0,
         lock_time: psbt.unsigned_tx.lock_time.to_consensus_u32(),
@@ -7016,14 +7021,19 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
         outputs,
         fee: total_in.saturating_sub(total_out),
         expiry,
-        policy_version: node.policy_version,
+        policy_version,
     }
+}
+
+/// [`commitment_for`] under this node's own wallet and baked policy version.
+fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
+    commitment_for(node.wallet_id, node.policy_version, psbt, expiry)
 }
 
 /// The coordinator-auth + freshness gate (ADR-0013 §2/§3): the ingress check
 /// EVERY request passes BEFORE the PIN. A request is rejected unless it is validly
-/// coord-signed over its canonical bytes against the node's configured
-/// `coordinator_auth_pubkey`, carries a nonce this node has not seen, and has an
+/// coord-signed over its canonical bytes against `coordinator_auth_pubkey`, names this
+/// node's own sealed `policy_version`, carries a nonce it has not seen, and has an
 /// expiry that is neither past nor beyond `now + max_commitment_age_secs`. `Err`
 /// carries the wire refusal. There is no un-gated mode: the key is mandatory
 /// config, so an unauthenticated caller never reaches the PIN, let alone a signer.
@@ -7055,7 +7065,7 @@ fn verify_coord_auth(
     nonces: &mut NonceLog,
     mono_now: Option<u64>,
 ) -> Result<(u64, Option<u64>), SignResponse> {
-    verify_coord_signature(node, request, coord_sig)?;
+    verify_coord_request(node, request, coord_sig)?;
     // Sender authenticated. Validate the expiry window, reject replay, enforce
     // capacity, and consume the nonce in one operation under the sign-state lock.
     // Pruning and the matching high-water advance through the expiries actually
@@ -7103,10 +7113,16 @@ fn verify_coord_auth(
     }
 }
 
-/// Verify only the coordinator signature, without consulting or mutating freshness
-/// state. The `/channel` path uses this before deriving a spend's memory-hard carrier
-/// id; the complete ingress gate remains [`verify_coord_auth`].
-fn verify_coord_signature(
+/// The combined coordinator gate: the ECDSA signature over the canonical request bytes,
+/// then the `policy_version` that signature covers against this node's own sealed one. It
+/// consults and mutates no freshness state, so all four entries — direct Spend, direct
+/// Refresh, fresh relay receipt resolution, outer-Stale — run it ahead of
+/// [`NonceLog::check_and_record`] and of every PIN, carrier, KDF, claim, intent, holder,
+/// candidate, confirmation, preflight and coordinator-request-memo mutation. On the two
+/// DIRECT routes terminal Lockdown (`FRAUD_SUSPECTED`) short-circuits first; only
+/// otherwise is this the first coordinator-request validation they run. No weaker
+/// signature-only primitive is left to reach for; [`verify_coord_auth`] adds freshness.
+fn verify_coord_request(
     node: &Node,
     request: CoordRequest<'_>,
     coord_sig: &str,
@@ -7141,7 +7157,16 @@ fn verify_coord_signature(
                 "coord_sig",
                 "coord_sig does not verify against the pinned coordinator_auth_pubkey".into(),
             )
-        })
+        })?;
+    // The authenticated request must also name the policy this node is sealed to.
+    let claimed = request.policy_version();
+    if claimed != node.policy_version {
+        let sealed = node.policy_version;
+        let detail = format!("request policy_version {claimed} is not this node's sealed {sealed}");
+        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);
+        return Err(refused);
+    }
+    Ok(())
 }
 
 /// The V0-6 prevout ground-truth PREFLIGHT (deliverable 9y5.3-d), run in the
@@ -9633,6 +9658,40 @@ mod commitment_parity_tests {
         );
     }
 
+    /// The PUBLISHED [`commitment_for`] and the node-side [`commitment_of`] are ONE
+    /// construction: same value, same id, on the same transaction. Both parameters the
+    /// public form takes are really bound, so a coordinator naming a different vault or a
+    /// different policy revision names a different commitment and cannot compute an id a
+    /// node would agree with by accident. A second construction of these bytes anywhere
+    /// would be a silent fork of ADR-0012's identity, which is why there is one.
+    #[test]
+    fn the_published_commitment_helper_is_the_nodes_own_construction() {
+        let (node, request) = test_support::node_and_valid_request();
+        let psbt = Psbt::from_str(&request.psbt).expect("coordinator PSBT");
+        let node_side = commitment_of(&node, &psbt, request.expiry);
+        let published = commitment_for(node.wallet_id, node.policy_version, &psbt, request.expiry);
+        assert_eq!(published, node_side, "one construction, not two");
+        assert_eq!(published.commitment_id(), node_side.commitment_id());
+
+        let other_wallet = commitment_for([9u8; 32], node.policy_version, &psbt, request.expiry);
+        let other_policy = commitment_for(
+            node.wallet_id,
+            node.policy_version + 1,
+            &psbt,
+            request.expiry,
+        );
+        for (what, other) in [
+            ("wallet_id", other_wallet),
+            ("policy_version", other_policy),
+        ] {
+            assert_ne!(
+                other.commitment_id(),
+                node_side.commitment_id(),
+                "{what} must be bound into the published id"
+            );
+        }
+    }
+
     #[test]
     fn changing_only_tx_version_changes_the_commitment_id() {
         let (node, request) = test_support::node_and_valid_request();
@@ -10711,3 +10770,8 @@ mod reboot_death_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// A path-declared unit file, so the normal build carries this declaration and nothing else.
+#[cfg(test)]
+#[path = "../tests/unit/policy_version_direct_routes.rs"]
+mod policy_version_direct_routes;

@@ -2251,3 +2251,150 @@ fn a_live_core_composes_a_real_valued_pair_that_the_real_signer_authorizes() {
     );
     assert_eq!(node.call("getmempoolinfo", json!([]))["size"], json!(0));
 }
+
+// =====================================================================================
+// M4-SBR — the published node surfaces, and the protocol documentation that adjudicates
+// the policy-version refusal (bead btc-policy-5jt).
+//
+// Both classes run in the ordinary `cargo test --workspace` gate: neither needs a daemon.
+// They live here because this is the target that can reach the sealed vault, the signer,
+// the node crate and the repository's own documentation tree together.
+// =====================================================================================
+
+/// The repository root — `crates/vault-cli`'s grandparent.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("the repository root")
+        .to_path_buf()
+}
+
+/// M4-SBR. The three canonical surfaces a later Spend command must size and name itself
+/// against are PUBLISHED by the node crate and exist exactly once in the workspace: the
+/// raw HTTP body cap, the channel-envelope fit predicate, and the transaction commitment.
+/// A coordinator that recomputed any of them locally could offer a request its own nodes
+/// then refuse — or, worse, name a `commitment_id` they do not agree with, which is a
+/// silent fork of ADR-0012's transaction identity rather than a visible error.
+#[test]
+fn the_node_publishes_one_body_cap_one_envelope_sizer_and_one_commitment() {
+    // Reachable from THIS crate, which is what "published" means here, and unchanged in
+    // value: making it public was a visibility change and nothing else.
+    assert_eq!(vault_node::server::MAX_BODY_BYTES, 1024 * 1024);
+
+    // The envelope sizer is a real function of the request, not a constant: the same
+    // request fits at the cap it needs and does not fit one byte under it. Found by
+    // bisection so this never hard-codes the base64/JSON expansion it is testing.
+    let request = vault_proto::TaggedRequest::Spend(vault_proto::SignRequest {
+        psbt: "cHNidP8B".repeat(64),
+        escape_psbt: "cHNidP8C".repeat(64),
+        escape_bumps: Vec::new(),
+        pin: "482913".into(),
+        nonce: "ab12".into(),
+        expiry: 1_752_500_000,
+        policy_version: 1,
+        coord_sig: "deadbeef".into(),
+    });
+    let fits = |cap: usize| vault_node::channel::request_fits_channel_body(&request, cap);
+    assert!(fits(vault_node::server::MAX_BODY_BYTES), "1 MiB is roomy");
+    assert!(!fits(0), "and nothing fits nothing");
+    let (mut low, mut high) = (0usize, vault_node::server::MAX_BODY_BYTES);
+    while low + 1 < high {
+        let mid = low + (high - low) / 2;
+        if fits(mid) {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    assert!(
+        fits(high) && !fits(low),
+        "one exact envelope boundary at {high}"
+    );
+
+    // Exactly one definition of each, workspace-wide. `production_sources()` strips
+    // comment lines, so a doc comment naming one of them is not a second definition.
+    let sources = production_sources();
+    for needle in [
+        "const MAX_BODY_BYTES",
+        "fn request_fits_channel_body",
+        "fn commitment_for",
+    ] {
+        let defined: usize = sources
+            .iter()
+            .map(|(_, code)| code.matches(needle).count())
+            .sum();
+        assert_eq!(defined, 1, "{needle} must be defined exactly once");
+    }
+    // And the coordinator side adds none of them again. It keeps exactly the ONE
+    // commitment construction that predates this — the adversarial harness derives the id
+    // independently ON PURPOSE, so its silence probe checks the node's answer against
+    // something other than the node's own code; collapsing that onto the published helper
+    // would make the probe check the node against itself. A SECOND one is what this bead
+    // forbids, and it would be a silent fork of ADR-0012's identity.
+    let builders: Vec<&String> = sources
+        .iter()
+        .filter(|(rel, code)| rel.contains("/vault-cli/") && code.contains("Commitment {"))
+        .map(|(rel, _)| rel)
+        .collect();
+    assert_eq!(
+        builders.len(),
+        1,
+        "a second coordinator commitment: {builders:?}"
+    );
+    assert!(
+        builders[0].ends_with("/vault-cli/src/attack.rs"),
+        "the one independent derivation is the adversary's: {builders:?}"
+    );
+    // No local body cap either, so nothing sizes a request against a second number.
+    for (rel, code) in &sources {
+        let local_cap = rel.contains("/vault-cli/") && code.contains("MAX_BODY_BYTES");
+        assert!(!local_cap, "{rel} keeps a body cap of its own");
+    }
+}
+
+/// M4-SBR. The DEFINING protocol documents must adjudicate the policy-version refusal, on
+/// ONE line each: which code it is, where in the order it fires — including what outranks
+/// it — that it consumes nothing, and what each route does. `PSBT_INCONSISTENT` is
+/// deliberately a broad category (a mixed transaction class and a refresh-shaped spend
+/// already share it), so a client holding only the code cannot tell those cases apart and
+/// must report a generic request/policy inconsistency. What makes this outcome adjudicable
+/// is that the defining documents name it, that the direct routes carry a locally authored
+/// `check`, and that the documents say what precedes it: terminal Lockdown answers
+/// `FRAUD_SUSPECTED` on the two direct routes BEFORE this gate is reached, so "the first
+/// coordinator-request validation" is a claim with an exception, and a document that
+/// omitted the exception would describe an order the code does not implement.
+///
+/// One LINE, not one document: a file mentioning `policy_version` in one place and
+/// `PSBT_INCONSISTENT` in another would satisfy a pair of `contains` calls while
+/// adjudicating nothing at all.
+#[test]
+fn the_defining_protocol_docs_adjudicate_policy_version_under_psbt_inconsistent() {
+    let root = repo_root();
+    for name in [
+        "docs/DESIGN.md",
+        "docs/adr/0013-concrete-protocol-schemas.md",
+    ] {
+        let text = std::fs::read_to_string(root.join(name)).expect(name);
+        let ruling = text
+            .lines()
+            .find(|line| line.contains("policy_version") && line.contains("PSBT_INCONSISTENT"))
+            .unwrap_or_else(|| {
+                panic!("{name} does not adjudicate policy_version as PSBT_INCONSISTENT")
+            });
+        for (what, needle) in [
+            ("the locally authored check", "check = \"policy_version\""),
+            ("the ordering against the nonce", "before"),
+            ("which state the order protects", "nonce"),
+            ("that nothing is consumed", "consumes nothing"),
+            ("the Lockdown precedence", "FRAUD_SUSPECTED"),
+            ("the relay outcome", "silent"),
+            ("the outer-stale outcome", "stale"),
+        ] {
+            assert!(
+                ruling.contains(needle),
+                "{name} states the refusal but not {what}: {ruling}"
+            );
+        }
+    }
+}

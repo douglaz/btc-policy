@@ -2400,7 +2400,210 @@ M4SA_OWNED = [
 ]
 
 # The rows M4-SBR owns. Each restores one behaviour that child introduces.
-M4SB_OWNED = []
+M4SB_OWNED = [
+    {
+        "id": 'M4-18-credential-authentication-returns-secret-authority',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/sealed.rs',
+        "edits": [
+            [
+                '    pub(crate) fn authenticate_spend(',
+                '    pub(crate) fn seckey(&self) -> SecretKey {\n        SecretKey::from_slice(self.seckey.as_slice()).expect("validated at load")\n    }\n    pub(crate) fn authenticate_spend(',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'sealed::tests::the_credential_authenticates_in_place',
+        "needle": "the credential's public surface moved",
+    },
+    {
+        "id": 'M4-20-direct-spend-bypasses-signature-and-policy-version-verification',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-node/src/lib.rs',
+        "edits": [
+            [
+                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    Ok(())',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-node',
+            '--lib',
+        ],
+        "filter": 'policy_version_direct_routes::a_direct_spend_naming_another_policy_version',
+        "needle": 'a spend for policy_version 2 must be refused',
+    },
+    {
+        "id": 'M4-21-direct-refresh-bypasses-signature-and-policy-version-verification',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-node/src/lib.rs',
+        "edits": [
+            [
+                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    Ok(())',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-node',
+            '--lib',
+        ],
+        "filter": 'policy_version_direct_routes::a_direct_refresh_naming_another_policy_version',
+        "needle": 'a refresh for policy_version 2 must be refused',
+    },
+    {
+        "id": 'M4-22-fresh-relay-receipt-bypasses-signature-and-policy-version-verification',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-node/src/lib.rs',
+        "edits": [
+            [
+                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    Ok(())',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-node',
+            '--lib',
+        ],
+        "filter": 'channel::policy_version_relay_routes::a_relayed_spend_for_another_policy_version',
+        "needle": 'a relayed mismatch may create no receipt state and pay no carrier KDF',
+    },
+    {
+        "id": 'M4-23-outer-stale-receipt-bypasses-signature-and-policy-version-verification',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-node/src/lib.rs',
+        "edits": [
+            [
+                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    Ok(())',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-node',
+            '--lib',
+        ],
+        "filter": 'channel::policy_version_relay_routes::an_outer_stale_spend_for_another_policy_version',
+        "needle": 'an outer-stale mismatch may derive nothing and claim no holder slot',
+    },
+    {
+        "id": 'M4-46-rebuilt-user-scalar-exists-outside-raii-erasure-guard',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/signer.rs',
+        "edits": [
+            [
+                '        // Rebuilt INSIDE the guard, so it is erased on this return and on an unwind.\n        let scalar = Scalar::from_bytes(&self.secret)?;',
+                '        let raw = bitcoin::secp256k1::SecretKey::from_slice(self.secret.as_slice())?;\n        let scalar = Scalar::from_bytes(&Zeroizing::new(raw.secret_bytes()))?;',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'signer::tests::the_signer_erases_its_parsed_key',
+        "needle": 'a user scalar outside the guard: SecretKey',
+    },
+    {
+        "id": 'M4SB-R01-scalar-exposes-forbidden-secret-authority',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/http.rs',
+        "edits": [
+            [
+                "pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;",
+                "pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;\n\npub(crate) struct Scalar(bitcoin::secp256k1::SecretKey);",
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'sealed::tests::the_scalar_guard_is_the_sole_secret_owner',
+        "needle": 'exactly one workspace implementation may own a secret under this name',
+    },
+    {
+        "id": 'M4SB-R02-policy-version-mismatch-moves-below-nonce-or-state-mutation',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-node/src/lib.rs',
+        "edits": [
+            [
+                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    Ok(())',
+            ],
+            [
+                '        NonceDecision::Accepted => Ok((\n            nonces.effective_now(now),\n            nonces.carrier_deadline(request.nonce()),\n        )),',
+                '        NonceDecision::Accepted if request.policy_version() == node.policy_version => Ok((\n            nonces.effective_now(now),\n            nonces.carrier_deadline(request.nonce()),\n        )),\n        NonceDecision::Accepted => Err(refusal(\n            RefusalCode::PsbtInconsistent,\n            "policy_version",\n            format!("request policy_version {} is not sealed", request.policy_version()),\n        )),',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-node',
+            '--lib',
+        ],
+        "filter": 'policy_version_direct_routes::a_direct_spend_naming_another_policy_version',
+        "needle": 'a refused spend may consume no nonce, candidate or PIN attempt',
+    },
+    {
+        "id": 'M4SB-R03-psbtinconsistent-defining-docs-omit-policy-version',
+        "state": 'ACTIVE',
+        "file": 'docs/adr/0013-concrete-protocol-schemas.md',
+        "edits": [
+            [
+                '(`PSBT_INCONSISTENT`, `check = "policy_version"`)',
+                '(`PSBT_INCONSISTENT`)',
+            ],
+            [
+                'only terminal Lockdown (`FRAUD_SUSPECTED`, ADR-0008) short-circuits ahead of it',
+                'nothing short-circuits ahead of it',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--test',
+            'core_view',
+            '--',
+        ],
+        "filter": 'the_defining_protocol_docs_adjudicate_policy_version',
+        "needle": 'states the refusal but not',
+    },
+]
 
 
 def rows():

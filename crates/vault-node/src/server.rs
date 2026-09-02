@@ -25,8 +25,10 @@ use zeroize::Zeroize;
 use crate::channel::{ChannelReply, RejectReason};
 use crate::{handle_channel_body_now, handle_refresh_now, handle_sign_now, propagate_outbox, Node};
 
-/// Unchanged 1 MiB cap applied while the zeroizing accumulator reads `/sign`.
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Unchanged 1 MiB cap applied while the zeroizing accumulator reads `/sign`, and now the
+/// crate's one PUBLISHED raw-HTTP body cap, so a coordinator sizes a request against the
+/// same number this server enforces rather than against a second copy of it.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Base handler deadline: production adds the configured maximum PIN backoff so
 /// every policy refusal can retain the HTTP-200 contract. It never cancels an

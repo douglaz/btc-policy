@@ -10,19 +10,18 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::str::FromStr;
 
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
-use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+use bitcoin::secp256k1::Message;
 use bitcoin::sighash::SighashCache;
-use bitcoin::{EcdsaSighashType, OutPoint, Psbt, PublicKey, ScriptBuf, Sequence, TxOut};
+use bitcoin::{EcdsaSighashType, OutPoint, Psbt, ScriptBuf, Sequence, TxOut};
 use policy_core::TxClass;
 use vault_proto::{ESCAPE_RBF_SEQUENCE, MAX_ESCAPE_BUMPS};
 use zeroize::Zeroizing;
 
 use crate::http::Error;
-use crate::sealed::LiveVault;
+use crate::sealed::{LiveVault, Scalar};
 
 /// The vault a request NAMES — a display and lookup hint, never authority.
 pub type WalletId = [u8; 32];
@@ -113,19 +112,15 @@ impl<'v> SoftwareSigner<'v> {
     pub(crate) fn load_file(vault: &'v LiveVault, path: &Path) -> Result<Self, Error> {
         let text = crate::sealed::read_secret(path)?;
         let named = path.display();
-        let mut scalar = SecretKey::from_str(text.trim())
-            .map_err(|e| format!("the user key at {named} does not parse: {e}"))?;
-        let derived = PublicKey::new(scalar.public_key(&Secp256k1::new()));
-        let secret = Zeroizing::new(scalar.secret_bytes());
-        // `SecretKey` is `Copy` and erases nothing on drop, so this function's own plain
-        // copy is wiped HERE — before the refusal as well as the success, since a key
-        // deriving the wrong public key is a secret too. Best effort: whatever the library
-        // copied internally is beyond reach.
-        scalar.non_secure_erase();
-        if derived != vault.template.user_key {
+        // Child A's guard owns the parse's only copy and erases it on the refusal below
+        // as well as the success, since a key deriving the wrong public key is a secret
+        // too. Best effort: whatever the library copied internally is beyond reach.
+        let scalar = Scalar::parse(text.trim(), &format!("the user key at {named}"))?;
+        if scalar.public_key() != vault.template.user_key {
             let refusal = "does not derive the sealed descriptor's user key";
             return bad(format!("the key at {named} {refusal}"));
         }
+        let secret = scalar.into_zeroizing_bytes();
         Ok(SoftwareSigner { vault, secret })
     }
 }
@@ -162,19 +157,18 @@ impl UserSigner for SoftwareSigner<'_> {
             }
             messages.push(per_input);
         }
-        let secp = Secp256k1::signing_only();
         let user_key = self.vault.template.user_key;
-        let mut scalar = SecretKey::from_slice(self.secret.as_slice())?;
+        // Rebuilt INSIDE the guard, so it is erased on this return and on an unwind.
+        let scalar = Scalar::from_bytes(&self.secret)?;
         for (psbt, per_input) in members.iter_mut().zip(&messages) {
             for (index, message) in per_input {
                 let signature = bitcoin::ecdsa::Signature {
-                    signature: secp.sign_ecdsa(message, &scalar),
+                    signature: scalar.sign_ecdsa(message),
                     sighash_type: EcdsaSighashType::All,
                 };
                 psbt.inputs[*index].partial_sigs.insert(user_key, signature);
             }
         }
-        scalar.non_secure_erase();
         Ok(Signed { display, members })
     }
 }
@@ -530,7 +524,9 @@ mod tests {
     use super::*;
     use crate::setup::tests::{ceremony_through_endorse, Ceremony};
     use bitcoin::absolute::LockTime;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use bitcoin::transaction::Version;
+    use bitcoin::PublicKey;
     use bitcoin::{Amount, Transaction, TxIn, Witness};
     use miniscript::{Descriptor, DescriptorPublicKey};
     use std::os::unix::fs::PermissionsExt;
@@ -1475,9 +1471,10 @@ mod tests {
         assert!(!code.split(split).any(named_pin), "the signer names a pin");
     }
 
-    /// 16. The owned scalar is zeroize-on-drop, the parsed `SecretKey` is erased on BOTH
-    ///     exits, a key that does not derive the sealed one is refused without printing
-    ///     itself, and no coordinator credential is reachable from here.
+    /// 16. The owned scalar is zeroize-on-drop, every plain `SecretKey` this module would
+    ///     otherwise hold lives inside child A's RAII guard instead — at load and on the
+    ///     signing rebuild alike — a key that does not derive the sealed one is refused
+    ///     without printing itself, and no coordinator credential is reachable from here.
     #[test]
     fn the_signer_erases_its_parsed_key_and_refuses_one_that_is_not_the_sealed_users() {
         let (vault, _) = sealed();
@@ -1500,12 +1497,27 @@ mod tests {
 
         let code = production();
         assert!(code.contains("secret: Zeroizing<[u8; 32]>"));
+        // The user scalar exists ONLY inside child A's non-`Copy` RAII guard, and that is
+        // a property of this whole half rather than of one line: name a plain `SecretKey`
+        // or its raw bytes here at all — at load, or on the rebuild the signing loop needs
+        // — and a `Copy` key or a bare array is live in a local that nothing erases, on
+        // the refusal path and on an unwind alike. `Scalar` wipes itself on drop instead,
+        // so this half hands the erase to a destructor and never spells one out.
+        for raw in ["SecretKey", "secret_bytes", "non_secure_erase"] {
+            assert!(
+                !code.contains(raw),
+                "a user scalar outside the guard: {raw}"
+            );
+        }
+        assert_eq!(
+            code.matches("Scalar::").count(),
+            2,
+            "exactly one guarded parse and one guarded rebuild"
+        );
         let load = code.split("fn load_file").nth(1).expect("the constructor");
-        let erase = load.find("scalar.non_secure_erase();").expect("the erase");
+        let guarded = load.find("Scalar::parse(").expect("the guarded parse");
         let refusal = load.find("does not derive").expect("the refusal");
-        assert!(erase < refusal, "the parsed key is wiped before refusing");
-        // Once in `load_file`, once for the signing copy: both plain `SecretKey`s go.
-        assert_eq!(code.matches("non_secure_erase()").count(), 2);
+        assert!(guarded < refusal, "the key is guarded before the refusal");
         assert!(!code.contains("oordinator"), "no credential is reachable");
     }
 

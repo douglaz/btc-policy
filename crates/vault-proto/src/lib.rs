@@ -379,6 +379,15 @@ impl<'a> CoordRequest<'a> {
         }
     }
 
+    /// The policy revision the coordinator authenticated, read out of the signed value for
+    /// the reason [`Self::nonce`] gives: a version taken beside it is one it never covered.
+    pub fn policy_version(&self) -> u32 {
+        match *self {
+            CoordRequest::Spend { policy_version, .. }
+            | CoordRequest::Refresh { policy_version, .. } => policy_version,
+        }
+    }
+
     /// The deterministic preimage the coordinator signs and the node verifies: a
     /// variant tag byte, then each field in fixed order — PSBTs, pin, and nonce as
     /// their raw bytes under a u32-LE length prefix; numerics little-endian. The

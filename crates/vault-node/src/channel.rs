@@ -5711,7 +5711,12 @@ pub(crate) fn request_payload(request: &TaggedRequest) -> Zeroizing<Vec<u8>> {
 /// and of the wall-clock timestamp. A request that fails this preflight must never
 /// be acknowledged: after acknowledgement the coordinator has no partials and peer
 /// propagation is the only path to a quorum.
-pub(crate) fn request_fits_channel_body(request: &TaggedRequest, max_msg_bytes: usize) -> bool {
+///
+/// PUBLISHED so a coordinator composing a request answers this exact question with this
+/// exact arithmetic, over the production serialization paths. There is no second
+/// base64/JSON size estimate, envelope, or cap anywhere, and adding one would let the two
+/// sides disagree about which requests are propagatable.
+pub fn request_fits_channel_body(request: &TaggedRequest, max_msg_bytes: usize) -> bool {
     const HEX_32_BYTES: usize = 64;
     const HEX_16_BYTES: usize = 32;
     const MAX_CHANNEL_SIG_HEX_BYTES: usize = MAX_ECDSA_DER_BYTES * 2;
@@ -23729,3 +23734,8 @@ mod hot_budget {
         // = 3V — the soft-vault tolerance, not the < 2V censorship residual.
     }
 }
+
+/// A path-declared unit file, so the normal build carries this declaration and nothing else.
+#[cfg(test)]
+#[path = "../tests/unit/policy_version_relay_routes.rs"]
+mod policy_version_relay_routes;
