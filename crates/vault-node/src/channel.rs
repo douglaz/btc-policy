@@ -10437,12 +10437,9 @@ mod net {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn retry_fails_over_from_a_dead_endorsed_endpoint_to_a_live_one() {
-        let (dead_listener, dead_port) = ephemeral().await;
+        let dead_port = 1; // unbindable; a RELEASED port is re-issued and ANSWERS, not refuses.
         let (sender_listener, sender_port) = ephemeral().await;
         let (live_listener, live_port) = ephemeral().await;
-        // Hold all three binds until their addresses are distinct, then release
-        // only the two endpoints intended to be unreachable/unserved.
-        drop(dead_listener);
         drop(sender_listener);
         let mut fx = Fixture::with_ports(2, &[sender_port, live_port]);
         fx.replace_endpoints(
