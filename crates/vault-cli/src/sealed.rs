@@ -910,10 +910,14 @@ mod tests {
         for spelling in ["Clone for Scalar", "Debug for Scalar", "Deref for Scalar"] {
             assert!(!code.contains(spelling), "Scalar implements {spelling}");
         }
+        // A DERIVE grants what those three forbid while writing no `impl` line, so the
+        // declaration itself is pinned, from the fragments the ownership scan also uses.
+        let (owner, secret) = (format!("struct {}", "Scalar"), format!("Secret{}", "Key"));
+        let sole = format!("`Debug`.\npub(crate) {owner}({secret});\n");
+        assert!(code.contains(&sole), "an attribute on the guard");
 
         // WORKSPACE-WIDE OWNERSHIP. The needles are assembled from fragments so this
         // test's own bytes are never one of the declarations it counts.
-        let (owner, secret) = (format!("struct {}", "Scalar"), format!("Secret{}", "Key"));
         let mut owners = Vec::new();
         for path in workspace_sources() {
             let text = std::fs::read_to_string(&path).expect("a workspace source");
