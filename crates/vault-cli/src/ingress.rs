@@ -505,7 +505,9 @@ mod tests {
 
     /// Drive the seam with a scripted clock and a transport that opens NO socket, and
     /// report the ABSOLUTE deadline each endpoint was handed, in order. `offsets` are what
-    /// the clock answers, sample by sample, from `base`; the last one repeats.
+    /// the clock answers, sample by sample, from `base` — one per sample, indexed
+    /// directly, so a caller that scripts the wrong number of samples panics here rather
+    /// than being handed a silently repeated last one.
     fn scripted(
         base: Instant,
         offsets: &[Duration],
@@ -515,7 +517,7 @@ mod tests {
         let sampled = Mutex::new(0usize);
         let clock = || {
             let mut at = sampled.lock().expect("lock");
-            let now = base + offsets[(*at).min(offsets.len() - 1)];
+            let now = base + offsets[*at];
             *at += 1;
             now
         };

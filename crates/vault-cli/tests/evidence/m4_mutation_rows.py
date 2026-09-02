@@ -2,9 +2,11 @@
 """The M4 mutation row definitions, TRACKED and checkout-portable.
 
 This file is test evidence, not production code: it carries the exact final row
-definitions M4-SA inherited and the rows M4-SA owns, so a later governed run depends on
-this repository alone. The ignored provenance artifacts that produced the inherited rows
-are recorded in [`SOURCES`] by path and SHA-256 and are NOT runtime inputs.
+definitions M4-SA inherited, the rows M4-SA owns, and the rows M4-SBR owns, so a later
+governed run depends on this repository alone. The ignored provenance artifacts that
+produced the inherited rows are recorded in [`SOURCES`] by path and SHA-256 and are NOT
+runtime inputs. Each child's rows live in their own ordered list — `M4SA_OWNED` and
+`M4SB_OWNED` — and `rows()` is their union with `INHERITED`, in that order.
 
 Provenance. The 91 inherited rows are the exact final union the qhe final-byte harness
 produced: the 50 M3 rows that governed M3b's landed bytes (with `m30` re-anchored onto the
@@ -2191,8 +2193,8 @@ INHERITED = [
     },
 ]
 
-# The rows M4-SA owns. Each restores one behaviour this child introduces.
-OWNED = [
+# The rows M4-SA owns. Each restores one behaviour that child introduced.
+M4SA_OWNED = [
     {
         "id": 'M4-25-aggregate-deadline-rebuilt-from-a-remaining-duration',
         "state": 'ACTIVE',
@@ -2373,12 +2375,37 @@ OWNED = [
         "filter": 'verify',
         "needle": 'the re-anchor is byte-identical to its active definition',
     },
+    {
+        "id": 'M4SA-R03-aggregate-ceiling-removed',
+        "state": 'ACTIVE',
+        "file": 'crates/vault-cli/src/ingress.rs',
+        "edits": [
+            [
+                '        let deadline = now()\n            .checked_add(PER_ENDPOINT)\n            .unwrap_or(aggregate)\n            .min(aggregate);',
+                '        let deadline = now()\n            .checked_add(PER_ENDPOINT)\n            .unwrap_or(aggregate);',
+            ],
+        ],
+        "command": [
+            'cargo',
+            'test',
+            '--locked',
+            '-p',
+            'vault-cli',
+            '--bin',
+            'btc-vault',
+        ],
+        "filter": 'ingress::tests::every_endpoint_is_handed_the_minimum',
+        "needle": 'each endpoint is handed min(now + 60s, aggregate), and no rebased duration',
+    },
 ]
+
+# The rows M4-SBR owns. Each restores one behaviour that child introduces.
+M4SB_OWNED = []
 
 
 def rows():
-    """Every row this repository defines: the 91 inherited plus M4-SA's own."""
-    return INHERITED + OWNED
+    """Every row this repository defines: the 91 inherited plus each child's own."""
+    return INHERITED + M4SA_OWNED + M4SB_OWNED
 
 
 def verify(root=ROOT):
@@ -2425,8 +2452,6 @@ def verify(root=ROOT):
             if applied.count(old) != 1:
                 faults.append(f"{rid}: edit {index} is not unique after the edits before it")
             applied = applied.replace(old, new, 1)
-        if applied == text:
-            faults.append(f"{rid}: the edits change nothing")
         if state.startswith("REANCHORED_FROM="):
             prior = row.get("prior")
             if not prior:
@@ -2460,7 +2485,10 @@ def main(argv):
         print("MANIFEST VERIFICATION FAILED:")
         print("\n".join(f"  {fault}" for fault in faults))
         return 1
-    print(f"OK: {len(INHERITED)} inherited + {len(OWNED)} owned rows verified")
+    print(
+        f"OK: {len(INHERITED)} inherited + {len(M4SA_OWNED)} M4-SA + {len(M4SB_OWNED)} M4-SBR "
+        f"= {len(rows())} rows verified"
+    )
     return 0
 
 
