@@ -804,12 +804,14 @@ mod tests {
         body.split("\n}\n").next().expect("its end")
     }
 
-    /// Every `pub(crate) fn` signature line in one impl block, in source order.
+    /// Every non-private function signature line in one impl block, in source order.
     fn public_signatures(block: &'static str) -> Vec<&'static str> {
         block
             .lines()
             .map(str::trim)
-            .filter(|line| line.starts_with("pub(crate) fn "))
+            .filter(|line| {
+                (line.starts_with("pub ") || line.starts_with("pub(")) && line.contains(" fn ")
+            })
             .collect()
     }
 

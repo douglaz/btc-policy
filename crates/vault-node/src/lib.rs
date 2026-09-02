@@ -7033,7 +7033,7 @@ fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
 /// The coordinator-auth + freshness gate (ADR-0013 §2/§3): the ingress check
 /// EVERY request passes BEFORE the PIN. A request is rejected unless it is validly
 /// coord-signed over its canonical bytes against `coordinator_auth_pubkey`, names this
-/// node's own sealed `policy_version`, carries a nonce it has not seen, and has an
+/// node's own baked-at-setup `policy_version`, carries a nonce it has not seen, and has an
 /// expiry that is neither past nor beyond `now + max_commitment_age_secs`. `Err`
 /// carries the wire refusal. There is no un-gated mode: the key is mandatory
 /// config, so an unauthenticated caller never reaches the PIN, let alone a signer.
@@ -7114,7 +7114,7 @@ fn verify_coord_auth(
 }
 
 /// The combined coordinator gate: the ECDSA signature over the canonical request bytes,
-/// then the `policy_version` that signature covers against this node's own sealed one. It
+/// then the `policy_version` that signature covers against this node's baked-at-setup one. It
 /// consults and mutates no freshness state, so all four entries — direct Spend, direct
 /// Refresh, fresh relay receipt resolution, outer-Stale — run it ahead of
 /// [`NonceLog::check_and_record`] and of every PIN, carrier, KDF, claim, intent, holder,
@@ -7158,11 +7158,12 @@ fn verify_coord_request(
                 "coord_sig does not verify against the pinned coordinator_auth_pubkey".into(),
             )
         })?;
-    // The authenticated request must also name the policy this node is sealed to.
+    // The authenticated request must also name this node's baked-at-setup policy.
     let claimed = request.policy_version();
     if claimed != node.policy_version {
-        let sealed = node.policy_version;
-        let detail = format!("request policy_version {claimed} is not this node's sealed {sealed}");
+        let configured = node.policy_version;
+        let detail =
+            format!("request policy_version {claimed} is not this node's configured {configured}");
         let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);
         return Err(refused);
     }

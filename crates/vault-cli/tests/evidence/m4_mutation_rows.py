@@ -51,6 +51,8 @@ SOURCES = [
 # sources above. Keys: the row id, its state, the file it edits, its edits IN
 # ORDER, the focused unpiped argv command, the test filter, and the diagnostic the
 # RED run must print. The same command and filter are the restored-green control.
+# Optional `independent=True` instead applies each edit separately to the original
+# bytes, requiring one red run per edit rather than one combined ordered mutation.
 INHERITED = [
     {
         "id": 'm01-mempool-spent-coin-silently-excluded',
@@ -2429,7 +2431,7 @@ M4SB_OWNED = [
         "file": 'crates/vault-node/src/lib.rs',
         "edits": [
             [
-                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    // The authenticated request must also name this node\'s baked-at-setup policy.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let configured = node.policy_version;\n        let detail =\n            format!("request policy_version {claimed} is not this node\'s configured {configured}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
                 '    Ok(())',
             ],
         ],
@@ -2450,7 +2452,7 @@ M4SB_OWNED = [
         "file": 'crates/vault-node/src/lib.rs',
         "edits": [
             [
-                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    // The authenticated request must also name this node\'s baked-at-setup policy.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let configured = node.policy_version;\n        let detail =\n            format!("request policy_version {claimed} is not this node\'s configured {configured}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
                 '    Ok(())',
             ],
         ],
@@ -2471,7 +2473,7 @@ M4SB_OWNED = [
         "file": 'crates/vault-node/src/lib.rs',
         "edits": [
             [
-                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    // The authenticated request must also name this node\'s baked-at-setup policy.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let configured = node.policy_version;\n        let detail =\n            format!("request policy_version {claimed} is not this node\'s configured {configured}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
                 '    Ok(())',
             ],
         ],
@@ -2492,7 +2494,7 @@ M4SB_OWNED = [
         "file": 'crates/vault-node/src/lib.rs',
         "edits": [
             [
-                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    // The authenticated request must also name this node\'s baked-at-setup policy.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let configured = node.policy_version;\n        let detail =\n            format!("request policy_version {claimed} is not this node\'s configured {configured}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
                 '    Ok(())',
             ],
         ],
@@ -2557,7 +2559,7 @@ M4SB_OWNED = [
         "file": 'crates/vault-node/src/lib.rs',
         "edits": [
             [
-                '    // The authenticated request must also name the policy this node is sealed to.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let sealed = node.policy_version;\n        let detail = format!("request policy_version {claimed} is not this node\'s sealed {sealed}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
+                '    // The authenticated request must also name this node\'s baked-at-setup policy.\n    let claimed = request.policy_version();\n    if claimed != node.policy_version {\n        let configured = node.policy_version;\n        let detail =\n            format!("request policy_version {claimed} is not this node\'s configured {configured}");\n        let refused = refusal(RefusalCode::PsbtInconsistent, "policy_version", detail);\n        return Err(refused);\n    }\n    Ok(())',
                 '    Ok(())',
             ],
             [
