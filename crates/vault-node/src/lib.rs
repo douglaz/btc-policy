@@ -7025,7 +7025,6 @@ pub fn commitment_for(
     }
 }
 
-/// [`commitment_for`] under this node's own wallet and baked policy version.
 fn commitment_of(node: &Node, psbt: &Psbt, expiry: u64) -> Commitment {
     commitment_for(node.wallet_id, node.policy_version, psbt, expiry)
 }
