@@ -1,3 +1,12 @@
+//! The sealed-artifact trust boundary's own unit module, moved out of normal-build source
+//! because a path-only line counter charges mandatory test-only content to the production
+//! brake. Declared from `sealed.rs` under `#[cfg(test)]` with `#[path]`, so this is still
+//! lexically `sealed::tests` — `super` is that module, and its private items, `super`
+//! access, filters and behaviour are unchanged.
+//!
+//! Only the two physical-path-dependent includes moved with it: the production half it
+//! scans is `../../src/sealed.rs`, and the captured pre-M1 fixture `../fixtures/`.
+
 use super::*;
 use crate::setup::tests::{ceremony_through_endorse, Ceremony};
 use bitcoin::hashes::{sha256, Hash};
