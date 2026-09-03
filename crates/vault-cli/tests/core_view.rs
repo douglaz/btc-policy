@@ -2282,6 +2282,13 @@ fn the_node_publishes_one_body_cap_one_envelope_sizer_and_one_commitment() {
     // value: making it public was a visibility change and nothing else.
     assert_eq!(vault_node::server::MAX_BODY_BYTES, 1024 * 1024);
 
+    let psbt = Psbt::from_unsigned_tx(prevtx(0, &ScriptBuf::new(), 1)).expect("a PSBT");
+    let commitment = vault_node::commitment_for([0; 32], 1, &psbt, 0);
+    assert_eq!(
+        commitment.wallet_id, [0; 32],
+        "callable across the crate boundary"
+    );
+
     // The envelope sizer is a real function of the request, not a constant: the same
     // request fits at the cap it needs and does not fit one byte under it. Found by
     // bisection so this never hard-codes the base64/JSON expansion it is testing.
